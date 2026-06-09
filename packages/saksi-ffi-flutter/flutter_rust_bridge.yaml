@@ -1,0 +1,6 @@
+rust_input: crate::api
+dart_output: lib/src/rust
+rust_root: .
+dart_root: example
+web: false
+

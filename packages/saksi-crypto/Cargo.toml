@@ -1,0 +1,26 @@
+[package]
+name = "saksi-crypto"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Saksi: cryptographic primitives over ristretto255 — ElGamal threshold encryption, Pedersen DKG, Chaum-Pedersen and CDS NIZKs, Pedersen commitments, Benaloh challenge. Empty skeleton; primitives land in issues #10–#16."
+
+[lib]
+name = "saksi_crypto"
+path = "src/lib.rs"
+
+[dependencies]
+saksi-protocol = { path = "../saksi-protocol/rust" }
+curve25519-dalek.workspace = true
+merlin.workspace = true
+subtle.workspace = true
+zeroize.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+rand_core.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true

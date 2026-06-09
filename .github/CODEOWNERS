@@ -1,0 +1,19 @@
+# Default ownership for the Saksi framework repository.
+* @Banyel3
+
+# Framework packages (Rust).
+/packages/saksi-crypto/        @Banyel3
+/packages/saksi-credentials/   @Banyel3
+/packages/saksi-protocol/      @Banyel3
+/packages/saksi-ffi-flutter/   @Banyel3
+/packages/saksi-ffi-tauri/     @Banyel3
+
+# Framework: Hyperledger Fabric bulletin board (Go).
+/packages/saksi-bulletin/                @Banyel3
+/packages/saksi-bulletin/chaincode/      @Banyel3
+/packages/saksi-bulletin/network/        @Banyel3
+/packages/saksi-bulletin/client-sdk/     @Banyel3
+
+# Documentation and repository governance.
+/docs/      @Banyel3
+/.github/   @Banyel3

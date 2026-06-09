@@ -1,0 +1,25 @@
+[package]
+name = "saksi-ffi-tauri"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Saksi: Rust -> TypeScript bridge via Tauri commands for the trustee, admin, and auditor desktop apps. Exposes saksi-crypto, saksi-credentials, and saksi-protocol to the desktop clients."
+
+[lib]
+name = "saksi_ffi_tauri"
+path = "src/lib.rs"
+
+[features]
+default = []
+tauri = []
+
+[dependencies]
+saksi-crypto = { path = "../saksi-crypto" }
+saksi-credentials = { path = "../saksi-credentials" }
+saksi-protocol = { path = "../saksi-protocol/rust" }
+curve25519-dalek.workspace = true
+serde = { version = "1", features = ["derive", "std"] }
+sha2 = "0.10"

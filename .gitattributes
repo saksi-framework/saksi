@@ -1,0 +1,31 @@
+# Force LF line endings on text files that downstream toolchains require.
+# Without this, Windows clones with autocrlf=true can produce CRLF in committed
+# files, breaking gofmt, rustfmt, and shell scripts in CI.
+
+* text=auto eol=lf
+
+# Languages and tooling that REQUIRE LF endings.
+*.go         text eol=lf
+*.rs         text eol=lf
+*.toml       text eol=lf
+*.yaml       text eol=lf
+*.yml        text eol=lf
+*.sh         text eol=lf
+*.dart       text eol=lf
+*.proto      text eol=lf
+
+# Binary files — leave untouched.
+*.png        binary
+*.jpg        binary
+*.jpeg       binary
+*.gif        binary
+*.ico        binary
+*.pdf        binary
+*.zip        binary
+*.tar.gz     binary
+*.so         binary
+*.dylib      binary
+*.dll        binary
+*.exe        binary
+*.a          binary
+*.lib        binary

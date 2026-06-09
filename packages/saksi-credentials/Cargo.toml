@@ -1,0 +1,26 @@
+[package]
+name = "saksi-credentials"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Saksi: blind-signature anonymous credentials on ristretto255. Empty skeleton; implementation in issues #18 and #19."
+
+[lib]
+name = "saksi_credentials"
+path = "src/lib.rs"
+
+[dependencies]
+saksi-crypto = { path = "../saksi-crypto" }
+curve25519-dalek.workspace = true
+merlin.workspace = true
+subtle.workspace = true
+zeroize.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+rand_core.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true

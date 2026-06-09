@@ -1,0 +1,41 @@
+[workspace]
+resolver = "2"
+members = [
+    "packages/saksi-crypto",
+    "packages/saksi-credentials",
+    "packages/saksi-protocol/rust",
+    "packages/saksi-ffi-flutter",
+    "packages/saksi-ffi-tauri",
+]
+
+[workspace.package]
+edition = "2021"
+rust-version = "1.78"
+license = "Apache-2.0"
+repository = "https://github.com/saksi-framework/saksi"
+authors = ["BalotaChain contributors"]
+
+[workspace.dependencies]
+# Group + scalar arithmetic
+curve25519-dalek = { version = "4", default-features = false, features = ["digest", "rand_core", "serde", "zeroize"] }
+
+# Fiat-Shamir transcripts
+merlin = { version = "3", default-features = false }
+
+# Constant-time primitives
+subtle = { version = "2", default-features = false }
+
+# Zero-on-drop discipline
+zeroize = { version = "1", default-features = false, features = ["zeroize_derive"] }
+
+# Serialization
+serde = { version = "1", default-features = false, features = ["derive"] }
+
+# Error types
+thiserror = "1"
+
+# Randomness
+rand_core = { version = "0.6", default-features = false, features = ["getrandom"] }
+
+# Testing
+proptest = "1"

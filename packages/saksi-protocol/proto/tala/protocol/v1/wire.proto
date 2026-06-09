@@ -1,0 +1,101 @@
+syntax = "proto3";
+
+package tala.protocol.v1;
+
+option go_package = "github.com/saksi-framework/saksi/packages/saksi-protocol/go/talaprotocolv1;talaprotocolv1";
+
+message Ciphertext {
+  uint32 version = 1;
+  bytes pad = 2;
+  bytes data = 3;
+}
+
+message ChaumPedersenProof {
+  uint32 version = 1;
+  bytes commitment_a = 2;
+  bytes commitment_b = 3;
+  bytes challenge = 4;
+  bytes response = 5;
+}
+
+message CDSProofBranch {
+  bytes commitment_a = 1;
+  bytes commitment_b = 2;
+  bytes challenge = 3;
+  bytes response = 4;
+}
+
+message CDSProof {
+  uint32 version = 1;
+  repeated CDSProofBranch branches = 2;
+}
+
+message PedersenCommitment {
+  uint32 version = 1;
+  bytes commitment = 2;
+  bytes opening = 3;
+}
+
+message Nullifier {
+  uint32 version = 1;
+  bytes value = 2;
+}
+
+message CredentialPresentation {
+  uint32 version = 1;
+  bytes credential_commitment = 2;
+  bytes issuer_public_key = 3;
+  bytes presentation_proof = 4;
+  Nullifier nullifier = 5;
+}
+
+message Ballot {
+  uint32 version = 1;
+  string election_id = 2;
+  bytes voter_credential_commitment = 3;
+  repeated Ciphertext ciphertexts = 4;
+  repeated CDSProof well_formedness_proofs = 5;
+  CredentialPresentation credential_presentation = 6;
+}
+
+message TrusteeCommitment {
+  string trustee_id = 1;
+  repeated bytes coefficient_commitments = 2;
+}
+
+message DKGComplaint {
+  string complainant_id = 1;
+  string accused_id = 2;
+  string reason = 3;
+}
+
+message DKGTranscript {
+  uint32 version = 1;
+  string election_id = 2;
+  uint32 threshold = 3;
+  repeated TrusteeCommitment trustee_commitments = 4;
+  repeated DKGComplaint complaints = 5;
+}
+
+message PartialDecryption {
+  uint32 version = 1;
+  string trustee_id = 2;
+  bytes share = 3;
+  ChaumPedersenProof proof = 4;
+}
+
+message TallyResult {
+  uint32 version = 1;
+  string election_id = 2;
+  repeated uint64 totals = 3;
+  repeated PartialDecryption partial_decryptions = 4;
+}
+
+message ElectionParameters {
+  uint32 version = 1;
+  string election_id = 2;
+  repeated string contest_ids = 3;
+  repeated string trustee_ids = 4;
+  uint32 threshold = 5;
+}
+

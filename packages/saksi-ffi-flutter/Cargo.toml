@@ -1,0 +1,26 @@
+[package]
+name = "saksi-ffi-flutter"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Saksi: Rust -> Dart FFI bridge for the BalotaChain voter app, via flutter_rust_bridge. Exposes saksi-crypto, saksi-credentials, and saksi-protocol to the Flutter mobile client."
+
+[lib]
+name = "saksi_ffi_flutter"
+path = "src/lib.rs"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[features]
+default = []
+frb = []
+
+[dependencies]
+saksi-crypto = { path = "../saksi-crypto" }
+saksi-credentials = { path = "../saksi-credentials" }
+saksi-protocol = { path = "../saksi-protocol/rust" }
+curve25519-dalek.workspace = true
+serde = { version = "1", features = ["derive", "std"] }
+sha2 = "0.10"
