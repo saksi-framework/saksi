@@ -49,7 +49,7 @@ pub fn encrypt_ballot(
 
 pub fn generate_cds_proof(ciphertext: CiphertextDto, contest_id: String) -> ProofHandleDto {
     digest_handle(
-        "tala.ffi.flutter.cds-proof.v1",
+        "saksi.ffi.flutter.cds-proof.v1",
         &[ciphertext.pad, ciphertext.data, contest_id],
     )
 }
@@ -59,14 +59,14 @@ pub fn perform_benaloh_challenge(
     challenge_nonce: String,
 ) -> ProofHandleDto {
     digest_handle(
-        "tala.ffi.flutter.benaloh-challenge.v1",
+        "saksi.ffi.flutter.benaloh-challenge.v1",
         &[ciphertext.pad, ciphertext.data, challenge_nonce],
     )
 }
 
 pub fn derive_nullifier(credential_commitment: String, election_id: String) -> String {
     digest_handle(
-        "tala.ffi.flutter.nullifier.v1",
+        "saksi.ffi.flutter.nullifier.v1",
         &[credential_commitment, election_id],
     )
     .digest
@@ -74,7 +74,7 @@ pub fn derive_nullifier(credential_commitment: String, election_id: String) -> S
 
 pub fn present_credential(credential_commitment: String, election_id: String) -> ProofHandleDto {
     digest_handle(
-        "tala.ffi.flutter.credential-presentation.v1",
+        "saksi.ffi.flutter.credential-presentation.v1",
         &[credential_commitment, election_id],
     )
 }
@@ -176,7 +176,7 @@ mod tests {
             "nonce".to_owned(),
         );
 
-        assert_eq!(handle.label, "tala.ffi.flutter.benaloh-challenge.v1");
+        assert_eq!(handle.label, "saksi.ffi.flutter.benaloh-challenge.v1");
         assert_eq!(handle.digest.len(), 64);
     }
 }

@@ -3,8 +3,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     std::env::set_var("PROTOC", protoc);
 
     prost_build::Config::new()
-        .compile_protos(&["../proto/tala/protocol/v1/wire.proto"], &["../proto"])?;
+        .compile_protos(&["../proto/saksi/protocol/v1/wire.proto"], &["../proto"])?;
 
-    println!("cargo:rerun-if-changed=../proto/tala/protocol/v1/wire.proto");
+    println!("cargo:rerun-if-changed=../proto/saksi/protocol/v1/wire.proto");
     Ok(())
 }

@@ -6,7 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-description = "Saksi: canonical wire types and serialization shared by the Rust crypto stack and the Go Fabric chaincode. Schema in ../proto/tala/protocol/v1/wire.proto."
+description = "Saksi: canonical wire types and serialization shared by the Rust crypto stack and the Go Fabric chaincode. Schema in ../proto/saksi/protocol/v1/wire.proto."
 build = "build.rs"
 
 [lib]

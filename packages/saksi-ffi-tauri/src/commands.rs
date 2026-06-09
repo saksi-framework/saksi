@@ -41,14 +41,14 @@ pub fn publish_dkg_transcript(
     transcript_bytes: String,
 ) -> TranscriptPublicationDto {
     digest_handle(
-        "tala.ffi.tauri.dkg-transcript.v1",
+        "saksi.ffi.tauri.dkg-transcript.v1",
         &[trustee_id, transcript_bytes],
     )
 }
 
 pub fn publish_partial_decryption(partial: PartialDecryptionDto) -> TranscriptPublicationDto {
     digest_handle(
-        "tala.ffi.tauri.partial-decryption.v1",
+        "saksi.ffi.tauri.partial-decryption.v1",
         &[partial.trustee_id, partial.share],
     )
 }
@@ -129,7 +129,7 @@ mod tests {
     #[test]
     fn tauri_transcript_publication_returns_digest() {
         let publication = publish_dkg_transcript("trustee-1".to_owned(), "transcript".to_owned());
-        assert_eq!(publication.label, "tala.ffi.tauri.dkg-transcript.v1");
+        assert_eq!(publication.label, "saksi.ffi.tauri.dkg-transcript.v1");
         assert_eq!(publication.digest.len(), 64);
     }
 }
