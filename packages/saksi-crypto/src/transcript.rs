@@ -1,12 +1,12 @@
 use merlin::Transcript;
 
-pub const TRANSCRIPT_LABEL_ELGAMAL_ENCRYPTION: &[u8] = b"tala.elgamal.encryption.v1";
-pub const TRANSCRIPT_LABEL_CHAUM_PEDERSEN: &[u8] = b"tala.nizk.chaum-pedersen.v1";
-pub const TRANSCRIPT_LABEL_CDS: &[u8] = b"tala.nizk.cds.v1";
-pub const TRANSCRIPT_LABEL_SCHNORR: &[u8] = b"tala.nizk.schnorr.v1";
-pub const TRANSCRIPT_LABEL_PEDERSEN_COMMITMENT: &[u8] = b"tala.commitment.pedersen.v1";
-pub const TRANSCRIPT_LABEL_BENALOH_CHALLENGE: &[u8] = b"tala.benaloh.challenge.v1";
-pub const TRANSCRIPT_LABEL_DKG: &[u8] = b"tala.dkg.pedersen.v1";
+pub const TRANSCRIPT_LABEL_ELGAMAL_ENCRYPTION: &[u8] = b"saksi.elgamal.encryption.v1";
+pub const TRANSCRIPT_LABEL_CHAUM_PEDERSEN: &[u8] = b"saksi.nizk.chaum-pedersen.v1";
+pub const TRANSCRIPT_LABEL_CDS: &[u8] = b"saksi.nizk.cds.v1";
+pub const TRANSCRIPT_LABEL_SCHNORR: &[u8] = b"saksi.nizk.schnorr.v1";
+pub const TRANSCRIPT_LABEL_PEDERSEN_COMMITMENT: &[u8] = b"saksi.commitment.pedersen.v1";
+pub const TRANSCRIPT_LABEL_BENALOH_CHALLENGE: &[u8] = b"saksi.benaloh.challenge.v1";
+pub const TRANSCRIPT_LABEL_DKG: &[u8] = b"saksi.dkg.pedersen.v1";
 
 pub fn new_transcript(label: &'static [u8]) -> Transcript {
     Transcript::new(label)

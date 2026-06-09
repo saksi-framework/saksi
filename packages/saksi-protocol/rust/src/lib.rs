@@ -1,7 +1,7 @@
 //! # saksi-protocol (Rust)
 //!
 //! Canonical BalotaChain and Saksi wire types. Schema lives in
-//! [`../proto/tala/protocol/v1/wire.proto`](../../proto/tala/protocol/v1/wire.proto)
+//! [`../proto/saksi/protocol/v1/wire.proto`](../../proto/saksi/protocol/v1/wire.proto)
 //! and is compiled into Rust types via `prost` (see [`build.rs`](../build.rs)).
 //!
 //! The Go mirror under [`../go`](../../go/) compiles the same `.proto` with
@@ -18,7 +18,7 @@ use sha2::{Digest, Sha256};
 /// Generated Protocol Buffers types for the v1 wire format.
 #[allow(missing_docs)]
 pub mod v1 {
-    include!(concat!(env!("OUT_DIR"), "/tala.protocol.v1.rs"));
+    include!(concat!(env!("OUT_DIR"), "/saksi.protocol.v1.rs"));
 }
 
 pub use v1::{
@@ -58,13 +58,13 @@ where
 
 /// Compute a domain-separated SHA-256 hash over a list of byte slices.
 ///
-/// The hash is bound to `b"tala-protocol-v1"` followed by the caller-supplied
+/// The hash is bound to `b"saksi-protocol-v1"` followed by the caller-supplied
 /// domain label and length-prefixed input parts. This is the canonical hash
 /// helper used wherever a Saksi wire type needs to be bound to a transcript
 /// without leaking through ambiguous concatenation.
 pub fn domain_hash(domain: &'static [u8], parts: &[&[u8]]) -> [u8; 32] {
     let mut hasher = Sha256::new();
-    hasher.update(b"tala-protocol-v1");
+    hasher.update(b"saksi-protocol-v1");
     hasher.update((domain.len() as u64).to_be_bytes());
     hasher.update(domain);
 

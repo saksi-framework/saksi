@@ -1,6 +1,6 @@
 # Protocol Schema
 
-`tala/protocol/v1/wire.proto` is the canonical schema for bytes that cross a
+`saksi/protocol/v1/wire.proto` is the canonical schema for bytes that cross a
 trust boundary between BalotaChain clients, Saksi cryptographic code, and the
 bulletin board.
 
