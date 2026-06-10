@@ -2,6 +2,7 @@
 // non-chaincode caller uses to talk to the BalotaChain bulletin board. Admin,
 // trustee, auditor, and voter-side relays all consume this SDK.
 //
-// The SDK is currently an empty skeleton. Real implementation lands in issue #30:
-// https://github.com/saksi-framework/balotachain/issues/30.
+// It exposes Connect, which dials a peer gateway with an MSP identity, and a
+// BulletinClient with SubmitBallot/GetBallot. The cmd/submit-ballot program
+// runs a single end-to-end transaction against a live network.
 package clientsdk
