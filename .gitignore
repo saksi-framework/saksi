@@ -313,3 +313,6 @@ public/build/
 *.tgz
 *.7z
 *.rar
+
+# built chaincode binary (from `go build ./...`)
+/packages/saksi-bulletin/chaincode/chaincode

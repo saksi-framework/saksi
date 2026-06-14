@@ -10,7 +10,8 @@ import (
 
 	"github.com/hyperledger/fabric-chaincode-go/shim"
 	"github.com/hyperledger/fabric-contract-api-go/contractapi"
-	saksiprotocol "github.com/saksi-framework/saksi/packages/saksi-protocol/go"
+	saksiprotocolv1 "github.com/saksi-framework/saksi/packages/saksi-protocol/go/saksiprotocolv1"
+	"google.golang.org/protobuf/proto"
 )
 
 // fakeStub is an in-memory ChaincodeStubInterface covering only the methods the
@@ -43,6 +44,15 @@ func (c *fakeContext) GetStub() shim.ChaincodeStubInterface { return c.stub }
 
 func newContext() *fakeContext { return &fakeContext{stub: newFakeStub()} }
 
+func mustMarshal(t *testing.T, ballot *saksiprotocolv1.Ballot) string {
+	t.Helper()
+	raw, err := proto.Marshal(ballot)
+	if err != nil {
+		t.Fatalf("marshal ballot: %v", err)
+	}
+	return hex.EncodeToString(raw)
+}
+
 func goldenBallotHex(t *testing.T) string {
 	t.Helper()
 	raw, err := os.ReadFile(filepath.Join("..", "..", "saksi-protocol", "test-vectors", "ballot-v1.hex"))
@@ -58,11 +68,11 @@ func nullifierHexOf(t *testing.T, ballotHex string) (electionID, nullifier strin
 	if err != nil {
 		t.Fatalf("decode ballot hex: %v", err)
 	}
-	ballot, err := saksiprotocol.UnmarshalBallot(raw)
-	if err != nil {
+	var ballot saksiprotocolv1.Ballot
+	if err := proto.Unmarshal(raw, &ballot); err != nil {
 		t.Fatalf("decode ballot: %v", err)
 	}
-	return ballot.ElectionID, hex.EncodeToString(ballot.CredentialPresentation.Nullifier.Value)
+	return ballot.GetElectionId(), hex.EncodeToString(ballot.GetCredentialPresentation().GetNullifier().GetValue())
 }
 
 func TestSubmitBallotThenGetBallotRoundTrips(t *testing.T) {
@@ -117,53 +127,53 @@ func TestSubmitBallotRejectsBadHex(t *testing.T) {
 }
 
 func TestSubmitBallotRejectsMissingNullifier(t *testing.T) {
-	ballot := &saksiprotocol.Ballot{
-		Version:    saksiprotocol.WireVersion,
-		ElectionID: "election-2026",
-		Ciphertexts: []*saksiprotocol.Ciphertext{
-			{Version: saksiprotocol.WireVersion, Pad: bytes.Repeat([]byte{1}, 32), Data: bytes.Repeat([]byte{2}, 32)},
+	ballot := &saksiprotocolv1.Ballot{
+		Version:    saksiprotocolv1.WireVersion,
+		ElectionId: "election-2026",
+		Ciphertexts: []*saksiprotocolv1.Ciphertext{
+			{Version: saksiprotocolv1.WireVersion, Pad: bytes.Repeat([]byte{1}, 32), Data: bytes.Repeat([]byte{2}, 32)},
 		},
 	}
 	sc := &SmartContract{}
-	err := sc.SubmitBallot(newContext(), hex.EncodeToString(ballot.Marshal()))
+	err := sc.SubmitBallot(newContext(), mustMarshal(t, ballot))
 	if err == nil || !strings.Contains(err.Error(), "nullifier") {
 		t.Fatalf("expected a missing-nullifier error, got: %v", err)
 	}
 }
 
 func TestSubmitBallotRejectsMalformedCiphertext(t *testing.T) {
-	ballot := &saksiprotocol.Ballot{
-		Version:    saksiprotocol.WireVersion,
-		ElectionID: "election-2026",
-		Ciphertexts: []*saksiprotocol.Ciphertext{
-			{Version: saksiprotocol.WireVersion, Pad: bytes.Repeat([]byte{1}, 16), Data: bytes.Repeat([]byte{2}, 32)},
+	ballot := &saksiprotocolv1.Ballot{
+		Version:    saksiprotocolv1.WireVersion,
+		ElectionId: "election-2026",
+		Ciphertexts: []*saksiprotocolv1.Ciphertext{
+			{Version: saksiprotocolv1.WireVersion, Pad: bytes.Repeat([]byte{1}, 16), Data: bytes.Repeat([]byte{2}, 32)},
 		},
-		CredentialPresentation: &saksiprotocol.CredentialPresentation{
-			Version:   saksiprotocol.WireVersion,
-			Nullifier: &saksiprotocol.Nullifier{Version: saksiprotocol.WireVersion, Value: bytes.Repeat([]byte{9}, 32)},
+		CredentialPresentation: &saksiprotocolv1.CredentialPresentation{
+			Version:   saksiprotocolv1.WireVersion,
+			Nullifier: &saksiprotocolv1.Nullifier{Version: saksiprotocolv1.WireVersion, Value: bytes.Repeat([]byte{9}, 32)},
 		},
 	}
 	sc := &SmartContract{}
-	err := sc.SubmitBallot(newContext(), hex.EncodeToString(ballot.Marshal()))
+	err := sc.SubmitBallot(newContext(), mustMarshal(t, ballot))
 	if err == nil || !strings.Contains(err.Error(), "malformed") {
 		t.Fatalf("expected a malformed-ciphertext error, got: %v", err)
 	}
 }
 
 func TestSubmitBallotRejectsWrongVersion(t *testing.T) {
-	ballot := &saksiprotocol.Ballot{
+	ballot := &saksiprotocolv1.Ballot{
 		Version:    99,
-		ElectionID: "election-2026",
-		Ciphertexts: []*saksiprotocol.Ciphertext{
-			{Version: saksiprotocol.WireVersion, Pad: bytes.Repeat([]byte{1}, 32), Data: bytes.Repeat([]byte{2}, 32)},
+		ElectionId: "election-2026",
+		Ciphertexts: []*saksiprotocolv1.Ciphertext{
+			{Version: saksiprotocolv1.WireVersion, Pad: bytes.Repeat([]byte{1}, 32), Data: bytes.Repeat([]byte{2}, 32)},
 		},
-		CredentialPresentation: &saksiprotocol.CredentialPresentation{
-			Version:   saksiprotocol.WireVersion,
-			Nullifier: &saksiprotocol.Nullifier{Version: saksiprotocol.WireVersion, Value: bytes.Repeat([]byte{9}, 32)},
+		CredentialPresentation: &saksiprotocolv1.CredentialPresentation{
+			Version:   saksiprotocolv1.WireVersion,
+			Nullifier: &saksiprotocolv1.Nullifier{Version: saksiprotocolv1.WireVersion, Value: bytes.Repeat([]byte{9}, 32)},
 		},
 	}
 	sc := &SmartContract{}
-	err := sc.SubmitBallot(newContext(), hex.EncodeToString(ballot.Marshal()))
+	err := sc.SubmitBallot(newContext(), mustMarshal(t, ballot))
 	if err == nil || !strings.Contains(err.Error(), "version") {
 		t.Fatalf("expected an unsupported-version error, got: %v", err)
 	}

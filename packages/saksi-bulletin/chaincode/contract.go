@@ -5,7 +5,8 @@ import (
 	"fmt"
 
 	"github.com/hyperledger/fabric-contract-api-go/contractapi"
-	saksiprotocol "github.com/saksi-framework/saksi/packages/saksi-protocol/go"
+	saksiprotocolv1 "github.com/saksi-framework/saksi/packages/saksi-protocol/go/saksiprotocolv1"
+	"google.golang.org/protobuf/proto"
 )
 
 const (
@@ -48,38 +49,38 @@ func (s *SmartContract) SubmitBallot(ctx contractapi.TransactionContextInterface
 		return fmt.Errorf("ballot is not valid hex: %w", err)
 	}
 
-	ballot, err := saksiprotocol.UnmarshalBallot(raw)
-	if err != nil {
+	var ballot saksiprotocolv1.Ballot
+	if err := proto.Unmarshal(raw, &ballot); err != nil {
 		return fmt.Errorf("decode ballot: %w", err)
 	}
 
-	if ballot.Version != saksiprotocol.WireVersion {
-		return fmt.Errorf("unsupported ballot version %d, want %d", ballot.Version, saksiprotocol.WireVersion)
+	if ballot.GetVersion() != saksiprotocolv1.WireVersion {
+		return fmt.Errorf("unsupported ballot version %d, want %d", ballot.GetVersion(), saksiprotocolv1.WireVersion)
 	}
-	if ballot.ElectionID == "" {
+	if ballot.GetElectionId() == "" {
 		return fmt.Errorf("ballot is missing an election id")
 	}
-	if len(ballot.Ciphertexts) == 0 {
+	if len(ballot.GetCiphertexts()) == 0 {
 		return fmt.Errorf("ballot has no ciphertexts")
 	}
-	for i, ciphertext := range ballot.Ciphertexts {
-		if len(ciphertext.Pad) != ciphertextLen || len(ciphertext.Data) != ciphertextLen {
+	for i, ciphertext := range ballot.GetCiphertexts() {
+		if len(ciphertext.GetPad()) != ciphertextLen || len(ciphertext.GetData()) != ciphertextLen {
 			return fmt.Errorf(
 				"ciphertext %d is malformed: pad=%d data=%d bytes, want %d each",
-				i, len(ciphertext.Pad), len(ciphertext.Data), ciphertextLen,
+				i, len(ciphertext.GetPad()), len(ciphertext.GetData()), ciphertextLen,
 			)
 		}
 	}
 
-	presentation := ballot.CredentialPresentation
-	if presentation == nil || presentation.Nullifier == nil || len(presentation.Nullifier.Value) == 0 {
+	presentation := ballot.GetCredentialPresentation()
+	if presentation == nil || presentation.GetNullifier() == nil || len(presentation.GetNullifier().GetValue()) == 0 {
 		return fmt.Errorf("ballot is missing a credential-presentation nullifier")
 	}
-	nullifier := hex.EncodeToString(presentation.Nullifier.Value)
+	nullifier := hex.EncodeToString(presentation.GetNullifier().GetValue())
 
 	stub := ctx.GetStub()
 
-	nullifierKey, err := stub.CreateCompositeKey(nullifierIndex, []string{ballot.ElectionID, nullifier})
+	nullifierKey, err := stub.CreateCompositeKey(nullifierIndex, []string{ballot.GetElectionId(), nullifier})
 	if err != nil {
 		return fmt.Errorf("build nullifier key: %w", err)
 	}
@@ -88,10 +89,10 @@ func (s *SmartContract) SubmitBallot(ctx contractapi.TransactionContextInterface
 		return fmt.Errorf("read nullifier state: %w", err)
 	}
 	if spent != nil {
-		return fmt.Errorf("nullifier already spent in election %q (double vote)", ballot.ElectionID)
+		return fmt.Errorf("nullifier already spent in election %q (double vote)", ballot.GetElectionId())
 	}
 
-	ballotKey, err := stub.CreateCompositeKey(ballotIndex, []string{ballot.ElectionID, nullifier})
+	ballotKey, err := stub.CreateCompositeKey(ballotIndex, []string{ballot.GetElectionId(), nullifier})
 	if err != nil {
 		return fmt.Errorf("build ballot key: %w", err)
 	}

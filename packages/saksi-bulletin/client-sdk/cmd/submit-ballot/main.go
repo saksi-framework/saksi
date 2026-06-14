@@ -24,7 +24,8 @@ import (
 	"strings"
 
 	clientsdk "github.com/saksi-framework/saksi/packages/saksi-bulletin/client-sdk"
-	saksiprotocol "github.com/saksi-framework/saksi/packages/saksi-protocol/go"
+	saksiprotocolv1 "github.com/saksi-framework/saksi/packages/saksi-protocol/go/saksiprotocolv1"
+	"google.golang.org/protobuf/proto"
 )
 
 func main() {
@@ -53,14 +54,14 @@ func main() {
 	if err != nil {
 		log.Fatalf("ballot is not valid hex: %v", err)
 	}
-	ballot, err := saksiprotocol.UnmarshalBallot(decoded)
-	if err != nil {
+	var ballot saksiprotocolv1.Ballot
+	if err := proto.Unmarshal(decoded, &ballot); err != nil {
 		log.Fatalf("decode ballot: %v", err)
 	}
-	if ballot.CredentialPresentation == nil || ballot.CredentialPresentation.Nullifier == nil {
+	if ballot.GetCredentialPresentation() == nil || ballot.GetCredentialPresentation().GetNullifier() == nil {
 		log.Fatal("ballot has no credential-presentation nullifier")
 	}
-	nullifier := hex.EncodeToString(ballot.CredentialPresentation.Nullifier.Value)
+	nullifier := hex.EncodeToString(ballot.GetCredentialPresentation().GetNullifier().GetValue())
 
 	conn, err := clientsdk.Connect(cfg)
 	if err != nil {
@@ -74,8 +75,8 @@ func main() {
 	}
 	fmt.Println("Ballot endorsed, ordered, and committed.")
 
-	fmt.Printf("Reading it back (election=%q nullifier=%s)...\n", ballot.ElectionID, nullifier)
-	got, err := conn.Bulletin.GetBallot(ballot.ElectionID, nullifier)
+	fmt.Printf("Reading it back (election=%q nullifier=%s)...\n", ballot.GetElectionId(), nullifier)
+	got, err := conn.Bulletin.GetBallot(ballot.GetElectionId(), nullifier)
 	if err != nil {
 		log.Fatalf("get ballot: %v", err)
 	}
