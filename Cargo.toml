@@ -4,6 +4,7 @@ members = [
     "packages/saksi-crypto",
     "packages/saksi-credentials",
     "packages/saksi-protocol/rust",
+    "packages/saksi-auditor",
     "packages/saksi-ffi-flutter",
     "packages/saksi-ffi-tauri",
 ]

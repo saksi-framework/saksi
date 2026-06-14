@@ -1,0 +1,24 @@
+[package]
+name = "saksi-auditor"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Saksi: off-chain auditor — verifies a published election (DKG, ballots, partial decryptions, tally) and emits a structured pass/fail report."
+
+[lib]
+name = "saksi_auditor"
+path = "src/lib.rs"
+
+[dependencies]
+saksi-crypto = { path = "../saksi-crypto" }
+saksi-credentials = { path = "../saksi-credentials" }
+saksi-protocol = { path = "../saksi-protocol/rust" }
+curve25519-dalek.workspace = true
+serde = { version = "1", features = ["derive", "std"] }
+thiserror.workspace = true
+
+[dev-dependencies]
+rand_core.workspace = true

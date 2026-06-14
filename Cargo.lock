@@ -664,6 +664,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "saksi-auditor"
+version = "0.0.0"
+dependencies = [
+ "curve25519-dalek",
+ "rand_core 0.6.4",
+ "saksi-credentials",
+ "saksi-crypto",
+ "saksi-protocol",
+ "serde",
+ "thiserror",
+]
+
+[[package]]
 name = "saksi-credentials"
 version = "0.0.0"
 dependencies = [
