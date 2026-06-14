@@ -53,14 +53,56 @@ func mustMarshal(t *testing.T, ballot *saksiprotocolv1.Ballot) string {
 	return hex.EncodeToString(raw)
 }
 
-func goldenBallotHex(t *testing.T) string {
+// loadSigVector reads the cross-language credential-signature golden vector
+// (compress(Pk_i) || compress(C) || compress(R') || s).
+func loadSigVector(t *testing.T) (pk, commitment, rPrime, s []byte) {
 	t.Helper()
-	raw, err := os.ReadFile(filepath.Join("..", "..", "saksi-protocol", "test-vectors", "ballot-v1.hex"))
+	raw, err := os.ReadFile(filepath.Join("..", "..", "saksi-protocol", "test-vectors", "credential-sig-v1.hex"))
 	if err != nil {
-		t.Fatalf("read golden ballot: %v", err)
+		t.Fatalf("read credential-sig vector: %v", err)
 	}
-	return string(bytes.TrimSpace(raw))
+	d, err := hex.DecodeString(string(bytes.TrimSpace(raw)))
+	if err != nil {
+		t.Fatalf("decode credential-sig vector: %v", err)
+	}
+	if len(d) != 128 {
+		t.Fatalf("credential-sig vector is %d bytes, want 128", len(d))
+	}
+	return d[0:32], d[32:64], d[64:96], d[96:128]
 }
+
+// validBallot builds a ballot whose credential presentation carries a real
+// issuer signature (from the golden vector) so it passes the on-chain
+// credential-signature check. The nullifier is caller-supplied so double-vote
+// tests can repeat or vary it. Ciphertext bytes are shape-valid placeholders;
+// the chaincode checks only their shape (the NIZKs are off-chain).
+func validBallot(t *testing.T, nullifier []byte) *saksiprotocolv1.Ballot {
+	t.Helper()
+	pk, commitment, rPrime, s := loadSigVector(t)
+	proof := append(append([]byte{}, rPrime...), s...) // R' || s (64 bytes)
+	return &saksiprotocolv1.Ballot{
+		Version:    saksiprotocolv1.WireVersion,
+		ElectionId: "election-2026",
+		Ciphertexts: []*saksiprotocolv1.Ciphertext{
+			{Version: saksiprotocolv1.WireVersion, Pad: bytes.Repeat([]byte{1}, 32), Data: bytes.Repeat([]byte{2}, 32)},
+		},
+		CredentialPresentation: &saksiprotocolv1.CredentialPresentation{
+			Version:              saksiprotocolv1.WireVersion,
+			CredentialCommitment: commitment,
+			IssuerPublicKey:      pk,
+			PresentationProof:    proof,
+			Nullifier:            &saksiprotocolv1.Nullifier{Version: saksiprotocolv1.WireVersion, Value: nullifier},
+		},
+	}
+}
+
+func validBallotHex(t *testing.T, nullifier []byte) string {
+	t.Helper()
+	return mustMarshal(t, validBallot(t, nullifier))
+}
+
+// defaultNullifier is the canonical nullifier used by the happy-path ballot.
+func defaultNullifier() []byte { return bytes.Repeat([]byte{9}, 32) }
 
 func nullifierHexOf(t *testing.T, ballotHex string) (electionID, nullifier string) {
 	t.Helper()
@@ -79,7 +121,7 @@ func TestSubmitBallotThenGetBallotRoundTrips(t *testing.T) {
 	sc := &SmartContract{}
 	ctx := newContext()
 	withElection(t, sc, ctx)
-	ballotHex := goldenBallotHex(t)
+	ballotHex := validBallotHex(t, defaultNullifier())
 
 	if err := sc.SubmitBallot(ctx, ballotHex); err != nil {
 		t.Fatalf("SubmitBallot: %v", err)
@@ -99,7 +141,7 @@ func TestSubmitBallotRejectsDoubleVote(t *testing.T) {
 	sc := &SmartContract{}
 	ctx := newContext()
 	withElection(t, sc, ctx)
-	ballotHex := goldenBallotHex(t)
+	ballotHex := validBallotHex(t, defaultNullifier())
 
 	if err := sc.SubmitBallot(ctx, ballotHex); err != nil {
 		t.Fatalf("first SubmitBallot should succeed: %v", err)
@@ -403,9 +445,22 @@ func TestGetDKGTranscriptMissingIsError(t *testing.T) {
 
 func TestSubmitBallotRejectsUnknownElection(t *testing.T) {
 	sc := &SmartContract{}
-	err := sc.SubmitBallot(newContext(), goldenBallotHex(t))
+	err := sc.SubmitBallot(newContext(), validBallotHex(t, defaultNullifier()))
 	if err == nil || !strings.Contains(err.Error(), "does not exist") {
 		t.Fatalf("expected an unknown-election error, got: %v", err)
+	}
+}
+
+func TestSubmitBallotRejectsBadCredentialSignature(t *testing.T) {
+	sc := &SmartContract{}
+	ctx := newContext()
+	withElection(t, sc, ctx)
+	ballot := validBallot(t, defaultNullifier())
+	// Flip a byte in the signature scalar s (bytes 32..64 of the proof prefix).
+	ballot.CredentialPresentation.PresentationProof[40] ^= 0x01
+	err := sc.SubmitBallot(ctx, mustMarshal(t, ballot))
+	if err == nil || !strings.Contains(err.Error(), "credential signature") {
+		t.Fatalf("expected a credential-signature error, got: %v", err)
 	}
 }
 
@@ -416,7 +471,7 @@ func TestSubmitBallotRejectsClosedElection(t *testing.T) {
 	if err := sc.CloseElection(ctx, "election-2026"); err != nil {
 		t.Fatalf("CloseElection: %v", err)
 	}
-	err := sc.SubmitBallot(ctx, goldenBallotHex(t))
+	err := sc.SubmitBallot(ctx, validBallotHex(t, defaultNullifier()))
 	if err == nil || !strings.Contains(err.Error(), "not open") {
 		t.Fatalf("expected a not-open error, got: %v", err)
 	}
