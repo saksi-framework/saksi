@@ -45,16 +45,22 @@ EOF
 	fi
 }
 
+# Single-org endorsement policy for dev: only Org1 must endorse, so the console
+# can commit without wiring Org2. Override with SAKSI_CC_POLICY.
+CC_POLICY="${SAKSI_CC_POLICY:-OR('Org1MSP.peer')}"
+
 cmd_up() {
 	require_test_network up
 	cd "${TEST_NETWORK}"
-	./network.sh up createChannel -c "${CHANNEL}" -ca
+	# cryptogen (no -ca): avoids needing fabric-ca-client on PATH for dev.
+	./network.sh up createChannel -c "${CHANNEL}"
 }
 
 cmd_deploy() {
 	require_test_network deploy
 	cd "${TEST_NETWORK}"
-	./network.sh deployCC -c "${CHANNEL}" -ccn "${CC_NAME}" -ccp "${CHAINCODE_PATH}" -ccl go
+	./network.sh deployCC -c "${CHANNEL}" -ccn "${CC_NAME}" -ccp "${CHAINCODE_PATH}" -ccl go \
+		-ccep "${CC_POLICY}"
 }
 
 cmd_down() {

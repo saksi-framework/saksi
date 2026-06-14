@@ -258,7 +258,7 @@ fn cds_context(binding_context: &[u8], contest_id: &[u8], serial: &[u8]) -> Vec<
 
 /// Test-visible re-export so [`crate::fixtures`] can build CDS proofs with
 /// the exact same context bytes the auditor reconstructs.
-#[cfg(test)]
+#[cfg(any(test, feature = "demo"))]
 pub(crate) fn cds_context_for_test(
     binding_context: &[u8],
     contest_id: &[u8],

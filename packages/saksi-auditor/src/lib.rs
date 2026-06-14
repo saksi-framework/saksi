@@ -53,8 +53,11 @@ mod dkg;
 pub mod report;
 mod tally;
 
-#[cfg(test)]
+#[cfg(any(test, feature = "demo"))]
 pub(crate) mod fixtures;
+
+#[cfg(feature = "demo")]
+pub mod demo;
 
 use std::collections::HashMap;
 
