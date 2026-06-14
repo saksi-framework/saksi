@@ -19,6 +19,15 @@ saksi-protocol = { path = "../saksi-protocol/rust" }
 curve25519-dalek.workspace = true
 serde = { version = "1", features = ["derive", "std"] }
 thiserror.workspace = true
+rand_core = { workspace = true, optional = true }
+serde_json = { version = "1", optional = true }
+hex = { version = "0.4", optional = true }
+prost = { version = "0.13", optional = true }
+
+[features]
+# Exposes the happy-path election generator + bundle (de)serialization used by
+# the saksi-demo driver. Reuses the same fixture the auditor's own tests build.
+demo = ["dep:rand_core", "dep:serde_json", "dep:hex", "dep:prost"]
 
 [dev-dependencies]
 rand_core.workspace = true

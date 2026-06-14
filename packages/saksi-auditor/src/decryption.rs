@@ -351,7 +351,7 @@ fn cp_context(binding_context: &[u8], trustee_id: &str, contest_id: &str) -> Vec
 
 /// Test-only mirror so the fixture builder can produce proofs against the
 /// same transcript bytes the auditor reconstructs.
-#[cfg(test)]
+#[cfg(any(test, feature = "demo"))]
 pub(crate) fn cp_context_for_test(
     binding_context: &[u8],
     trustee_id: &str,
