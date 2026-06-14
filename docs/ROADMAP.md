@@ -1,11 +1,30 @@
 # Roadmap — Finishing Saksi to a verifiable end-to-end election
 
-Status: planning → execution. See [`../CLAUDE.md`](../CLAUDE.md) for current state
-and environment setup. This document is the build plan to take Saksi from its
-current core (ElGamal + DKG + bulletin board with `SubmitBallot`/`GetBallot`,
-proven live) to a **complete framework that runs and cryptographically audits a
-whole election**: DKG → encrypted votes with validity proofs → bulletin board →
-close → threshold decryption with proofs → tally → independent audit.
+Status: execution — Phases A–F complete; lifecycle D1–D5 complete; G2 governance
+docs complete. Remaining: **G1** (live e2e election + audit) and the `network.sh`
+repro fixes. See [`../CLAUDE.md`](../CLAUDE.md) for current state and environment
+setup. This document is the build plan to take Saksi from its core (ElGamal + DKG
++ bulletin board, proven live) to a **complete framework that runs and
+cryptographically audits a whole election**: DKG → encrypted votes with validity
+proofs → bulletin board → close → threshold decryption with proofs → tally →
+independent audit.
+
+## Progress (2026-06-14)
+
+- **A–B (crypto + credentials):** complete (all NIZKs + blind-Schnorr credentials).
+- **C (protoc-gen-go):** complete — 14 messages generated, Go↔Rust byte-identical
+  golden vector, `go.sum` committed.
+- **D (lifecycle):** complete — D1 CreateElection, D2 PublishDKGTranscript, D3
+  CloseElection + open-gate, D4a SubmitPartialDecryption/PublishTally + SDK, D4b
+  auditor `contest_id` routing, **D5 on-chain credential-signature verification**
+  (the parity fix — `credverify`, byte-exact with Rust, cross-vector tested).
+- **E (auditor):** complete.
+- **F (FFI):** real `*_v2` entry points complete; v1 stubs deprecated.
+- **G2 (governance):** complete — protocol spec ([`../spec/protocol.md`](../spec/protocol.md)),
+  threat model ([`../spec/threat-model.md`](../spec/threat-model.md)), and ADRs
+  0005 (hybrid split) + 0006 (lifecycle).
+- **Remaining:** **G1** live e2e election on the network + audit, and the
+  `network.sh` repro fixes.
 
 ## Scope (decided)
 
@@ -75,10 +94,11 @@ Extend `saksi-bulletin/chaincode/contract.go` (keep `SubmitBallot`/`GetBallot`):
 - **D3** `CloseElection` + gate `SubmitBallot` to open elections.
 - **D4** `SubmitPartialDecryption` (w/ Chaum-Pedersen proof; on-chain: shape +
   trustee membership + closed) and `PublishTally` + queries.
-- **D5** on-chain **credential-signature verification** — needs ristretto255 in Go
-  (e.g. `github.com/gtank/ristretto255`). **Open sub-decision:** do on-chain (honors
-  the hybrid split) vs. keep off-chain in the auditor for now. Confirm before adding
-  the Go crypto dep.
+- **D5** on-chain **credential-signature verification** — **DONE, on-chain**
+  (decision resolved per the locked architecture, [ADR-0005](adr/0005-hybrid-verification-split.md)).
+  Implemented in the `credverify` package with `gtank/ristretto255` +
+  `gtank/merlin`, byte-identical to the Rust signer and pinned by a cross-language
+  golden vector.
 - **SDK**: extend `client-sdk` + `cmd/` for every new tx + an election driver.
   Commit `go.sum` for chaincode + client-sdk.
 
@@ -109,9 +129,10 @@ election fixture.
   credential + nullifier) → `SubmitBallot`×N → `CloseElection` →
   `SubmitPartialDecryption`×threshold → `PublishTally` → **run `saksi-auditor`** →
   all checks pass.
-- **G2 repro/governance**: fix `network.sh` (split `up`/`createChannel`; default
-  Org1 endorsement for dev; document the `jq` prereq); a protocol-spec +
-  threat-model doc; ADRs for the hybrid-verification split and the election lifecycle.
+- **G2 repro/governance**: protocol-spec + threat-model doc + ADRs (hybrid split
+  0005, lifecycle 0006) — **DONE**. Still open: fix `network.sh` (split
+  `up`/`createChannel`; default Org1 endorsement for dev; document the `jq`
+  prereq).
 
 ---
 
