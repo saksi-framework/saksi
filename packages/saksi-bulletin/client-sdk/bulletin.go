@@ -106,3 +106,51 @@ func (b *BulletinClient) GetElectionStatus(electionID string) (string, error) {
 	}
 	return string(out), nil
 }
+
+// SubmitPartialDecryption records one trustee's partial decryption share for a
+// contest of the given election. partialHex is the hex-encoded canonical protobuf
+// encoding of a saksi.protocol.v1.PartialDecryption.
+func (b *BulletinClient) SubmitPartialDecryption(electionID, partialHex string) error {
+	if electionID == "" {
+		return fmt.Errorf("election id is empty")
+	}
+	if partialHex == "" {
+		return fmt.Errorf("partial decryption hex is empty")
+	}
+	if _, err := b.contract.SubmitTransaction("SubmitPartialDecryption", electionID, partialHex); err != nil {
+		return fmt.Errorf("submit partial decryption: %w", err)
+	}
+	return nil
+}
+
+// GetPartialDecryption evaluates the GetPartialDecryption query and returns the
+// recorded partial decryption as a hex string, or an error if it is absent.
+func (b *BulletinClient) GetPartialDecryption(electionID, contestID, trusteeID string) (string, error) {
+	out, err := b.contract.EvaluateTransaction("GetPartialDecryption", electionID, contestID, trusteeID)
+	if err != nil {
+		return "", fmt.Errorf("get partial decryption: %w", err)
+	}
+	return string(out), nil
+}
+
+// PublishTally records the final tally for an election. tallyHex is the
+// hex-encoded canonical protobuf encoding of a saksi.protocol.v1.TallyResult.
+func (b *BulletinClient) PublishTally(tallyHex string) error {
+	if tallyHex == "" {
+		return fmt.Errorf("tally hex is empty")
+	}
+	if _, err := b.contract.SubmitTransaction("PublishTally", tallyHex); err != nil {
+		return fmt.Errorf("publish tally: %w", err)
+	}
+	return nil
+}
+
+// GetTally evaluates the GetTally query and returns the published tally as a hex
+// string, or an error if none has been published.
+func (b *BulletinClient) GetTally(electionID string) (string, error) {
+	out, err := b.contract.EvaluateTransaction("GetTally", electionID)
+	if err != nil {
+		return "", fmt.Errorf("get tally: %w", err)
+	}
+	return string(out), nil
+}

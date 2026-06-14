@@ -461,3 +461,212 @@ func TestGetElectionStatusMissingIsError(t *testing.T) {
 		t.Fatal("GetElectionStatus for an unknown election should fail")
 	}
 }
+
+func validPartialDecryption() *saksiprotocolv1.PartialDecryption {
+	return &saksiprotocolv1.PartialDecryption{
+		Version:   saksiprotocolv1.WireVersion,
+		TrusteeId: "t1",
+		ContestId: "contest-1",
+		Share:     bytes.Repeat([]byte{7}, 32),
+		Proof:     &saksiprotocolv1.ChaumPedersenProof{Version: saksiprotocolv1.WireVersion},
+	}
+}
+
+func mustMarshalPartial(t *testing.T, p *saksiprotocolv1.PartialDecryption) string {
+	t.Helper()
+	raw, err := proto.Marshal(p)
+	if err != nil {
+		t.Fatalf("marshal partial decryption: %v", err)
+	}
+	return hex.EncodeToString(raw)
+}
+
+// withClosedElection creates the canonical election and closes it, the state
+// from which threshold decryption and tallying proceed.
+func withClosedElection(t *testing.T, sc *SmartContract, ctx *fakeContext) {
+	t.Helper()
+	withElection(t, sc, ctx)
+	if err := sc.CloseElection(ctx, "election-2026"); err != nil {
+		t.Fatalf("CloseElection: %v", err)
+	}
+}
+
+func TestSubmitPartialDecryptionThenGetRoundTrips(t *testing.T) {
+	sc := &SmartContract{}
+	ctx := newContext()
+	withClosedElection(t, sc, ctx)
+	partialHex := mustMarshalPartial(t, validPartialDecryption())
+
+	if err := sc.SubmitPartialDecryption(ctx, "election-2026", partialHex); err != nil {
+		t.Fatalf("SubmitPartialDecryption: %v", err)
+	}
+	got, err := sc.GetPartialDecryption(ctx, "election-2026", "contest-1", "t1")
+	if err != nil {
+		t.Fatalf("GetPartialDecryption: %v", err)
+	}
+	if got != partialHex {
+		t.Fatalf("GetPartialDecryption returned a different partial decryption")
+	}
+}
+
+func TestSubmitPartialDecryptionRejectsOpenElection(t *testing.T) {
+	sc := &SmartContract{}
+	ctx := newContext()
+	withElection(t, sc, ctx) // still open
+	err := sc.SubmitPartialDecryption(ctx, "election-2026", mustMarshalPartial(t, validPartialDecryption()))
+	if err == nil || !strings.Contains(err.Error(), "not closed") {
+		t.Fatalf("expected a not-closed error, got: %v", err)
+	}
+}
+
+func TestSubmitPartialDecryptionRejectsUnknownElection(t *testing.T) {
+	err := (&SmartContract{}).SubmitPartialDecryption(newContext(), "election-2026", mustMarshalPartial(t, validPartialDecryption()))
+	if err == nil || !strings.Contains(err.Error(), "does not exist") {
+		t.Fatalf("expected an unknown-election error, got: %v", err)
+	}
+}
+
+func TestSubmitPartialDecryptionRejectsUnknownContestOrTrustee(t *testing.T) {
+	sc := &SmartContract{}
+	ctx := newContext()
+	withClosedElection(t, sc, ctx)
+
+	badContest := validPartialDecryption()
+	badContest.ContestId = "contest-9"
+	if err := sc.SubmitPartialDecryption(ctx, "election-2026", mustMarshalPartial(t, badContest)); err == nil || !strings.Contains(err.Error(), "contest") {
+		t.Fatalf("expected an unknown-contest error, got: %v", err)
+	}
+
+	badTrustee := validPartialDecryption()
+	badTrustee.TrusteeId = "t9"
+	if err := sc.SubmitPartialDecryption(ctx, "election-2026", mustMarshalPartial(t, badTrustee)); err == nil || !strings.Contains(err.Error(), "trustee") {
+		t.Fatalf("expected an unknown-trustee error, got: %v", err)
+	}
+}
+
+func TestSubmitPartialDecryptionRejectsDuplicate(t *testing.T) {
+	sc := &SmartContract{}
+	ctx := newContext()
+	withClosedElection(t, sc, ctx)
+	partialHex := mustMarshalPartial(t, validPartialDecryption())
+	if err := sc.SubmitPartialDecryption(ctx, "election-2026", partialHex); err != nil {
+		t.Fatalf("first submit: %v", err)
+	}
+	err := sc.SubmitPartialDecryption(ctx, "election-2026", partialHex)
+	if err == nil || !strings.Contains(err.Error(), "already submitted") {
+		t.Fatalf("expected a duplicate-share error, got: %v", err)
+	}
+}
+
+func TestSubmitPartialDecryptionRejectsMalformedShareOrMissingProof(t *testing.T) {
+	sc := &SmartContract{}
+	ctx := newContext()
+	withClosedElection(t, sc, ctx)
+
+	badShare := validPartialDecryption()
+	badShare.Share = bytes.Repeat([]byte{7}, 16)
+	if err := sc.SubmitPartialDecryption(ctx, "election-2026", mustMarshalPartial(t, badShare)); err == nil || !strings.Contains(err.Error(), "share") {
+		t.Fatalf("expected a share-shape error, got: %v", err)
+	}
+
+	noProof := validPartialDecryption()
+	noProof.Proof = nil
+	if err := sc.SubmitPartialDecryption(ctx, "election-2026", mustMarshalPartial(t, noProof)); err == nil || !strings.Contains(err.Error(), "proof") {
+		t.Fatalf("expected a missing-proof error, got: %v", err)
+	}
+}
+
+func TestSubmitPartialDecryptionRejectsWrongVersion(t *testing.T) {
+	sc := &SmartContract{}
+	ctx := newContext()
+	withClosedElection(t, sc, ctx)
+	bad := validPartialDecryption()
+	bad.Version = 99
+	err := sc.SubmitPartialDecryption(ctx, "election-2026", mustMarshalPartial(t, bad))
+	if err == nil || !strings.Contains(err.Error(), "version") {
+		t.Fatalf("expected a version error, got: %v", err)
+	}
+}
+
+func TestGetPartialDecryptionMissingIsError(t *testing.T) {
+	if _, err := (&SmartContract{}).GetPartialDecryption(newContext(), "election-2026", "contest-1", "t1"); err == nil {
+		t.Fatal("GetPartialDecryption for an absent share should fail")
+	}
+}
+
+func validTally() *saksiprotocolv1.TallyResult {
+	return &saksiprotocolv1.TallyResult{
+		Version:    saksiprotocolv1.WireVersion,
+		ElectionId: "election-2026",
+		Totals:     []uint64{12, 7}, // two contests
+	}
+}
+
+func mustMarshalTally(t *testing.T, tr *saksiprotocolv1.TallyResult) string {
+	t.Helper()
+	raw, err := proto.Marshal(tr)
+	if err != nil {
+		t.Fatalf("marshal tally: %v", err)
+	}
+	return hex.EncodeToString(raw)
+}
+
+func TestPublishTallyThenGetRoundTrips(t *testing.T) {
+	sc := &SmartContract{}
+	ctx := newContext()
+	withClosedElection(t, sc, ctx)
+	tallyHex := mustMarshalTally(t, validTally())
+
+	if err := sc.PublishTally(ctx, tallyHex); err != nil {
+		t.Fatalf("PublishTally: %v", err)
+	}
+	got, err := sc.GetTally(ctx, "election-2026")
+	if err != nil {
+		t.Fatalf("GetTally: %v", err)
+	}
+	if got != tallyHex {
+		t.Fatalf("GetTally returned a different tally")
+	}
+}
+
+func TestPublishTallyRejectsOpenElection(t *testing.T) {
+	sc := &SmartContract{}
+	ctx := newContext()
+	withElection(t, sc, ctx) // still open
+	err := sc.PublishTally(ctx, mustMarshalTally(t, validTally()))
+	if err == nil || !strings.Contains(err.Error(), "not closed") {
+		t.Fatalf("expected a not-closed error, got: %v", err)
+	}
+}
+
+func TestPublishTallyRejectsWrongTotalsCount(t *testing.T) {
+	sc := &SmartContract{}
+	ctx := newContext()
+	withClosedElection(t, sc, ctx)
+	bad := validTally()
+	bad.Totals = []uint64{1} // election has two contests
+	err := sc.PublishTally(ctx, mustMarshalTally(t, bad))
+	if err == nil || !strings.Contains(err.Error(), "totals") {
+		t.Fatalf("expected a totals-count error, got: %v", err)
+	}
+}
+
+func TestPublishTallyRejectsDuplicate(t *testing.T) {
+	sc := &SmartContract{}
+	ctx := newContext()
+	withClosedElection(t, sc, ctx)
+	tallyHex := mustMarshalTally(t, validTally())
+	if err := sc.PublishTally(ctx, tallyHex); err != nil {
+		t.Fatalf("first publish: %v", err)
+	}
+	err := sc.PublishTally(ctx, tallyHex)
+	if err == nil || !strings.Contains(err.Error(), "already published") {
+		t.Fatalf("expected a duplicate-tally error, got: %v", err)
+	}
+}
+
+func TestGetTallyMissingIsError(t *testing.T) {
+	if _, err := (&SmartContract{}).GetTally(newContext(), "election-2026"); err == nil {
+		t.Fatal("GetTally for an election with no tally should fail")
+	}
+}
