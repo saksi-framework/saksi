@@ -75,7 +75,12 @@ const SIGNATURE_PREFIX_LEN: usize = POINT_LEN + SCALAR_LEN;
 /// Builds the Chaum-Pedersen `context` string from the election id and the
 /// caller-supplied context, with explicit length prefixes so a tampered
 /// concatenation cannot smuggle one field into the other.
-fn presentation_context(election_id: &[u8], context: &[u8]) -> Vec<u8> {
+///
+/// Stable: callers reproducing a presentation outside of `Credential::present`
+/// (e.g. an FFI bridge that owns the wire encoding directly) may rely on the
+/// byte layout here. Any change is a breaking change and bumps the
+/// `saksi.credentials.presentation.v*` version prefix.
+pub fn presentation_context(election_id: &[u8], context: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(8 + election_id.len() + 8 + context.len() + 32);
     out.extend_from_slice(b"saksi.credentials.presentation.v1");
     out.extend_from_slice(&(election_id.len() as u64).to_be_bytes());
@@ -413,6 +418,26 @@ mod tests {
             n1, n2,
             "double-vote detection: nullifier must be deterministic per (credential, election)"
         );
+    }
+
+    #[test]
+    fn presentation_context_is_length_prefixed_and_stable() {
+        // Known-input fixture so we catch silent format drift.
+        let ctx = presentation_context(b"election-2026", b"contest=president");
+        // The bytes are: domain tag (33B) || u64(13).BE || "election-2026" || u64(17).BE || "contest=president".
+        assert!(ctx.starts_with(b"saksi.credentials.presentation.v1"));
+        let mut expected = Vec::new();
+        expected.extend_from_slice(b"saksi.credentials.presentation.v1");
+        expected.extend_from_slice(&13u64.to_be_bytes());
+        expected.extend_from_slice(b"election-2026");
+        expected.extend_from_slice(&17u64.to_be_bytes());
+        expected.extend_from_slice(b"contest=president");
+        assert_eq!(ctx, expected);
+
+        // Cross-check vs Credential::present: building the same context here and
+        // running it through ChaumPedersenProof::prove/verify against fresh
+        // (s_cred, election, context) should round-trip cleanly. This is implicit
+        // in the existing `verify_presentation` tests; here we only pin the bytes.
     }
 
     /// Two presentations of the same credential to **different** elections

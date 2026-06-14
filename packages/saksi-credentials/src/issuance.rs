@@ -235,6 +235,32 @@ pub struct Credential {
 }
 
 impl Credential {
+    /// Reconstructs a [`Credential`] from previously held parts.
+    ///
+    /// `s_cred` is the voter's secret scalar; `signature_r` and `signature_s`
+    /// are the Schnorr signature pair `(R', s_sig)` on `C = s_cred · G` under
+    /// the issuer's public key. The commitment is recomputed internally as
+    /// `s_cred · G`.
+    ///
+    /// This is the constructor callers use when the credential was issued in
+    /// a previous session and persisted out-of-band (e.g. by the voter app
+    /// across launches, or by an FFI bridge that receives the parts as hex).
+    /// The returned [`Credential`] zeroizes `s_cred` and `signature_s` on
+    /// drop, exactly like one returned from `voter_finalize_issuance`.
+    ///
+    /// **No validation is performed here**: callers that need to confirm the
+    /// signature matches the supplied issuer should call
+    /// [`Credential::verify_against_issuer`] right after.
+    pub fn from_parts(s_cred: Scalar, signature_r: RistrettoPoint, signature_s: Scalar) -> Self {
+        let commitment = s_cred * basepoint();
+        Self {
+            s_cred,
+            commitment,
+            signature_r,
+            signature_s,
+        }
+    }
+
     /// Returns the public credential commitment `C = s_cred · G`.
     pub fn public_commitment(&self) -> RistrettoPoint {
         self.commitment
@@ -587,6 +613,34 @@ mod tests {
         let mut rng = OsRng;
         let _sk = IssuerSecretKey::generate(&mut rng);
         // Intentionally no debug print — documenting the invariant.
+    }
+
+    #[test]
+    fn credential_from_parts_round_trips_through_presentation() {
+        // Issue a real credential via the existing protocol so we know good parts.
+        let mut rng = OsRng;
+        let issuer = IssuerSecretKey::generate(&mut rng);
+        let issuer_pk = issuer.public_key();
+
+        let (req, state) = voter_begin_issuance(&mut rng);
+        let (pre, issuer_state) = issuer_pre_sign(&issuer, &req, &mut rng);
+        let (blinded_challenge, voter_state2) =
+            voter_blind_challenge(state, &pre, &issuer_pk, &mut rng);
+        let response = issuer_sign(&issuer, issuer_state, &blinded_challenge);
+        let original =
+            voter_finalize_issuance(voter_state2, &response, &issuer_pk).expect("issuance");
+
+        // Pull the parts out and rebuild via the new constructor.
+        let (sig_r, sig_s) = original.signature();
+        let s_cred = *original.secret_scalar(); // pub(crate) — same crate, so OK in this test
+        let original_commit = original.public_commitment();
+        drop(original);
+
+        let rebuilt = Credential::from_parts(s_cred, sig_r, sig_s);
+        assert_eq!(rebuilt.public_commitment(), original_commit);
+        rebuilt
+            .verify_against_issuer(&issuer_pk)
+            .expect("signature still verifies");
     }
 
     #[test]
