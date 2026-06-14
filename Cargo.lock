@@ -715,6 +715,9 @@ name = "saksi-ffi-flutter"
 version = "0.0.0"
 dependencies = [
  "curve25519-dalek",
+ "merlin",
+ "prost",
+ "rand_core 0.6.4",
  "saksi-credentials",
  "saksi-crypto",
  "saksi-protocol",
@@ -727,6 +730,9 @@ name = "saksi-ffi-tauri"
 version = "0.0.0"
 dependencies = [
  "curve25519-dalek",
+ "merlin",
+ "prost",
+ "rand_core 0.6.4",
  "saksi-credentials",
  "saksi-crypto",
  "saksi-protocol",
