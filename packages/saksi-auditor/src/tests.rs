@@ -387,3 +387,59 @@ fn dkg_transcript_trustee_count_mismatch_is_caught() {
         report
     );
 }
+
+// ---------------------------------------------------------------------------
+// 13. Partial decryptions are routed by contest_id, not by position
+// ---------------------------------------------------------------------------
+
+#[test]
+fn partial_decryptions_in_any_order_still_pass() {
+    let mut fixture = happy_path_fixture();
+    // Each PartialDecryption carries its own contest_id, so a non-canonical
+    // order must not change the verdict.
+    fixture.partial_decryptions.reverse();
+
+    let report = audit(fixture.artifacts());
+    assert_eq!(
+        report.overall,
+        AuditStatus::Pass,
+        "reordered partial decryptions should still pass: {:#?}",
+        report
+    );
+}
+
+#[test]
+fn partial_decryption_with_unknown_contest_id_is_caught() {
+    let mut fixture = happy_path_fixture();
+    fixture.partial_decryptions[0].contest_id = "contest-bogus".into();
+
+    let report = audit(fixture.artifacts());
+    assert_eq!(report.overall, AuditStatus::Fail);
+    assert!(
+        report
+            .findings
+            .iter()
+            .any(|f| f.check == "decryption.shape" && matches!(f.status, AuditStatus::Fail)),
+        "expected decryption.shape Fail for an unknown contest_id in {:#?}",
+        report
+    );
+}
+
+#[test]
+fn duplicate_partial_decryption_for_contest_is_caught() {
+    let mut fixture = happy_path_fixture();
+    // A trustee submitting a second share for the same contest must be rejected.
+    let dup = fixture.partial_decryptions[0].clone();
+    fixture.partial_decryptions.push(dup);
+
+    let report = audit(fixture.artifacts());
+    assert_eq!(report.overall, AuditStatus::Fail);
+    assert!(
+        report
+            .findings
+            .iter()
+            .any(|f| f.check == "decryption.duplicate" && matches!(f.status, AuditStatus::Fail)),
+        "expected decryption.duplicate Fail in {:#?}",
+        report
+    );
+}
