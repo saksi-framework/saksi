@@ -18,8 +18,6 @@
 //! values can be borrowed into an [`crate::ElectionArtifacts`]. Tests mutate
 //! one field of this struct, call [`crate::audit`], and assert.
 
-#![cfg(test)]
-
 use curve25519_dalek::{ristretto::RistrettoPoint, scalar::Scalar, traits::Identity};
 use rand_core::OsRng;
 
@@ -235,6 +233,7 @@ pub(crate) fn happy_path_fixture() -> ElectionFixture {
                 trustee_id: trustee_id_str.clone(),
                 share: compress_point(&share_point).to_vec(),
                 proof: Some(cp.to_wire()),
+                contest_id: contest_id.clone(),
             });
         }
     }
