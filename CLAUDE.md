@@ -11,12 +11,14 @@ verifiable** systems (voting and beyond), on **ristretto255**, with a
 app (separate repo `saksi-framework/balotachain`). Permissioned chain — **no
 cryptocurrency, no gas, no wallets**; identity is X.509 MSP.
 
-## Current state (2026-06-14, end of Rust build session)
+## Current state (2026-06-14, end of lifecycle + parity session)
 
-All Rust phases of the roadmap are **complete and in `main`**. The
-remaining work is Go-only and waits on a WSL environment with the Go
-toolchain. Detailed handoff:
-[`docs/2026-06-14-rust-build-session-handoff.md`](docs/2026-06-14-rust-build-session-handoff.md).
+Phases **A–F complete**, the full **election lifecycle (D1–D5) complete**, and
+**G2 governance docs complete**. A parity check against the locked architecture
+confirmed the framework is in line; its one real deviation (on-chain
+credential-signature verification) is now **fixed (D5)**. Remaining: **G1** (live
+e2e election + audit) and the `network.sh` repro fixes. Spec + threat model live
+in [`spec/`](spec/); see [ROADMAP](docs/ROADMAP.md) Progress section.
 
 **Implemented + tested (143 tests in `main`):**
 - `saksi-crypto` (84 tests): ElGamal threshold encryption, Pedersen DKG,
@@ -32,11 +34,15 @@ toolchain. Detailed handoff:
   -> AuditReport` runs every check (DKG, per-ballot CDS + credential
   presentation, nullifier uniqueness, per-trustee Chaum-Pedersen, threshold
   count, homomorphic sum vs published tally) without short-circuiting.
-- `saksi-protocol` (3 tests): Rust `prost` types for all 14 wire messages;
-  hand-written Go codec for 6 of 14 (still pending Phase C).
-- `saksi-bulletin/chaincode`: Fabric chaincode `SubmitBallot` + `GetBallot`
-  (wire-version + ciphertext-shape + **nullifier-uniqueness** checks),
-  unit-tested with an in-memory fake stub.
+- `saksi-protocol`: Rust `prost` types for all 14 wire messages; **Go types
+  generated via protoc-gen-go** (Phase C), Go↔Rust byte-identity pinned by a
+  golden vector. `PartialDecryption` carries `contest_id`.
+- `saksi-bulletin/chaincode`: full election lifecycle — `CreateElection`,
+  `PublishDKGTranscript`, `SubmitBallot`, `CloseElection`,
+  `SubmitPartialDecryption`, `PublishTally` (+ queries). On-chain checks:
+  wire version, lifecycle gating, ciphertext shape, **on-chain credential
+  Schnorr-signature verification** (`credverify`, byte-exact with Rust),
+  **nullifier uniqueness**. Unit-tested with an in-memory fake stub.
 - `saksi-bulletin/client-sdk`: `BulletinClient` over fabric-gateway,
   `Connect` (TLS/MSP), `cmd/submit-ballot`.
 - `saksi-bulletin/network`: minimal Fabric `test-network` wrapper + runbook.
@@ -50,23 +56,19 @@ toolchain. Detailed handoff:
 network (submit → endorse → order → commit → read-back identical; a replayed
 ballot was rejected by the nullifier guard).
 
-**Still STUB / missing** (Go-only, blocked on WSL):
-- **C** — `protoc-gen-go` (ADR-0003): replace the hand-written Go codec
-  with generated types for all 14 messages; commit `go.sum`.
-- **D** — Election-lifecycle chaincode + SDK: `CreateElection`,
-  `PublishDKGTranscript`, `CloseElection`, `SubmitPartialDecryption`,
-  `PublishTally`. Blocked on C.
-- **G** — End-to-end audited election demo on the live network +
-  `network.sh` fixes (split `up`/`createChannel`, default Org1 endorsement
-  for dev, document `jq` prereq).
+**Still missing:**
+- **G1** — the end-to-end audited election demo on the live network: a driver
+  running DKG → `CreateElection` → `PublishDKGTranscript` → `SubmitBallot`×N →
+  `CloseElection` → `SubmitPartialDecryption`×t → `PublishTally` → run
+  `saksi-auditor` → all checks pass.
+- **`network.sh` repro fixes** — split `up`/`createChannel`, default Org1
+  endorsement for dev, document the `jq` prereq.
 
-**Architectural flags filed for Phase D** (in the handoff doc):
-1. Wire `PartialDecryption` has no `contest_id` field — auditor assumes
-   `contest_count * trustee_count` contest-major layout. Decide before
-   the chaincode ossifies.
-2. Auditor reimplements Lagrange-at-zero on wire types rather than reuse
-   `dkg::combine_partial_decryptions` (which takes in-memory types).
-   Decoupling is intentional; a thin wire→in-memory shim is one option.
+**Resolved (were Phase-D flags):**
+1. `PartialDecryption` now carries `contest_id`; the auditor routes shares by id
+   (no positional layout). See [ADR-0006](docs/adr/0006-election-lifecycle.md).
+2. Auditor's wire-side Lagrange-at-zero is intentionally decoupled from
+   `dkg::combine_partial_decryptions`; left as-is.
 
 ## The plan (decided)
 
