@@ -41,6 +41,8 @@ pub struct PartialDecryptionDto {
 #[serde(rename_all = "camelCase")]
 pub struct PartialDecryptionV2Dto {
     pub trustee_id: String,
+    /// Identifier of the contest whose aggregate ciphertext this share decrypts.
+    pub contest_id: String,
     /// Hex-encoded 32-byte compressed ristretto encoding of the share point
     /// `D_i = s_i · R` where `R` is the ciphertext pad.
     pub share_hex: String,
@@ -112,6 +114,7 @@ pub fn publish_partial_decryption(partial: PartialDecryptionDto) -> TranscriptPu
 ///   would reject.
 pub fn partial_decrypt_v2(
     trustee_id: String,
+    contest_id: String,
     secret_share_hex: String,
     trustee_share_public_key_hex: String,
     ciphertext: CiphertextDto,
@@ -148,6 +151,7 @@ pub fn partial_decrypt_v2(
 
     Ok(PartialDecryptionV2Dto {
         trustee_id,
+        contest_id,
         share_hex: hex_lower(&compress_point(&share_point)),
         proof_bytes_hex: hex_lower(&proof_bytes),
     })
@@ -221,6 +225,7 @@ pub fn publish_partial_decryption_v2(
         trustee_id: partial.trustee_id.clone(),
         share: share_bytes.to_vec(),
         proof: Some(proof_wire),
+        contest_id: partial.contest_id.clone(),
     };
     let canonical = encode_protocol_message(&pd);
 
@@ -354,6 +359,7 @@ mod v2_tests {
         let ct = sample_ciphertext();
         let dto = partial_decrypt_v2(
             "trustee-1".to_owned(),
+            "contest-1".to_owned(),
             secret_share_hex,
             pub_share_hex,
             ct.clone(),
@@ -389,6 +395,7 @@ mod v2_tests {
 
         let err = partial_decrypt_v2(
             "trustee-1".to_owned(),
+            "contest-1".to_owned(),
             secret_share_hex,
             pub_share_hex,
             sample_ciphertext(),
@@ -446,6 +453,7 @@ mod v2_tests {
         let pub_share = secret_share * basepoint();
         let partial = partial_decrypt_v2(
             "trustee-7".to_owned(),
+            "contest-1".to_owned(),
             hex_lower(&secret_share.to_bytes()),
             hex_lower(&compress_point(&pub_share)),
             sample_ciphertext(),
@@ -468,6 +476,7 @@ mod v2_tests {
             trustee_id: partial.trustee_id.clone(),
             share: share_bytes.to_vec(),
             proof: Some(proof_wire),
+            contest_id: partial.contest_id.clone(),
         };
         let canonical = encode_protocol_message(&pd);
         let decoded: PartialDecryption = decode_protocol_message(&canonical).expect("re-decodes");

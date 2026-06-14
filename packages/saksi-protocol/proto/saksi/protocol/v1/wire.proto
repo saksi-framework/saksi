@@ -82,6 +82,10 @@ message PartialDecryption {
   string trustee_id = 2;
   bytes share = 3;
   ChaumPedersenProof proof = 4;
+  // Identifies which contest's homomorphic ciphertext this share decrypts, so
+  // on-chain partial decryptions are self-describing rather than relying on a
+  // positional contest-major layout.
+  string contest_id = 5;
 }
 
 message TallyResult {
