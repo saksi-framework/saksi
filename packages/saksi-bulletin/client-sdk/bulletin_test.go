@@ -106,3 +106,36 @@ func TestGetElectionReturnsPayloadAsString(t *testing.T) {
 		t.Fatalf("args = %v, want [election-2026]", fc.submitArgs)
 	}
 }
+
+func TestPublishDKGTranscriptInvokesSubmitTransaction(t *testing.T) {
+	fc := &fakeContract{}
+	if err := NewBulletinClient(fc).PublishDKGTranscript("0a0b0c"); err != nil {
+		t.Fatalf("PublishDKGTranscript: %v", err)
+	}
+	if fc.submitName != "PublishDKGTranscript" {
+		t.Fatalf("transaction name = %q, want PublishDKGTranscript", fc.submitName)
+	}
+	if len(fc.submitArgs) != 1 || fc.submitArgs[0] != "0a0b0c" {
+		t.Fatalf("args = %v, want [0a0b0c]", fc.submitArgs)
+	}
+}
+
+func TestPublishDKGTranscriptRejectsEmpty(t *testing.T) {
+	if err := NewBulletinClient(&fakeContract{}).PublishDKGTranscript(""); err == nil {
+		t.Fatal("PublishDKGTranscript should reject empty input")
+	}
+}
+
+func TestGetDKGTranscriptReturnsPayloadAsString(t *testing.T) {
+	fc := &fakeContract{evalReturn: []byte("beef")}
+	got, err := NewBulletinClient(fc).GetDKGTranscript("election-2026")
+	if err != nil {
+		t.Fatalf("GetDKGTranscript: %v", err)
+	}
+	if got != "beef" {
+		t.Fatalf("payload = %q, want beef", got)
+	}
+	if fc.submitName != "GetDKGTranscript" {
+		t.Fatalf("transaction name = %q, want GetDKGTranscript", fc.submitName)
+	}
+}

@@ -277,3 +277,124 @@ func TestGetElectionMissingIsError(t *testing.T) {
 		t.Fatal("GetElection for an unknown election should fail")
 	}
 }
+
+func validDKGTranscript() *saksiprotocolv1.DKGTranscript {
+	ids := []string{"t1", "t2", "t3", "t4", "t5"}
+	commits := make([]*saksiprotocolv1.TrusteeCommitment, len(ids))
+	for i, id := range ids {
+		commits[i] = &saksiprotocolv1.TrusteeCommitment{
+			TrusteeId: id,
+			CoefficientCommitments: [][]byte{
+				bytes.Repeat([]byte{byte(i + 1)}, 32),
+				bytes.Repeat([]byte{byte(i + 1)}, 32),
+				bytes.Repeat([]byte{byte(i + 1)}, 32),
+			},
+		}
+	}
+	return &saksiprotocolv1.DKGTranscript{
+		Version:            saksiprotocolv1.WireVersion,
+		ElectionId:         "election-2026",
+		Threshold:          3,
+		TrusteeCommitments: commits,
+	}
+}
+
+func mustMarshalDKG(t *testing.T, d *saksiprotocolv1.DKGTranscript) string {
+	t.Helper()
+	raw, err := proto.Marshal(d)
+	if err != nil {
+		t.Fatalf("marshal DKG transcript: %v", err)
+	}
+	return hex.EncodeToString(raw)
+}
+
+// withElection creates the canonical election in ctx so DKG/lifecycle tests can
+// build on it.
+func withElection(t *testing.T, sc *SmartContract, ctx *fakeContext) {
+	t.Helper()
+	if err := sc.CreateElection(ctx, mustMarshalParams(t, validElectionParams())); err != nil {
+		t.Fatalf("CreateElection: %v", err)
+	}
+}
+
+func TestPublishDKGTranscriptThenGetRoundTrips(t *testing.T) {
+	sc := &SmartContract{}
+	ctx := newContext()
+	withElection(t, sc, ctx)
+	transcriptHex := mustMarshalDKG(t, validDKGTranscript())
+
+	if err := sc.PublishDKGTranscript(ctx, transcriptHex); err != nil {
+		t.Fatalf("PublishDKGTranscript: %v", err)
+	}
+	got, err := sc.GetDKGTranscript(ctx, "election-2026")
+	if err != nil {
+		t.Fatalf("GetDKGTranscript: %v", err)
+	}
+	if got != transcriptHex {
+		t.Fatalf("GetDKGTranscript returned a different transcript")
+	}
+}
+
+func TestPublishDKGTranscriptRejectsMissingElection(t *testing.T) {
+	sc := &SmartContract{}
+	err := sc.PublishDKGTranscript(newContext(), mustMarshalDKG(t, validDKGTranscript()))
+	if err == nil || !strings.Contains(err.Error(), "no election found") {
+		t.Fatalf("expected a missing-election error, got: %v", err)
+	}
+}
+
+func TestPublishDKGTranscriptRejectsDuplicate(t *testing.T) {
+	sc := &SmartContract{}
+	ctx := newContext()
+	withElection(t, sc, ctx)
+	transcriptHex := mustMarshalDKG(t, validDKGTranscript())
+	if err := sc.PublishDKGTranscript(ctx, transcriptHex); err != nil {
+		t.Fatalf("first publish: %v", err)
+	}
+	err := sc.PublishDKGTranscript(ctx, transcriptHex)
+	if err == nil || !strings.Contains(err.Error(), "already published") {
+		t.Fatalf("expected a duplicate-transcript error, got: %v", err)
+	}
+}
+
+func TestPublishDKGTranscriptRejectsThresholdMismatch(t *testing.T) {
+	sc := &SmartContract{}
+	ctx := newContext()
+	withElection(t, sc, ctx)
+	bad := validDKGTranscript()
+	bad.Threshold = 4
+	err := sc.PublishDKGTranscript(ctx, mustMarshalDKG(t, bad))
+	if err == nil || !strings.Contains(err.Error(), "threshold") {
+		t.Fatalf("expected a threshold-mismatch error, got: %v", err)
+	}
+}
+
+func TestPublishDKGTranscriptRejectsTrusteeCountMismatch(t *testing.T) {
+	sc := &SmartContract{}
+	ctx := newContext()
+	withElection(t, sc, ctx)
+	bad := validDKGTranscript()
+	bad.TrusteeCommitments = bad.TrusteeCommitments[:4]
+	err := sc.PublishDKGTranscript(ctx, mustMarshalDKG(t, bad))
+	if err == nil || !strings.Contains(err.Error(), "trustee") {
+		t.Fatalf("expected a trustee-count error, got: %v", err)
+	}
+}
+
+func TestPublishDKGTranscriptRejectsWrongVersion(t *testing.T) {
+	sc := &SmartContract{}
+	ctx := newContext()
+	withElection(t, sc, ctx)
+	bad := validDKGTranscript()
+	bad.Version = 99
+	err := sc.PublishDKGTranscript(ctx, mustMarshalDKG(t, bad))
+	if err == nil || !strings.Contains(err.Error(), "version") {
+		t.Fatalf("expected a version error, got: %v", err)
+	}
+}
+
+func TestGetDKGTranscriptMissingIsError(t *testing.T) {
+	if _, err := (&SmartContract{}).GetDKGTranscript(newContext(), "election-2026"); err == nil {
+		t.Fatal("GetDKGTranscript for an election with no transcript should fail")
+	}
+}

@@ -65,3 +65,25 @@ func (b *BulletinClient) GetElection(electionID string) (string, error) {
 	}
 	return string(out), nil
 }
+
+// PublishDKGTranscript records the DKG transcript for an election. transcriptHex
+// is the hex-encoded canonical protobuf encoding of a saksi.protocol.v1.DKGTranscript.
+func (b *BulletinClient) PublishDKGTranscript(transcriptHex string) error {
+	if transcriptHex == "" {
+		return fmt.Errorf("DKG transcript hex is empty")
+	}
+	if _, err := b.contract.SubmitTransaction("PublishDKGTranscript", transcriptHex); err != nil {
+		return fmt.Errorf("publish DKG transcript: %w", err)
+	}
+	return nil
+}
+
+// GetDKGTranscript evaluates the GetDKGTranscript query and returns the recorded
+// transcript as a hex string, or an error if none has been published.
+func (b *BulletinClient) GetDKGTranscript(electionID string) (string, error) {
+	out, err := b.contract.EvaluateTransaction("GetDKGTranscript", electionID)
+	if err != nil {
+		return "", fmt.Errorf("get DKG transcript: %w", err)
+	}
+	return string(out), nil
+}

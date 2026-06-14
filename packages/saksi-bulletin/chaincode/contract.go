@@ -12,6 +12,8 @@ import (
 const (
 	// electionIndex keys stored election parameters by electionID.
 	electionIndex = "election"
+	// dkgIndex keys the stored DKG transcript by electionID (one per election).
+	dkgIndex = "dkg"
 	// ballotIndex keys stored ballots by (electionID, nullifier).
 	ballotIndex = "ballot"
 	// nullifierIndex records spent nullifiers by (electionID, nullifier).
@@ -195,6 +197,97 @@ func (s *SmartContract) GetElection(ctx contractapi.TransactionContextInterface,
 	}
 	if raw == nil {
 		return "", fmt.Errorf("no election found with id %q", electionID)
+	}
+	return hex.EncodeToString(raw), nil
+}
+
+// PublishDKGTranscript records the distributed-key-generation transcript for an
+// election. The argument is the hex-encoded canonical protobuf encoding of a
+// saksi.protocol.v1.DKGTranscript.
+//
+// On-chain checks: supported wire version, a non-empty election id whose
+// election already exists, at least one trustee commitment, and consistency with
+// the election parameters (threshold and trustee count must match). Exactly one
+// transcript may be published per election.
+func (s *SmartContract) PublishDKGTranscript(ctx contractapi.TransactionContextInterface, transcriptHex string) error {
+	raw, err := hex.DecodeString(transcriptHex)
+	if err != nil {
+		return fmt.Errorf("DKG transcript is not valid hex: %w", err)
+	}
+
+	var transcript saksiprotocolv1.DKGTranscript
+	if err := proto.Unmarshal(raw, &transcript); err != nil {
+		return fmt.Errorf("decode DKG transcript: %w", err)
+	}
+
+	if transcript.GetVersion() != saksiprotocolv1.WireVersion {
+		return fmt.Errorf("unsupported DKG transcript version %d, want %d", transcript.GetVersion(), saksiprotocolv1.WireVersion)
+	}
+	electionID := transcript.GetElectionId()
+	if electionID == "" {
+		return fmt.Errorf("DKG transcript is missing an election id")
+	}
+	if len(transcript.GetTrusteeCommitments()) == 0 {
+		return fmt.Errorf("DKG transcript has no trustee commitments")
+	}
+
+	stub := ctx.GetStub()
+
+	// The election must exist, and the transcript must match its parameters.
+	electionKey, err := stub.CreateCompositeKey(electionIndex, []string{electionID})
+	if err != nil {
+		return fmt.Errorf("build election key: %w", err)
+	}
+	electionRaw, err := stub.GetState(electionKey)
+	if err != nil {
+		return fmt.Errorf("read election state: %w", err)
+	}
+	if electionRaw == nil {
+		return fmt.Errorf("no election found with id %q", electionID)
+	}
+	var params saksiprotocolv1.ElectionParameters
+	if err := proto.Unmarshal(electionRaw, &params); err != nil {
+		return fmt.Errorf("decode stored election parameters: %w", err)
+	}
+	if transcript.GetThreshold() != params.GetThreshold() {
+		return fmt.Errorf("DKG transcript threshold %d does not match election threshold %d", transcript.GetThreshold(), params.GetThreshold())
+	}
+	if got, want := len(transcript.GetTrusteeCommitments()), len(params.GetTrusteeIds()); got != want {
+		return fmt.Errorf("DKG transcript has %d trustee commitments, election has %d trustees", got, want)
+	}
+
+	dkgKey, err := stub.CreateCompositeKey(dkgIndex, []string{electionID})
+	if err != nil {
+		return fmt.Errorf("build DKG key: %w", err)
+	}
+	existing, err := stub.GetState(dkgKey)
+	if err != nil {
+		return fmt.Errorf("read DKG state: %w", err)
+	}
+	if existing != nil {
+		return fmt.Errorf("a DKG transcript is already published for election %q", electionID)
+	}
+	if err := stub.PutState(dkgKey, raw); err != nil {
+		return fmt.Errorf("store DKG transcript: %w", err)
+	}
+	return nil
+}
+
+// GetDKGTranscript returns the hex-encoded DKG transcript recorded for an
+// election id, or an error if none has been published.
+func (s *SmartContract) GetDKGTranscript(ctx contractapi.TransactionContextInterface, electionID string) (string, error) {
+	stub := ctx.GetStub()
+
+	key, err := stub.CreateCompositeKey(dkgIndex, []string{electionID})
+	if err != nil {
+		return "", fmt.Errorf("build DKG key: %w", err)
+	}
+	raw, err := stub.GetState(key)
+	if err != nil {
+		return "", fmt.Errorf("read DKG state: %w", err)
+	}
+	if raw == nil {
+		return "", fmt.Errorf("no DKG transcript found for election %q", electionID)
 	}
 	return hex.EncodeToString(raw), nil
 }
