@@ -21,6 +21,7 @@ zeroize.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 rand_core.workspace = true
+sha2 = { version = "0.10", default-features = false }
 
 [dev-dependencies]
 proptest.workspace = true

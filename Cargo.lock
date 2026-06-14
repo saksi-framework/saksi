@@ -688,6 +688,7 @@ dependencies = [
  "rand_core 0.6.4",
  "saksi-protocol",
  "serde",
+ "sha2",
  "subtle",
  "thiserror",
  "zeroize",
