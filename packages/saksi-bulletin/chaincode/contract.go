@@ -5,6 +5,7 @@ import (
 	"fmt"
 
 	"github.com/hyperledger/fabric-contract-api-go/contractapi"
+	"github.com/saksi-framework/saksi/packages/saksi-bulletin/chaincode/credverify"
 	saksiprotocolv1 "github.com/saksi-framework/saksi/packages/saksi-protocol/go/saksiprotocolv1"
 	"google.golang.org/protobuf/proto"
 )
@@ -28,6 +29,9 @@ const (
 	// ciphertextLen is the expected ristretto255 compressed-point length, in
 	// bytes, for both the pad and data components of an ElGamal ciphertext.
 	ciphertextLen = 32
+	// signaturePrefixLen is the length of the issuer-signature prefix at the
+	// start of a credential presentation_proof: R' (32) || s (32).
+	signaturePrefixLen = 64
 )
 
 // Election lifecycle status values stored under statusIndex.
@@ -40,9 +44,10 @@ const (
 //
 // Per the locked hybrid-verification split (the architecture record and
 // ADR set), the chaincode performs only the cheap, deterministic checks on
-// submission — wire version, ciphertext structural shape, and nullifier
-// uniqueness — and records the ballot. The heavy NIZK well-formedness proofs
-// are verified off-chain by auditor clients reading the bulletin board.
+// submission — wire version, ciphertext structural shape, credential-signature
+// verification, and nullifier uniqueness — and records the ballot. The heavy
+// NIZK well-formedness proofs are verified off-chain by auditor clients reading
+// the bulletin board.
 type SmartContract struct {
 	contractapi.Contract
 }
@@ -55,6 +60,9 @@ type SmartContract struct {
 //   - an election id is present;
 //   - at least one ciphertext, each with a correctly shaped pad and data;
 //   - a credential-presentation nullifier is present;
+//   - the issuer Schnorr signature on the credential commitment verifies
+//     (ristretto255 + a Merlin-compatible challenge, byte-identical to the Rust
+//     saksi-credentials signer — see the credverify package);
 //   - the nullifier has not already been spent in this election (no double
 //     vote).
 //
@@ -94,6 +102,27 @@ func (s *SmartContract) SubmitBallot(ctx contractapi.TransactionContextInterface
 		return fmt.Errorf("ballot is missing a credential-presentation nullifier")
 	}
 	nullifier := hex.EncodeToString(presentation.GetNullifier().GetValue())
+
+	// Verify the issuer Schnorr signature on the credential commitment on-chain
+	// (the locked hybrid-verification split puts credential-signature checks on
+	// the bulletin board). The presentation_proof envelope begins with the
+	// 64-byte signature prefix R' (32) || s (32); the remaining bytes (the
+	// Chaum-Pedersen NIZK) are verified off-chain by the auditor.
+	proof := presentation.GetPresentationProof()
+	if len(proof) < signaturePrefixLen {
+		return fmt.Errorf(
+			"ballot credential presentation_proof is %d bytes, shorter than the %d-byte signature prefix",
+			len(proof), signaturePrefixLen,
+		)
+	}
+	if err := credverify.VerifyIssuerSignature(
+		presentation.GetIssuerPublicKey(),
+		presentation.GetCredentialCommitment(),
+		proof[:ciphertextLen],
+		proof[ciphertextLen:signaturePrefixLen],
+	); err != nil {
+		return fmt.Errorf("credential signature verification failed: %w", err)
+	}
 
 	stub := ctx.GetStub()
 

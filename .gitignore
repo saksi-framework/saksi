@@ -194,8 +194,9 @@ go.work.sum
 coverage.out
 coverage.html
 
-# Vendored dependencies (often committed, but allow override per project)
-# vendor/
+# Vendored Go dependencies — CI builds with -mod=mod and downloads modules, so
+# the chaincode/SDK vendor trees are local-only build artifacts, never committed.
+vendor/
 
 # ----------------------------------------------------------------------------
 # Rust

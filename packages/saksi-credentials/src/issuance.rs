@@ -508,10 +508,63 @@ pub(crate) fn verify_signature_for_presentation(
     verify_issuer_signature(issuer_pk, commitment, r, s)
 }
 
+/// Deterministic Schnorr-sign a credential commitment under the issuance
+/// transcript, used only to build the cross-language golden vector. Mirrors
+/// exactly what a real issuance produces: `(R', s)` with
+/// `s = k + e·x`, `e = compute_issuance_challenge(Pk_i, C, R')`, `R' = k·G`.
+#[cfg(test)]
+fn deterministic_issuer_signature(
+    x: Scalar,
+    s_cred: Scalar,
+    k: Scalar,
+) -> (IssuerPublicKey, RistrettoPoint, RistrettoPoint, Scalar) {
+    let g = basepoint();
+    let pk = IssuerPublicKey(x * g);
+    let commitment = s_cred * g;
+    let r_prime = k * g;
+    let e = compute_issuance_challenge(&pk, &commitment, &r_prime);
+    let s = k + e * x;
+    (pk, commitment, r_prime, s)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use rand_core::OsRng;
+
+    /// Cross-language golden vector for **on-chain credential-signature
+    /// verification**. The Go chaincode (`saksi-bulletin`) must accept exactly
+    /// this `(Pk_i, C, R', s)` tuple and reject any single-byte tamper. The
+    /// 128-byte layout is `compress(Pk_i) || compress(C) || compress(R') || s`.
+    #[test]
+    fn credential_signature_golden_vector() {
+        let (pk, commitment, r_prime, s) = deterministic_issuer_signature(
+            Scalar::from(123_456_789_u64),
+            Scalar::from(987_654_321_u64),
+            Scalar::from(555_000_111_u64),
+        );
+
+        // It must be a valid signature.
+        verify_issuer_signature(&pk, &commitment, &r_prime, &s).expect("golden vector verifies");
+
+        let mut vector = Vec::with_capacity(128);
+        vector.extend_from_slice(&compress_point(pk.as_point()));
+        vector.extend_from_slice(&compress_point(&commitment));
+        vector.extend_from_slice(&compress_point(&r_prime));
+        vector.extend_from_slice(&s.to_bytes());
+        let hex = vector
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>();
+
+        // Pin the bytes so any change to the issuance transcript or encoding
+        // (which the Go on-chain verifier mirrors) is caught here.
+        assert_eq!(
+            hex,
+            include_str!("../../saksi-protocol/test-vectors/credential-sig-v1.hex").trim(),
+            "credential-signature golden vector drifted; regenerate the Go cross-check too"
+        );
+    }
 
     /// End-to-end happy path: voter + issuer run the full protocol and the
     /// resulting credential verifies under the issuer's public key.
