@@ -69,4 +69,4 @@ pub use issuance::{
 pub use nullifier::{
     compress_nullifier, decompress_nullifier, derive_nullifier, nullifier_h, NULLIFIER_DOMAIN,
 };
-pub use presentation::verify_presentation;
+pub use presentation::{presentation_context, verify_presentation};
