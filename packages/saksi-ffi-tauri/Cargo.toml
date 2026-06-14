@@ -21,5 +21,8 @@ saksi-crypto = { path = "../saksi-crypto" }
 saksi-credentials = { path = "../saksi-credentials" }
 saksi-protocol = { path = "../saksi-protocol/rust" }
 curve25519-dalek.workspace = true
+merlin.workspace = true
+rand_core.workspace = true
 serde = { version = "1", features = ["derive", "std"] }
 sha2 = "0.10"
+prost = "0.13"
