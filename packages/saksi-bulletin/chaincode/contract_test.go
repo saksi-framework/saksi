@@ -178,3 +178,102 @@ func TestSubmitBallotRejectsWrongVersion(t *testing.T) {
 		t.Fatalf("expected an unsupported-version error, got: %v", err)
 	}
 }
+
+func validElectionParams() *saksiprotocolv1.ElectionParameters {
+	return &saksiprotocolv1.ElectionParameters{
+		Version:    saksiprotocolv1.WireVersion,
+		ElectionId: "election-2026",
+		ContestIds: []string{"contest-1", "contest-2"},
+		TrusteeIds: []string{"t1", "t2", "t3", "t4", "t5"},
+		Threshold:  3,
+	}
+}
+
+func mustMarshalParams(t *testing.T, p *saksiprotocolv1.ElectionParameters) string {
+	t.Helper()
+	raw, err := proto.Marshal(p)
+	if err != nil {
+		t.Fatalf("marshal election parameters: %v", err)
+	}
+	return hex.EncodeToString(raw)
+}
+
+func TestCreateElectionThenGetElectionRoundTrips(t *testing.T) {
+	sc := &SmartContract{}
+	ctx := newContext()
+	paramsHex := mustMarshalParams(t, validElectionParams())
+
+	if err := sc.CreateElection(ctx, paramsHex); err != nil {
+		t.Fatalf("CreateElection: %v", err)
+	}
+	got, err := sc.GetElection(ctx, "election-2026")
+	if err != nil {
+		t.Fatalf("GetElection: %v", err)
+	}
+	if got != paramsHex {
+		t.Fatalf("GetElection returned different parameters\n got: %s\nwant: %s", got, paramsHex)
+	}
+}
+
+func TestCreateElectionRejectsDuplicate(t *testing.T) {
+	sc := &SmartContract{}
+	ctx := newContext()
+	paramsHex := mustMarshalParams(t, validElectionParams())
+
+	if err := sc.CreateElection(ctx, paramsHex); err != nil {
+		t.Fatalf("first CreateElection: %v", err)
+	}
+	err := sc.CreateElection(ctx, paramsHex)
+	if err == nil || !strings.Contains(err.Error(), "already exists") {
+		t.Fatalf("expected a duplicate-election error, got: %v", err)
+	}
+}
+
+func TestCreateElectionRejectsBadThreshold(t *testing.T) {
+	for _, th := range []uint32{0, 6} {
+		p := validElectionParams()
+		p.Threshold = th
+		err := (&SmartContract{}).CreateElection(newContext(), mustMarshalParams(t, p))
+		if err == nil || !strings.Contains(err.Error(), "threshold") {
+			t.Fatalf("threshold %d: expected a threshold error, got: %v", th, err)
+		}
+	}
+}
+
+func TestCreateElectionRejectsEmptyContestsOrTrustees(t *testing.T) {
+	noContests := validElectionParams()
+	noContests.ContestIds = nil
+	if err := (&SmartContract{}).CreateElection(newContext(), mustMarshalParams(t, noContests)); err == nil || !strings.Contains(err.Error(), "contest") {
+		t.Fatalf("expected a no-contests error, got: %v", err)
+	}
+	noTrustees := validElectionParams()
+	noTrustees.TrusteeIds = nil
+	if err := (&SmartContract{}).CreateElection(newContext(), mustMarshalParams(t, noTrustees)); err == nil || !strings.Contains(err.Error(), "trustee") {
+		t.Fatalf("expected a no-trustees error, got: %v", err)
+	}
+}
+
+func TestCreateElectionRejectsMissingIDOrWrongVersion(t *testing.T) {
+	noID := validElectionParams()
+	noID.ElectionId = ""
+	if err := (&SmartContract{}).CreateElection(newContext(), mustMarshalParams(t, noID)); err == nil || !strings.Contains(err.Error(), "election id") {
+		t.Fatalf("expected a missing-id error, got: %v", err)
+	}
+	wrongVersion := validElectionParams()
+	wrongVersion.Version = 99
+	if err := (&SmartContract{}).CreateElection(newContext(), mustMarshalParams(t, wrongVersion)); err == nil || !strings.Contains(err.Error(), "version") {
+		t.Fatalf("expected a version error, got: %v", err)
+	}
+}
+
+func TestCreateElectionRejectsBadHex(t *testing.T) {
+	if err := (&SmartContract{}).CreateElection(newContext(), "nothex!!"); err == nil {
+		t.Fatal("CreateElection should reject non-hex input")
+	}
+}
+
+func TestGetElectionMissingIsError(t *testing.T) {
+	if _, err := (&SmartContract{}).GetElection(newContext(), "no-such-election"); err == nil {
+		t.Fatal("GetElection for an unknown election should fail")
+	}
+}

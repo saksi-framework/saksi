@@ -43,3 +43,25 @@ func (b *BulletinClient) GetBallot(electionID, nullifier string) (string, error)
 	}
 	return string(out), nil
 }
+
+// CreateElection records a new election on the bulletin board. paramsHex is the
+// hex-encoded canonical protobuf encoding of a saksi.protocol.v1.ElectionParameters.
+func (b *BulletinClient) CreateElection(paramsHex string) error {
+	if paramsHex == "" {
+		return fmt.Errorf("election parameters hex is empty")
+	}
+	if _, err := b.contract.SubmitTransaction("CreateElection", paramsHex); err != nil {
+		return fmt.Errorf("create election: %w", err)
+	}
+	return nil
+}
+
+// GetElection evaluates the GetElection query and returns the recorded election
+// parameters as a hex string, or an error if the election is absent.
+func (b *BulletinClient) GetElection(electionID string) (string, error) {
+	out, err := b.contract.EvaluateTransaction("GetElection", electionID)
+	if err != nil {
+		return "", fmt.Errorf("get election: %w", err)
+	}
+	return string(out), nil
+}
