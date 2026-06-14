@@ -139,3 +139,30 @@ func TestGetDKGTranscriptReturnsPayloadAsString(t *testing.T) {
 		t.Fatalf("transaction name = %q, want GetDKGTranscript", fc.submitName)
 	}
 }
+
+func TestCloseElectionInvokesSubmitTransaction(t *testing.T) {
+	fc := &fakeContract{}
+	if err := NewBulletinClient(fc).CloseElection("election-2026"); err != nil {
+		t.Fatalf("CloseElection: %v", err)
+	}
+	if fc.submitName != "CloseElection" {
+		t.Fatalf("transaction name = %q, want CloseElection", fc.submitName)
+	}
+	if len(fc.submitArgs) != 1 || fc.submitArgs[0] != "election-2026" {
+		t.Fatalf("args = %v, want [election-2026]", fc.submitArgs)
+	}
+}
+
+func TestGetElectionStatusReturnsPayloadAsString(t *testing.T) {
+	fc := &fakeContract{evalReturn: []byte("open")}
+	got, err := NewBulletinClient(fc).GetElectionStatus("election-2026")
+	if err != nil {
+		t.Fatalf("GetElectionStatus: %v", err)
+	}
+	if got != "open" {
+		t.Fatalf("payload = %q, want open", got)
+	}
+	if fc.submitName != "GetElectionStatus" {
+		t.Fatalf("transaction name = %q, want GetElectionStatus", fc.submitName)
+	}
+}

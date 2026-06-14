@@ -87,3 +87,22 @@ func (b *BulletinClient) GetDKGTranscript(electionID string) (string, error) {
 	}
 	return string(out), nil
 }
+
+// CloseElection transitions an election from open to closed, after which no
+// further ballots are accepted.
+func (b *BulletinClient) CloseElection(electionID string) error {
+	if _, err := b.contract.SubmitTransaction("CloseElection", electionID); err != nil {
+		return fmt.Errorf("close election: %w", err)
+	}
+	return nil
+}
+
+// GetElectionStatus evaluates the GetElectionStatus query and returns the
+// lifecycle status ("open" or "closed"), or an error if the election is absent.
+func (b *BulletinClient) GetElectionStatus(electionID string) (string, error) {
+	out, err := b.contract.EvaluateTransaction("GetElectionStatus", electionID)
+	if err != nil {
+		return "", fmt.Errorf("get election status: %w", err)
+	}
+	return string(out), nil
+}

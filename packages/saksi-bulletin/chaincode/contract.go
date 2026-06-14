@@ -14,6 +14,8 @@ const (
 	electionIndex = "election"
 	// dkgIndex keys the stored DKG transcript by electionID (one per election).
 	dkgIndex = "dkg"
+	// statusIndex keys the election lifecycle status by electionID.
+	statusIndex = "status"
 	// ballotIndex keys stored ballots by (electionID, nullifier).
 	ballotIndex = "ballot"
 	// nullifierIndex records spent nullifiers by (electionID, nullifier).
@@ -21,6 +23,12 @@ const (
 	// ciphertextLen is the expected ristretto255 compressed-point length, in
 	// bytes, for both the pad and data components of an ElGamal ciphertext.
 	ciphertextLen = 32
+)
+
+// Election lifecycle status values stored under statusIndex.
+const (
+	electionStatusOpen   = "open"
+	electionStatusClosed = "closed"
 )
 
 // SmartContract implements the BalotaChain bulletin board.
@@ -83,6 +91,22 @@ func (s *SmartContract) SubmitBallot(ctx contractapi.TransactionContextInterface
 	nullifier := hex.EncodeToString(presentation.GetNullifier().GetValue())
 
 	stub := ctx.GetStub()
+
+	// The election must exist and be open for ballots.
+	statusKey, err := stub.CreateCompositeKey(statusIndex, []string{ballot.GetElectionId()})
+	if err != nil {
+		return fmt.Errorf("build status key: %w", err)
+	}
+	status, err := stub.GetState(statusKey)
+	if err != nil {
+		return fmt.Errorf("read election status: %w", err)
+	}
+	if status == nil {
+		return fmt.Errorf("election %q does not exist", ballot.GetElectionId())
+	}
+	if string(status) != electionStatusOpen {
+		return fmt.Errorf("election %q is not open for ballots", ballot.GetElectionId())
+	}
 
 	nullifierKey, err := stub.CreateCompositeKey(nullifierIndex, []string{ballot.GetElectionId(), nullifier})
 	if err != nil {
@@ -178,6 +202,14 @@ func (s *SmartContract) CreateElection(ctx contractapi.TransactionContextInterfa
 	}
 	if err := stub.PutState(key, raw); err != nil {
 		return fmt.Errorf("store election: %w", err)
+	}
+
+	statusKey, err := stub.CreateCompositeKey(statusIndex, []string{electionID})
+	if err != nil {
+		return fmt.Errorf("build status key: %w", err)
+	}
+	if err := stub.PutState(statusKey, []byte(electionStatusOpen)); err != nil {
+		return fmt.Errorf("set election status: %w", err)
 	}
 	return nil
 }
@@ -290,4 +322,49 @@ func (s *SmartContract) GetDKGTranscript(ctx contractapi.TransactionContextInter
 		return "", fmt.Errorf("no DKG transcript found for election %q", electionID)
 	}
 	return hex.EncodeToString(raw), nil
+}
+
+// CloseElection transitions an election from open to closed, after which no
+// further ballots are accepted and threshold decryption may begin. The election
+// must exist and not already be closed.
+func (s *SmartContract) CloseElection(ctx contractapi.TransactionContextInterface, electionID string) error {
+	stub := ctx.GetStub()
+
+	statusKey, err := stub.CreateCompositeKey(statusIndex, []string{electionID})
+	if err != nil {
+		return fmt.Errorf("build status key: %w", err)
+	}
+	status, err := stub.GetState(statusKey)
+	if err != nil {
+		return fmt.Errorf("read election status: %w", err)
+	}
+	if status == nil {
+		return fmt.Errorf("no election found with id %q", electionID)
+	}
+	if string(status) == electionStatusClosed {
+		return fmt.Errorf("election %q is already closed", electionID)
+	}
+	if err := stub.PutState(statusKey, []byte(electionStatusClosed)); err != nil {
+		return fmt.Errorf("close election: %w", err)
+	}
+	return nil
+}
+
+// GetElectionStatus returns the lifecycle status ("open" or "closed") of an
+// election, or an error if no such election exists.
+func (s *SmartContract) GetElectionStatus(ctx contractapi.TransactionContextInterface, electionID string) (string, error) {
+	stub := ctx.GetStub()
+
+	statusKey, err := stub.CreateCompositeKey(statusIndex, []string{electionID})
+	if err != nil {
+		return "", fmt.Errorf("build status key: %w", err)
+	}
+	status, err := stub.GetState(statusKey)
+	if err != nil {
+		return "", fmt.Errorf("read election status: %w", err)
+	}
+	if status == nil {
+		return "", fmt.Errorf("no election found with id %q", electionID)
+	}
+	return string(status), nil
 }

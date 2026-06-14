@@ -78,6 +78,7 @@ func nullifierHexOf(t *testing.T, ballotHex string) (electionID, nullifier strin
 func TestSubmitBallotThenGetBallotRoundTrips(t *testing.T) {
 	sc := &SmartContract{}
 	ctx := newContext()
+	withElection(t, sc, ctx)
 	ballotHex := goldenBallotHex(t)
 
 	if err := sc.SubmitBallot(ctx, ballotHex); err != nil {
@@ -97,6 +98,7 @@ func TestSubmitBallotThenGetBallotRoundTrips(t *testing.T) {
 func TestSubmitBallotRejectsDoubleVote(t *testing.T) {
 	sc := &SmartContract{}
 	ctx := newContext()
+	withElection(t, sc, ctx)
 	ballotHex := goldenBallotHex(t)
 
 	if err := sc.SubmitBallot(ctx, ballotHex); err != nil {
@@ -396,5 +398,66 @@ func TestPublishDKGTranscriptRejectsWrongVersion(t *testing.T) {
 func TestGetDKGTranscriptMissingIsError(t *testing.T) {
 	if _, err := (&SmartContract{}).GetDKGTranscript(newContext(), "election-2026"); err == nil {
 		t.Fatal("GetDKGTranscript for an election with no transcript should fail")
+	}
+}
+
+func TestSubmitBallotRejectsUnknownElection(t *testing.T) {
+	sc := &SmartContract{}
+	err := sc.SubmitBallot(newContext(), goldenBallotHex(t))
+	if err == nil || !strings.Contains(err.Error(), "does not exist") {
+		t.Fatalf("expected an unknown-election error, got: %v", err)
+	}
+}
+
+func TestSubmitBallotRejectsClosedElection(t *testing.T) {
+	sc := &SmartContract{}
+	ctx := newContext()
+	withElection(t, sc, ctx)
+	if err := sc.CloseElection(ctx, "election-2026"); err != nil {
+		t.Fatalf("CloseElection: %v", err)
+	}
+	err := sc.SubmitBallot(ctx, goldenBallotHex(t))
+	if err == nil || !strings.Contains(err.Error(), "not open") {
+		t.Fatalf("expected a not-open error, got: %v", err)
+	}
+}
+
+func TestCloseElectionTransitionsStatus(t *testing.T) {
+	sc := &SmartContract{}
+	ctx := newContext()
+	withElection(t, sc, ctx)
+	if got, err := sc.GetElectionStatus(ctx, "election-2026"); err != nil || got != "open" {
+		t.Fatalf("status after create = %q (err %v), want open", got, err)
+	}
+	if err := sc.CloseElection(ctx, "election-2026"); err != nil {
+		t.Fatalf("CloseElection: %v", err)
+	}
+	if got, err := sc.GetElectionStatus(ctx, "election-2026"); err != nil || got != "closed" {
+		t.Fatalf("status after close = %q (err %v), want closed", got, err)
+	}
+}
+
+func TestCloseElectionRejectsMissing(t *testing.T) {
+	if err := (&SmartContract{}).CloseElection(newContext(), "no-such-election"); err == nil || !strings.Contains(err.Error(), "no election") {
+		t.Fatalf("expected a missing-election error, got: %v", err)
+	}
+}
+
+func TestCloseElectionRejectsAlreadyClosed(t *testing.T) {
+	sc := &SmartContract{}
+	ctx := newContext()
+	withElection(t, sc, ctx)
+	if err := sc.CloseElection(ctx, "election-2026"); err != nil {
+		t.Fatalf("first close: %v", err)
+	}
+	err := sc.CloseElection(ctx, "election-2026")
+	if err == nil || !strings.Contains(err.Error(), "already closed") {
+		t.Fatalf("expected an already-closed error, got: %v", err)
+	}
+}
+
+func TestGetElectionStatusMissingIsError(t *testing.T) {
+	if _, err := (&SmartContract{}).GetElectionStatus(newContext(), "no-such-election"); err == nil {
+		t.Fatal("GetElectionStatus for an unknown election should fail")
 	}
 }
