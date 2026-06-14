@@ -12,24 +12,20 @@
 //!
 //! Also enforces:
 //!
-//! - per-decryption version / trustee_id-in-parameters checks (shape),
+//! - per-decryption version / contest_id / trustee_id-in-parameters checks (shape),
+//! - **at most one** partial decryption per `(contest_id, trustee_id)` (a trustee
+//!   may not submit two shares for the same contest),
 //! - the **threshold count**: the number of distinct trustee ids that submitted
 //!   a partial decryption for any given contest must be at least
 //!   `parameters.threshold`.
 //!
-//! ## Layout assumption (v1)
+//! ## Self-describing routing
 //!
-//! The wire schema has no contest field on [`saksi_protocol::PartialDecryption`].
-//! The auditor therefore assumes a canonical layout:
-//!
-//! ```text
-//! partial_decryptions.len() == contest_count * trustee_count
-//! partial_decryptions[c * trustee_count + t]
-//!     = trustee parameters.trustee_ids[t] decrypting contest c
-//! ```
-//!
-//! The bulletin-board client SDK (Phase D) is expected to produce this
-//! layout. A mismatch is a shape failure.
+//! Each [`saksi_protocol::PartialDecryption`] now carries its own `contest_id`
+//! (matching the on-chain `SubmitPartialDecryption`), so the auditor routes each
+//! share to the contest it names rather than relying on a positional layout.
+//! Partial decryptions may appear in any order, and a contest need not have a
+//! share from every trustee — only `>= threshold` distinct verified trustees.
 
 use std::collections::HashSet;
 
@@ -78,7 +74,6 @@ pub(crate) fn verify_partial_decryptions(
     builder: &mut ReportBuilder,
 ) -> Option<DecryptionVerification> {
     let contest_count = parameters.contest_ids.len();
-    let trustee_count = parameters.trustee_ids.len();
     let threshold = parameters.threshold as usize;
 
     // -- 1. Per-contest aggregate ElGamal ciphertexts -----------------------
@@ -141,164 +136,166 @@ pub(crate) fn verify_partial_decryptions(
         "aggregate ElGamal ciphertexts assembled per contest",
     );
 
-    // -- 2. Shape: layout (contest_count * trustee_count) -------------------
-
-    let expected_len = contest_count * trustee_count;
-    if partial_decryptions.len() != expected_len {
-        builder.fail(
-            "decryption.shape",
-            format!(
-                "partial_decryptions length {} != contest_count * trustee_count = {} * {} = {}",
-                partial_decryptions.len(),
-                contest_count,
-                trustee_count,
-                expected_len
-            ),
-        );
-        return None;
-    }
-    builder.pass(
-        "decryption.shape",
-        "partial_decryptions length matches contest_count * trustee_count",
-    );
-
-    // -- 3. Per-contest verification of each PartialDecryption --------------
+    // -- 2/3. Route each partial decryption to its named contest and verify -
 
     let mut verified_shares: Vec<Vec<VerifiedShare>> =
         (0..contest_count).map(|_| Vec::new()).collect();
+    // Reject a trustee submitting more than one share for the same contest.
+    let mut seen: HashSet<(usize, usize)> = HashSet::new();
 
-    for c in 0..contest_count {
+    for (idx, pd) in partial_decryptions.iter().enumerate() {
+        if pd.version != WIRE_VERSION {
+            builder.fail(
+                "decryption.shape",
+                format!(
+                    "partial_decryptions[{idx}] version {} != supported {}",
+                    pd.version, WIRE_VERSION
+                ),
+            );
+            continue;
+        }
+
+        // Route by the share's own contest_id (self-describing — no positional
+        // layout assumption).
+        let c = match parameters
+            .contest_ids
+            .iter()
+            .position(|id| id == &pd.contest_id)
+        {
+            Some(c) => c,
+            None => {
+                builder.fail(
+                    "decryption.shape",
+                    format!(
+                        "partial_decryptions[{idx}] contest_id {:?} not in parameters.contest_ids",
+                        pd.contest_id
+                    ),
+                );
+                continue;
+            }
+        };
         let contest_id = &parameters.contest_ids[c];
+
+        let trustee_index = match parameters
+            .trustee_ids
+            .iter()
+            .position(|id| id == &pd.trustee_id)
+        {
+            Some(i) => i,
+            None => {
+                builder.fail(
+                    "decryption.shape",
+                    format!(
+                        "partial_decryptions[{idx}] trustee_id {:?} not in parameters.trustee_ids",
+                        pd.trustee_id
+                    ),
+                );
+                continue;
+            }
+        };
+
+        // At most one share per (contest, trustee).
+        if !seen.insert((c, trustee_index)) {
+            builder.fail(
+                "decryption.duplicate",
+                format!(
+                    "partial_decryptions[{idx}]: trustee {:?} submitted more than one share for contest {contest_id}",
+                    pd.trustee_id
+                ),
+            );
+            continue;
+        }
+        builder.pass(
+            "decryption.shape",
+            format!(
+                "partial_decryptions[{idx}] routes to contest {contest_id}, trustee {:?}",
+                pd.trustee_id
+            ),
+        );
+
         let aggregate_pad = aggregate_pads[c];
-        for t in 0..trustee_count {
-            let idx = c * trustee_count + t;
-            let pd = &partial_decryptions[idx];
 
-            if pd.version != WIRE_VERSION {
+        // decode share point
+        let share_array: [u8; 32] = match pd.share.as_slice().try_into() {
+            Ok(a) => a,
+            Err(_) => {
                 builder.fail(
-                    "decryption.shape",
+                    "decryption.share_decode",
+                    format!("partial_decryptions[{idx}] share has wrong length"),
+                );
+                continue;
+            }
+        };
+        let share_point = match point_from_compressed(share_array) {
+            Ok(p) => p,
+            Err(_) => {
+                builder.fail(
+                    "decryption.share_decode",
+                    format!("partial_decryptions[{idx}] share is not a valid ristretto point"),
+                );
+                continue;
+            }
+        };
+
+        // decode Chaum-Pedersen proof
+        let cp_wire = match pd.proof.as_ref() {
+            Some(w) => w,
+            None => {
+                builder.fail(
+                    "decryption.cp_decode",
+                    format!("partial_decryptions[{idx}] missing Chaum-Pedersen proof"),
+                );
+                continue;
+            }
+        };
+        let cp_proof = match ChaumPedersenProof::from_wire(cp_wire) {
+            Ok(p) => p,
+            Err(err) => {
+                builder.fail(
+                    "decryption.cp_decode",
                     format!(
-                        "partial_decryptions[{idx}] (contest {contest_id}, slot {t}) version {} != supported {}",
-                        pd.version, WIRE_VERSION
+                        "partial_decryptions[{idx}] Chaum-Pedersen proof failed to decode: {err}"
                     ),
                 );
                 continue;
             }
+        };
 
-            // `trustee_id` is a string; map back to the index it must occupy
-            // in the canonical layout.
-            let expected_trustee_id = &parameters.trustee_ids[t];
-            if &pd.trustee_id != expected_trustee_id {
-                builder.fail(
-                    "decryption.shape",
+        // Sanity-decode the cached scalar fields too — a tampered `response`
+        // field that survives `from_wire` (because it stayed canonical) will
+        // fail the verifier below; non-canonical bytes would have failed
+        // from_wire. Either way we reject.
+        let _ = {
+            let bytes: [u8; 32] = cp_wire.response.as_slice().try_into().unwrap_or([0u8; 32]);
+            scalar_from_canonical_bytes(bytes).ok()
+        };
+
+        // Verify against the aggregate pad and the trustee's public share.
+        let g = basepoint();
+        let pub_share = trustee_share_publics[trustee_index];
+        let context = cp_context(binding_context, &pd.trustee_id, contest_id);
+        match cp_proof.verify(&g, &aggregate_pad, &pub_share, &share_point, &context) {
+            Ok(()) => {
+                builder.pass(
+                    "decryption.cp_proof",
                     format!(
-                        "partial_decryptions[{idx}] trustee_id {:?} does not match expected slot {:?} (contest {contest_id})",
-                        pd.trustee_id, expected_trustee_id
+                        "partial_decryptions[{idx}] (trustee {}, contest {contest_id}) Chaum-Pedersen verifies",
+                        pd.trustee_id
                     ),
                 );
-                continue;
+                verified_shares[c].push(VerifiedShare {
+                    trustee_index,
+                    share_point,
+                });
             }
-
-            let trustee_index = match parameters
-                .trustee_ids
-                .iter()
-                .position(|id| id == &pd.trustee_id)
-            {
-                Some(i) => i,
-                None => {
-                    builder.fail(
-                        "decryption.shape",
-                        format!(
-                            "partial_decryptions[{idx}] trustee_id {:?} not in parameters.trustee_ids",
-                            pd.trustee_id
-                        ),
-                    );
-                    continue;
-                }
-            };
-
-            // decode share point
-            let share_array: [u8; 32] = match pd.share.as_slice().try_into() {
-                Ok(a) => a,
-                Err(_) => {
-                    builder.fail(
-                        "decryption.share_decode",
-                        format!("partial_decryptions[{idx}] share has wrong length"),
-                    );
-                    continue;
-                }
-            };
-            let share_point = match point_from_compressed(share_array) {
-                Ok(p) => p,
-                Err(_) => {
-                    builder.fail(
-                        "decryption.share_decode",
-                        format!("partial_decryptions[{idx}] share is not a valid ristretto point"),
-                    );
-                    continue;
-                }
-            };
-
-            // decode Chaum-Pedersen proof
-            let cp_wire = match pd.proof.as_ref() {
-                Some(w) => w,
-                None => {
-                    builder.fail(
-                        "decryption.cp_decode",
-                        format!("partial_decryptions[{idx}] missing Chaum-Pedersen proof"),
-                    );
-                    continue;
-                }
-            };
-            let cp_proof = match ChaumPedersenProof::from_wire(cp_wire) {
-                Ok(p) => p,
-                Err(err) => {
-                    builder.fail(
-                        "decryption.cp_decode",
-                        format!(
-                            "partial_decryptions[{idx}] Chaum-Pedersen proof failed to decode: {err}"
-                        ),
-                    );
-                    continue;
-                }
-            };
-
-            // Sanity-decode the cached scalar fields too — a tampered
-            // `response` field that survives `from_wire` (because it stayed
-            // canonical) will fail the verifier below; non-canonical bytes
-            // would have failed from_wire. Either way we reject.
-            let _ = {
-                let bytes: [u8; 32] = cp_wire.response.as_slice().try_into().unwrap_or([0u8; 32]);
-                scalar_from_canonical_bytes(bytes).ok()
-            };
-
-            // Verify against the aggregate pad and the trustee's public share.
-            let g = basepoint();
-            let pub_share = trustee_share_publics[trustee_index];
-            let context = cp_context(binding_context, &pd.trustee_id, contest_id);
-            match cp_proof.verify(&g, &aggregate_pad, &pub_share, &share_point, &context) {
-                Ok(()) => {
-                    builder.pass(
-                        "decryption.cp_proof",
-                        format!(
-                            "partial_decryptions[{idx}] (trustee {}, contest {contest_id}) Chaum-Pedersen verifies",
-                            pd.trustee_id
-                        ),
-                    );
-                    verified_shares[c].push(VerifiedShare {
-                        trustee_index,
-                        share_point,
-                    });
-                }
-                Err(err) => {
-                    builder.fail(
-                        "decryption.cp_proof",
-                        format!(
-                            "partial_decryptions[{idx}] (trustee {}, contest {contest_id}) Chaum-Pedersen failed: {err}",
-                            pd.trustee_id
-                        ),
-                    );
-                }
+            Err(err) => {
+                builder.fail(
+                    "decryption.cp_proof",
+                    format!(
+                        "partial_decryptions[{idx}] (trustee {}, contest {contest_id}) Chaum-Pedersen failed: {err}",
+                        pd.trustee_id
+                    ),
+                );
             }
         }
     }
