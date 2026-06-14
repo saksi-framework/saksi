@@ -14,6 +14,7 @@ path = "src/lib.rs"
 
 [dependencies]
 saksi-crypto = { path = "../saksi-crypto" }
+saksi-protocol = { path = "../saksi-protocol/rust" }
 curve25519-dalek.workspace = true
 merlin.workspace = true
 subtle.workspace = true
@@ -21,6 +22,8 @@ zeroize.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 rand_core.workspace = true
+sha2 = { version = "0.10", default-features = false }
+prost = "0.13"
 
 [dev-dependencies]
 proptest.workspace = true
