@@ -1,20 +1,17 @@
-use curve25519_dalek::{ristretto::RistrettoPoint, scalar::Scalar};
+use curve25519_dalek::scalar::Scalar;
 use rand_core::OsRng;
 use saksi_credentials::{
     derive_nullifier as credentials_derive_nullifier,
-    issuance::IssuerPublicKey,
-    nullifier::{compress_nullifier, nullifier_h},
-    verify_presentation,
+    issuance::{Credential, IssuerPublicKey},
+    nullifier::compress_nullifier,
 };
 use saksi_crypto::{
     benaloh::BenalohCommitment,
     elgamal::{encrypt, Ciphertext, Plaintext, PublicKey, SecretKey},
-    group::{basepoint, compress_point, point_from_compressed, scalar_from_canonical_bytes},
-    nizk::{cds::CDSProof, chaum_pedersen::ChaumPedersenProof},
+    group::{compress_point, point_from_compressed, scalar_from_canonical_bytes},
+    nizk::cds::CDSProof,
 };
-use saksi_protocol::{
-    encode as encode_protocol_message, CredentialPresentation, Nullifier, WIRE_VERSION,
-};
+use saksi_protocol::encode as encode_protocol_message;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -292,76 +289,37 @@ pub fn present_credential_v2(
     let issuer_pk_point = decode_point(&issuer_public_key_hex)?;
     let issuer_pk = IssuerPublicKey(issuer_pk_point);
 
-    // Reconstruct the public commitment C = s_cred · G from the secret scalar.
-    let g = basepoint();
-    let commitment: RistrettoPoint = s_cred * g;
+    // Rebuild the canonical Credential from the supplied parts and verify the
+    // issuer signature *before* producing the presentation. This is the FFI's
+    // guarantee that we never emit a presentation the bulletin board would
+    // reject on submit, and it surfaces a tampered signature as
+    // `VerificationFailed` at the boundary (matching the v1 test expectation).
+    let credential = Credential::from_parts(s_cred, signature_r, signature_s);
+    credential
+        .verify_against_issuer(&issuer_pk)
+        .map_err(|err| err.to_string())?;
 
-    // Build the Chaum-Pedersen NIZK tying C and the nullifier point to the
-    // same s_cred — this is what `Credential::present` would do internally.
-    let h_e = nullifier_h(election_id.as_bytes());
-    let nullifier_point: RistrettoPoint =
-        credentials_derive_nullifier(&s_cred, election_id.as_bytes());
-    let cp_context = build_presentation_context(election_id.as_bytes(), context.as_bytes());
-    let cp_proof = ChaumPedersenProof::prove(
-        &g,
-        &h_e,
-        &commitment,
-        &nullifier_point,
-        &s_cred,
-        &cp_context,
-        &mut OsRng,
-    );
-
-    // presentation_proof envelope: R' (32) || s_sig (32) || CP_proof (variable)
-    let cp_wire_bytes = encode_protocol_message(&cp_proof.to_wire());
-    let mut proof_bytes = Vec::with_capacity(64 + cp_wire_bytes.len());
-    proof_bytes.extend_from_slice(&compress_point(&signature_r));
-    proof_bytes.extend_from_slice(&signature_s.to_bytes());
-    proof_bytes.extend_from_slice(&cp_wire_bytes);
-
-    let presentation = CredentialPresentation {
-        version: WIRE_VERSION,
-        credential_commitment: compress_point(&commitment).to_vec(),
-        issuer_public_key: compress_point(issuer_pk.as_point()).to_vec(),
-        presentation_proof: proof_bytes,
-        nullifier: Some(Nullifier {
-            version: WIRE_VERSION,
-            value: compress_nullifier(&nullifier_point).to_vec(),
-        }),
-    };
-
-    // Sanity-check via the canonical verifier *before* handing the bytes back.
-    // This catches a bad issuer signature (so the FFI does not emit a
-    // presentation that the bulletin board would reject on submit).
-    verify_presentation(
-        &presentation,
+    // Run the real present(). This emits the canonical wire bytes and the same
+    // nullifier `derive_nullifier_v2` would produce — by construction.
+    let presentation = credential.present(
         &issuer_pk,
         election_id.as_bytes(),
         context.as_bytes(),
-    )
-    .map_err(|err| err.to_string())?;
+        &mut OsRng,
+    );
 
+    let nullifier_hex = presentation
+        .nullifier
+        .as_ref()
+        .map(|n| hex_lower(&n.value))
+        .unwrap_or_default();
     let wire_bytes = encode_protocol_message(&presentation);
-    let nullifier_hex = hex_lower(&compress_nullifier(&nullifier_point));
 
     Ok(CredentialPresentationDto {
         label: "saksi.ffi.flutter.credential-presentation.v2".to_owned(),
         wire_bytes_hex: hex_lower(&wire_bytes),
         nullifier_hex,
     })
-}
-
-/// Build the same length-prefixed presentation transcript context the
-/// `saksi-credentials` crate uses internally, so the Chaum-Pedersen NIZK we
-/// emit is interchangeable with one produced by `Credential::present`.
-fn build_presentation_context(election_id: &[u8], context: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(64 + election_id.len() + context.len());
-    out.extend_from_slice(b"saksi.credentials.presentation.v1");
-    out.extend_from_slice(&(election_id.len() as u64).to_be_bytes());
-    out.extend_from_slice(election_id);
-    out.extend_from_slice(&(context.len() as u64).to_be_bytes());
-    out.extend_from_slice(context);
-    out
 }
 
 // ---------------------------------------------------------------------------
@@ -490,13 +448,14 @@ mod tests {
 #[cfg(test)]
 mod v2_tests {
     use super::*;
-    use curve25519_dalek::ristretto::CompressedRistretto;
+    use curve25519_dalek::ristretto::{CompressedRistretto, RistrettoPoint};
     use merlin::Transcript;
     use prost::Message;
     use saksi_credentials::issuance::IssuerSecretKey;
     use saksi_credentials::verify_presentation;
     use saksi_crypto::benaloh::BenalohCommitment;
     use saksi_crypto::elgamal::{self, encrypt, Plaintext, SecretKey};
+    use saksi_crypto::group::basepoint;
     use saksi_protocol::{CDSProof as ProtoCDSProof, CredentialPresentation};
 
     fn keypair_hex(scalar: u64) -> (String, SecretKey) {
