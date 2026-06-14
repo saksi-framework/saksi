@@ -166,3 +166,76 @@ func TestGetElectionStatusReturnsPayloadAsString(t *testing.T) {
 		t.Fatalf("transaction name = %q, want GetElectionStatus", fc.submitName)
 	}
 }
+
+func TestSubmitPartialDecryptionInvokesSubmitTransaction(t *testing.T) {
+	fc := &fakeContract{}
+	if err := NewBulletinClient(fc).SubmitPartialDecryption("election-2026", "0a0b"); err != nil {
+		t.Fatalf("SubmitPartialDecryption: %v", err)
+	}
+	if fc.submitName != "SubmitPartialDecryption" {
+		t.Fatalf("transaction name = %q, want SubmitPartialDecryption", fc.submitName)
+	}
+	if len(fc.submitArgs) != 2 || fc.submitArgs[0] != "election-2026" || fc.submitArgs[1] != "0a0b" {
+		t.Fatalf("args = %v, want [election-2026 0a0b]", fc.submitArgs)
+	}
+}
+
+func TestSubmitPartialDecryptionRejectsEmpty(t *testing.T) {
+	c := NewBulletinClient(&fakeContract{})
+	if err := c.SubmitPartialDecryption("", "0a"); err == nil {
+		t.Fatal("SubmitPartialDecryption should reject empty election id")
+	}
+	if err := c.SubmitPartialDecryption("election-2026", ""); err == nil {
+		t.Fatal("SubmitPartialDecryption should reject empty partial hex")
+	}
+}
+
+func TestGetPartialDecryptionReturnsPayloadAsString(t *testing.T) {
+	fc := &fakeContract{evalReturn: []byte("feed")}
+	got, err := NewBulletinClient(fc).GetPartialDecryption("election-2026", "contest-1", "trustee-1")
+	if err != nil {
+		t.Fatalf("GetPartialDecryption: %v", err)
+	}
+	if got != "feed" {
+		t.Fatalf("payload = %q, want feed", got)
+	}
+	if fc.submitName != "GetPartialDecryption" {
+		t.Fatalf("transaction name = %q, want GetPartialDecryption", fc.submitName)
+	}
+	if len(fc.submitArgs) != 3 || fc.submitArgs[0] != "election-2026" || fc.submitArgs[1] != "contest-1" || fc.submitArgs[2] != "trustee-1" {
+		t.Fatalf("args = %v, want [election-2026 contest-1 trustee-1]", fc.submitArgs)
+	}
+}
+
+func TestPublishTallyInvokesSubmitTransaction(t *testing.T) {
+	fc := &fakeContract{}
+	if err := NewBulletinClient(fc).PublishTally("0a0b0c"); err != nil {
+		t.Fatalf("PublishTally: %v", err)
+	}
+	if fc.submitName != "PublishTally" {
+		t.Fatalf("transaction name = %q, want PublishTally", fc.submitName)
+	}
+	if len(fc.submitArgs) != 1 || fc.submitArgs[0] != "0a0b0c" {
+		t.Fatalf("args = %v, want [0a0b0c]", fc.submitArgs)
+	}
+}
+
+func TestPublishTallyRejectsEmpty(t *testing.T) {
+	if err := NewBulletinClient(&fakeContract{}).PublishTally(""); err == nil {
+		t.Fatal("PublishTally should reject empty input")
+	}
+}
+
+func TestGetTallyReturnsPayloadAsString(t *testing.T) {
+	fc := &fakeContract{evalReturn: []byte("d00d")}
+	got, err := NewBulletinClient(fc).GetTally("election-2026")
+	if err != nil {
+		t.Fatalf("GetTally: %v", err)
+	}
+	if got != "d00d" {
+		t.Fatalf("payload = %q, want d00d", got)
+	}
+	if fc.submitName != "GetTally" {
+		t.Fatalf("transaction name = %q, want GetTally", fc.submitName)
+	}
+}
