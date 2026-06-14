@@ -22,6 +22,19 @@ Philippine open-source cryptographic infrastructure.
 
 > *Saksi* is Filipino for *witness*.
 
+## Run the demo
+
+A complete election runs end-to-end against a real Hyperledger Fabric network
+(DKG → encrypted ballots with on-chain credential-signature checks → close →
+threshold decryption → tally → independent audit) from one menu:
+
+```bash
+bash tools/saksi-demo.sh        # interactive menu, or `… all` for the whole run
+```
+
+Full setup for **Windows (WSL)** and **macOS** — Docker, toolchains, Fabric, and
+troubleshooting — is in **[DEMO.md](DEMO.md)**.
+
 ## Status
 
 Saksi is early research-grade software under active development. Most components

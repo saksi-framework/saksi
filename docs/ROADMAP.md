@@ -23,8 +23,14 @@ independent audit.
 - **G2 (governance):** complete — protocol spec ([`../spec/protocol.md`](../spec/protocol.md)),
   threat model ([`../spec/threat-model.md`](../spec/threat-model.md)), and ADRs
   0005 (hybrid split) + 0006 (lifecycle).
-- **Remaining:** **G1** live e2e election on the network + audit, and the
-  `network.sh` repro fixes.
+- **G1 (capstone):** **complete** — the full election cycle runs end-to-end on
+  the live Fabric test-network (deploy → DKG → ballots passing the on-chain
+  credential-signature check → close → partial decryptions → tally → `AUDIT:
+  PASS`), driven by the `saksi-console` + `tools/saksi-demo.sh` demo CLI.
+  `network.sh` repro fixes landed (cryptogen, single-org dev endorsement).
+  Setup: [`../DEMO.md`](../DEMO.md).
+- **Remaining:** nothing in this roadmap. Future (out of scope here): the 5-org
+  production network and MSP/role-based transaction authorization.
 
 ## Scope (decided)
 

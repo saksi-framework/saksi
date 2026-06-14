@@ -56,13 +56,17 @@ in [`spec/`](spec/); see [ROADMAP](docs/ROADMAP.md) Progress section.
 network (submit → endorse → order → commit → read-back identical; a replayed
 ballot was rejected by the nullifier guard).
 
-**Still missing:**
-- **G1** — the end-to-end audited election demo on the live network: a driver
-  running DKG → `CreateElection` → `PublishDKGTranscript` → `SubmitBallot`×N →
-  `CloseElection` → `SubmitPartialDecryption`×t → `PublishTally` → run
-  `saksi-auditor` → all checks pass.
-- **`network.sh` repro fixes** — split `up`/`createChannel`, default Org1
-  endorsement for dev, document the `jq` prereq.
+**Done — full demo runs live:**
+- **G1 capstone** — the whole election cycle runs end-to-end on the live Fabric
+  test-network (DKG → `CreateElection` → `PublishDKGTranscript` →
+  `SubmitBallot`×N passing the on-chain credential-signature check →
+  `CloseElection` → `SubmitPartialDecryption`×t → `PublishTally` →
+  `saksi-auditor` → `AUDIT: PASS`). Driven by `packages/saksi-demo` (bundle
+  generator + auditor CLI), `client-sdk/cmd/saksi-console` (live lifecycle
+  driver), and `tools/saksi-demo.sh` (top-level menu). Setup for Windows + macOS:
+  [`DEMO.md`](DEMO.md).
+- **`network.sh` repro fixes** — cryptogen (no `-ca`), single-org Org1
+  endorsement for dev.
 
 **Resolved (were Phase-D flags):**
 1. `PartialDecryption` now carries `contest_id`; the auditor routes shares by id
