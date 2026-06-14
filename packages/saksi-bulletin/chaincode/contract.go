@@ -10,6 +10,8 @@ import (
 )
 
 const (
+	// electionIndex keys stored election parameters by electionID.
+	electionIndex = "election"
 	// ballotIndex keys stored ballots by (electionID, nullifier).
 	ballotIndex = "ballot"
 	// nullifierIndex records spent nullifiers by (electionID, nullifier).
@@ -120,6 +122,79 @@ func (s *SmartContract) GetBallot(ctx contractapi.TransactionContextInterface, e
 	}
 	if raw == nil {
 		return "", fmt.Errorf("no ballot found for election %q nullifier %q", electionID, nullifier)
+	}
+	return hex.EncodeToString(raw), nil
+}
+
+// CreateElection records the parameters of a new election. The argument is the
+// hex-encoded canonical protobuf encoding of a saksi.protocol.v1.ElectionParameters.
+//
+// On-chain checks: supported wire version, a non-empty election id, at least one
+// contest and one trustee, and a threshold in 1..=trustee_count. The election id
+// must be new — re-creating an existing election is rejected.
+func (s *SmartContract) CreateElection(ctx contractapi.TransactionContextInterface, paramsHex string) error {
+	raw, err := hex.DecodeString(paramsHex)
+	if err != nil {
+		return fmt.Errorf("election parameters are not valid hex: %w", err)
+	}
+
+	var params saksiprotocolv1.ElectionParameters
+	if err := proto.Unmarshal(raw, &params); err != nil {
+		return fmt.Errorf("decode election parameters: %w", err)
+	}
+
+	if params.GetVersion() != saksiprotocolv1.WireVersion {
+		return fmt.Errorf("unsupported election parameters version %d, want %d", params.GetVersion(), saksiprotocolv1.WireVersion)
+	}
+	electionID := params.GetElectionId()
+	if electionID == "" {
+		return fmt.Errorf("election parameters are missing an election id")
+	}
+	if len(params.GetContestIds()) == 0 {
+		return fmt.Errorf("election has no contests")
+	}
+	trustees := len(params.GetTrusteeIds())
+	if trustees == 0 {
+		return fmt.Errorf("election has no trustees")
+	}
+	threshold := int(params.GetThreshold())
+	if threshold < 1 || threshold > trustees {
+		return fmt.Errorf("election threshold %d is out of range 1..%d", threshold, trustees)
+	}
+
+	stub := ctx.GetStub()
+	key, err := stub.CreateCompositeKey(electionIndex, []string{electionID})
+	if err != nil {
+		return fmt.Errorf("build election key: %w", err)
+	}
+	existing, err := stub.GetState(key)
+	if err != nil {
+		return fmt.Errorf("read election state: %w", err)
+	}
+	if existing != nil {
+		return fmt.Errorf("election %q already exists", electionID)
+	}
+	if err := stub.PutState(key, raw); err != nil {
+		return fmt.Errorf("store election: %w", err)
+	}
+	return nil
+}
+
+// GetElection returns the hex-encoded ElectionParameters recorded for an
+// election id, or an error if no such election exists.
+func (s *SmartContract) GetElection(ctx contractapi.TransactionContextInterface, electionID string) (string, error) {
+	stub := ctx.GetStub()
+
+	key, err := stub.CreateCompositeKey(electionIndex, []string{electionID})
+	if err != nil {
+		return "", fmt.Errorf("build election key: %w", err)
+	}
+	raw, err := stub.GetState(key)
+	if err != nil {
+		return "", fmt.Errorf("read election state: %w", err)
+	}
+	if raw == nil {
+		return "", fmt.Errorf("no election found with id %q", electionID)
 	}
 	return hex.EncodeToString(raw), nil
 }

@@ -70,3 +70,39 @@ func TestGetBallotReturnsPayloadAsString(t *testing.T) {
 		t.Fatalf("args = %v, want [election-2026 0d0d]", fc.submitArgs)
 	}
 }
+
+func TestCreateElectionInvokesSubmitTransaction(t *testing.T) {
+	fc := &fakeContract{}
+	if err := NewBulletinClient(fc).CreateElection("0a0b0c"); err != nil {
+		t.Fatalf("CreateElection: %v", err)
+	}
+	if fc.submitName != "CreateElection" {
+		t.Fatalf("transaction name = %q, want CreateElection", fc.submitName)
+	}
+	if len(fc.submitArgs) != 1 || fc.submitArgs[0] != "0a0b0c" {
+		t.Fatalf("args = %v, want [0a0b0c]", fc.submitArgs)
+	}
+}
+
+func TestCreateElectionRejectsEmpty(t *testing.T) {
+	if err := NewBulletinClient(&fakeContract{}).CreateElection(""); err == nil {
+		t.Fatal("CreateElection should reject empty input")
+	}
+}
+
+func TestGetElectionReturnsPayloadAsString(t *testing.T) {
+	fc := &fakeContract{evalReturn: []byte("cafe")}
+	got, err := NewBulletinClient(fc).GetElection("election-2026")
+	if err != nil {
+		t.Fatalf("GetElection: %v", err)
+	}
+	if got != "cafe" {
+		t.Fatalf("payload = %q, want cafe", got)
+	}
+	if fc.submitName != "GetElection" {
+		t.Fatalf("transaction name = %q, want GetElection", fc.submitName)
+	}
+	if len(fc.submitArgs) != 1 || fc.submitArgs[0] != "election-2026" {
+		t.Fatalf("args = %v, want [election-2026]", fc.submitArgs)
+	}
+}
