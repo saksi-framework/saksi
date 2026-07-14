@@ -81,7 +81,15 @@ pub(crate) fn verify_partial_decryptions(
     let mut aggregate_pads = vec![RistrettoPoint::identity(); contest_count];
     let mut aggregate_data = vec![RistrettoPoint::identity(); contest_count];
     for ballot in eligible_ballots {
-        for (c, ct) in ballot.ciphertexts.iter().enumerate().take(contest_count) {
+        // Map this ballot's local ciphertexts to their global contest indices
+        // (ADR-0007 one-record-per-position; empty position = whole ballot). A
+        // ballot only contributes to the contests its position covers.
+        let contest_idxs =
+            crate::contest_indices_for_position(&parameters.contest_ids, &ballot.position_id);
+        for (local_idx, ct) in ballot.ciphertexts.iter().enumerate() {
+            // `verify_ballots` already checked ciphertexts.len() == contest_idxs.len()
+            // for eligible ballots, so this index is always in range.
+            let c = contest_idxs[local_idx];
             // Ballots that passed `verify_ballots` already had their
             // ciphertexts decoded once; we redo it here so this module is
             // standalone and we don't ferry decoded points around. Failures

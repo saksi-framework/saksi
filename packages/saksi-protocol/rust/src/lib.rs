@@ -109,6 +109,7 @@ mod tests {
                     value: vec![13; 32],
                 }),
             }),
+            position_id: "president".to_owned(),
         }
     }
 

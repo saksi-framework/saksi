@@ -171,6 +171,33 @@ pub fn audit(artifacts: ElectionArtifacts) -> AuditReport {
     builder.finish()
 }
 
+/// Global indices (into `contest_ids`) of the contests a ballot in `position_id`
+/// covers (ADR-0007 one-record-per-position model). Contests are
+/// position-qualified as `"<position_id>/<candidate_idx>"`, so a ballot carries
+/// exactly the ciphertexts/proofs for its position's candidates, aligned in
+/// order to the returned indices.
+///
+/// An **empty `position_id`** is the legacy single-position path: the ballot
+/// covers *all* contests (the pre-R2 whole-ballot model). The single source of
+/// truth for this mapping — the chaincode mirrors it in Go (`contract.go`),
+/// and both the auditor's CDS check and its tally aggregation call it, so the
+/// prover, verifier, and on-chain gate agree by construction.
+pub(crate) fn contest_indices_for_position(
+    contest_ids: &[String],
+    position_id: &str,
+) -> Vec<usize> {
+    if position_id.is_empty() {
+        return (0..contest_ids.len()).collect();
+    }
+    let prefix = format!("{position_id}/");
+    contest_ids
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| c.starts_with(&prefix))
+        .map(|(i, _)| i)
+        .collect()
+}
+
 /// Shape checks on `parameters`. Returns `false` if any shape check fails
 /// in a way that makes downstream verification meaningless.
 fn check_parameters(parameters: &ElectionParameters, builder: &mut ReportBuilder) -> bool {

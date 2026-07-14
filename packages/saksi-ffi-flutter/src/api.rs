@@ -164,6 +164,14 @@ pub fn present_credential(credential_commitment: String, election_id: String) ->
 /// UTF-8 bytes, so any later mismatch by the auditor causes verification to
 /// fail.
 ///
+/// NOTE (ADR-0007, Phase 7): this app-side prover still binds `contest_id` only.
+/// The on-chain CDS verifier and the auditor now use the canonical
+/// `saksi_crypto::nizk::cds::binding_context(election_id, contest_id, nullifier)`.
+/// Before the Flutter voter app submits real ballots to the chaincode, this must
+/// switch to that binding (which requires threading `election_id` + the ballot
+/// nullifier through this call). Deferred with the rest of the app wiring
+/// (Phase 7); backend/demo path already uses the canonical binding.
+///
 /// Returns the canonical wire-encoded [`saksi_protocol::CDSProof`] bytes as
 /// hex inside a [`ProofBytesDto`].
 pub fn generate_cds_proof_v2(
@@ -244,12 +252,19 @@ pub fn perform_benaloh_challenge_v2(
 ///
 /// `election_id` is mixed into the hash-to-point via its UTF-8 bytes; the
 /// caller is responsible for using a canonical election identifier.
+///
+/// `position_id` binds the nullifier to a ballot position (R2 / ADR-0007): a
+/// voter gets a distinct nullifier per position, so double voting is prevented
+/// per voter per position. Pass an empty string for the legacy per-election
+/// nullifier (single-position / transitional path).
 pub fn derive_nullifier_v2(
     credential_secret_scalar_hex: String,
     election_id: String,
+    position_id: String,
 ) -> Result<String, String> {
     let s_cred = decode_scalar(&credential_secret_scalar_hex)?;
-    let nullifier = credentials_derive_nullifier(&s_cred, election_id.as_bytes());
+    let nullifier =
+        credentials_derive_nullifier(&s_cred, election_id.as_bytes(), position_id.as_bytes());
     Ok(hex_lower(&compress_nullifier(&nullifier)))
 }
 
@@ -272,6 +287,7 @@ pub fn present_credential_v2(
     credential_signature_hex: String,
     issuer_public_key_hex: String,
     election_id: String,
+    position_id: String,
     context: String,
 ) -> Result<CredentialPresentationDto, String> {
     let s_cred = decode_scalar(&credential_secret_scalar_hex)?;
@@ -304,6 +320,7 @@ pub fn present_credential_v2(
     let presentation = credential.present(
         &issuer_pk,
         election_id.as_bytes(),
+        position_id.as_bytes(),
         context.as_bytes(),
         &mut OsRng,
     );
@@ -569,8 +586,9 @@ mod v2_tests {
     #[test]
     fn nullifier_v2_is_deterministic() {
         let s_hex = hex_lower(&Scalar::from(987u64).to_bytes());
-        let a = derive_nullifier_v2(s_hex.clone(), "election-2026".to_owned()).unwrap();
-        let b = derive_nullifier_v2(s_hex, "election-2026".to_owned()).unwrap();
+        let a = derive_nullifier_v2(s_hex.clone(), "election-2026".to_owned(), "pos".to_owned())
+            .unwrap();
+        let b = derive_nullifier_v2(s_hex, "election-2026".to_owned(), "pos".to_owned()).unwrap();
         assert_eq!(a, b);
         // Sanity: 32-byte point hex.
         assert_eq!(a.len(), 64);
@@ -579,8 +597,13 @@ mod v2_tests {
     #[test]
     fn nullifier_v2_separates_elections() {
         let s_hex = hex_lower(&Scalar::from(987u64).to_bytes());
-        let a = derive_nullifier_v2(s_hex.clone(), "election-2026-A".to_owned()).unwrap();
-        let b = derive_nullifier_v2(s_hex, "election-2026-B".to_owned()).unwrap();
+        let a = derive_nullifier_v2(
+            s_hex.clone(),
+            "election-2026-A".to_owned(),
+            "pos".to_owned(),
+        )
+        .unwrap();
+        let b = derive_nullifier_v2(s_hex, "election-2026-B".to_owned(), "pos".to_owned()).unwrap();
         assert_ne!(a, b);
     }
 
@@ -653,6 +676,7 @@ mod v2_tests {
             sig_hex,
             issuer_pk_hex,
             "election-2026".to_owned(),
+            "pos".to_owned(),
             "ctx".to_owned(),
         )
         .expect("present_credential_v2 ok");
@@ -662,7 +686,7 @@ mod v2_tests {
         let wire_bytes = parse_hex(&dto.wire_bytes_hex).expect("hex");
         let presentation =
             CredentialPresentation::decode(&wire_bytes[..]).expect("decode presentation");
-        verify_presentation(&presentation, &issuer_pk, b"election-2026", b"ctx")
+        verify_presentation(&presentation, &issuer_pk, b"election-2026", b"pos", b"ctx")
             .expect("presentation verifies under credentials verifier");
 
         // Sanity: returned nullifier matches the presentation's nullifier.
@@ -688,6 +712,7 @@ mod v2_tests {
             sig_hex,
             issuer_pk_hex,
             "e".to_owned(),
+            "pos".to_owned(),
             "c".to_owned(),
         )
         .expect_err("tampered signature must be rejected");

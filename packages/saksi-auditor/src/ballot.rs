@@ -40,14 +40,25 @@ pub(crate) fn verify_ballots<'a>(
     binding_context: &[u8],
     builder: &mut ReportBuilder,
 ) -> Vec<&'a Ballot> {
-    let contest_count = parameters.contest_ids.len();
     let binary_choice_set = [Scalar::ZERO, Scalar::ONE];
 
     let mut eligible = Vec::with_capacity(ballots.len());
 
     for (idx, ballot) in ballots.iter().enumerate() {
-        let serial = idx as u64;
-        let serial_bytes = serial.to_be_bytes();
+        // The CDS proofs are bound to this ballot's nullifier (order-independent,
+        // the same binding the chaincode reconstructs at endorsement — ADR-0007).
+        let nullifier_bytes: Vec<u8> = ballot
+            .credential_presentation
+            .as_ref()
+            .and_then(|p| p.nullifier.as_ref())
+            .map(|n| n.value.clone())
+            .unwrap_or_default();
+
+        // Contests this ballot's position covers (ADR-0007 one-record-per-position;
+        // empty position_id = legacy whole-ballot). The ciphertexts/proofs align in
+        // order to these global contest indices.
+        let contest_idxs =
+            crate::contest_indices_for_position(&parameters.contest_ids, &ballot.position_id);
 
         // -- wire shape ----------------------------------------------------
 
@@ -61,17 +72,28 @@ pub(crate) fn verify_ballots<'a>(
             );
             continue;
         }
-        if ballot.ciphertexts.len() != contest_count
-            || ballot.well_formedness_proofs.len() != contest_count
+        if contest_idxs.is_empty() {
+            builder.fail(
+                "ballot.shape",
+                format!(
+                    "ballot[{idx}] position {:?} matches no contest in the election parameters",
+                    ballot.position_id
+                ),
+            );
+            continue;
+        }
+        if ballot.ciphertexts.len() != contest_idxs.len()
+            || ballot.well_formedness_proofs.len() != contest_idxs.len()
         {
             builder.fail(
                 "ballot.shape",
                 format!(
-                    "ballot[{}] has {} ciphertexts / {} proofs, expected {} (one per contest)",
+                    "ballot[{}] (position {:?}) has {} ciphertexts / {} proofs, expected {} (one per position candidate)",
                     idx,
+                    ballot.position_id,
                     ballot.ciphertexts.len(),
                     ballot.well_formedness_proofs.len(),
-                    contest_count
+                    contest_idxs.len()
                 ),
             );
             continue;
@@ -84,8 +106,9 @@ pub(crate) fn verify_ballots<'a>(
         // -- per-contest CDS check ----------------------------------------
 
         let mut all_cds_ok = true;
-        for (contest_idx, contest_id) in parameters.contest_ids.iter().enumerate() {
-            let wire_ct = &ballot.ciphertexts[contest_idx];
+        for (local_idx, &global_idx) in contest_idxs.iter().enumerate() {
+            let contest_id = &parameters.contest_ids[global_idx];
+            let wire_ct = &ballot.ciphertexts[local_idx];
             let pad_array: [u8; 32] = match wire_ct.pad.as_slice().try_into() {
                 Ok(a) => a,
                 Err(_) => {
@@ -140,7 +163,7 @@ pub(crate) fn verify_ballots<'a>(
             };
             let ciphertext = elgamal::Ciphertext::new(pad, data);
 
-            let cds = match CDSProof::from_wire(&ballot.well_formedness_proofs[contest_idx]) {
+            let cds = match CDSProof::from_wire(&ballot.well_formedness_proofs[local_idx]) {
                 Ok(c) => c,
                 Err(err) => {
                     builder.fail(
@@ -154,7 +177,11 @@ pub(crate) fn verify_ballots<'a>(
                 }
             };
 
-            let context = cds_context(binding_context, contest_id.as_bytes(), &serial_bytes);
+            let context = saksi_crypto::nizk::cds::binding_context(
+                parameters.election_id.as_bytes(),
+                contest_id.as_bytes(),
+                &nullifier_bytes,
+            );
             if let Err(err) = cds.verify(
                 election_public_key,
                 &ciphertext,
@@ -212,6 +239,9 @@ pub(crate) fn verify_ballots<'a>(
             presentation,
             issuer_public_key,
             parameters.election_id.as_bytes(),
+            // Per-position nullifier (ADR-0007): the record's position_id recomputes
+            // H_e = nullifier_h(election_id, position_id). Empty = legacy per-election.
+            ballot.position_id.as_bytes(),
             binding_context,
         ) {
             Ok(()) => {
@@ -241,28 +271,15 @@ pub(crate) fn verify_ballots<'a>(
     eligible
 }
 
-/// Build the per-ballot CDS transcript context — `binding_context ||
-/// contest_id || ballot_serial` with explicit length prefixes so the three
-/// fields can't be smushed together ambiguously.
-fn cds_context(binding_context: &[u8], contest_id: &[u8], serial: &[u8]) -> Vec<u8> {
-    let mut ctx =
-        Vec::with_capacity(binding_context.len() + contest_id.len() + serial.len() + 3 * 8);
-    ctx.extend_from_slice(&(binding_context.len() as u64).to_be_bytes());
-    ctx.extend_from_slice(binding_context);
-    ctx.extend_from_slice(&(contest_id.len() as u64).to_be_bytes());
-    ctx.extend_from_slice(contest_id);
-    ctx.extend_from_slice(&(serial.len() as u64).to_be_bytes());
-    ctx.extend_from_slice(serial);
-    ctx
-}
-
-/// Test-visible re-export so [`crate::fixtures`] can build CDS proofs with
-/// the exact same context bytes the auditor reconstructs.
+/// Test-visible re-export so [`crate::fixtures`] builds CDS proofs with the
+/// exact same context the auditor (and the on-chain chaincode) reconstruct:
+/// the canonical `binding_context(election_id, contest_id, nullifier)` from
+/// saksi-crypto. See [`saksi_crypto::nizk::cds::binding_context`].
 #[cfg(any(test, feature = "demo"))]
 pub(crate) fn cds_context_for_test(
-    binding_context: &[u8],
+    election_id: &[u8],
     contest_id: &[u8],
-    serial: u64,
+    nullifier: &[u8],
 ) -> Vec<u8> {
-    cds_context(binding_context, contest_id, &serial.to_be_bytes())
+    saksi_crypto::nizk::cds::binding_context(election_id, contest_id, nullifier)
 }

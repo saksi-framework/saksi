@@ -62,6 +62,9 @@ func TestBallotGoldenDecodeMatchesFields(t *testing.T) {
 	if got := len(cp.GetNullifier().GetValue()); got != 32 {
 		t.Fatalf("nullifier value length = %d, want 32", got)
 	}
+	if ballot.GetPositionId() != "president" {
+		t.Fatalf("position id = %q, want president", ballot.GetPositionId())
+	}
 }
 
 func TestBallotGoldenRoundTripIsByteIdentical(t *testing.T) {

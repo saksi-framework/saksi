@@ -6,8 +6,97 @@ use rand_core::OsRng;
 
 use saksi_credentials::IssuerSecretKey;
 
-use crate::fixtures::happy_path_fixture;
+use crate::fixtures::{happy_path_fixture, multi_position_fixture};
 use crate::{audit, AuditStatus};
+
+// ---------------------------------------------------------------------------
+// 0. Multi-position model (ADR-0007 one-record-per-position)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn multi_position_audit_passes() {
+    // 4 voters, 3 positions, 3 candidates → 12 ballot records, 9 P×C contests.
+    let fixture = multi_position_fixture(4, 3, 3);
+    assert_eq!(
+        fixture.ballots.len(),
+        4 * 3,
+        "one record per (voter, position)"
+    );
+    assert_eq!(fixture.parameters.contest_ids.len(), 3 * 3, "P×C contests");
+    // Each position elects exactly one candidate per voter, so the per-position
+    // ground-truth totals sum to the voter count.
+    for p in 0..3 {
+        let sum: u64 = (0..3).map(|k| fixture.ground_truth[p * 3 + k]).sum();
+        assert_eq!(sum, 4, "position {p}: one selection per voter");
+    }
+    let report = audit(fixture.artifacts());
+    assert!(
+        report.passed(),
+        "multi-position audit should pass; failing: {:#?}",
+        report
+            .findings
+            .iter()
+            .filter(|f| matches!(f.status, AuditStatus::Fail))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn single_position_axis_audit_passes() {
+    // positions == 1 is the single-position ballot axis.
+    let fixture = multi_position_fixture(5, 1, 4);
+    assert_eq!(fixture.ballots.len(), 5);
+    let report = audit(fixture.artifacts());
+    assert!(report.passed(), "single-position axis should audit clean");
+}
+
+#[test]
+fn per_position_double_vote_is_caught() {
+    // A voter voting the SAME position twice replays that position's nullifier —
+    // caught by cross-ballot nullifier uniqueness.
+    let mut fixture = multi_position_fixture(3, 3, 3);
+    // Ballot 0 and 1 are voter 0's position 0 and 1; duplicate ballot 0 as a
+    // second submission for the same (voter, position) → identical nullifier.
+    let replay = fixture.ballots[0].clone();
+    fixture.ballots.push(replay);
+    let report = audit(fixture.artifacts());
+    assert_eq!(
+        report.overall,
+        AuditStatus::Fail,
+        "replaying a (voter, position) nullifier must fail the audit"
+    );
+    assert!(
+        matches!(
+            report.finding("nullifier.unique").map(|f| &f.status),
+            Some(AuditStatus::Fail)
+        ),
+        "the duplicate must be caught by nullifier.unique"
+    );
+}
+
+#[test]
+fn same_voter_different_positions_is_allowed() {
+    // The complement of the double-vote test: one voter voting across DIFFERENT
+    // positions yields DISTINCT nullifiers, so the honest election audits clean.
+    let fixture = multi_position_fixture(1, 3, 2);
+    assert_eq!(fixture.ballots.len(), 3, "one voter, three positions");
+    let nullifiers: std::collections::HashSet<Vec<u8>> = fixture
+        .ballots
+        .iter()
+        .map(|b| {
+            b.credential_presentation
+                .as_ref()
+                .unwrap()
+                .nullifier
+                .as_ref()
+                .unwrap()
+                .value
+                .clone()
+        })
+        .collect();
+    assert_eq!(nullifiers.len(), 3, "distinct per-position nullifiers");
+    assert!(audit(fixture.artifacts()).passed());
+}
 
 // ---------------------------------------------------------------------------
 // 1. Happy path

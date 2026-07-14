@@ -2,31 +2,107 @@
 //!
 //! Two subcommands:
 //!
-//! - `gen [outfile]` — write the demo election bundle (hex wire artifacts) to
-//!   `outfile`, or stdout if omitted. The Go `saksi-console` submits this bundle
-//!   to a live bulletin board.
+//! - `gen [--voters N] [--positions P] [--candidates C] [outfile]` — write a
+//!   demo election bundle (hex wire artifacts) to `outfile`, or stdout if
+//!   omitted. With no `--voters/--positions/--candidates`, emits the legacy
+//!   happy-path bundle. With them, emits a parameterized multi-position bundle
+//!   (one ballot record per (voter, position); ADR-0007) after the fail-closed
+//!   validation gate. The Go `saksi-console` submits the bundle to a live
+//!   bulletin board.
 //! - `audit <bundle.json>` — run the off-chain auditor over a bundle and print
 //!   a pass/fail report. Exits non-zero if the audit fails.
 
 use std::process::ExitCode;
 
-use saksi_auditor::demo::{audit_bundle_json, election_bundle_json};
+use saksi_auditor::demo::{audit_bundle_json, election_bundle_json, election_bundle_json_params};
 use saksi_auditor::{AuditReport, AuditStatus};
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(String::as_str) {
-        Some("gen") => cmd_gen(args.get(2).map(String::as_str)),
+        Some("gen") => cmd_gen(&args[2..]),
         Some("audit") => cmd_audit(args.get(2).map(String::as_str)),
         _ => {
-            eprintln!("usage: saksi-demo <gen [outfile] | audit <bundle.json>>");
+            eprintln!(
+                "usage: saksi-demo <gen [--voters N] [--positions P] [--candidates C] [outfile] | audit <bundle.json>>"
+            );
             ExitCode::FAILURE
         }
     }
 }
 
-fn cmd_gen(out: Option<&str>) -> ExitCode {
-    let json = election_bundle_json();
+fn cmd_gen(args: &[String]) -> ExitCode {
+    // Parse optional --voters/--positions/--candidates flags; the lone
+    // non-flag argument is the output path.
+    let (mut voters, mut positions, mut candidates) = (None, None, None);
+    let mut out: Option<&str> = None;
+    let mut i = 0;
+    while i < args.len() {
+        let parse = |v: Option<&String>, name: &str| -> Result<usize, String> {
+            v.and_then(|s| s.parse::<usize>().ok())
+                .filter(|&n| n >= 1)
+                .ok_or_else(|| format!("{name} needs a positive integer"))
+        };
+        match args[i].as_str() {
+            "--voters" => match parse(args.get(i + 1), "--voters") {
+                Ok(n) => {
+                    voters = Some(n);
+                    i += 2;
+                }
+                Err(e) => {
+                    eprintln!("{e}");
+                    return ExitCode::FAILURE;
+                }
+            },
+            "--positions" => match parse(args.get(i + 1), "--positions") {
+                Ok(n) => {
+                    positions = Some(n);
+                    i += 2;
+                }
+                Err(e) => {
+                    eprintln!("{e}");
+                    return ExitCode::FAILURE;
+                }
+            },
+            "--candidates" => match parse(args.get(i + 1), "--candidates") {
+                Ok(n) => {
+                    candidates = Some(n);
+                    i += 2;
+                }
+                Err(e) => {
+                    eprintln!("{e}");
+                    return ExitCode::FAILURE;
+                }
+            },
+            other => {
+                out = Some(other);
+                i += 1;
+            }
+        }
+    }
+
+    // Any dimension flag switches to the parameterized multi-position generator
+    // (defaulting the unspecified dimensions); none = the legacy bundle.
+    let json = if voters.is_some() || positions.is_some() || candidates.is_some() {
+        let (v, p, c) = (
+            voters.unwrap_or(6),
+            positions.unwrap_or(3),
+            candidates.unwrap_or(3),
+        );
+        match election_bundle_json_params(v, p, c) {
+            Ok(json) => {
+                eprintln!("generated {v} voters × {p} positions × {c} candidates (gate passed)");
+                json
+            }
+            Err(e) => {
+                eprintln!("validation gate rejected the population: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    } else {
+        election_bundle_json()
+    };
+
     match out {
         Some(path) => match std::fs::write(path, &json) {
             Ok(()) => {

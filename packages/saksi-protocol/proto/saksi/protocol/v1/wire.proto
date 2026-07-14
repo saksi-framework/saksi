@@ -56,6 +56,13 @@ message Ballot {
   repeated Ciphertext ciphertexts = 4;
   repeated CDSProof well_formedness_proofs = 5;
   CredentialPresentation credential_presentation = 6;
+  // Position this ballot record votes in (one record per voter per position;
+  // ADR-0007 / R2). The ciphertexts/proofs cover exactly this position's
+  // candidate contests — the election-wide contest_ids are position-qualified
+  // ("<position_id>/<candidate_idx>"), and the nullifier is
+  // PRF(s_cred, election_id || position_id) so double voting is prevented per
+  // voter per position. Empty on a legacy single-position ballot.
+  string position_id = 7;
 }
 
 message TrusteeCommitment {

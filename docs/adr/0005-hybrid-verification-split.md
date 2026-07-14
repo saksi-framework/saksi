@@ -2,7 +2,10 @@
 
 ## Status
 
-Accepted
+Accepted; **partially superseded by [ADR-0007](0007-on-chain-cds-verification.md)** —
+the CDS ballot-well-formedness proof moved on-chain. The rest of this split
+(credential sig + nullifier + shape on-chain; presentation & per-trustee
+Chaum-Pedersen and tally-sum off-chain) still holds.
 
 ## Context
 

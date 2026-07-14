@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/binary"
 	"encoding/hex"
 	"os"
 	"path/filepath"
@@ -101,6 +102,108 @@ func validBallotHex(t *testing.T, nullifier []byte) string {
 	return mustMarshal(t, validBallot(t, nullifier))
 }
 
+// loadCDSVector parses the cross-language CDS golden vector (produced by the
+// Rust saksi-crypto test `cds_golden_vector`) into its components.
+func loadCDSVector(t *testing.T) (electionID, contestID string, nullifier, pk, pad, data []byte, branches []*saksiprotocolv1.CDSProofBranch) {
+	t.Helper()
+	raw, err := os.ReadFile(filepath.Join("..", "..", "saksi-protocol", "test-vectors", "cds-proof-v1.hex"))
+	if err != nil {
+		t.Fatalf("read cds vector: %v", err)
+	}
+	buf, err := hex.DecodeString(string(bytes.TrimSpace(raw)))
+	if err != nil {
+		t.Fatalf("decode cds vector: %v", err)
+	}
+	off := 0
+	readLP := func() []byte {
+		n := int(binary.BigEndian.Uint64(buf[off : off+8]))
+		off += 8
+		s := buf[off : off+n]
+		off += n
+		return s
+	}
+	next := func(n int) []byte {
+		s := buf[off : off+n]
+		off += n
+		return s
+	}
+	electionID = string(readLP())
+	contestID = string(readLP())
+	nullifier = next(32)
+	pk = next(32)
+	pad = next(32)
+	data = next(32)
+	nb := int(buf[off])
+	off++
+	for i := 0; i < nb; i++ {
+		branches = append(branches, &saksiprotocolv1.CDSProofBranch{
+			CommitmentA: next(32),
+			CommitmentB: next(32),
+			Challenge:   next(32),
+			Response:    next(32),
+		})
+	}
+	return
+}
+
+// validCDSBallot builds a ballot that passes the full on-chain gate: a real
+// issuer signature (credential-sig vector), a real CDS well-formedness proof
+// and matching ciphertext (CDS vector), and a nullifier equal to the one the
+// CDS proof is bound to. Pair with withCDSElection so the derived election key
+// matches the vector.
+func validCDSBallot(t *testing.T) *saksiprotocolv1.Ballot {
+	t.Helper()
+	electionID, _, nullifier, _, pad, data, branches := loadCDSVector(t)
+	sigPK, commitment, rPrime, s := loadSigVector(t)
+	proof := append(append([]byte{}, rPrime...), s...)
+	return &saksiprotocolv1.Ballot{
+		Version:    saksiprotocolv1.WireVersion,
+		ElectionId: electionID,
+		Ciphertexts: []*saksiprotocolv1.Ciphertext{
+			{Version: saksiprotocolv1.WireVersion, Pad: pad, Data: data},
+		},
+		WellFormednessProofs: []*saksiprotocolv1.CDSProof{
+			{Version: saksiprotocolv1.WireVersion, Branches: branches},
+		},
+		CredentialPresentation: &saksiprotocolv1.CredentialPresentation{
+			Version:              saksiprotocolv1.WireVersion,
+			CredentialCommitment: commitment,
+			IssuerPublicKey:      sigPK,
+			PresentationProof:    proof,
+			Nullifier:            &saksiprotocolv1.Nullifier{Version: saksiprotocolv1.WireVersion, Value: nullifier},
+		},
+	}
+}
+
+// withCDSElection creates a single-contest, single-trustee election whose
+// derived joint key equals the CDS golden vector's public key, and publishes
+// the matching DKG transcript, so validCDSBallot's CDS proof verifies on-chain.
+func withCDSElection(t *testing.T, sc *SmartContract, ctx *fakeContext) {
+	t.Helper()
+	_, contestID, _, pk, _, _, _ := loadCDSVector(t)
+	params := &saksiprotocolv1.ElectionParameters{
+		Version:    saksiprotocolv1.WireVersion,
+		ElectionId: "election-2026",
+		ContestIds: []string{contestID},
+		TrusteeIds: []string{"t1"},
+		Threshold:  1,
+	}
+	if err := sc.CreateElection(ctx, mustMarshalParams(t, params)); err != nil {
+		t.Fatalf("CreateElection: %v", err)
+	}
+	dkg := &saksiprotocolv1.DKGTranscript{
+		Version:    saksiprotocolv1.WireVersion,
+		ElectionId: "election-2026",
+		Threshold:  1,
+		TrusteeCommitments: []*saksiprotocolv1.TrusteeCommitment{
+			{TrusteeId: "t1", CoefficientCommitments: [][]byte{pk}},
+		},
+	}
+	if err := sc.PublishDKGTranscript(ctx, mustMarshalDKG(t, dkg)); err != nil {
+		t.Fatalf("PublishDKGTranscript: %v", err)
+	}
+}
+
 // defaultNullifier is the canonical nullifier used by the happy-path ballot.
 func defaultNullifier() []byte { return bytes.Repeat([]byte{9}, 32) }
 
@@ -120,8 +223,8 @@ func nullifierHexOf(t *testing.T, ballotHex string) (electionID, nullifier strin
 func TestSubmitBallotThenGetBallotRoundTrips(t *testing.T) {
 	sc := &SmartContract{}
 	ctx := newContext()
-	withElection(t, sc, ctx)
-	ballotHex := validBallotHex(t, defaultNullifier())
+	withCDSElection(t, sc, ctx)
+	ballotHex := mustMarshal(t, validCDSBallot(t))
 
 	if err := sc.SubmitBallot(ctx, ballotHex); err != nil {
 		t.Fatalf("SubmitBallot: %v", err)
@@ -140,8 +243,8 @@ func TestSubmitBallotThenGetBallotRoundTrips(t *testing.T) {
 func TestSubmitBallotRejectsDoubleVote(t *testing.T) {
 	sc := &SmartContract{}
 	ctx := newContext()
-	withElection(t, sc, ctx)
-	ballotHex := validBallotHex(t, defaultNullifier())
+	withCDSElection(t, sc, ctx)
+	ballotHex := mustMarshal(t, validCDSBallot(t))
 
 	if err := sc.SubmitBallot(ctx, ballotHex); err != nil {
 		t.Fatalf("first SubmitBallot should succeed: %v", err)
@@ -152,6 +255,100 @@ func TestSubmitBallotRejectsDoubleVote(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "double vote") {
 		t.Fatalf("expected a double-vote error, got: %v", err)
+	}
+}
+
+// TestSubmitBallotRejectsTamperedCDSProof is the positive/negative pair for the
+// on-chain CDS gate: the same setup that accepts validCDSBallot must reject a
+// ballot whose CDS proof is tampered.
+func TestSubmitBallotRejectsTamperedCDSProof(t *testing.T) {
+	sc := &SmartContract{}
+	ctx := newContext()
+	withCDSElection(t, sc, ctx)
+	ballot := validCDSBallot(t)
+	// Flip a byte in the first branch's response scalar.
+	ballot.WellFormednessProofs[0].Branches[0].Response[0] ^= 0x01
+	err := sc.SubmitBallot(ctx, mustMarshal(t, ballot))
+	if err == nil || !strings.Contains(err.Error(), "well-formedness proof failed") {
+		t.Fatalf("expected a CDS-proof failure, got: %v", err)
+	}
+}
+
+// TestSubmitBallotRejectsMissingDKG: on-chain CDS needs the joint key, so a
+// ballot for an election with no published DKG transcript is rejected.
+func TestSubmitBallotRejectsMissingDKG(t *testing.T) {
+	sc := &SmartContract{}
+	ctx := newContext()
+	_, contestID, _, _, _, _, _ := loadCDSVector(t)
+	params := &saksiprotocolv1.ElectionParameters{
+		Version:    saksiprotocolv1.WireVersion,
+		ElectionId: "election-2026",
+		ContestIds: []string{contestID},
+		TrusteeIds: []string{"t1"},
+		Threshold:  1,
+	}
+	if err := sc.CreateElection(ctx, mustMarshalParams(t, params)); err != nil {
+		t.Fatalf("CreateElection: %v", err)
+	}
+	err := sc.SubmitBallot(ctx, mustMarshal(t, validCDSBallot(t)))
+	if err == nil || !strings.Contains(err.Error(), "no published DKG transcript") {
+		t.Fatalf("expected a missing-DKG error, got: %v", err)
+	}
+}
+
+// TestSubmitBallotRejectsContestCountMismatch: the ballot's ciphertext/proof
+// counts must match the election's contest count.
+func TestSubmitBallotRejectsContestCountMismatch(t *testing.T) {
+	sc := &SmartContract{}
+	ctx := newContext()
+	withCDSElection(t, sc, ctx) // one contest
+	ballot := validCDSBallot(t)
+	// Drop the well-formedness proof so counts disagree (1 ciphertext, 0 proofs).
+	ballot.WellFormednessProofs = nil
+	err := sc.SubmitBallot(ctx, mustMarshal(t, ballot))
+	if err == nil || !strings.Contains(err.Error(), "ciphertexts") {
+		t.Fatalf("expected a ciphertext/proof-count error, got: %v", err)
+	}
+}
+
+// TestContestIndicesForPosition pins the position→contest mapping and its parity
+// with the Rust auditor's contest_indices_for_position (byte-for-byte semantics).
+func TestContestIndicesForPosition(t *testing.T) {
+	contests := []string{"pos0/cand0", "pos0/cand1", "pos1/cand0", "pos10/cand0"}
+	cases := []struct {
+		position string
+		want     []int
+	}{
+		{"", []int{0, 1, 2, 3}}, // legacy: all contests
+		{"pos0", []int{0, 1}},   // one position's candidates
+		{"pos1", []int{2}},      // slash disambiguates pos1 from pos10
+		{"pos10", []int{3}},     // ...and vice versa
+		{"ghost", []int{}},      // unknown position → none
+	}
+	for _, c := range cases {
+		got := contestIndicesForPosition(contests, c.position)
+		if len(got) != len(c.want) {
+			t.Fatalf("position %q: got %v, want %v", c.position, got, c.want)
+		}
+		for i := range got {
+			if got[i] != c.want[i] {
+				t.Fatalf("position %q: got %v, want %v", c.position, got, c.want)
+			}
+		}
+	}
+}
+
+// TestSubmitBallotRejectsUnknownPosition: a ballot whose position_id matches no
+// contest in the election is rejected at endorsement (ADR-0007 per-position gate).
+func TestSubmitBallotRejectsUnknownPosition(t *testing.T) {
+	sc := &SmartContract{}
+	ctx := newContext()
+	withCDSElection(t, sc, ctx)
+	ballot := validCDSBallot(t)
+	ballot.PositionId = "ghost" // no contest is prefixed "ghost/"
+	err := sc.SubmitBallot(ctx, mustMarshal(t, ballot))
+	if err == nil || !strings.Contains(err.Error(), "matches no contest") {
+		t.Fatalf("expected an unknown-position rejection, got: %v", err)
 	}
 }
 

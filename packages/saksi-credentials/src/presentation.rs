@@ -106,14 +106,15 @@ impl Credential {
         &self,
         issuer_pk: &IssuerPublicKey,
         election_id: &[u8],
+        position_id: &[u8],
         context: &[u8],
         rng: &mut (impl RngCore + CryptoRng),
     ) -> CredentialPresentation {
         let g = basepoint();
-        let h_e = nullifier_h(election_id);
+        let h_e = nullifier_h(election_id, position_id);
 
         let commitment = self.public_commitment();
-        let nullifier_point = derive_nullifier(self.secret_scalar(), election_id);
+        let nullifier_point = derive_nullifier(self.secret_scalar(), election_id, position_id);
         let cp_context = presentation_context(election_id, context);
 
         let cp_proof = ChaumPedersenProof::prove(
@@ -160,6 +161,7 @@ pub fn verify_presentation(
     presentation: &CredentialPresentation,
     issuer_pk: &IssuerPublicKey,
     election_id: &[u8],
+    position_id: &[u8],
     context: &[u8],
 ) -> CryptoResult<()> {
     if presentation.version != WIRE_VERSION {
@@ -201,7 +203,7 @@ pub fn verify_presentation(
 
     // ---- (2) Chaum-Pedersen tying C and nullifier to the same s_cred ----
     let g = basepoint();
-    let h_e = nullifier_h(election_id);
+    let h_e = nullifier_h(election_id, position_id);
     let cp_context = presentation_context(election_id, context);
     cp_proof.verify(&g, &h_e, &commitment, &nullifier_point, &cp_context)?;
 
@@ -280,8 +282,9 @@ mod tests {
     fn present_then_verify_round_trips() {
         let mut rng = OsRng;
         let (issuer_pk, credential) = issue(&mut rng);
-        let presentation = credential.present(&issuer_pk, b"election-2026", b"ctx", &mut rng);
-        verify_presentation(&presentation, &issuer_pk, b"election-2026", b"ctx")
+        let presentation =
+            credential.present(&issuer_pk, b"election-2026", b"pos", b"ctx", &mut rng);
+        verify_presentation(&presentation, &issuer_pk, b"election-2026", b"pos", b"ctx")
             .expect("honest presentation verifies");
     }
 
@@ -289,11 +292,12 @@ mod tests {
     fn wrong_election_id_at_verify_is_rejected() {
         let mut rng = OsRng;
         let (issuer_pk, credential) = issue(&mut rng);
-        let presentation = credential.present(&issuer_pk, b"election-2026", b"ctx", &mut rng);
+        let presentation =
+            credential.present(&issuer_pk, b"election-2026", b"pos", b"ctx", &mut rng);
         // Mismatched election id at verify time changes both H_e and the
         // transcript binding; CP verification must fail.
         assert!(matches!(
-            verify_presentation(&presentation, &issuer_pk, b"election-2027", b"ctx"),
+            verify_presentation(&presentation, &issuer_pk, b"election-2027", b"pos", b"ctx"),
             Err(CryptoError::VerificationFailed)
         ));
     }
@@ -302,9 +306,16 @@ mod tests {
     fn wrong_context_at_verify_is_rejected() {
         let mut rng = OsRng;
         let (issuer_pk, credential) = issue(&mut rng);
-        let presentation = credential.present(&issuer_pk, b"election-2026", b"ctx-A", &mut rng);
+        let presentation =
+            credential.present(&issuer_pk, b"election-2026", b"pos", b"ctx-A", &mut rng);
         assert!(matches!(
-            verify_presentation(&presentation, &issuer_pk, b"election-2026", b"ctx-B"),
+            verify_presentation(
+                &presentation,
+                &issuer_pk,
+                b"election-2026",
+                b"pos",
+                b"ctx-B"
+            ),
             Err(CryptoError::VerificationFailed)
         ));
     }
@@ -313,13 +324,13 @@ mod tests {
     fn tampered_presentation_proof_bytes_is_rejected() {
         let mut rng = OsRng;
         let (issuer_pk, credential) = issue(&mut rng);
-        let mut presentation = credential.present(&issuer_pk, b"e", b"c", &mut rng);
+        let mut presentation = credential.present(&issuer_pk, b"e", b"pos", b"c", &mut rng);
         // Flip a byte deep inside the CP proof portion (past the
         // signature prefix). Any change there must cause CP verification
         // to fail.
         let idx = SIGNATURE_PREFIX_LEN + 4;
         presentation.presentation_proof[idx] ^= 0x01;
-        let err = verify_presentation(&presentation, &issuer_pk, b"e", b"c")
+        let err = verify_presentation(&presentation, &issuer_pk, b"e", b"pos", b"c")
             .expect_err("tampered proof must fail");
         // We accept either VerificationFailed or one of the decode errors,
         // depending on which byte got flipped — both are "rejected".
@@ -336,12 +347,12 @@ mod tests {
     fn tampered_credential_commitment_is_rejected() {
         let mut rng = OsRng;
         let (issuer_pk, credential) = issue(&mut rng);
-        let mut presentation = credential.present(&issuer_pk, b"e", b"c", &mut rng);
+        let mut presentation = credential.present(&issuer_pk, b"e", b"pos", b"c", &mut rng);
         // Replace `credential_commitment` with a different valid point.
         let other = Scalar::from(2024u64) * basepoint();
         presentation.credential_commitment = compress_point(&other).to_vec();
         assert!(matches!(
-            verify_presentation(&presentation, &issuer_pk, b"e", b"c"),
+            verify_presentation(&presentation, &issuer_pk, b"e", b"pos", b"c"),
             Err(CryptoError::VerificationFailed)
         ));
     }
@@ -350,14 +361,14 @@ mod tests {
     fn tampered_nullifier_value_is_rejected() {
         let mut rng = OsRng;
         let (issuer_pk, credential) = issue(&mut rng);
-        let mut presentation = credential.present(&issuer_pk, b"e", b"c", &mut rng);
+        let mut presentation = credential.present(&issuer_pk, b"e", b"pos", b"c", &mut rng);
         // Replace `nullifier.value` with a different valid point.
         let other = Scalar::from(99u64) * basepoint();
         if let Some(ref mut n) = presentation.nullifier {
             n.value = compress_point(&other).to_vec();
         }
         assert!(matches!(
-            verify_presentation(&presentation, &issuer_pk, b"e", b"c"),
+            verify_presentation(&presentation, &issuer_pk, b"e", b"pos", b"c"),
             Err(CryptoError::VerificationFailed)
         ));
     }
@@ -366,14 +377,14 @@ mod tests {
     fn wrong_issuer_public_key_at_verify_is_rejected() {
         let mut rng = OsRng;
         let (issuer_pk, credential) = issue(&mut rng);
-        let presentation = credential.present(&issuer_pk, b"e", b"c", &mut rng);
+        let presentation = credential.present(&issuer_pk, b"e", b"pos", b"c", &mut rng);
 
         let other_pk = IssuerSecretKey::generate(&mut rng).public_key();
         assert_ne!(issuer_pk, other_pk);
         // Verifier passes a different `issuer_pk`; the embedded-vs-supplied
         // mismatch is detected and the call returns `VerificationFailed`.
         assert!(matches!(
-            verify_presentation(&presentation, &other_pk, b"e", b"c"),
+            verify_presentation(&presentation, &other_pk, b"e", b"pos", b"c"),
             Err(CryptoError::VerificationFailed)
         ));
     }
@@ -382,13 +393,13 @@ mod tests {
     fn wire_roundtrip_identity() {
         let mut rng = OsRng;
         let (issuer_pk, credential) = issue(&mut rng);
-        let presentation = credential.present(&issuer_pk, b"e", b"c", &mut rng);
+        let presentation = credential.present(&issuer_pk, b"e", b"pos", b"c", &mut rng);
 
         let bytes = presentation.encode_to_vec();
         let decoded =
             CredentialPresentation::decode(&bytes[..]).expect("encoded presentation re-decodes");
         assert_eq!(decoded, presentation);
-        verify_presentation(&decoded, &issuer_pk, b"e", b"c")
+        verify_presentation(&decoded, &issuer_pk, b"e", b"pos", b"c")
             .expect("decoded presentation still verifies");
     }
 
@@ -399,8 +410,8 @@ mod tests {
     fn same_election_same_credential_yields_identical_nullifier() {
         let mut rng = OsRng;
         let (issuer_pk, credential) = issue(&mut rng);
-        let first = credential.present(&issuer_pk, b"election-A", b"ctx-1", &mut rng);
-        let second = credential.present(&issuer_pk, b"election-A", b"ctx-2", &mut rng);
+        let first = credential.present(&issuer_pk, b"election-A", b"pos", b"ctx-1", &mut rng);
+        let second = credential.present(&issuer_pk, b"election-A", b"pos", b"ctx-2", &mut rng);
 
         let n1 = first
             .nullifier
@@ -446,8 +457,8 @@ mod tests {
     fn different_elections_yield_distinct_nullifiers() {
         let mut rng = OsRng;
         let (issuer_pk, credential) = issue(&mut rng);
-        let first = credential.present(&issuer_pk, b"election-A", b"ctx", &mut rng);
-        let second = credential.present(&issuer_pk, b"election-B", b"ctx", &mut rng);
+        let first = credential.present(&issuer_pk, b"election-A", b"pos", b"ctx", &mut rng);
+        let second = credential.present(&issuer_pk, b"election-B", b"pos", b"ctx", &mut rng);
 
         let n1 = &first.nullifier.as_ref().unwrap().value;
         let n2 = &second.nullifier.as_ref().unwrap().value;

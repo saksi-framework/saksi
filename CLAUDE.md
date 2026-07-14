@@ -11,6 +11,34 @@ verifiable** systems (voting and beyond), on **ristretto255**, with a
 app (separate repo `saksi-framework/balotachain`). Permissioned chain — **no
 cryptocurrency, no gas, no wallets**; identity is X.509 MSP.
 
+## Paper-alignment (2026-07-14): thesis evaluation — Phases 0–1 DONE + green
+
+Moving Saksi to match the BalotaChain thesis (Design-Science evaluation study).
+Plan sequencing LOCKED: finish the saksi backend (Phases 0–6) before the
+balotachain apps (Phase 7). Done so far, all green (cargo test / clippy -D / fmt /
+go test / go vet):
+- **Phase 0 R1** — CDS OR-proof well-formedness verification moved **on-chain**
+  (chaincode `cdsverify/`, byte-exact with the Rust prover, golden-vector pinned).
+  Serial-free binding: `binding_context(election_id ‖ contest_id ‖ nullifier)`.
+  Election pubkey derived on-chain from the DKG transcript. **ADR-0007** (supersedes
+  the CDS portion of ADR-0005).
+- **Phase 0 R2** — per-position nullifier `PRF(s_cred, election_id ‖ position_id)`
+  (length-prefixed; empty position = legacy per-election).
+- **Phase 1** — `Ballot.position_id` (proto field #7); **one ballot record per
+  (voter, position)** with position-qualified contests `"<pos>/<cand>"`; shared
+  `contest_indices_for_position` mapping (Rust + Go mirror); parameterized generator
+  `saksi-demo gen --voters --positions --candidates` + seeded `ground_truth` in the
+  bundle + fail-closed validation gate. 1k population generates+validates+audits.
+- **Next: Phase 2** — benchmark harness (instrument `saksi-console --auto`:
+  concurrent submission, phase-separated Fabric timing, CDS-verify sub-split,
+  Appendix-C CSVs). See the plan (`~/.claude/plans/wobbly-stirring-leaf.md`) for
+  Phases 2–7.
+
+Codegen note: `scripts/codegen.sh` needs Docker; when Docker is down, regenerate Go
+proto on the host with the cargo-vendored `protoc.exe` + `go install
+google.golang.org/protobuf/cmd/protoc-gen-go@v1.34.2`, then `go mod vendor` in
+chaincode + client-sdk.
+
 ## Current state (2026-06-14, end of lifecycle + parity session)
 
 Phases **A–F complete**, the full **election lifecycle (D1–D5) complete**, and

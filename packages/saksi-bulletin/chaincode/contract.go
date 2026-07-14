@@ -3,12 +3,41 @@ package main
 import (
 	"encoding/hex"
 	"fmt"
+	"strings"
 
 	"github.com/hyperledger/fabric-contract-api-go/contractapi"
+	"github.com/saksi-framework/saksi/packages/saksi-bulletin/chaincode/cdsverify"
 	"github.com/saksi-framework/saksi/packages/saksi-bulletin/chaincode/credverify"
 	saksiprotocolv1 "github.com/saksi-framework/saksi/packages/saksi-protocol/go/saksiprotocolv1"
 	"google.golang.org/protobuf/proto"
 )
+
+// contestIndicesForPosition returns the indices into contestIDs of the contests
+// a ballot in positionID covers (ADR-0007 one-record-per-position). Contests are
+// position-qualified as "<position_id>/<candidate_idx>", so a ballot carries
+// exactly its position's candidate ciphertexts, aligned in order to the returned
+// indices. An empty positionID is the legacy single-position path: the ballot
+// covers all contests. This mirrors the Rust auditor's
+// `contest_indices_for_position` (packages/saksi-auditor/src/lib.rs) byte-for-
+// byte so the prover, off-chain auditor, and this endorsement gate agree.
+// Order-preserving and allocation-deterministic — endorsement-safe.
+func contestIndicesForPosition(contestIDs []string, positionID string) []int {
+	if positionID == "" {
+		idxs := make([]int, len(contestIDs))
+		for i := range contestIDs {
+			idxs[i] = i
+		}
+		return idxs
+	}
+	prefix := positionID + "/"
+	idxs := make([]int, 0, len(contestIDs))
+	for i, c := range contestIDs {
+		if strings.HasPrefix(c, prefix) {
+			idxs = append(idxs, i)
+		}
+	}
+	return idxs
+}
 
 const (
 	// electionIndex keys stored election parameters by electionID.
@@ -152,6 +181,82 @@ func (s *SmartContract) SubmitBallot(ctx contractapi.TransactionContextInterface
 	}
 	if spent != nil {
 		return fmt.Errorf("nullifier already spent in election %q (double vote)", ballot.GetElectionId())
+	}
+
+	// Verify each contest's CDS well-formedness OR-proof on-chain (ADR-0007,
+	// superseding the off-chain-only split). The joint election public key is
+	// derived from the published DKG transcript; the CDS Fiat-Shamir context is
+	// bound to (election_id, contest_id, nullifier) — all reconstructible here
+	// at endorsement, so verification is deterministic and order-independent.
+	params, err := loadElection(stub, ballot.GetElectionId())
+	if err != nil {
+		return err
+	}
+	contestIDs := params.GetContestIds()
+	// The contests this record's position covers (ADR-0007 one-record-per-
+	// position; empty position_id = legacy whole-ballot). Ciphertexts/proofs
+	// align in order to these indices.
+	contestIdxs := contestIndicesForPosition(contestIDs, ballot.GetPositionId())
+	if len(contestIdxs) == 0 {
+		return fmt.Errorf(
+			"ballot position %q matches no contest in election %q",
+			ballot.GetPositionId(), ballot.GetElectionId(),
+		)
+	}
+	if len(ballot.GetCiphertexts()) != len(contestIdxs) || len(ballot.GetWellFormednessProofs()) != len(contestIdxs) {
+		return fmt.Errorf(
+			"ballot (position %q) has %d ciphertexts / %d well-formedness proofs, expected %d for that position in election %q",
+			ballot.GetPositionId(), len(ballot.GetCiphertexts()), len(ballot.GetWellFormednessProofs()), len(contestIdxs), ballot.GetElectionId(),
+		)
+	}
+
+	dkgKey, err := stub.CreateCompositeKey(dkgIndex, []string{ballot.GetElectionId()})
+	if err != nil {
+		return fmt.Errorf("build DKG key: %w", err)
+	}
+	dkgRaw, err := stub.GetState(dkgKey)
+	if err != nil {
+		return fmt.Errorf("read DKG transcript state: %w", err)
+	}
+	if dkgRaw == nil {
+		return fmt.Errorf("election %q has no published DKG transcript; ballot well-formedness cannot be verified", ballot.GetElectionId())
+	}
+	var transcript saksiprotocolv1.DKGTranscript
+	if err := proto.Unmarshal(dkgRaw, &transcript); err != nil {
+		return fmt.Errorf("decode stored DKG transcript: %w", err)
+	}
+	electionPK, err := deriveElectionPublicKey(&transcript)
+	if err != nil {
+		return fmt.Errorf("derive election public key: %w", err)
+	}
+
+	nullifierBytes := presentation.GetNullifier().GetValue()
+	for local, globalIdx := range contestIdxs {
+		contestID := contestIDs[globalIdx]
+		ciphertext := ballot.GetCiphertexts()[local]
+		proofMsg := ballot.GetWellFormednessProofs()[local]
+		if proofMsg.GetVersion() != saksiprotocolv1.WireVersion {
+			return fmt.Errorf(
+				"contest %q: unsupported CDS proof version %d, want %d",
+				contestID, proofMsg.GetVersion(), saksiprotocolv1.WireVersion,
+			)
+		}
+		wireBranches := proofMsg.GetBranches()
+		branches := make([]cdsverify.Branch, len(wireBranches))
+		for j, b := range wireBranches {
+			branches[j] = cdsverify.Branch{
+				CommitmentA: b.GetCommitmentA(),
+				CommitmentB: b.GetCommitmentB(),
+				Challenge:   b.GetChallenge(),
+				Response:    b.GetResponse(),
+			}
+		}
+		if err := cdsverify.VerifyBinaryCDS(
+			ballot.GetElectionId(), contestID, nullifierBytes,
+			electionPK, ciphertext.GetPad(), ciphertext.GetData(), branches,
+		); err != nil {
+			return fmt.Errorf("contest %q CDS well-formedness proof failed: %w", contestID, err)
+		}
 	}
 
 	ballotKey, err := stub.CreateCompositeKey(ballotIndex, []string{ballot.GetElectionId(), nullifier})

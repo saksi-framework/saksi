@@ -63,6 +63,32 @@ use crate::{
 
 pub const MODULE_NAME: &str = "cds";
 
+/// Canonical CDS Fiat-Shamir context binding for a ballot's per-contest
+/// ciphertext: length-prefixed `election_id || contest_id || nullifier`.
+///
+/// Every field is reconstructible at Fabric *endorsement* time — `election_id`
+/// and `nullifier` travel in the ballot, `contest_id` comes from the on-chain
+/// election parameters — so the chaincode can verify the CDS OR-proof on-chain
+/// (ADR-0007, superseding the off-chain-only split). The old auditor binding
+/// used the ballot's positional serial, which endorsement cannot know because
+/// it runs before ordering; the nullifier is a per-ballot unique tag that
+/// serves the same anti-transplantation role and is order-independent (so it
+/// stays valid under concurrent submission). The 8-byte big-endian length
+/// prefixes keep the three fields from being smushed together ambiguously.
+///
+/// The Go chaincode verifier (`saksi-bulletin/chaincode/cdsverify`) mirrors
+/// this byte-for-byte; a cross-language golden vector
+/// (`saksi-protocol/test-vectors/cds-proof-v1.hex`) pins the agreement.
+pub fn binding_context(election_id: &[u8], contest_id: &[u8], nullifier: &[u8]) -> Vec<u8> {
+    let mut ctx =
+        Vec::with_capacity(3 * 8 + election_id.len() + contest_id.len() + nullifier.len());
+    for part in [election_id, contest_id, nullifier] {
+        ctx.extend_from_slice(&(part.len() as u64).to_be_bytes());
+        ctx.extend_from_slice(part);
+    }
+    ctx
+}
+
 /// One branch of a CDS OR-proof.
 ///
 /// On the honest branch, `(commitment_g, commitment_h) = (k·G, k·pk)` is the
@@ -692,5 +718,100 @@ mod tests {
         let mut wire = proof.to_wire();
         wire.branches[1].response = vec![0xff; 32];
         assert_eq!(CDSProof::from_wire(&wire), Err(CryptoError::InvalidScalar),);
+    }
+
+    // -- 15: cross-language golden vector (R1 on-chain CDS) ------------------
+
+    /// Deterministic splitmix64 RNG so the golden vector is byte-stable across
+    /// runs (the CDS prover consumes randomness for its simulated branches).
+    struct CountRng(u64);
+    impl RngCore for CountRng {
+        fn next_u32(&mut self) -> u32 {
+            self.next_u64() as u32
+        }
+        fn next_u64(&mut self) -> u64 {
+            self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        }
+        fn fill_bytes(&mut self, dest: &mut [u8]) {
+            let mut i = 0;
+            while i < dest.len() {
+                let chunk = self.next_u64().to_le_bytes();
+                let n = core::cmp::min(8, dest.len() - i);
+                dest[i..i + n].copy_from_slice(&chunk[..n]);
+                i += n;
+            }
+        }
+        fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), rand_core::Error> {
+            self.fill_bytes(dest);
+            Ok(())
+        }
+    }
+    impl CryptoRng for CountRng {}
+
+    /// Cross-language golden vector for **on-chain CDS OR-proof verification**
+    /// (R1). The Go chaincode (`saksi-bulletin/chaincode/cdsverify`) must accept
+    /// exactly this proof and reject any single-byte tamper. Layout (all length
+    /// prefixes u64 big-endian):
+    ///   len||election_id | len||contest_id | nullifier[32] | pk[32] |
+    ///   pad[32] | data[32] | num_branches[1] |
+    ///   num_branches × (commitment_a[32] commitment_b[32] challenge[32] response[32])
+    /// The CDS context is `binding_context(election_id, contest_id, nullifier)`;
+    /// the choice set is the binary `{0, 1}`.
+    #[test]
+    fn cds_golden_vector() {
+        use crate::elgamal::{encrypt, Plaintext};
+
+        let mut rng = CountRng(0x5341_4b53_495f_3031); // "SAKSI_01"
+        let election_id: &[u8] = b"election-2026";
+        let contest_id: &[u8] = b"contest-1";
+
+        // Fixed election keypair + nullifier (deterministic).
+        let pk = elgamal::PublicKey::from_point(Scalar::from(7u64) * basepoint());
+        let nullifier = compress_point(&(Scalar::from(42u64) * basepoint()));
+
+        // Encrypt choice 1 with fixed randomness.
+        let r = Scalar::from(9u64);
+        let ct = encrypt(&pk, Plaintext::from_small_integer(1), r);
+        let (pad, data) = ct.to_compressed_bytes();
+
+        let choice_set = [Scalar::ZERO, Scalar::ONE];
+        let ctx = binding_context(election_id, contest_id, &nullifier);
+        let proof =
+            CDSProof::prove(&pk, &ct, &choice_set, 1, &r, &ctx, &mut rng).expect("prove ok");
+        proof
+            .verify(&pk, &ct, &choice_set, &ctx)
+            .expect("verify ok");
+        let wire = proof.to_wire();
+
+        let mut v: Vec<u8> = Vec::new();
+        v.extend_from_slice(&(election_id.len() as u64).to_be_bytes());
+        v.extend_from_slice(election_id);
+        v.extend_from_slice(&(contest_id.len() as u64).to_be_bytes());
+        v.extend_from_slice(contest_id);
+        v.extend_from_slice(&nullifier);
+        v.extend_from_slice(&pk.to_compressed_bytes());
+        v.extend_from_slice(&pad);
+        v.extend_from_slice(&data);
+        v.push(wire.branches.len() as u8);
+        for b in &wire.branches {
+            v.extend_from_slice(&b.commitment_a);
+            v.extend_from_slice(&b.commitment_b);
+            v.extend_from_slice(&b.challenge);
+            v.extend_from_slice(&b.response);
+        }
+        let hex: String = v.iter().map(|b| format!("{b:02x}")).collect();
+
+        // Pin the bytes so any change to the CDS transcript or encoding (which
+        // the Go on-chain verifier mirrors) is caught here — regenerate the Go
+        // cross-check too if this drifts.
+        assert_eq!(
+            hex,
+            include_str!("../../../saksi-protocol/test-vectors/cds-proof-v1.hex").trim(),
+            "CDS golden vector drifted; regenerate the Go cross-check too"
+        );
     }
 }

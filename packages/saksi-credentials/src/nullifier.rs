@@ -44,34 +44,40 @@ use saksi_crypto::{
 /// framework uses (e.g. the Pedersen `H` generator).
 pub const NULLIFIER_DOMAIN: &[u8] = b"saksi.credentials.nullifier.v1";
 
-/// Returns the per-election nullifier base point `H_e`.
+/// Returns the per-election, per-position nullifier base point `H_e`.
 ///
-/// `H_e = RistrettoPoint::hash_from_bytes::<Sha512>(NULLIFIER_DOMAIN || election_id)`.
+/// `H_e = hash_to_point(NULLIFIER_DOMAIN || len(election_id) || election_id ||
+/// len(position_id) || position_id)`, with 8-byte big-endian length prefixes so
+/// the `election_id`/`position_id` boundary is unambiguous.
 ///
-/// The output is deterministic — same `election_id` bytes, same point — and
-/// callers must be careful to pass the canonical bytes of the election
-/// identifier (this crate does not normalize them).
-pub fn nullifier_h(election_id: &[u8]) -> RistrettoPoint {
-    // We avoid allocating a single contiguous buffer by feeding both parts
-    // into the SHA-512 state directly. `RistrettoPoint::hash_from_bytes`
-    // doesn't expose an incremental API, so we settle for the small alloc
-    // — `election_id` is bounded by the calling protocol (`election_id` is
-    // typically <= 64 bytes).
-    let mut input = Vec::with_capacity(NULLIFIER_DOMAIN.len() + election_id.len());
+/// Binding the position means a voter's nullifier differs per position, so
+/// double voting is prevented **per voter per position** (the paper's
+/// multi-position model). An **empty `position_id`** reproduces the legacy
+/// per-election nullifier — the single-position / transitional path until the
+/// generator emits one record per position (Phase 1).
+///
+/// The output is deterministic — same bytes, same point — and callers must pass
+/// the canonical bytes of the identifiers (this crate does not normalize them).
+pub fn nullifier_h(election_id: &[u8], position_id: &[u8]) -> RistrettoPoint {
+    let mut input =
+        Vec::with_capacity(NULLIFIER_DOMAIN.len() + 16 + election_id.len() + position_id.len());
     input.extend_from_slice(NULLIFIER_DOMAIN);
+    input.extend_from_slice(&(election_id.len() as u64).to_be_bytes());
     input.extend_from_slice(election_id);
+    input.extend_from_slice(&(position_id.len() as u64).to_be_bytes());
+    input.extend_from_slice(position_id);
     RistrettoPoint::hash_from_bytes::<Sha512>(&input)
 }
 
-/// Derives the nullifier `n = s_cred · H_e` from the voter's secret
-/// credential scalar and the election identifier.
+/// Derives the nullifier `n = s_cred · H_e` from the voter's secret credential
+/// scalar, the election identifier, and the position identifier.
 ///
-/// The scalar multiplication is constant-time, so this function does not
-/// leak `s_cred` through timing. The return value is a raw ristretto point;
-/// use [`compress_nullifier`] to obtain the 32-byte wire encoding the
-/// bulletin board stores.
-pub fn derive_nullifier(s_cred: &Scalar, election_id: &[u8]) -> RistrettoPoint {
-    s_cred * nullifier_h(election_id)
+/// The scalar multiplication is constant-time, so this function does not leak
+/// `s_cred` through timing. The return value is a raw ristretto point; use
+/// [`compress_nullifier`] to obtain the 32-byte wire encoding the bulletin board
+/// stores. Pass an empty `position_id` for the legacy per-election nullifier.
+pub fn derive_nullifier(s_cred: &Scalar, election_id: &[u8], position_id: &[u8]) -> RistrettoPoint {
+    s_cred * nullifier_h(election_id, position_id)
 }
 
 /// Compresses a nullifier point to its canonical 32-byte ristretto encoding.
@@ -106,20 +112,20 @@ mod tests {
     #[test]
     fn derive_nullifier_is_deterministic() {
         let s = Scalar::from(42u64);
-        let n1 = derive_nullifier(&s, b"election-2026");
-        let n2 = derive_nullifier(&s, b"election-2026");
+        let n1 = derive_nullifier(&s, b"election-2026", b"president");
+        let n2 = derive_nullifier(&s, b"election-2026", b"president");
         assert_eq!(
             compress_nullifier(&n1),
             compress_nullifier(&n2),
-            "same (s_cred, election_id) must give byte-identical nullifiers"
+            "same (s_cred, election_id, position_id) must give byte-identical nullifiers"
         );
     }
 
     #[test]
     fn different_election_id_changes_nullifier() {
         let s = Scalar::from(42u64);
-        let a = derive_nullifier(&s, b"election-2026-A");
-        let b = derive_nullifier(&s, b"election-2026-B");
+        let a = derive_nullifier(&s, b"election-2026-A", b"president");
+        let b = derive_nullifier(&s, b"election-2026-B", b"president");
         assert_ne!(
             compress_nullifier(&a),
             compress_nullifier(&b),
@@ -128,11 +134,50 @@ mod tests {
     }
 
     #[test]
+    fn different_position_id_changes_nullifier() {
+        // The R2 property: one voter, one election, two positions -> two
+        // distinct nullifiers, so double voting is prevented per position while
+        // the same voter can still vote in every position.
+        let s = Scalar::from(42u64);
+        let president = derive_nullifier(&s, b"election-2026", b"president");
+        let senator = derive_nullifier(&s, b"election-2026", b"senator");
+        assert_ne!(
+            compress_nullifier(&president),
+            compress_nullifier(&senator),
+            "distinct position_id must produce distinct nullifiers (per-position double-vote prevention)"
+        );
+    }
+
+    #[test]
+    fn empty_position_is_the_legacy_per_election_nullifier() {
+        // The single-position / transitional path: an empty position_id must be
+        // deterministic and independent of any non-empty position.
+        let s = Scalar::from(42u64);
+        let legacy1 = derive_nullifier(&s, b"election-2026", b"");
+        let legacy2 = derive_nullifier(&s, b"election-2026", b"");
+        assert_eq!(compress_nullifier(&legacy1), compress_nullifier(&legacy2));
+        let positioned = derive_nullifier(&s, b"election-2026", b"president");
+        assert_ne!(
+            compress_nullifier(&legacy1),
+            compress_nullifier(&positioned)
+        );
+    }
+
+    #[test]
+    fn length_prefix_disambiguates_election_and_position() {
+        // Without length prefixes, ("ab","c") and ("a","bc") would collide.
+        let s = Scalar::from(9u64);
+        let ab_c = derive_nullifier(&s, b"ab", b"c");
+        let a_bc = derive_nullifier(&s, b"a", b"bc");
+        assert_ne!(compress_nullifier(&ab_c), compress_nullifier(&a_bc));
+    }
+
+    #[test]
     fn different_s_cred_changes_nullifier() {
         let s1 = Scalar::from(42u64);
         let s2 = Scalar::from(43u64);
-        let a = derive_nullifier(&s1, b"election-2026");
-        let b = derive_nullifier(&s2, b"election-2026");
+        let a = derive_nullifier(&s1, b"election-2026", b"president");
+        let b = derive_nullifier(&s2, b"election-2026", b"president");
         assert_ne!(
             compress_nullifier(&a),
             compress_nullifier(&b),
@@ -141,18 +186,20 @@ mod tests {
     }
 
     #[test]
-    fn nullifier_h_is_election_dependent() {
-        let h1 = nullifier_h(b"e1");
-        let h2 = nullifier_h(b"e2");
-        let h1_again = nullifier_h(b"e1");
+    fn nullifier_h_is_election_and_position_dependent() {
+        let h1 = nullifier_h(b"e1", b"p1");
+        let h2 = nullifier_h(b"e2", b"p1");
+        let h3 = nullifier_h(b"e1", b"p2");
+        let h1_again = nullifier_h(b"e1", b"p1");
         assert_eq!(h1, h1_again);
         assert_ne!(h1, h2);
+        assert_ne!(h1, h3);
     }
 
     #[test]
     fn compress_decompress_round_trips() {
         let s = Scalar::from(7u64);
-        let n = derive_nullifier(&s, b"e");
+        let n = derive_nullifier(&s, b"e", b"p");
         let bytes = compress_nullifier(&n);
         let recovered = decompress_nullifier(bytes).expect("canonical bytes decode");
         assert_eq!(recovered, n);
@@ -166,18 +213,19 @@ mod tests {
         ));
     }
 
-    /// Pinned vector: `s_cred = 123`, `election_id = b"election-2026"`.
+    /// Pinned vector: `s_cred = 123`, `election_id = b"election-2026"`,
+    /// `position_id = b"president"`.
     ///
-    /// If this hex ever changes, either [`NULLIFIER_DOMAIN`], SHA-512, the
-    /// ristretto255 hash-to-point map, or the scalar multiplication has
-    /// drifted; any of those is a wire-breaking change.
+    /// If this hex ever changes, either [`NULLIFIER_DOMAIN`], the length-prefix
+    /// framing, SHA-512, the ristretto255 hash-to-point map, or the scalar
+    /// multiplication has drifted; any of those is a wire-breaking change.
     #[test]
     fn pinned_nullifier_vector() {
         let s = Scalar::from(123u64);
-        let n = derive_nullifier(&s, b"election-2026");
+        let n = derive_nullifier(&s, b"election-2026", b"president");
         assert_eq!(
             hex_lower(&compress_nullifier(&n)),
-            "1414ed00f2788047a0b6068f9ffd49059e7dc81b297b1542a96cc5c840463006",
+            "682bab1fac2ec1fbbcbde1774aad52067ce115c703a7d70c9edd8324435fd354",
             "pinned nullifier vector must remain stable across releases"
         );
     }
