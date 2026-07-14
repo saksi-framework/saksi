@@ -24,6 +24,7 @@ import (
 	"strings"
 
 	clientsdk "github.com/saksi-framework/saksi/packages/saksi-bulletin/client-sdk"
+	"github.com/saksi-framework/saksi/packages/saksi-bulletin/client-sdk/bench"
 	saksiprotocolv1 "github.com/saksi-framework/saksi/packages/saksi-protocol/go/saksiprotocolv1"
 	"google.golang.org/protobuf/proto"
 )
@@ -38,6 +39,9 @@ type bundle struct {
 	Ballots            []string `json:"ballots"`
 	PartialDecryptions []string `json:"partial_decryptions"`
 	Tally              string   `json:"tally"`
+	// Ballot-axis labels for the benchmark CSV (absent on legacy bundles → 0).
+	Positions  int `json:"positions"`
+	Candidates int `json:"candidates"`
 }
 
 func main() {
@@ -52,6 +56,11 @@ func main() {
 	flag.StringVar(&cfg.Chaincode, "chaincode", "saksi-bulletin", "deployed chaincode name")
 	bundlePath := flag.String("bundle", "", "path to a demo bundle JSON (from `saksi-demo gen`) (required)")
 	auto := flag.Bool("auto", false, "run the full election cycle non-interactively, then exit")
+	// Benchmark harness (thesis Appendix C). Only used with --auto.
+	metricsCSV := flag.String("metrics-csv", "", "with --auto: benchmark ballot submission and append an Appendix-C row to this CSV")
+	concurrency := flag.Int("concurrency", 1, "benchmark: max in-flight ballot submissions (>1 needed for valid tps)")
+	sendRate := flag.Float64("send-rate", 0, "benchmark: target submissions per second (0 = as fast as workers drain)")
+	benchAxis := flag.String("bench-axis", "multi", "benchmark: ballot-axis label for the CSV row (single|multi)")
 	flag.Parse()
 
 	if *bundlePath == "" {
@@ -71,12 +80,29 @@ func main() {
 		b.ElectionID, len(b.Ballots), len(b.PartialDecryptions))
 
 	if *auto {
-		if err := runFullCycle(client, b); err != nil {
+		var cfg *benchConfig
+		if *metricsCSV != "" {
+			cfg = &benchConfig{
+				csvPath:     *metricsCSV,
+				concurrency: *concurrency,
+				sendRate:    *sendRate,
+				axis:        *benchAxis,
+			}
+		}
+		if err := runFullCycle(client, b, cfg); err != nil {
 			log.Fatalf("election cycle failed: %v", err)
 		}
 		return
 	}
 	menu(client, b)
+}
+
+// benchConfig parameterizes the benchmarked ballot-submission path (Appendix C).
+type benchConfig struct {
+	csvPath     string
+	concurrency int
+	sendRate    float64
+	axis        string
 }
 
 func loadBundle(path string) bundle {
@@ -137,7 +163,7 @@ select> `)
 		case "8":
 			getTally(client, b)
 		case "9":
-			if err := runFullCycle(client, b); err != nil {
+			if err := runFullCycle(client, b, nil); err != nil {
 				fmt.Printf("  cycle stopped: %v\n", err)
 			}
 		case "0", "":
@@ -148,14 +174,18 @@ select> `)
 	}
 }
 
-func runFullCycle(client *clientsdk.BulletinClient, b bundle) error {
+func runFullCycle(client *clientsdk.BulletinClient, b bundle, cfg *benchConfig) error {
+	ballotStep := func() error { return submitBallots(client, b) }
+	if cfg != nil {
+		ballotStep = func() error { return submitBallotsBenchmarked(client, b, cfg) }
+	}
 	steps := []struct {
 		name string
 		fn   func() error
 	}{
 		{"CreateElection", func() error { return client.CreateElection(b.Params) }},
 		{"PublishDKGTranscript", func() error { return client.PublishDKGTranscript(b.DKG) }},
-		{"SubmitBallots", func() error { return submitBallots(client, b) }},
+		{"SubmitBallots", ballotStep},
 		{"CloseElection", func() error { return client.CloseElection(b.ElectionID) }},
 		{"SubmitPartialDecryptions", func() error { return submitPartials(client, b) }},
 		{"PublishTally", func() error { return client.PublishTally(b.Tally) }},
@@ -169,6 +199,50 @@ func runFullCycle(client *clientsdk.BulletinClient, b bundle) error {
 	getTally(client, b)
 	fmt.Println("✓ Full election cycle committed on the bulletin board.")
 	return nil
+}
+
+// submitBallotsBenchmarked submits every ballot with bounded concurrency / an
+// optional send rate (bench.Run), records per-ballot commit latency, and appends
+// one Appendix-C CSV row. A drop (endorsement timeout / MVCC conflict / rejection)
+// is counted, never swallowed, so a high-tps undercount surfaces as `dropped > 0`
+// rather than a clean-looking result.
+//
+// ponytail: fills the end-to-end latency + throughput columns the SDK can measure
+// from here. The finer Fabric phase split (endorse/order/validate/commit),
+// CDS-verify sub-cost, decrypt time, and docker-stats CPU/mem peaks are populated
+// by the campaign runner (Phase 6) that has peer/orderer access; left zero here.
+func submitBallotsBenchmarked(client *clientsdk.BulletinClient, b bundle, cfg *benchConfig) error {
+	res := bench.Run(len(b.Ballots), cfg.concurrency, cfg.sendRate, func(i int) error {
+		return client.SubmitBallot(b.Ballots[i])
+	})
+	row := res.ToRow(len(b.Ballots), cfg.axis, b.Positions, b.Candidates, cfg.sendRate)
+	fmt.Printf("  benchmark: %d submitted, %d committed, %d dropped, %.1f tps (p50=%v p95=%v p99=%v)\n",
+		row.Submitted, row.Committed, row.Dropped, row.ThroughputTPS, row.LatencyP50, row.LatencyP95, row.LatencyP99)
+
+	if err := appendCSVRow(cfg.csvPath, row); err != nil {
+		return fmt.Errorf("write metrics CSV: %w", err)
+	}
+	fmt.Printf("  appended Appendix-C row -> %s\n", cfg.csvPath)
+	if res.Dropped > 0 {
+		return fmt.Errorf("%d of %d ballots dropped during submission", res.Dropped, res.Submitted)
+	}
+	return nil
+}
+
+// appendCSVRow appends one Appendix-C row to path, writing the header first if
+// the file is new/empty.
+func appendCSVRow(path string, row bench.Row) error {
+	info, statErr := os.Stat(path)
+	fresh := os.IsNotExist(statErr) || (statErr == nil && info.Size() == 0)
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = f.Close() }()
+	if fresh {
+		return bench.WriteCSV(f, []bench.Row{row}) // header + row
+	}
+	return bench.WriteRow(f, row) // row only
 }
 
 // submitBallots submits every ballot and reads the first one back.
