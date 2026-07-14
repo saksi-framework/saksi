@@ -6,7 +6,7 @@ use rand_core::OsRng;
 
 use saksi_credentials::IssuerSecretKey;
 
-use crate::fixtures::{happy_path_fixture, multi_position_fixture};
+use crate::fixtures::{happy_path_fixture, multi_position_fixture, SelectionProfile};
 use crate::{audit, AuditStatus};
 
 // ---------------------------------------------------------------------------
@@ -16,7 +16,7 @@ use crate::{audit, AuditStatus};
 #[test]
 fn multi_position_audit_passes() {
     // 4 voters, 3 positions, 3 candidates → 12 ballot records, 9 P×C contests.
-    let fixture = multi_position_fixture(4, 3, 3);
+    let fixture = multi_position_fixture(4, 3, 3, SelectionProfile::Uniform);
     assert_eq!(
         fixture.ballots.len(),
         4 * 3,
@@ -44,7 +44,7 @@ fn multi_position_audit_passes() {
 #[test]
 fn single_position_axis_audit_passes() {
     // positions == 1 is the single-position ballot axis.
-    let fixture = multi_position_fixture(5, 1, 4);
+    let fixture = multi_position_fixture(5, 1, 4, SelectionProfile::Uniform);
     assert_eq!(fixture.ballots.len(), 5);
     let report = audit(fixture.artifacts());
     assert!(report.passed(), "single-position axis should audit clean");
@@ -54,7 +54,7 @@ fn single_position_axis_audit_passes() {
 fn per_position_double_vote_is_caught() {
     // A voter voting the SAME position twice replays that position's nullifier —
     // caught by cross-ballot nullifier uniqueness.
-    let mut fixture = multi_position_fixture(3, 3, 3);
+    let mut fixture = multi_position_fixture(3, 3, 3, SelectionProfile::Uniform);
     // Ballot 0 and 1 are voter 0's position 0 and 1; duplicate ballot 0 as a
     // second submission for the same (voter, position) → identical nullifier.
     let replay = fixture.ballots[0].clone();
@@ -78,7 +78,7 @@ fn per_position_double_vote_is_caught() {
 fn same_voter_different_positions_is_allowed() {
     // The complement of the double-vote test: one voter voting across DIFFERENT
     // positions yields DISTINCT nullifiers, so the honest election audits clean.
-    let fixture = multi_position_fixture(1, 3, 2);
+    let fixture = multi_position_fixture(1, 3, 2, SelectionProfile::Uniform);
     assert_eq!(fixture.ballots.len(), 3, "one voter, three positions");
     let nullifiers: std::collections::HashSet<Vec<u8>> = fixture
         .ballots

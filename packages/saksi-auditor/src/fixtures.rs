@@ -55,6 +55,11 @@ pub(crate) struct ElectionFixture {
     /// consumer can cross-check the published tally and the ballot sum against
     /// it independently (the Phase 1 validation gate + Phase 3 accuracy score).
     pub(crate) ground_truth: Vec<u64>,
+    /// Synthetic voter identifier per ballot record (paper Table 3.1). Repeats
+    /// across a voter's positions and is unique per voter. Generation-side
+    /// metadata only — it is NOT on the wire ballot (on-chain unlinkability),
+    /// but the validation gate and Appendix-A records use it.
+    pub(crate) voter_ids: Vec<String>,
 }
 
 impl ElectionFixture {
@@ -272,6 +277,9 @@ pub(crate) fn happy_path_fixture() -> ElectionFixture {
         partial_decryptions: partial_decryptions.clone(),
     };
 
+    // Legacy fixture: one ballot per voter, so voter-i labels the i-th ballot.
+    let voter_ids = (0..ballots.len()).map(|i| format!("voter-{i}")).collect();
+
     ElectionFixture {
         parameters,
         dkg_transcript,
@@ -280,6 +288,7 @@ pub(crate) fn happy_path_fixture() -> ElectionFixture {
         tally,
         issuer_public_key: issuer_pk,
         ground_truth: plaintext_tallies,
+        voter_ids,
     }
 }
 
@@ -296,10 +305,56 @@ pub(crate) fn happy_path_fixture() -> ElectionFixture {
 /// (deterministic, seeded), so the ground truth is well-defined and every ballot
 /// is valid. `positions == 1` is the single-position ballot axis; `> 1` is
 /// multi-position.
+/// Candidate-selection distribution profile (paper §Appendix A: "uniform and
+/// skewed profiles, fixed for reproducibility"). Both are deterministic so a
+/// generated population is byte-reproducible.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum SelectionProfile {
+    /// Even spread of selections across the candidate set.
+    Uniform,
+    /// Biased toward the first candidate (~half the votes), the rest spread.
+    Skewed,
+}
+
+/// Philippine multi-position ballot labels (paper §3.4: President, Vice
+/// President, Senator — single-winner each); generic slug beyond three.
+pub(crate) fn ph_position_id(p: usize) -> String {
+    match p {
+        0 => "president".to_string(),
+        1 => "vice-president".to_string(),
+        2 => "senator".to_string(),
+        n => format!("position-{n}"),
+    }
+}
+
+/// Deterministic 1-of-C selection under a fixed profile (reproducible).
+fn select_candidate(
+    profile: SelectionProfile,
+    voter_idx: usize,
+    p: usize,
+    candidates: usize,
+) -> usize {
+    if candidates <= 1 {
+        return 0;
+    }
+    match profile {
+        SelectionProfile::Uniform => (voter_idx + p) % candidates,
+        // Half the voters pick candidate 0; the rest spread over 1..C.
+        SelectionProfile::Skewed => {
+            if voter_idx % 2 == 0 {
+                0
+            } else {
+                1 + ((voter_idx / 2 + p) % (candidates - 1))
+            }
+        }
+    }
+}
+
 pub(crate) fn multi_position_fixture(
     voters: usize,
     positions: usize,
     candidates: usize,
+    profile: SelectionProfile,
 ) -> ElectionFixture {
     assert!(
         voters >= 1 && positions >= 1 && candidates >= 1,
@@ -314,7 +369,7 @@ pub(crate) fn multi_position_fixture(
     let mut contest_ids: Vec<String> = Vec::with_capacity(positions * candidates);
     for p in 0..positions {
         for k in 0..candidates {
-            contest_ids.push(format!("pos{p}/cand{k}"));
+            contest_ids.push(format!("{}/cand{k}", ph_position_id(p)));
         }
     }
     let parameters = ElectionParameters {
@@ -362,15 +417,15 @@ pub(crate) fn multi_position_fixture(
     // -- one ballot per (voter, position); ground truth per contest --------
 
     let mut ballots: Vec<Ballot> = Vec::with_capacity(voters * positions);
+    let mut voter_ids: Vec<String> = Vec::with_capacity(voters * positions);
     let mut ground_truth = vec![0u64; contest_ids.len()];
     let choice_set = [Scalar::ZERO, Scalar::ONE];
 
     for (voter_idx, credential) in credentials.iter().enumerate() {
         for p in 0..positions {
-            let position_id = format!("pos{p}");
-            // Deterministic 1-of-C selection; varies by voter and position so
-            // per-position totals differ (catches contest-mixing bugs).
-            let selected = (voter_idx + p) % candidates;
+            let position_id = ph_position_id(p);
+            // Deterministic 1-of-C selection under the chosen profile.
+            let selected = select_candidate(profile, voter_idx, p, candidates);
 
             let presentation = credential.present(
                 &issuer_pk,
@@ -430,6 +485,9 @@ pub(crate) fn multi_position_fixture(
                 credential_presentation: Some(presentation),
                 position_id,
             });
+            // Synthetic voter id: shared across this voter's positions, unique
+            // per voter (paper Table 3.1). Off-wire generation metadata.
+            voter_ids.push(format!("voter-{voter_idx}"));
         }
     }
 
@@ -499,6 +557,7 @@ pub(crate) fn multi_position_fixture(
         tally,
         issuer_public_key: issuer_pk,
         ground_truth,
+        voter_ids,
     }
 }
 

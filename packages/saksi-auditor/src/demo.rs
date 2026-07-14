@@ -26,7 +26,9 @@ use saksi_credentials::IssuerPublicKey;
 use saksi_crypto::group::{compress_point, point_from_compressed};
 use saksi_protocol::{Ballot, DKGTranscript, ElectionParameters, PartialDecryption, TallyResult};
 
-use crate::fixtures::{happy_path_fixture, multi_position_fixture, ElectionFixture};
+use crate::fixtures::{
+    happy_path_fixture, multi_position_fixture, ph_position_id, ElectionFixture, SelectionProfile,
+};
 use crate::{audit, AuditReport, ElectionArtifacts};
 
 /// Serializes a built [`ElectionFixture`] into the pretty-printed JSON bundle of
@@ -56,6 +58,9 @@ fn fixture_to_bundle_json(f: &ElectionFixture, positions: usize, candidates: usi
         "partial_decryptions": partials,
         "tally": hex::encode(art.tally.encode_to_vec()),
         "ground_truth": f.ground_truth,
+        // Synthetic voter id per ballot (paper Table 3.1 / Appendix A) — repeats
+        // across a voter's positions; off-wire generation metadata.
+        "voter_ids": f.voter_ids,
         // Ballot-axis labels for the benchmark harness's Appendix-C CSV row.
         "positions": positions,
         "candidates": candidates,
@@ -81,8 +86,14 @@ pub fn election_bundle_json_params(
     voters: usize,
     positions: usize,
     candidates: usize,
+    skewed: bool,
 ) -> Result<String, String> {
-    let f = multi_position_fixture(voters, positions, candidates);
+    let profile = if skewed {
+        SelectionProfile::Skewed
+    } else {
+        SelectionProfile::Uniform
+    };
+    let f = multi_position_fixture(voters, positions, candidates, profile);
     validate_population(&f, voters, positions, candidates)?;
     Ok(fixture_to_bundle_json(&f, positions, candidates))
 }
@@ -92,11 +103,12 @@ pub fn election_bundle_json_params(
 /// the first violation found. Catches generator bugs that would otherwise read
 /// as clean throughput/accuracy numbers downstream.
 ///
-/// Checks: (1) exactly `voters × positions` ballots, `voters` per position;
-/// (2) all nullifiers pairwise distinct; (3) every ballot carries exactly
-/// `candidates` ciphertexts/proofs (selection in-range for its position); and
-/// (4) per-position ground-truth aggregate == the ballot count for that position
-/// (one selection per voter per position).
+/// Checks (paper §Data Validation): (1) exactly `voters × positions` ballots,
+/// `voters` per position; (2) all nullifiers pairwise distinct; (3) every ballot
+/// carries exactly `candidates` ciphertexts/proofs (selection in-range); (4)
+/// per-position ground-truth aggregate == the ballot count for that position;
+/// and (5) voter ids unique per voter and repeated exactly once per position
+/// (one record per voter per position, sharing a voter id).
 fn validate_population(
     f: &ElectionFixture,
     voters: usize,
@@ -112,6 +124,13 @@ fn validate_population(
             f.ballots.len()
         ));
     }
+    if f.voter_ids.len() != f.ballots.len() {
+        return Err(format!(
+            "voter_ids len {} != ballot count {}",
+            f.voter_ids.len(),
+            f.ballots.len()
+        ));
+    }
     if f.ground_truth.len() != positions * candidates {
         return Err(format!(
             "ground_truth len {} != positions*candidates {}",
@@ -120,11 +139,17 @@ fn validate_population(
         ));
     }
 
+    // Map each named position label to its index (President→0, …).
+    let label_index: std::collections::HashMap<String, usize> =
+        (0..positions).map(|p| (ph_position_id(p), p)).collect();
+
     let mut nullifiers: HashSet<Vec<u8>> = HashSet::with_capacity(f.ballots.len());
     let mut per_position_ballots = vec![0usize; positions];
-    // Voter-uniqueness per position: a credential commitment must not appear
-    // twice within the same position.
-    let mut per_position_voters: Vec<HashSet<Vec<u8>>> = vec![HashSet::new(); positions];
+    // Each voter id must appear once per position (a voter votes each position
+    // exactly once), and its total occurrences must equal `positions`.
+    let mut per_position_voter_ids: Vec<HashSet<&str>> = vec![HashSet::new(); positions];
+    let mut voter_id_occurrences: std::collections::HashMap<&str, usize> =
+        std::collections::HashMap::new();
 
     for (i, ballot) in f.ballots.iter().enumerate() {
         if ballot.ciphertexts.len() != candidates
@@ -136,21 +161,12 @@ fn validate_population(
                 ballot.well_formedness_proofs.len()
             ));
         }
-        let position = ballot
-            .position_id
-            .strip_prefix("pos")
-            .and_then(|n| n.parse::<usize>().ok())
-            .ok_or_else(|| {
-                format!(
-                    "ballot {i} has malformed position_id {:?}",
-                    ballot.position_id
-                )
-            })?;
-        if position >= positions {
-            return Err(format!(
-                "ballot {i} position {position} out of range 0..{positions}"
-            ));
-        }
+        let position = *label_index.get(&ballot.position_id).ok_or_else(|| {
+            format!(
+                "ballot {i} position {:?} is not one of the election's positions",
+                ballot.position_id
+            )
+        })?;
         per_position_ballots[position] += 1;
 
         let presentation = ballot
@@ -168,9 +184,13 @@ fn validate_population(
                 "ballot {i} replays an already-seen nullifier (double vote)"
             ));
         }
-        if !per_position_voters[position].insert(ballot.voter_credential_commitment.clone()) {
+
+        let voter_id = f.voter_ids[i].as_str();
+        *voter_id_occurrences.entry(voter_id).or_insert(0) += 1;
+        if !per_position_voter_ids[position].insert(voter_id) {
             return Err(format!(
-                "ballot {i} repeats a voter credential within position {position}"
+                "ballot {i} repeats voter id {voter_id:?} within position {:?}",
+                ballot.position_id
             ));
         }
     }
@@ -189,6 +209,21 @@ fn validate_population(
                 "position {p} ground-truth aggregate {selected} != ballot count {voters} (each voter must select exactly one candidate)"
             ));
         }
+    }
+
+    // Every voter id repeats exactly `positions` times (one record per position).
+    for (vid, count) in &voter_id_occurrences {
+        if *count != positions {
+            return Err(format!(
+                "voter id {vid:?} appears {count} times, expected {positions} (one record per position)"
+            ));
+        }
+    }
+    if voter_id_occurrences.len() != voters {
+        return Err(format!(
+            "distinct voter ids {} != voter count {voters}",
+            voter_id_occurrences.len()
+        ));
     }
 
     Ok(())
@@ -276,7 +311,7 @@ mod tests {
     #[test]
     fn multi_position_bundle_generates_validates_and_audits() {
         // Passes the fail-closed gate, then re-audits clean off the wire bytes.
-        let bundle = election_bundle_json_params(4, 3, 3).expect("gate passes");
+        let bundle = election_bundle_json_params(4, 3, 3, false).expect("gate passes");
         let report = audit_bundle_json(&bundle).expect("bundle audits");
         assert_eq!(report.overall, AuditStatus::Pass, "{report:#?}");
     }
@@ -285,7 +320,7 @@ mod tests {
     fn gate_rejects_duplicated_nullifier() {
         // Corrupt the population by forcing two ballots to share a position's
         // nullifier — the gate must reject before anything reaches the network.
-        let mut f = multi_position_fixture(3, 2, 2);
+        let mut f = multi_position_fixture(3, 2, 2, SelectionProfile::Uniform);
         let dup = f.ballots[0].credential_presentation.clone();
         f.ballots[1].credential_presentation = dup;
         let err = validate_population(&f, 3, 2, 2).expect_err("must reject dup nullifier");
@@ -296,17 +331,39 @@ mod tests {
     fn gate_rejects_out_of_range_selection() {
         // A ballot with the wrong number of ciphertexts (selection not in the
         // position's candidate range) fails the gate.
-        let mut f = multi_position_fixture(3, 2, 2);
+        let mut f = multi_position_fixture(3, 2, 2, SelectionProfile::Uniform);
         f.ballots[0].ciphertexts.pop();
         let err = validate_population(&f, 3, 2, 2).expect_err("must reject bad shape");
         assert!(err.contains("ciphertexts"), "unexpected error: {err}");
     }
 
     #[test]
+    fn skewed_distribution_generates_validates_and_audits() {
+        // The skewed profile must still pass the gate + audit clean (only the
+        // per-candidate distribution differs from uniform).
+        let bundle = election_bundle_json_params(6, 3, 3, true).expect("gate passes");
+        let report = audit_bundle_json(&bundle).expect("bundle audits");
+        assert_eq!(report.overall, AuditStatus::Pass, "{report:#?}");
+    }
+
+    #[test]
+    fn gate_rejects_broken_voter_id_repetition() {
+        // Corrupt the synthetic voter ids so one voter appears twice within a
+        // position (paper: one record per voter per position) — the gate rejects.
+        let mut f = multi_position_fixture(3, 2, 2, SelectionProfile::Uniform);
+        // voter_ids are voter-major [v0,v0,v1,v1,v2,v2]; index 0 and 2 are both
+        // the "president" position. Point index 0 at voter-1 → voter-1 twice in
+        // that position.
+        f.voter_ids[0] = f.voter_ids[2].clone();
+        let err = validate_population(&f, 3, 2, 2).expect_err("must reject");
+        assert!(err.contains("voter id"), "unexpected error: {err}");
+    }
+
+    #[test]
     fn gate_rejects_tampered_ground_truth() {
         // If the per-position aggregate no longer equals the ballot count, the
         // gate refuses (guards against a generator that miscounts selections).
-        let mut f = multi_position_fixture(3, 2, 2);
+        let mut f = multi_position_fixture(3, 2, 2, SelectionProfile::Uniform);
         f.ground_truth[0] += 1;
         let err = validate_population(&f, 3, 2, 2).expect_err("must reject bad ground truth");
         assert!(err.contains("aggregate"), "unexpected error: {err}");

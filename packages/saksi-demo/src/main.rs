@@ -2,7 +2,7 @@
 //!
 //! Two subcommands:
 //!
-//! - `gen [--voters N] [--positions P] [--candidates C] [outfile]` — write a
+//! - `gen [--voters N] [--positions P] [--candidates C] [--distribution uniform|skewed] [outfile]` — write a
 //!   demo election bundle (hex wire artifacts) to `outfile`, or stdout if
 //!   omitted. With no `--voters/--positions/--candidates`, emits the legacy
 //!   happy-path bundle. With them, emits a parameterized multi-position bundle
@@ -24,7 +24,7 @@ fn main() -> ExitCode {
         Some("audit") => cmd_audit(args.get(2).map(String::as_str)),
         _ => {
             eprintln!(
-                "usage: saksi-demo <gen [--voters N] [--positions P] [--candidates C] [outfile] | audit <bundle.json>>"
+                "usage: saksi-demo <gen [--voters N] [--positions P] [--candidates C] [--distribution uniform|skewed] [outfile] | audit <bundle.json>>"
             );
             ExitCode::FAILURE
         }
@@ -32,9 +32,10 @@ fn main() -> ExitCode {
 }
 
 fn cmd_gen(args: &[String]) -> ExitCode {
-    // Parse optional --voters/--positions/--candidates flags; the lone
-    // non-flag argument is the output path.
+    // Parse optional --voters/--positions/--candidates/--distribution flags; the
+    // lone non-flag argument is the output path.
     let (mut voters, mut positions, mut candidates) = (None, None, None);
+    let mut skewed = false;
     let mut out: Option<&str> = None;
     let mut i = 0;
     while i < args.len() {
@@ -74,6 +75,20 @@ fn cmd_gen(args: &[String]) -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             },
+            "--distribution" => match args.get(i + 1).map(String::as_str) {
+                Some("uniform") => {
+                    skewed = false;
+                    i += 2;
+                }
+                Some("skewed") => {
+                    skewed = true;
+                    i += 2;
+                }
+                _ => {
+                    eprintln!("--distribution must be 'uniform' or 'skewed'");
+                    return ExitCode::FAILURE;
+                }
+            },
             other => {
                 out = Some(other);
                 i += 1;
@@ -89,9 +104,12 @@ fn cmd_gen(args: &[String]) -> ExitCode {
             positions.unwrap_or(3),
             candidates.unwrap_or(3),
         );
-        match election_bundle_json_params(v, p, c) {
+        match election_bundle_json_params(v, p, c, skewed) {
             Ok(json) => {
-                eprintln!("generated {v} voters × {p} positions × {c} candidates (gate passed)");
+                let dist = if skewed { "skewed" } else { "uniform" };
+                eprintln!(
+                    "generated {v} voters × {p} positions × {c} candidates ({dist}; gate passed)"
+                );
                 json
             }
             Err(e) => {
