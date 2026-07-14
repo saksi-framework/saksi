@@ -56,6 +56,7 @@ func main() {
 	flag.StringVar(&cfg.Chaincode, "chaincode", "saksi-bulletin", "deployed chaincode name")
 	bundlePath := flag.String("bundle", "", "path to a demo bundle JSON (from `saksi-demo gen`) (required)")
 	auto := flag.Bool("auto", false, "run the full election cycle non-interactively, then exit")
+	setupOnly := flag.Bool("setup-only", false, "run only CreateElection + PublishDKGTranscript, then exit (leaves the ballot round to an external driver, e.g. Caliper)")
 	// Benchmark harness (thesis Appendix C). Only used with --auto.
 	metricsCSV := flag.String("metrics-csv", "", "with --auto: benchmark ballot submission and append an Appendix-C row to this CSV")
 	concurrency := flag.Int("concurrency", 1, "benchmark: max in-flight ballot submissions (>1 needed for valid tps)")
@@ -78,6 +79,25 @@ func main() {
 	fmt.Printf("Connected to %s (channel=%s chaincode=%s)\n", cfg.PeerEndpoint, cfg.Channel, cfg.Chaincode)
 	fmt.Printf("Election %q: %d ballots, %d partial decryptions.\n",
 		b.ElectionID, len(b.Ballots), len(b.PartialDecryptions))
+
+	if *setupOnly {
+		// Caliper (or any external ballot driver) owns the measured ballot round;
+		// the console just stands the election up so ballots have somewhere to go.
+		for _, s := range []struct {
+			name string
+			fn   func() error
+		}{
+			{"CreateElection", func() error { return client.CreateElection(b.Params) }},
+			{"PublishDKGTranscript", func() error { return client.PublishDKGTranscript(b.DKG) }},
+		} {
+			fmt.Printf("→ %s ...\n", s.name)
+			if err := s.fn(); err != nil {
+				log.Fatalf("%s: %v", s.name, err)
+			}
+		}
+		fmt.Println("election set up; ready for external ballot submission")
+		return
+	}
 
 	if *auto {
 		var cfg *benchConfig

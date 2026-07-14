@@ -1,0 +1,14 @@
+{
+  "name": "saksi-caliper",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Hyperledger Caliper benchmark for the Saksi bulletin-board SubmitBallot workload (thesis Phase 2, paper-mandated tool).",
+  "scripts": {
+    "bind": "caliper bind --caliper-bind-sut fabric:2.2",
+    "test": "node workloads/partition.test.js",
+    "bench": "caliper launch manager --caliper-workspace . --caliper-networkconfig networks/saksi-fabric.yaml --caliper-benchconfig benchmarks/ballot-submission.yaml --caliper-flow-only-test"
+  },
+  "devDependencies": {
+    "@hyperledger/caliper-cli": "^0.6.0"
+  }
+}

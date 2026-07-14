@@ -1,0 +1,32 @@
+name: saksi-fabric
+version: '2.0.0'
+
+# Caliper Fabric network config for the Saksi bulletin board. Targets the same
+# one-org test-network that `network/network.sh` brings up (channel `saksi`,
+# chaincode `saksi-bulletin`, endorsement OR('Org1MSP.peer')).
+#
+# PATHS: resolved relative to this file. The defaults assume fabric-samples is a
+# sibling of the saksi repo (matching network.sh's default) and that the network
+# was brought up with cryptogen (deterministic `priv_sk` + `*-cert.pem` names).
+# If your fabric-samples lives elsewhere, edit the four paths below.
+
+caliper:
+  blockchain: fabric
+
+channels:
+  - channelName: saksi
+    contracts:
+      - id: saksi-bulletin
+
+organizations:
+  - mspid: Org1MSP
+    identities:
+      certificates:
+        - name: User1
+          clientPrivateKey:
+            path: ../../../../fabric-samples/test-network/organizations/peerOrganizations/org1.example.com/users/User1@org1.example.com/msp/keystore/priv_sk
+          clientSignedCert:
+            path: ../../../../fabric-samples/test-network/organizations/peerOrganizations/org1.example.com/users/User1@org1.example.com/msp/signcerts/User1@org1.example.com-cert.pem
+    connectionProfile:
+      path: ../../../../fabric-samples/test-network/organizations/peerOrganizations/org1.example.com/connection-org1.yaml
+      discover: true

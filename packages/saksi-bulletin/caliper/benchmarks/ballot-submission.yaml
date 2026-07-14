@@ -1,0 +1,79 @@
+# Caliper benchmark config — Saksi bulletin-board SubmitBallot throughput
+# (thesis Phase 2 / paper Tables 3.4-3.6, Appendix C).
+#
+# One round per (scale tier x ballot axis). Caliper natively reports the
+# paper's metrics: send rate, committed-tps throughput, latency min/max/avg +
+# percentiles, and success/fail counts. The `monitors` block captures the
+# resource-consumption axis (peak CPU/mem of the peer + orderer containers).
+#
+# HOW TO SCALE: each round's `txNumber` MUST equal the ballot count in the
+# bundle it points at (the workload submits each unique ballot exactly once).
+# Generate a bundle per tier/axis with `saksi-demo gen --voters N --positions P`
+# (P=1 single, P=3 multi), point `arguments.bundle` at it, set txNumber=N.
+# The 1k rounds below are concrete; the larger tiers are templated (uncomment +
+# supply the bundle). Sweep offered load by editing `rateControl` (fixed-rate
+# tps for a send-rate sweep, fixed-load to hold a target backlog).
+
+test:
+  name: saksi-ballot-submission
+  description: >
+    SubmitBallot throughput/latency for the Saksi permissioned bulletin board.
+    On-chain CDS + credential + nullifier verification runs at endorsement, so
+    committed-tps here is directly comparable to the Galal baseline row.
+  workers:
+    number: 8
+  rounds:
+    - label: submit-1k-single
+      txNumber: 1000
+      rateControl:
+        type: fixed-rate
+        opts:
+          tps: 50
+      workload:
+        module: workloads/submit-ballot.js
+        arguments:
+          bundle: ../../../bundles/bundle-1k-single.json
+          channel: saksi
+          contractId: saksi-bulletin
+
+    - label: submit-1k-multi
+      txNumber: 1000
+      rateControl:
+        type: fixed-rate
+        opts:
+          tps: 50
+      workload:
+        module: workloads/submit-ballot.js
+        arguments:
+          bundle: ../../../bundles/bundle-1k-multi.json
+          channel: saksi
+          contractId: saksi-bulletin
+
+    # --- larger tiers: generate the bundle, set txNumber == its ballot count ---
+    # - label: submit-10k-multi
+    #   txNumber: 10000
+    #   rateControl: { type: fixed-load, opts: { transactionLoad: 100 } }
+    #   workload:
+    #     module: workloads/submit-ballot.js
+    #     arguments: { bundle: ../../../bundles/bundle-10k-multi.json, channel: saksi, contractId: saksi-bulletin }
+    # - label: submit-50k-multi   # Galal comparison point (4.66 tps @ 50k)
+    #   txNumber: 50000
+    #   rateControl: { type: fixed-load, opts: { transactionLoad: 100 } }
+    #   workload:
+    #     module: workloads/submit-ballot.js
+    #     arguments: { bundle: ../../../bundles/bundle-50k-multi.json, channel: saksi, contractId: saksi-bulletin }
+    # - label: submit-483k-multi  # PH precinct-scale; multi-day, resumable campaign
+    #   txNumber: 483000
+    #   ...
+    # - label: submit-1m-multi
+    #   txNumber: 1000000
+    #   ...
+
+monitors:
+  resource:
+    - module: docker
+      options:
+        interval: 5
+        containers:
+          - peer0.org1.example.com
+          - orderer.example.com
