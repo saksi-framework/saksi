@@ -15,7 +15,7 @@
 //! | 2 | Malformed ballot / bad proof | [`crate::tests::tampered_ballot_cds_proof_is_caught`], [`crate::tests::tampered_credential_presentation_proof_is_caught`] |
 //! | 3 | Sub-threshold trustees       | [`crate::tests::under_threshold_decryptions_are_caught`] (+ positive control below) |
 //! | 4 | Malicious admin (params)     | [`crate::tests::bad_parameters_version_is_caught`], [`crate::tests::wrong_issuer_pk_is_caught`], [`crate::tests::dkg_transcript_trustee_count_mismatch_is_caught`] (+ control below) |
-//! | 5 | Malicious BB node (drop)     | [`malicious_bb_node_dropping_a_committed_ballot_is_detected`] (this module) |
+//! | 5 | Malicious BB node (drop/reorder) | [`malicious_bb_node_dropping_a_committed_ballot_is_detected`] + [`malicious_bb_node_reordering_ballots_is_detected_by_ledger_digest`] (this module) |
 //! | 6 | Network replay               | [`crate::tests::reused_nullifier_is_caught`] (replay == duplicate nullifier) |
 //!
 //! The chaincode-side rejections for classes 1/2/6 (on-chain, at endorsement)
@@ -64,6 +64,35 @@ fn malicious_bb_node_dropping_a_committed_ballot_is_detected() {
             Some(AuditStatus::Fail)
         ),
         "the drop must surface as a tally mismatch, not pass silently"
+    );
+}
+
+#[test]
+fn malicious_bb_node_reordering_ballots_is_detected_by_ledger_digest() {
+    // Reordering does NOT change the order-independent homomorphic tally, so the
+    // tally check cannot catch it — the paper's "detected by hash verification"
+    // path is the order-dependent ledger digest.
+    let f = multi_position_fixture(4, 2, 2, SelectionProfile::Uniform);
+    let recorded = crate::ledger::ledger_digest(&f.ballots);
+    // Positive control: recomputing over the same committed order matches.
+    assert_eq!(recorded, crate::ledger::ledger_digest(&f.ballots));
+
+    // Attack: a malicious BB node serves the same ballots in a different order.
+    let mut served = f.ballots.clone();
+    served.reverse();
+    assert_ne!(
+        crate::ledger::ledger_digest(&served),
+        recorded,
+        "reordering must change the ledger digest (hash verification detects it)"
+    );
+
+    // And confirm the tally really is order-blind, so the digest is the ONLY
+    // detector of a pure reorder: reverse a fresh fixture's ballots and audit.
+    let mut reordered = multi_position_fixture(4, 2, 2, SelectionProfile::Uniform);
+    reordered.ballots.reverse();
+    assert!(
+        audit(reordered.artifacts()).passed(),
+        "a pure reorder leaves the homomorphic tally clean — only the ledger digest catches it"
     );
 }
 
