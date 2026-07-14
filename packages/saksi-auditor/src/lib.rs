@@ -296,3 +296,6 @@ fn check_nullifier_uniqueness(ballots: &[Ballot], builder: &mut ReportBuilder) {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod security_privacy;
