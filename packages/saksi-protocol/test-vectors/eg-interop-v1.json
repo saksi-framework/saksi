@@ -1,24 +1,34 @@
 {
-  "_source": "ElectionGuard v2.0 additive-homomorphic ElGamal tally model (github.com/microsoft/electionguard).",
-  "_framing": "INTEROP SANITY CHECK, NOT CONFORMANCE. ElectionGuard uses integer ElGamal modulo a large prime p; Saksi uses ristretto255 elliptic-curve ElGamal. Ciphertext bytes, nonces, and proof systems therefore differ and are NOT comparable. What is pinned here is the plaintext tally SEMANTICS that both exponential-ElGamal voting schemes must agree on: encrypt each {0,1} selection, homomorphically add the ciphertexts, threshold/secret decrypt, and recover the SAME per-selection totals. Each ballot is a single-choice contest (exactly one selection = 1), mirroring ElectionGuard's in-range selection model.",
+  "_source": "Microsoft ElectionGuard reference implementation (github.com/microsoft/electionguard-python), published sample data: data/plaintext_ballots_simple.json (6 ballots) tallied against data/election_manifest_simple.json. Fetched 2026-07-14 from raw.githubusercontent.com/microsoft/electionguard-python/main/. Selection order and votes_allowed are taken verbatim from the manifest's ballot_selections sequence_order.",
+  "_framing": "INTEROP SANITY CHECK, NOT CONFORMANCE. ElectionGuard uses integer ElGamal modulo a large prime p; Saksi uses ristretto255 elliptic-curve ElGamal. Ciphertext bytes, nonces, and proof systems therefore differ and are NOT comparable. What is pinned here is the plaintext tally SEMANTICS both exponential-ElGamal voting schemes must agree on: encrypt each per-selection {0,1} choice, homomorphically add the ciphertexts, threshold/secret decrypt, and recover the SAME per-selection totals ElectionGuard's own published ballots produce. These are REAL ElectionGuard sample ballots (not authored toy data): multi-select contests (votes_allowed>1) and undervotes appear, so the invariant is per-ballot selected-count <= votes_allowed, NOT exactly-one.",
   "scenarios": [
     {
-      "name": "referendum-yes-no",
+      "name": "eg-justice-supreme-court",
+      "_contest": "justice-supreme-court (votes_allowed=2), a vote-for-two contest across ElectionGuard's 6 published simple ballots.",
+      "candidates": 4,
+      "selection_labels": ["john-adams", "benjamin-franklin", "john-hancock", "write-in"],
+      "votes_allowed": 2,
+      "ballots": [
+        [1, 0, 0, 1],
+        [1, 0, 0, 1],
+        [1, 1, 0, 0],
+        [1, 0, 1, 0],
+        [1, 0, 1, 0],
+        [1, 0, 0, 1]
+      ],
+      "expected_tally": [6, 1, 2, 3]
+    },
+    {
+      "name": "eg-referendum-pineapple",
+      "_contest": "referendum-pineapple (votes_allowed=1), cast on 2 of the 6 published ballots (the other 4 undervote this contest).",
       "candidates": 2,
-      "ballots": [[1, 0], [1, 0], [0, 1], [1, 0], [0, 1]],
-      "expected_tally": [3, 2]
-    },
-    {
-      "name": "three-candidate-single-choice",
-      "candidates": 3,
-      "ballots": [[1, 0, 0], [0, 1, 0], [0, 0, 1], [1, 0, 0], [0, 1, 0], [1, 0, 0]],
-      "expected_tally": [3, 2, 1]
-    },
-    {
-      "name": "unanimous-single-candidate",
-      "candidates": 3,
-      "ballots": [[1, 0, 0], [1, 0, 0], [1, 0, 0], [1, 0, 0]],
-      "expected_tally": [4, 0, 0]
+      "selection_labels": ["affirmative", "negative"],
+      "votes_allowed": 1,
+      "ballots": [
+        [1, 0],
+        [0, 1]
+      ],
+      "expected_tally": [1, 1]
     }
   ]
 }

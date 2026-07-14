@@ -6,9 +6,14 @@
 //! not comparable. What this pins is the plaintext **tally semantics** both
 //! exponential-ElGamal voting schemes must agree on: encrypt each `{0,1}`
 //! selection, homomorphically add the ciphertexts, decrypt, and recover the same
-//! per-selection totals ElectionGuard's model produces.
+//! per-selection totals ElectionGuard's own published ballots produce.
 //!
-//! The pinned scenarios live in
+//! The pinned scenarios are ElectionGuard's **real published sample ballots**
+//! (`data/plaintext_ballots_simple.json` tallied against
+//! `data/election_manifest_simple.json` from microsoft/electionguard-python), not
+//! authored toy data — so multi-select contests (`votes_allowed > 1`) and
+//! undervotes appear. The per-ballot invariant is therefore *selected count ≤
+//! votes_allowed*, not exactly-one. The vectors live in
 //! `saksi-protocol/test-vectors/eg-interop-v1.json` (see its `_source` /
 //! `_framing`).
 
@@ -43,6 +48,7 @@ mod tests {
         for scenario in scenarios {
             let name = scenario["name"].as_str().unwrap_or("?");
             let candidates = scenario["candidates"].as_u64().expect("candidates") as usize;
+            let votes_allowed = scenario["votes_allowed"].as_u64().expect("votes_allowed");
             let ballots = scenario["ballots"].as_array().expect("ballots");
             let expected: Vec<u64> = scenario["expected_tally"]
                 .as_array()
@@ -85,10 +91,13 @@ mod tests {
                     plaintext_sum[c] += s;
                     acc[c] += encrypt(&public_key, Plaintext::from_small_integer(s), nonce(b, c));
                 }
-                // ElectionGuard single-choice contest: exactly one selection set.
-                assert_eq!(
-                    chosen, 1,
-                    "scenario {name}: ballot {b} must be a valid single choice"
+                // ElectionGuard in-range check: a ballot may select up to
+                // `votes_allowed` options (and may undervote). Real EG sample
+                // ballots include vote-for-two contests, so this is a range
+                // bound, not exactly-one.
+                assert!(
+                    chosen <= votes_allowed,
+                    "scenario {name}: ballot {b} selected {chosen} > votes_allowed {votes_allowed}"
                 );
             }
 
