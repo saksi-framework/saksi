@@ -15,6 +15,9 @@ pub mod group;
 pub mod nizk;
 pub mod transcript;
 
+#[cfg(test)]
+mod eg_interop;
+
 pub use error::{CryptoError, CryptoResult};
 
 /// Returns the package name for smoke tests and FFI metadata.

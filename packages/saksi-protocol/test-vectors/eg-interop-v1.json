@@ -1,0 +1,24 @@
+{
+  "_source": "ElectionGuard v2.0 additive-homomorphic ElGamal tally model (github.com/microsoft/electionguard).",
+  "_framing": "INTEROP SANITY CHECK, NOT CONFORMANCE. ElectionGuard uses integer ElGamal modulo a large prime p; Saksi uses ristretto255 elliptic-curve ElGamal. Ciphertext bytes, nonces, and proof systems therefore differ and are NOT comparable. What is pinned here is the plaintext tally SEMANTICS that both exponential-ElGamal voting schemes must agree on: encrypt each {0,1} selection, homomorphically add the ciphertexts, threshold/secret decrypt, and recover the SAME per-selection totals. Each ballot is a single-choice contest (exactly one selection = 1), mirroring ElectionGuard's in-range selection model.",
+  "scenarios": [
+    {
+      "name": "referendum-yes-no",
+      "candidates": 2,
+      "ballots": [[1, 0], [1, 0], [0, 1], [1, 0], [0, 1]],
+      "expected_tally": [3, 2]
+    },
+    {
+      "name": "three-candidate-single-choice",
+      "candidates": 3,
+      "ballots": [[1, 0, 0], [0, 1, 0], [0, 0, 1], [1, 0, 0], [0, 1, 0], [1, 0, 0]],
+      "expected_tally": [3, 2, 1]
+    },
+    {
+      "name": "unanimous-single-candidate",
+      "candidates": 3,
+      "ballots": [[1, 0, 0], [1, 0, 0], [1, 0, 0], [1, 0, 0]],
+      "expected_tally": [4, 0, 0]
+    }
+  ]
+}
