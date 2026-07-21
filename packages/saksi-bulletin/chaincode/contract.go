@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"strings"
 
@@ -270,6 +271,82 @@ func (s *SmartContract) SubmitBallot(ctx contractapi.TransactionContextInterface
 		return fmt.Errorf("mark nullifier spent: %w", err)
 	}
 	return nil
+}
+
+// maxNullifierPageSize caps a single ListNullifiers page. Fabric peers refuse
+// range queries larger than core.yaml's `totalQueryLimit` (default 100000);
+// this cap keeps every page well under that default so the resume path works on
+// an unmodified peer, on every box, without config drift.
+const maxNullifierPageSize = 10000
+
+// NullifierPage is one page of the nullifiers committed for an election.
+// NextBookmark is the cursor that starts the following page, and is empty
+// exactly when this page is the last one.
+type NullifierPage struct {
+	Nullifiers   []string `json:"nullifiers"`
+	NextBookmark string   `json:"next_bookmark"`
+}
+
+// ListNullifiers returns one page of the nullifiers committed for electionID,
+// in lexical key order, plus the bookmark for the next page.
+//
+// This is the chain-authoritative source the campaign runner uses to resume an
+// interrupted submission run: the chain — not a local file — decides which
+// ballots are already committed, so a resumed run never re-submits a committed
+// ballot (a re-submit is nullifier-rejected and would falsely count as a drop).
+//
+// Pagination is mandatory, not a nicety. An unpaginated range query silently
+// truncates at the peer's totalQueryLimit, which would under-report committed
+// ballots at the 483k/1M tiers and make resume redo work it already did.
+//
+//	page 1            page 2            page 3
+//	[n0 n1]  --bm-->  [n2 n3]  --bm-->  [n4]  --""--> done
+func (s *SmartContract) ListNullifiers(
+	ctx contractapi.TransactionContextInterface, electionID string, pageSize int32, bookmark string,
+) (string, error) {
+	if pageSize <= 0 {
+		return "", fmt.Errorf("pageSize must be positive, got %d", pageSize)
+	}
+	if pageSize > maxNullifierPageSize {
+		return "", fmt.Errorf(
+			"pageSize %d exceeds the %d cap (peer totalQueryLimit)", pageSize, maxNullifierPageSize,
+		)
+	}
+
+	stub := ctx.GetStub()
+	iter, meta, err := stub.GetStateByPartialCompositeKeyWithPagination(
+		nullifierIndex, []string{electionID}, pageSize, bookmark,
+	)
+	if err != nil {
+		return "", fmt.Errorf("query nullifiers for election %q: %w", electionID, err)
+	}
+	defer func() { _ = iter.Close() }()
+
+	// Non-nil empty slice so an exhausted election marshals as [], not null.
+	page := NullifierPage{Nullifiers: []string{}}
+	for iter.HasNext() {
+		kv, err := iter.Next()
+		if err != nil {
+			return "", fmt.Errorf("read nullifier record: %w", err)
+		}
+		_, attrs, err := stub.SplitCompositeKey(kv.GetKey())
+		if err != nil {
+			return "", fmt.Errorf("split nullifier key: %w", err)
+		}
+		if len(attrs) != 2 {
+			return "", fmt.Errorf("nullifier key has %d attributes, want 2 (electionID, nullifier)", len(attrs))
+		}
+		page.Nullifiers = append(page.Nullifiers, attrs[1])
+	}
+	if meta != nil {
+		page.NextBookmark = meta.GetBookmark()
+	}
+
+	raw, err := json.Marshal(page)
+	if err != nil {
+		return "", fmt.Errorf("encode nullifier page: %w", err)
+	}
+	return string(raw), nil
 }
 
 // GetBallot returns the hex-encoded ballot recorded for an (electionID,
