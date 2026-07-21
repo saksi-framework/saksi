@@ -60,6 +60,9 @@ pub(crate) mod fixtures;
 #[cfg(feature = "demo")]
 pub mod demo;
 
+#[cfg(feature = "demo")]
+pub mod stream;
+
 use std::collections::HashMap;
 
 use saksi_credentials::IssuerPublicKey;

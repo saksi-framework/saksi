@@ -1,0 +1,17 @@
+{
+  "election_id": "stream-fixture-election",
+  "params": "0a1773747265616d2d666978747572652d656c656374696f6e",
+  "dkg": "0a1773747265616d2d666978747572652d656c656374696f6e",
+  "issuer_pk": "e2f2ae0a6abc4e71a884a961c500515f58e30b6aa582dd8db6a65945e08d2d76",
+  "binding_context": "73616b73692d61756469746f722d7631",
+  "partial_decryptions": [
+    "0a0474726565",
+    "0a0474726566"
+  ],
+  "tally": "0a1773747265616d2d666978747572652d656c656374696f6e",
+  "ground_truth": [2, 1, 0, 3],
+  "voter_ids": ["voter-0", "voter-0", "voter-1", "voter-1"],
+  "positions": 2,
+  "candidates": 2,
+  "n": 4
+}
