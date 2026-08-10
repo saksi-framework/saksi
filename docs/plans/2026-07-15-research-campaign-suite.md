@@ -89,9 +89,50 @@ not fall out of the Fabric Gateway SDK.
 - 3.2 `serve` dashboard: loopback bind, tier/axis allowlist, SSE live matrix,
   run/resume/verify buttons, table export.
 
-**Phase 4 — campaigns** (network + time gated)
-- 1k → 10k local verification, then 50k/483k/1M on a dedicated box; projection
-  fallback for any tier that cannot finish.
+**Phase 3.5 — correctness ladder (advisor gate, do BEFORE any perf tier)**
+Advisor guidance (2026-07): complexity is the biggest risk; prove the *complete
+protocol* correct at tiny scale before scaling. Run the full cycle (gen → submit
+→ close → partial-decrypt → tally → **E=0 == ground truth** + Reconcile
+zero-drop) at **N = 1, 10, 100, 1000 voters**, each a pass/fail milestone. These
+are correctness gates, not performance runs: single-thread submit is fine, no
+warmup/sweep needed. Perf tiers (Phase 4) do not start until N=1000 passes E=0.
+The generator already takes `--voters N`, so the micro-tiers are free.
+
+```
+N=1 ─▶ N=10 ─▶ N=100 ─▶ N=1000    (each: E=0 + zero-drop, else STOP)
+  └─ correctness proven ─┴─▶ Phase 4 perf tiers
+```
+
+**Phase 4 — perf campaigns** (network + time gated; only after Phase 3.5 passes)
+- 1k → 10k local, then 50k/483k/1M on a dedicated box; projection fallback for
+  any tier that cannot finish. The million-voter run is NOT attempted before the
+  correctness ladder is green (advisor's explicit constraint).
+
+## Sequencing decision — apps vs evaluation (RESOLVED 2026-07)
+
+Investigated the apps' distance to real Fabric (evidence in the eng review /
+apps-readiness report). Findings:
+- **Auditor read path is code-complete + CI-proven** — SMALL (needs only a live
+  network). `services/fabric-adapter` `GET /bulletin` + `BulletinSource::from_env`.
+- **Write path is ABSENT, not stubbed** — balotachain has no chaincode-submit
+  code at all; voter/trustee/admin write ballots to a JSON file, credential
+  material is sha256 stubs, and the real credential FFI (`present_credential_v2`,
+  `derive_nullifier_v2`) exists in saksi but is unwired. Building it = DKG
+  ceremony + real issuance + on-chain submit = LARGE, and reverses the locked
+  "stubs as-is" decision.
+- **The complete protocol is already correctness-provable** without the apps:
+  `saksi-demo.sh` runs the real full lifecycle (DKG, credentials, ballots,
+  on-chain CDS verify) end-to-end. That IS the advisor's prove-small-first.
+
+**Decision: eval-track + cheap app demos.** Order:
+1. Correctness ladder — `saksi-demo` at N=1/10/100/1000 with E=0 (Phase 3.5).
+2. Auditor real-Fabric demo (SMALL) — the Objective-1 "app works on real chain".
+3. Perf eval (Phase 4) — the paper's novel contribution.
+
+The LARGE voter/trustee/admin write path stays **deferred** (balotachain Phase 7):
+re-implementing it reverses a locked decision, produces no evaluation data, and
+duplicates what `saksi-demo` already proves. Revisit only if the advisor requires
+the interactive apps (not just the auditor) demonstrated on real Fabric.
 
 ## Eng review hardening (E1–E6, all accepted)
 
