@@ -239,3 +239,54 @@ func TestGetTallyReturnsPayloadAsString(t *testing.T) {
 		t.Fatalf("transaction name = %q, want GetTally", fc.submitName)
 	}
 }
+
+// pagingContract returns ListNullifiers pages keyed by the requested bookmark,
+// so CountCommittedBallots can be exercised across multiple pages.
+type pagingContract struct {
+	pages map[string][]byte
+	calls int
+}
+
+func (p *pagingContract) SubmitTransaction(string, ...string) ([]byte, error) {
+	return nil, nil
+}
+func (p *pagingContract) EvaluateTransaction(_ string, args ...string) ([]byte, error) {
+	p.calls++
+	bookmark := ""
+	if len(args) == 3 {
+		bookmark = args[2]
+	}
+	return p.pages[bookmark], nil
+}
+
+func TestCountCommittedBallotsPagesToTheEnd(t *testing.T) {
+	// Three pages: "" -> 2 (next "b1"), "b1" -> 2 (next "b2"), "b2" -> 1 (done).
+	fc := &pagingContract{pages: map[string][]byte{
+		"":   []byte(`{"nullifiers":["a","b"],"next_bookmark":"b1"}`),
+		"b1": []byte(`{"nullifiers":["c","d"],"next_bookmark":"b2"}`),
+		"b2": []byte(`{"nullifiers":["e"],"next_bookmark":""}`),
+	}}
+	got, err := NewBulletinClient(fc).CountCommittedBallots("election-2026")
+	if err != nil {
+		t.Fatalf("CountCommittedBallots: %v", err)
+	}
+	if got != 5 {
+		t.Fatalf("committed count = %d, want 5", got)
+	}
+	if fc.calls != 3 {
+		t.Fatalf("page requests = %d, want 3 (2+2+1)", fc.calls)
+	}
+}
+
+func TestCountCommittedBallotsEmptyElection(t *testing.T) {
+	fc := &pagingContract{pages: map[string][]byte{
+		"": []byte(`{"nullifiers":[],"next_bookmark":""}`),
+	}}
+	got, err := NewBulletinClient(fc).CountCommittedBallots("none")
+	if err != nil {
+		t.Fatalf("CountCommittedBallots: %v", err)
+	}
+	if got != 0 {
+		t.Fatalf("committed count = %d, want 0", got)
+	}
+}

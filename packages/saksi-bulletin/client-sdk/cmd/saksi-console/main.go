@@ -206,6 +206,7 @@ func runFullCycle(client *clientsdk.BulletinClient, b bundle, cfg *benchConfig) 
 		{"CreateElection", func() error { return client.CreateElection(b.Params) }},
 		{"PublishDKGTranscript", func() error { return client.PublishDKGTranscript(b.DKG) }},
 		{"SubmitBallots", ballotStep},
+		{"Reconcile", func() error { return reconcileCommitted(client, b) }},
 		{"CloseElection", func() error { return client.CloseElection(b.ElectionID) }},
 		{"SubmitPartialDecryptions", func() error { return submitPartials(client, b) }},
 		{"PublishTally", func() error { return client.PublishTally(b.Tally) }},
@@ -263,6 +264,25 @@ func appendCSVRow(path string, row bench.Row) error {
 		return bench.WriteCSV(f, []bench.Row{row}) // header + row
 	}
 	return bench.WriteRow(f, row) // row only
+}
+
+// reconcileCommitted is the fail-loud accuracy gate (Phase 3): after ballots are
+// submitted, the chain-authoritative committed count (via paginated
+// ListNullifiers) must equal the submitted count and the expected population.
+// A silent drop at high tps — an endorsement timeout or MVCC conflict — would
+// otherwise read as a clean undercount downstream, so a mismatch is a hard error.
+func reconcileCommitted(client *clientsdk.BulletinClient, b bundle) error {
+	committed, err := client.CountCommittedBallots(b.ElectionID)
+	if err != nil {
+		return fmt.Errorf("count committed ballots: %w", err)
+	}
+	submitted := len(b.Ballots)
+	// expected == submitted: the whole generated population is the ground truth.
+	if err := bench.Reconcile(submitted, committed, submitted); err != nil {
+		return err
+	}
+	fmt.Printf("  reconcile: %d submitted == %d committed (no drops)\n", submitted, committed)
+	return nil
 }
 
 // submitBallots submits every ballot and reads the first one back.

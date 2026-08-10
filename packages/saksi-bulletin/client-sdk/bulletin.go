@@ -1,6 +1,58 @@
 package clientsdk
 
-import "fmt"
+import (
+	"encoding/json"
+	"fmt"
+	"strconv"
+)
+
+// nullifierPageSize is the per-page cap for ListNullifiers. It matches the
+// chaincode's maxNullifierPageSize so a single page never trips the peer's
+// totalQueryLimit.
+const nullifierPageSize = 10000
+
+// NullifierPage is one page of committed nullifiers for an election, mirroring
+// the chaincode's ListNullifiers JSON response.
+type NullifierPage struct {
+	Nullifiers   []string `json:"nullifiers"`
+	NextBookmark string   `json:"next_bookmark"`
+}
+
+// ListNullifiers evaluates one page of the committed nullifiers for an election.
+func (b *BulletinClient) ListNullifiers(electionID string, pageSize int, bookmark string) (NullifierPage, error) {
+	var page NullifierPage
+	out, err := b.contract.EvaluateTransaction(
+		"ListNullifiers", electionID, strconv.Itoa(pageSize), bookmark,
+	)
+	if err != nil {
+		return page, fmt.Errorf("list nullifiers: %w", err)
+	}
+	if err := json.Unmarshal(out, &page); err != nil {
+		return page, fmt.Errorf("decode nullifier page: %w", err)
+	}
+	return page, nil
+}
+
+// CountCommittedBallots returns the number of ballots committed on-chain for an
+// election by paging through ListNullifiers (one nullifier == one committed
+// ballot). This is the chain-authoritative committed count the campaign runner
+// reconciles against the submitted count — the pagination is mandatory so the
+// count does not silently truncate at the peer's totalQueryLimit at scale.
+func (b *BulletinClient) CountCommittedBallots(electionID string) (int, error) {
+	total := 0
+	bookmark := ""
+	for {
+		page, err := b.ListNullifiers(electionID, nullifierPageSize, bookmark)
+		if err != nil {
+			return 0, err
+		}
+		total += len(page.Nullifiers)
+		if page.NextBookmark == "" {
+			return total, nil
+		}
+		bookmark = page.NextBookmark
+	}
+}
 
 // Contract is the subset of the Fabric Gateway contract API the bulletin client
 // uses. *github.com/hyperledger/fabric-gateway/pkg/client.Contract satisfies it,
