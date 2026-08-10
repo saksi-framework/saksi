@@ -73,6 +73,7 @@ impl ElectionFixture {
             tally: &self.tally,
             binding_context: BINDING_CONTEXT,
             issuer_public_key: &self.issuer_public_key,
+            ground_truth: Some(&self.ground_truth),
         }
     }
 }

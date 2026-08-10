@@ -303,6 +303,23 @@ pub fn audit_bundle_json(bundle: &str) -> Result<AuditReport, String> {
         .map(|p| PartialDecryption::decode(&p[..]).map_err(|e| format!("decode partial: {e}")))
         .collect::<Result<_, String>>()?;
 
+    // Optional seeded ground truth: when the bundle carries it, the audit adds
+    // the E=0 accuracy assertion (decoded tally == ground truth). Absent for a
+    // real on-chain election that was not generated with a known truth.
+    let ground_truth: Option<Vec<u64>> = match v.get("ground_truth") {
+        None => None,
+        Some(v) => Some(
+            v.as_array()
+                .ok_or_else(|| "ground_truth is not an array".to_string())?
+                .iter()
+                .map(|n| {
+                    n.as_u64()
+                        .ok_or_else(|| "a ground_truth entry is not a u64".to_string())
+                })
+                .collect::<Result<_, String>>()?,
+        ),
+    };
+
     let artifacts = ElectionArtifacts {
         parameters: &parameters,
         dkg_transcript: &dkg_transcript,
@@ -311,6 +328,7 @@ pub fn audit_bundle_json(bundle: &str) -> Result<AuditReport, String> {
         tally: &tally,
         binding_context: &binding_context,
         issuer_public_key: &issuer_public_key,
+        ground_truth: ground_truth.as_deref(),
     };
     Ok(audit(artifacts))
 }
@@ -367,6 +385,46 @@ mod tests {
         let bundle = election_bundle_json_params(6, 3, 3, true).expect("gate passes");
         let report = audit_bundle_json(&bundle).expect("bundle audits");
         assert_eq!(report.overall, AuditStatus::Pass, "{report:#?}");
+    }
+
+    #[test]
+    fn audit_scores_e0_accuracy_against_ground_truth() {
+        // The generated bundle carries seeded ground truth, so the audit must
+        // decode the real tally and confirm it equals that truth (E = 0).
+        let bundle = election_bundle_json_params(6, 3, 3, false).expect("gate passes");
+        let report = audit_bundle_json(&bundle).expect("bundle audits");
+        assert_eq!(report.overall, AuditStatus::Pass, "{report:#?}");
+        assert!(
+            matches!(
+                report.finding("tally.accuracy").map(|f| &f.status),
+                Some(AuditStatus::Pass)
+            ),
+            "E=0 accuracy check must run and pass: {report:#?}"
+        );
+    }
+
+    #[test]
+    fn tampered_ground_truth_fails_e0() {
+        // Flip one ground-truth total after generation. The real decrypt of the
+        // (untouched) ballots no longer matches it, so E != 0 and the accuracy
+        // check fails — proving E=0 compares against the seeded truth, not just
+        // the co-generated published tally.
+        let bundle = election_bundle_json_params(6, 2, 2, false).expect("gate passes");
+        let mut v: serde_json::Value = serde_json::from_str(&bundle).unwrap();
+        let gt = v["ground_truth"].as_array_mut().unwrap();
+        let bumped = gt[0].as_u64().unwrap() + 1;
+        gt[0] = serde_json::json!(bumped);
+        let tampered = serde_json::to_string(&v).unwrap();
+
+        let report = audit_bundle_json(&tampered).expect("audit runs");
+        assert_eq!(report.overall, AuditStatus::Fail, "{report:#?}");
+        assert!(
+            matches!(
+                report.finding("tally.accuracy").map(|f| &f.status),
+                Some(AuditStatus::Fail)
+            ),
+            "tampered ground truth must fail E=0: {report:#?}"
+        );
     }
 
     #[test]

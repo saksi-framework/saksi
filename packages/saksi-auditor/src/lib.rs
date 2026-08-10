@@ -99,6 +99,13 @@ pub struct ElectionArtifacts<'a> {
     /// The single per-election issuer public key. v1 assumes one issuer per
     /// election; pass it here so the auditor does not need a trust store.
     pub issuer_public_key: &'a IssuerPublicKey,
+    /// Optional seeded ground-truth totals (one per contest, aligned to
+    /// `parameters.contest_ids`). When present, the tally check adds the
+    /// **accuracy** assertion `E = 0`: the value recovered by real threshold
+    /// decryption equals the independently-seeded ground truth (not merely the
+    /// published tally). `None` for a real on-chain election with no seeded
+    /// truth (e.g. the fabric-adapter read path).
+    pub ground_truth: Option<&'a [u64]>,
 }
 
 /// Runs every audit check against `artifacts` and returns a structured
@@ -168,6 +175,7 @@ pub fn audit(artifacts: ElectionArtifacts) -> AuditReport {
             artifacts.tally,
             &decryption,
             eligible.len(),
+            artifacts.ground_truth,
             &mut builder,
         );
     }

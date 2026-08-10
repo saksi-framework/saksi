@@ -22,6 +22,7 @@ pub(crate) fn verify_tally(
     tally: &TallyResult,
     decryption: &DecryptionVerification,
     eligible_ballot_count: usize,
+    ground_truth: Option<&[u64]>,
     builder: &mut ReportBuilder,
 ) {
     // -- shape --------------------------------------------------------------
@@ -70,6 +71,23 @@ pub(crate) fn verify_tally(
         );
         return;
     }
+
+    // Validate the ground-truth width once; a mismatch disables the accuracy
+    // check (and is reported) rather than risking an out-of-bounds index.
+    let ground_truth = match ground_truth {
+        Some(truth) if truth.len() != parameters.contest_ids.len() => {
+            builder.fail(
+                "tally.accuracy",
+                format!(
+                    "ground truth has {} entries, expected {} (one per contest); accuracy check skipped",
+                    truth.len(),
+                    parameters.contest_ids.len()
+                ),
+            );
+            None
+        }
+        other => other,
+    };
 
     let threshold = parameters.threshold as usize;
     let g = basepoint();
@@ -151,6 +169,32 @@ pub(crate) fn verify_tally(
                             "contest {contest_id}: homomorphic decode = {k}, published tally = {published}"
                         ),
                     );
+                }
+
+                // Accuracy (E = 0): the value recovered by real threshold
+                // decryption must equal the independently-seeded ground truth.
+                // This is stronger than the homomorphic_sum check above (decode
+                // vs *published* tally) — it catches a published tally that was
+                // set to a wrong value that happens to differ from the real
+                // decrypt, and a decrypt that drifts from the seeded intent.
+                if let Some(truth) = ground_truth {
+                    let expected = truth[c];
+                    if k == expected {
+                        builder.pass(
+                            "tally.accuracy",
+                            format!(
+                                "contest {contest_id}: decoded tally = {k} == ground truth (E=0)"
+                            ),
+                        );
+                    } else {
+                        builder.fail(
+                            "tally.accuracy",
+                            format!(
+                                "contest {contest_id}: decoded tally = {k} != ground truth {expected} (E={})",
+                                k as i64 - expected as i64
+                            ),
+                        );
+                    }
                 }
             }
         }
