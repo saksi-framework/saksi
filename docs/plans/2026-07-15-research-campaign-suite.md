@@ -108,6 +108,29 @@ N=1 ─▶ N=10 ─▶ N=100 ─▶ N=1000    (each: E=0 + zero-drop, else STOP)
   any tier that cannot finish. The million-voter run is NOT attempted before the
   correctness ladder is green (advisor's explicit constraint).
 
+### Panel-driven requirements (folded 2026-08-11; this plan owns the harness)
+
+The thesis panel comments (balotachain `docs/plans/2026-08-11-panel-response-plan.md`,
+items I4–I7) impose these on the measurement harness — recorded HERE as the single
+source of truth so the two plans don't drift:
+
+- **Tier reclassification (panel #20):** relabel tiers **Primary** (1k/10k/50k, must
+  complete) · **Large** (483k) · **Stress** (1M, attempt-only, NOT a thesis pass
+  condition). A tier that cannot finish records the bottleneck (CPU/RAM/storage
+  util, tx backlog, throughput degradation, failure point); the `campaign.json`
+  manifest gains an **`incomplete+analyzed`** cell state that `verify` accepts for
+  a Stress cell. Supersedes the earlier "attempt all tiers, mandatory" framing.
+- **Statistical rigor (panel #18):** on top of the Phase 2.3 warmup + ≥3 reps + CI,
+  also report **stddev / IQR** alongside min/median/mean/p95/p99, and add **disk +
+  network** utilization to the docker-stats resource capture (peer + orderer).
+- **Environment capture (panel #19):** the manifest records the complete env per run
+  (CPU, RAM, storage, OS, Docker/Fabric/Go/Rust/Flutter/Tauri/Caliper versions,
+  peers, orderers, consensus config, container resource limits, network config).
+- **Baseline comparability (panel #21):** the no-CDS Galal variant (Phase 2.4,
+  `//go:build nocds`) MUST run same-box / same Fabric config / same workload; any
+  number from different hardware is labelled a **cross-study** comparison, never a
+  controlled experimental comparison, in both manifest and write-up.
+
 ## Sequencing decision — apps vs evaluation (RESOLVED 2026-07)
 
 Investigated the apps' distance to real Fabric (evidence in the eng review /
