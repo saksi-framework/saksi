@@ -82,7 +82,10 @@ pub struct StreamHeader {
 ///
 /// Ballots stream out one line at a time, so peak memory is one ballot rather
 /// than the whole population. Both files land atomically (temp + rename).
-pub fn write_election_stream(
+///
+/// `pub(crate)` because it takes an [`ElectionFixture`] (crate-private); the
+/// public streaming entry point is the params wrapper in [`crate::demo`].
+pub(crate) fn write_election_stream(
     dir: &Path,
     f: &ElectionFixture,
     positions: usize,
@@ -250,6 +253,18 @@ mod tests {
             assert_eq!(ballot.election_id, header.election_id);
         }
 
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn stream_params_entry_gates_then_writes_a_verifiable_stream() {
+        // The CLI-facing entry: build → validation gate → streamed write.
+        let dir = scratch("params-entry");
+        crate::demo::write_election_stream_params(&dir, 3, 2, 2, false)
+            .expect("valid population writes a stream");
+        // 3 voters × 2 positions = 6 ballots, and the N-count gate passes.
+        assert_eq!(verify_stream(&dir).expect("gate passes"), 6);
+        assert_eq!(read_header(&dir).expect("header").positions, 2);
         let _ = fs::remove_dir_all(&dir);
     }
 

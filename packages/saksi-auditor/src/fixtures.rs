@@ -327,6 +327,30 @@ pub(crate) fn ph_position_id(p: usize) -> String {
     }
 }
 
+/// Independent ground-truth tally over the recorded per-ballot selections.
+///
+/// Ground truth is derived HERE, from an explicit record of what each voter
+/// chose — never accumulated as a side effect of the ciphertext-building loop.
+/// That separation is what gives the `E = 0` accuracy check teeth: if a bug in
+/// the crypto loop encrypts a different bit than the voter selected, the
+/// homomorphic decrypt of the ciphertexts diverges from this independent tally
+/// and `E = 0` fails, instead of both sharing the same wrong `choice` and
+/// passing (eng review finding: self-reported ground truth).
+///
+/// Each entry is `(position_index, selected_candidate)`; it contributes `+1` to
+/// contest slot `position_index * candidates + selected_candidate`.
+pub(crate) fn tally_selections(
+    selections: &[(usize, usize)],
+    contest_count: usize,
+    candidates: usize,
+) -> Vec<u64> {
+    let mut totals = vec![0u64; contest_count];
+    for &(p, selected) in selections {
+        totals[p * candidates + selected] += 1;
+    }
+    totals
+}
+
 /// Deterministic 1-of-C selection under a fixed profile (reproducible).
 fn select_candidate(
     profile: SelectionProfile,
@@ -418,7 +442,9 @@ pub(crate) fn multi_position_fixture(
 
     let mut ballots: Vec<Ballot> = Vec::with_capacity(voters * positions);
     let mut voter_ids: Vec<String> = Vec::with_capacity(voters * positions);
-    let mut ground_truth = vec![0u64; contest_ids.len()];
+    // Recorded selections drive the INDEPENDENT ground-truth tally (see
+    // `tally_selections`) — never accumulated inline with the ciphertexts.
+    let mut selections: Vec<(usize, usize)> = Vec::with_capacity(voters * positions);
     let choice_set = [Scalar::ZERO, Scalar::ONE];
 
     for (voter_idx, credential) in credentials.iter().enumerate() {
@@ -426,6 +452,7 @@ pub(crate) fn multi_position_fixture(
             let position_id = ph_position_id(p);
             // Deterministic 1-of-C selection under the chosen profile.
             let selected = select_candidate(profile, voter_idx, p, candidates);
+            selections.push((p, selected));
 
             let presentation = credential.present(
                 &issuer_pk,
@@ -446,7 +473,6 @@ pub(crate) fn multi_position_fixture(
             for k in 0..candidates {
                 let global_c = p * candidates + k;
                 let choice: u8 = u8::from(k == selected);
-                ground_truth[global_c] += choice as u64;
 
                 let r = Scalar::random(&mut rng);
                 let plaintext = Plaintext::from_small_integer(choice as u64);
@@ -490,6 +516,9 @@ pub(crate) fn multi_position_fixture(
             voter_ids.push(format!("voter-{voter_idx}"));
         }
     }
+
+    // -- independent ground truth (NOT accumulated in the crypto loop) ------
+    let ground_truth = tally_selections(&selections, contest_ids.len(), candidates);
 
     // -- aggregate per contest (reuse the shared position→contest mapping) --
 
@@ -590,4 +619,42 @@ pub(crate) fn joint_public_key_from_transcript(transcript: &DKGTranscript) -> Pu
         joint += saksi_crypto::group::point_from_compressed(bytes).unwrap();
     }
     elgamal::PublicKey::from_point(joint)
+}
+
+#[cfg(test)]
+mod tally_selection_tests {
+    use super::*;
+
+    #[test]
+    fn tally_selections_sums_into_position_qualified_slots() {
+        // 2 positions × 3 candidates = 6 contest slots.
+        // Selections: p0 picks c1, c1, c0; p1 picks c2, c2.
+        let selections = [(0, 1), (0, 1), (0, 0), (1, 2), (1, 2)];
+        let totals = tally_selections(&selections, 6, 3);
+        // p0: [c0=1, c1=2, c2=0] ; p1: [c0=0, c1=0, c2=2]
+        assert_eq!(totals, vec![1, 2, 0, 0, 0, 2]);
+        // Sanity: total selections == sum of totals (nothing lost/duplicated).
+        assert_eq!(totals.iter().sum::<u64>(), selections.len() as u64);
+    }
+
+    #[test]
+    fn ground_truth_is_independent_of_the_ciphertext_loop() {
+        // The fixture's ground_truth must equal a from-scratch recount of what
+        // each voter selected — proving it is derived from the recorded
+        // selections, not co-produced with the ciphertexts.
+        let f = multi_position_fixture(4, 2, 3, SelectionProfile::Skewed);
+        let mut recount = vec![0u64; f.parameters.contest_ids.len()];
+        for voter_idx in 0..4 {
+            for p in 0..2 {
+                let selected = select_candidate(SelectionProfile::Skewed, voter_idx, p, 3);
+                recount[p * 3 + selected] += 1;
+            }
+        }
+        assert_eq!(
+            f.ground_truth, recount,
+            "ground_truth must match an independent recount of the selections"
+        );
+        // One selection per (voter, position): total == voters * positions.
+        assert_eq!(f.ground_truth.iter().sum::<u64>(), 4 * 2);
+    }
 }

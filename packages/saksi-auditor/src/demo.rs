@@ -98,6 +98,29 @@ pub fn election_bundle_json_params(
     Ok(fixture_to_bundle_json(&f, positions, candidates))
 }
 
+/// Generates a parameterized multi-position election and writes it as a streamed
+/// `header.json` + `ballots.ndjson` under `dir` (bounded memory, for the 483k/1M
+/// tiers) — **after** the same fail-closed validation gate as the one-blob path.
+/// This is the streaming counterpart of [`election_bundle_json_params`]; the CLI
+/// (`saksi-demo gen --stream`) calls it. A population that fails the gate returns
+/// `Err` and nothing is written.
+pub fn write_election_stream_params(
+    dir: &std::path::Path,
+    voters: usize,
+    positions: usize,
+    candidates: usize,
+    skewed: bool,
+) -> Result<(), String> {
+    let profile = if skewed {
+        SelectionProfile::Skewed
+    } else {
+        SelectionProfile::Uniform
+    };
+    let f = multi_position_fixture(voters, positions, candidates, profile);
+    validate_population(&f, voters, positions, candidates)?;
+    crate::stream::write_election_stream(dir, &f, positions, candidates)
+}
+
 /// Fail-closed validation gate (Phase 1): structural invariants that must hold
 /// before a generated population is allowed onto the network. Returns `Err` with
 /// the first violation found. Catches generator bugs that would otherwise read
