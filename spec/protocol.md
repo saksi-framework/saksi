@@ -15,9 +15,14 @@ Related records: [ADR-0003](../docs/adr/0003-protocol-buffers-for-wire-serializa
 
 - **Group:** ristretto255 (the prime-order group over Curve25519), via
   `curve25519-dalek` in Rust and `gtank/ristretto255` in Go. `G` is the
-  ristretto255 basepoint; `ℓ` is the group order. No pairings; a single group
-  throughout. **Stable:** points are the 32-byte canonical ristretto255
-  encoding; scalars are 32-byte canonical little-endian.
+  ristretto255 basepoint; `ℓ` is the group order — a prime of roughly **252 bits**
+  (`ℓ = 2^252 + 27742317777372353535851937790883648493`), so the scalar field is
+  `Z_ℓ`. No pairings; a single group throughout. **Stable:** points are the
+  32-byte canonical ristretto255 encoding; scalars are 32-byte canonical
+  little-endian, reduced mod `ℓ`.
+- **Randomness:** all secret scalars and nonces are sampled from the operating
+  system CSPRNG — the Rust `getrandom` crate (`OsRng`) in the library, and the
+  peer's platform RNG in Go. No userspace PRNG seeds secret material.
 - **Fiat-Shamir:** all NIZK challenges derive from **Merlin** transcripts
   (STROBE-128). Transcript labels are domain-separated and versioned under the
   `saksi.*` namespace. A Go port (`gtank/merlin`) reproduces the challenge bytes
@@ -27,10 +32,17 @@ Related records: [ADR-0003](../docs/adr/0003-protocol-buffers-for-wire-serializa
 
 ## 2. Primitives
 
-- **Additive ElGamal** over ristretto255. A message `m` is encoded as `m·G`;
-  ciphertext `(pad, data) = (r·G, m·G + r·Pk)`. Homomorphic: componentwise
-  addition of ciphertexts adds plaintexts, enabling a homomorphic tally. Small
-  plaintexts are recovered by brute-force discrete log over the expected range.
+- **Additive ("lifted") ElGamal** over ristretto255. The **encoding chain** for a
+  vote is: a selection bit `m ∈ {0,1}` is *lifted* to the group element `m·G`
+  before encryption; the ciphertext is `(pad, data) = (r·G, m·G + r·Pk)` for a
+  fresh nonce `r`. Ciphertexts add componentwise (`(pad₁+pad₂, data₁+data₂)`), so
+  the per-contest aggregate over all ballots is an encryption of the plaintext
+  sum `T·G` where `T` is the vote count. Trustees remove the mask `r·Pk` by
+  threshold decryption (§6), leaving `T·G`; the integer `T` is then recovered by a
+  **bounded discrete-log search**, with the bound set to the number of accepted
+  ballots (so recovery is exact and always terminates). The search is a **linear
+  scan below 50 000 voters and Shanks's baby-step giant-step at 50 000 and above**
+  (`O(√T)`), in `saksi-auditor::tally::decode_tally`.
 - **Pedersen / Feldman DKG** producing a joint public key `Pk` with a
   `t`-of-`n` threshold; includes complaint handling, Lagrange combination, and
   threshold decryption. Default threshold **3-of-5**.
@@ -139,3 +151,92 @@ election (double-vote detection) and unlinkable across elections.
 
 Changing any labelled byte layout in this section is a breaking wire change and
 bumps the relevant `v*` suffix.
+
+## 9. Algorithms (pseudocode)
+
+Reference pseudocode for the portions implemented in this repository. `G` is the
+basepoint, `ℓ` the group order, `x ←$ Z_ℓ` a CSPRNG-sampled scalar, `H(·)` a
+Merlin Fiat-Shamir challenge (reduced mod `ℓ`). Public inputs are the on-chain
+bulletin contents; secrets are held only by the named party. Source: `saksi-crypto`,
+`saksi-credentials`, `saksi-auditor`.
+
+**Algorithm 1 — Additive ElGamal (encrypt, aggregate).**
+```text
+Encrypt(Pk, m ∈ {0,1}):
+    r ←$ Z_ℓ
+    return (pad, data) = (r·G, m·G + r·Pk)
+Aggregate(cts):                       # per contest, over all ballots
+    (P, D) = (0, 0)
+    for (pad, data) in cts: (P, D) = (P + pad, D + data)
+    return (P, D)                     # = ( (Σr)·G , (Σm)·G + (Σr)·Pk )
+```
+
+**Algorithm 2 — Pedersen/Feldman DKG (t-of-n, default 3-of-5).**
+```text
+Deal(d):                              # each trustee d
+    a_{d,0..t-1} ←$ Z_ℓ               # secret polynomial f_d
+    broadcast commitments A_{d,k} = a_{d,k}·G      # Feldman
+    send share f_d(e+1) to trustee e; each verifies against A_{d,*}
+JointKey:  Pk = Σ_d A_{d,0}                        # = (Σ_d a_{d,0})·G
+Share(k):  sk_k = Σ_d f_d(k+1)         # trustee k's aggregate secret share
+PubShare(k): pub_k = Σ_d eval(A_{d,*}, k+1)        # verifier-recomputable
+```
+
+**Algorithm 3 — Threshold partial decryption + Chaum-Pedersen proof.**
+```text
+PartialDecrypt(sk_k, aggregate pad P):
+    S_k = sk_k · P                      # share point
+    prove  A = sk_k·G  ∧  S_k = sk_k·P   (equal discrete logs):
+        w ←$ Z_ℓ ; T1 = w·G ; T2 = w·P
+        c = H("saksi.chaum_pedersen…", G, P, pub_k, S_k, T1, T2)
+        z = w + c·sk_k
+    return (S_k, π = (T1, T2, z))
+Verify: z·G == T1 + c·pub_k  ∧  z·P == T2 + c·S_k
+```
+
+**Algorithm 4 — Combine + tally decode.**
+```text
+Combine(shares ≥ t):                   # Lagrange at x = 0
+    M = D − Σ_{k∈subset} λ_k · S_k      # λ_k = Π_{j≠k} x_j/(x_j−x_k)
+    return M                            # = T·G
+Decode(M, bound = accepted_ballots):    # decode_tally
+    if bound < 50_000: linear scan k·G for k in [0, bound]
+    else:              baby-step giant-step, m = ⌈√(bound+1)⌉
+    return T with T·G = M, else ⊥
+```
+
+**Algorithm 5 — CDS {0,1} OR-proof (ballot well-formedness).**
+```text
+Prove(Pk, (pad,data) enc of m, contest-context ctx):
+    # prove data − 0·G  OR  data − 1·G  is r·Pk, without revealing m
+    for the FALSE branch i≠m: sample (c_i, z_i) ←$ Z_ℓ, back-solve commitments
+    for the TRUE branch  j=m: pick nonce w, commitments T_j = w·G, w·Pk
+    c = H("saksi.nizk.cds…", ctx, pad, data, {commitments})    # Fiat-Shamir
+    c_m = c − Σ_{i≠m} c_i     ;   z_m = w + c_m·r               # forced split
+    return branches {(commitment_g_i, commitment_h_i, c_i, z_i)}
+Verify: Σ_i c_i == H(…)  ∧  each branch's two Schnorr checks hold
+```
+
+**Algorithm 6 — Blind credential issuance (Pointcheval–Stern) + on-chain verify.**
+```text
+Issue: voter blinds a commitment C = s_cred·G; issuer (x_i, Pk_i=x_i·G)
+       blind-signs; voter unblinds to a Schnorr signature (R', s) on C.
+VerifyIssuerSig(Pk_i, C, R', s):                 # chaincode credverify, §4
+    e = H("saksi.credentials.issuance.v1", compress(Pk_i), compress(C), compress(R'))
+    accept iff  s·G == R' + e·Pk_i
+```
+
+**Algorithm 7 — Credential presentation + per-position nullifier.**
+```text
+H_{e,pos} = hash_to_ristretto("saksi.nullifier…" ‖ lp(election_id) ‖ lp(position_id))
+n = s_cred · H_{e,pos}                            # deterministic PRF nullifier
+Present: Chaum-Pedersen proof that  C = s_cred·G  ∧  n = s_cred·H_{e,pos}
+         (same secret), transcript bound to presentation_context(§5) + position_id.
+# n is identical for two ballots of one credential in one (election, position)
+# → per-position double-vote detection; unlinkable across elections/positions.
+# lp(x) = u64_be(len(x)) ‖ x  (length-prefixed, canonical).
+```
+
+These match the wire-level checks in §4–§6 and the verifier in
+`saksi-auditor`; the byte-exact NIZK transcripts are pinned by the golden vectors
+in `test-vectors/`.
