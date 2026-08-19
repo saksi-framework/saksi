@@ -281,10 +281,7 @@ fn privacy_linkage_attempt_fails_over_the_anonymity_set() {
         }
         // A "hit" is any registration id whose bytes appear on-chain.
         for id in &registration {
-            if on_chain
-                .windows(id.len())
-                .any(|w| w == id.as_bytes())
-            {
+            if on_chain.windows(id.len()).any(|w| w == id.as_bytes()) {
                 linkage_hits += 1;
             }
         }

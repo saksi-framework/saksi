@@ -298,8 +298,9 @@ mod decode_tests {
 
     #[test]
     fn decode_tally_routes_by_threshold_but_recovers_t() {
-        assert_eq!(decode_tally(point(7), 10), Some(7)); // linear path (max<50k)
-        assert_eq!(decode_tally(point(7), BSGS_THRESHOLD), Some(7)); // bsgs path
+        // Below the threshold routes to the linear path; at/above to bsgs.
+        assert_eq!(decode_tally(point(7), 10), Some(7));
+        assert_eq!(decode_tally(point(7), BSGS_THRESHOLD), Some(7));
         // Boundary value at the boundary max, via the bsgs path.
         assert_eq!(
             decode_tally(point(BSGS_THRESHOLD), BSGS_THRESHOLD),
@@ -317,6 +318,9 @@ mod decode_tests {
     #[test]
     fn zero_decodes_to_zero() {
         assert_eq!(decode_tally(RistrettoPoint::identity(), 10), Some(0));
-        assert_eq!(bsgs_decode(RistrettoPoint::identity(), BSGS_THRESHOLD), Some(0));
+        assert_eq!(
+            bsgs_decode(RistrettoPoint::identity(), BSGS_THRESHOLD),
+            Some(0)
+        );
     }
 }

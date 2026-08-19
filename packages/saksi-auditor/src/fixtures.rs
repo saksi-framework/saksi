@@ -83,6 +83,7 @@ impl ElectionFixture {
     /// independent-verification test (panel #29) audits: the verifier must
     /// reproduce and check the tally from public data alone, never against a
     /// private answer key.
+    #[cfg(test)]
     pub(crate) fn public_artifacts(&self) -> ElectionArtifacts<'_> {
         ElectionArtifacts {
             ground_truth: None,
