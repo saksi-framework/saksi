@@ -240,3 +240,74 @@ fn only_the_aggregate_is_decrypted_never_an_individual_ballot() {
     let total: u64 = f.tally.totals.iter().sum();
     assert_eq!(total, 5, "aggregate = one selection per voter, summed");
 }
+
+// ---------------------------------------------------------------------------
+// Phase 5 · unlinkability as a linkage-ATTEMPT experiment (matrix M16, panel #17)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn privacy_linkage_attempt_fails_over_the_anonymity_set() {
+    // Adversary model (Pfitzmann-Hansen): the adversary holds the FULL on-chain
+    // record (all ballots: ciphertexts, nullifiers, credential commitments,
+    // public labels) AND the synthetic voter-registration list. Successful
+    // linkage = identifying a targeted voter's ballot better than random over the
+    // anonymity set. The experiment RUNS the linkage attempt and shows it fails:
+    // no on-chain field joins to a registration identifier, so the best the
+    // adversary can do is guess, bounded by 1 / (anonymity-set size).
+    let voters = 5usize;
+    let f = multi_position_fixture(voters, 1, 2, SelectionProfile::Uniform);
+
+    // The registration list (off-chain, synthetic) — the identifiers the
+    // adversary tries to attach to on-chain ballots.
+    let registration: Vec<&str> = f.voter_ids.iter().map(String::as_str).collect();
+
+    // Attempt linkage: for every ballot, gather ALL bytes the adversary sees
+    // on-chain and test whether any registration identifier appears in them.
+    let mut linkage_hits = 0usize;
+    for ballot in &f.ballots {
+        let mut on_chain: Vec<u8> = Vec::new();
+        on_chain.extend_from_slice(ballot.election_id.as_bytes());
+        on_chain.extend_from_slice(ballot.position_id.as_bytes());
+        on_chain.extend_from_slice(&ballot.voter_credential_commitment);
+        if let Some(p) = &ballot.credential_presentation {
+            if let Some(n) = &p.nullifier {
+                on_chain.extend_from_slice(&n.value);
+            }
+            on_chain.extend_from_slice(&p.credential_commitment);
+        }
+        for ct in &ballot.ciphertexts {
+            on_chain.extend_from_slice(&ct.pad);
+            on_chain.extend_from_slice(&ct.data);
+        }
+        // A "hit" is any registration id whose bytes appear on-chain.
+        for id in &registration {
+            if on_chain
+                .windows(id.len())
+                .any(|w| w == id.as_bytes())
+            {
+                linkage_hits += 1;
+            }
+        }
+    }
+    assert_eq!(
+        linkage_hits, 0,
+        "no on-chain field may join to a registration identifier"
+    );
+
+    // Anonymity set: within a single position, the V ballots carry V DISTINCT
+    // credential commitments (no voter reuses another's), so a targeted voter is
+    // hidden among all V. The adversary's link probability is therefore bounded
+    // by 1/V — the unlinkability hypothesis (structural, no timing/metadata).
+    let commitments: std::collections::HashSet<Vec<u8>> = f
+        .ballots
+        .iter()
+        .map(|b| b.voter_credential_commitment.clone())
+        .collect();
+    assert_eq!(
+        commitments.len(),
+        voters,
+        "anonymity set = {voters}; link probability bounded by 1/{voters}"
+    );
+    // Acknowledged limit (out of scope): two ballots of the SAME credential share
+    // the commitment, so they are linkable to each other — never to an identity.
+}

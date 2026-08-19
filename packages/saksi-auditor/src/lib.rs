@@ -311,3 +311,6 @@ mod tests;
 
 #[cfg(test)]
 mod security_privacy;
+
+#[cfg(test)]
+mod independent_verification;

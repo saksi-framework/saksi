@@ -76,6 +76,19 @@ impl ElectionFixture {
             ground_truth: Some(&self.ground_truth),
         }
     }
+
+    /// Borrow this fixture as the **public election record only** — the same
+    /// bulletin-board artifacts a third party would have, with `ground_truth`
+    /// stripped (the seeded answer key is NOT public). This is what the formal
+    /// independent-verification test (panel #29) audits: the verifier must
+    /// reproduce and check the tally from public data alone, never against a
+    /// private answer key.
+    pub(crate) fn public_artifacts(&self) -> ElectionArtifacts<'_> {
+        ElectionArtifacts {
+            ground_truth: None,
+            ..self.artifacts()
+        }
+    }
 }
 
 /// Build the standard happy-path fixture used by every test.
