@@ -196,8 +196,15 @@ Lanes A + B run in parallel; C after both; D last. No shared modules between A a
 
 ## NOT in scope
 
-Standing up production Fabric; dashboard auth (loopback-only research tool); BSGS
-decode (linear is fine at these N); balotachain Phase 7 apps (last).
+Standing up production Fabric; dashboard auth (loopback-only research tool);
+balotachain Phase 7 apps (last).
+
+**BSGS decode — NOW IN SCOPE (was excluded; reversed 2026-08-19).** The committed
+manuscript (p.40 line 734) states tally recovery uses "a linear scan at the
+smaller tiers and Shanks's baby-step giant-step method at fifty thousand voters
+and above." So the auditor's tally decode must use **BSGS at ≥50k** (linear
+below), bound to the accepted-ballot count. Tracked in the panel-response plan
+(item M12); lands in `saksi-auditor::tally`.
 
 ## GSTACK REVIEW REPORT
 
