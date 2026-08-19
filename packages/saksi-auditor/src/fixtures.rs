@@ -60,6 +60,15 @@ pub(crate) struct ElectionFixture {
     /// metadata only — it is NOT on the wire ballot (on-chain unlinkability),
     /// but the validation gate and Appendix-A records use it.
     pub(crate) voter_ids: Vec<String>,
+    /// Display-only election name (stream header metadata; not bound into any
+    /// proof). Equals `election_id` for the back-compat `simple` path.
+    // ponytail: read by the stream header in Task 3; allow until then.
+    #[allow(dead_code)]
+    pub(crate) election_name: String,
+    /// Display-only trustee names, aligned to `parameters.trustee_ids` (stream
+    /// header metadata; not on the wire). `"1".."n"` for the back-compat path.
+    #[allow(dead_code)]
+    pub(crate) trustee_names: Vec<String>,
 }
 
 impl ElectionFixture {
@@ -304,6 +313,8 @@ pub(crate) fn happy_path_fixture() -> ElectionFixture {
         issuer_public_key: issuer_pk,
         ground_truth: plaintext_tallies,
         voter_ids,
+        election_name: "election-2026".into(),
+        trustee_names: trustee_ids.clone(),
     }
 }
 
@@ -324,11 +335,65 @@ pub(crate) fn happy_path_fixture() -> ElectionFixture {
 /// skewed profiles, fixed for reproducibility"). Both are deterministic so a
 /// generated population is byte-reproducible.
 #[derive(Clone, Copy, Debug)]
-pub(crate) enum SelectionProfile {
+pub enum SelectionProfile {
     /// Even spread of selections across the candidate set.
     Uniform,
     /// Biased toward the first candidate (~half the votes), the rest spread.
     Skewed,
+}
+
+/// Full parameterization for the multi-position generator. Carries the
+/// cryptographically-bound `election_id`, the display-only `election_name` +
+/// `trustee_names` (surfaced in the stream header, off-wire — NOT bound into any
+/// proof), the t-of-n DKG shape, and the population dimensions.
+///
+/// Re-exported as `saksi_auditor::demo::GenParams` so the `saksi-demo` CLI (a
+/// separate crate) can construct it; the fixture module itself is `pub(crate)`.
+#[derive(Clone, Debug)]
+pub struct GenParams {
+    /// Cryptographically-bound election identifier (nullifier + proof domain).
+    pub election_id: String,
+    /// Display-only election name for the stream header (not bound into proofs).
+    pub election_name: String,
+    /// DKG threshold `t` (`1 <= t <= trustees`).
+    pub threshold: usize,
+    /// DKG trustee count `n`.
+    pub trustees: usize,
+    /// Display-only trustee names, aligned to the `n` trustees (header metadata).
+    pub trustee_names: Vec<String>,
+    /// Number of voters (one credential each).
+    pub voters: usize,
+    /// Number of ballot positions.
+    pub positions: usize,
+    /// Number of candidates per position.
+    pub candidates: usize,
+    /// Deterministic candidate-selection distribution profile.
+    pub profile: SelectionProfile,
+}
+
+impl GenParams {
+    /// Back-compat constructor filling today's defaults (`election_id` +
+    /// `election_name` = `"election-2026"`, 3-of-5, trustee names `"1".."5"`).
+    /// Every existing caller passes only the population dimensions; the console
+    /// builds a full [`GenParams`].
+    pub fn simple(
+        voters: usize,
+        positions: usize,
+        candidates: usize,
+        profile: SelectionProfile,
+    ) -> Self {
+        Self {
+            election_id: "election-2026".into(),
+            election_name: "election-2026".into(),
+            threshold: 3,
+            trustees: 5,
+            trustee_names: (1..=5u32).map(|i| i.to_string()).collect(),
+            voters,
+            positions,
+            candidates,
+            profile,
+        }
+    }
 }
 
 /// Philippine multi-position ballot labels (paper §3.4: President, Vice
@@ -389,22 +454,32 @@ fn select_candidate(
     }
 }
 
-pub(crate) fn multi_position_fixture(
-    voters: usize,
-    positions: usize,
-    candidates: usize,
-    profile: SelectionProfile,
-) -> ElectionFixture {
+pub(crate) fn multi_position_fixture(params: &GenParams) -> ElectionFixture {
+    let voters = params.voters;
+    let positions = params.positions;
+    let candidates = params.candidates;
+    let profile = params.profile;
     assert!(
         voters >= 1 && positions >= 1 && candidates >= 1,
         "multi_position_fixture needs non-empty dimensions"
+    );
+    assert!(
+        params.threshold >= 1 && params.threshold <= params.trustees,
+        "multi_position_fixture needs 1 <= threshold <= trustees"
+    );
+    assert_eq!(
+        params.trustee_names.len(),
+        params.trustees,
+        "trustee_names must align with trustees"
     );
     let mut rng = OsRng;
 
     // -- election parameters (position-qualified contests) -----------------
 
-    let trustee_ids: Vec<String> = (1..=5).map(|i: u32| i.to_string()).collect();
-    let threshold: u32 = 3;
+    let trustee_ids: Vec<String> = (1..=params.trustees as u32)
+        .map(|i| i.to_string())
+        .collect();
+    let threshold: u32 = params.threshold as u32;
     let mut contest_ids: Vec<String> = Vec::with_capacity(positions * candidates);
     for p in 0..positions {
         for k in 0..candidates {
@@ -413,15 +488,15 @@ pub(crate) fn multi_position_fixture(
     }
     let parameters = ElectionParameters {
         version: WIRE_VERSION,
-        election_id: "election-2026".into(),
+        election_id: params.election_id.clone(),
         contest_ids: contest_ids.clone(),
         trustee_ids: trustee_ids.clone(),
         threshold,
     };
 
-    // -- DKG (same deterministic dealers as happy_path) --------------------
+    // -- DKG (t-of-n; deterministic dealers as happy_path) -----------------
 
-    let config = DkgConfig::default_3_of_5();
+    let config = DkgConfig::new(params.threshold, params.trustees).expect("valid t-of-n");
     let dealers: Vec<Dealer> = (1..=config.trustees)
         .map(|dealer_id| {
             Dealer::new(
@@ -602,6 +677,8 @@ pub(crate) fn multi_position_fixture(
         issuer_public_key: issuer_pk,
         ground_truth,
         voter_ids,
+        election_name: params.election_name.clone(),
+        trustee_names: params.trustee_names.clone(),
     }
 }
 
@@ -657,7 +734,7 @@ mod tally_selection_tests {
         // The fixture's ground_truth must equal a from-scratch recount of what
         // each voter selected — proving it is derived from the recorded
         // selections, not co-produced with the ciphertexts.
-        let f = multi_position_fixture(4, 2, 3, SelectionProfile::Skewed);
+        let f = multi_position_fixture(&GenParams::simple(4, 2, 3, SelectionProfile::Skewed));
         let mut recount = vec![0u64; f.parameters.contest_ids.len()];
         for voter_idx in 0..4 {
             for p in 0..2 {
@@ -671,5 +748,31 @@ mod tally_selection_tests {
         );
         // One selection per (voter, position): total == voters * positions.
         assert_eq!(f.ground_truth.iter().sum::<u64>(), 4 * 2);
+    }
+
+    #[test]
+    fn parameterized_fixture_honors_trustees_and_name() {
+        let p = GenParams {
+            election_id: "midterm-2026".into(),
+            election_name: "Midterm 2026".into(),
+            threshold: 2,
+            trustees: 3,
+            trustee_names: vec!["Alice".into(), "Bob".into(), "Carol".into()],
+            voters: 4,
+            positions: 2,
+            candidates: 2,
+            profile: SelectionProfile::Uniform,
+        };
+        let f = multi_position_fixture(&p);
+        assert_eq!(f.parameters.election_id, "midterm-2026");
+        assert_eq!(f.parameters.trustee_ids.len(), 3);
+        assert_eq!(f.parameters.threshold, 2);
+        // one ballot per (voter, position)
+        assert_eq!(f.ballots.len(), 4 * 2);
+        // one partial decryption per (contest, trustee): 2 positions × 2 cand × 3
+        assert_eq!(f.partial_decryptions.len(), 2 * 2 * 3);
+        // display metadata carried through to the fixture (for the stream header)
+        assert_eq!(f.election_name, "Midterm 2026");
+        assert_eq!(f.trustee_names, vec!["Alice", "Bob", "Carol"]);
     }
 }

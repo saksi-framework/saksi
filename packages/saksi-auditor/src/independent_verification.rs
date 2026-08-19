@@ -15,11 +15,11 @@
 //! ballot ciphertext/proof, tally total, dropped ballot, reordered ballots,
 //! partial-decryption share, and DKG transcript.
 
-use crate::fixtures::{multi_position_fixture, SelectionProfile};
+use crate::fixtures::{multi_position_fixture, GenParams, SelectionProfile};
 use crate::{audit, AuditStatus};
 
 fn fixture() -> crate::fixtures::ElectionFixture {
-    multi_position_fixture(4, 2, 2, SelectionProfile::Uniform)
+    multi_position_fixture(&GenParams::simple(4, 2, 2, SelectionProfile::Uniform))
 }
 
 /// Positive: from the public record alone (no ground truth) the verifier

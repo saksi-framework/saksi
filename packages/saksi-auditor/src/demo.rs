@@ -27,9 +27,14 @@ use saksi_crypto::group::{compress_point, point_from_compressed};
 use saksi_protocol::{Ballot, DKGTranscript, ElectionParameters, PartialDecryption, TallyResult};
 
 use crate::fixtures::{
-    happy_path_fixture, multi_position_fixture, ph_position_id, ElectionFixture, SelectionProfile,
+    happy_path_fixture, multi_position_fixture, ph_position_id, ElectionFixture,
 };
 use crate::{audit, AuditReport, ElectionArtifacts};
+
+/// Re-export the generator's parameter types at the crate's public `demo` surface
+/// so the `saksi-demo` CLI (a separate crate) can construct them — the `fixtures`
+/// module itself is `pub(crate)`, so these would otherwise be unreachable.
+pub use crate::fixtures::{GenParams, SelectionProfile};
 
 /// Serializes a built [`ElectionFixture`] into the pretty-printed JSON bundle of
 /// hex-encoded wire messages (the shape the Go `saksi-console` submits). Also
@@ -93,7 +98,7 @@ pub fn election_bundle_json_params(
     } else {
         SelectionProfile::Uniform
     };
-    let f = multi_position_fixture(voters, positions, candidates, profile);
+    let f = multi_position_fixture(&GenParams::simple(voters, positions, candidates, profile));
     validate_population(&f, voters, positions, candidates)?;
     Ok(fixture_to_bundle_json(&f, positions, candidates))
 }
@@ -116,7 +121,7 @@ pub fn write_election_stream_params(
     } else {
         SelectionProfile::Uniform
     };
-    let f = multi_position_fixture(voters, positions, candidates, profile);
+    let f = multi_position_fixture(&GenParams::simple(voters, positions, candidates, profile));
     validate_population(&f, voters, positions, candidates)?;
     crate::stream::write_election_stream(dir, &f, positions, candidates)
 }
@@ -361,7 +366,7 @@ mod tests {
     fn gate_rejects_duplicated_nullifier() {
         // Corrupt the population by forcing two ballots to share a position's
         // nullifier — the gate must reject before anything reaches the network.
-        let mut f = multi_position_fixture(3, 2, 2, SelectionProfile::Uniform);
+        let mut f = multi_position_fixture(&GenParams::simple(3, 2, 2, SelectionProfile::Uniform));
         let dup = f.ballots[0].credential_presentation.clone();
         f.ballots[1].credential_presentation = dup;
         let err = validate_population(&f, 3, 2, 2).expect_err("must reject dup nullifier");
@@ -372,7 +377,7 @@ mod tests {
     fn gate_rejects_out_of_range_selection() {
         // A ballot with the wrong number of ciphertexts (selection not in the
         // position's candidate range) fails the gate.
-        let mut f = multi_position_fixture(3, 2, 2, SelectionProfile::Uniform);
+        let mut f = multi_position_fixture(&GenParams::simple(3, 2, 2, SelectionProfile::Uniform));
         f.ballots[0].ciphertexts.pop();
         let err = validate_population(&f, 3, 2, 2).expect_err("must reject bad shape");
         assert!(err.contains("ciphertexts"), "unexpected error: {err}");
@@ -431,7 +436,7 @@ mod tests {
     fn gate_rejects_broken_voter_id_repetition() {
         // Corrupt the synthetic voter ids so one voter appears twice within a
         // position (paper: one record per voter per position) — the gate rejects.
-        let mut f = multi_position_fixture(3, 2, 2, SelectionProfile::Uniform);
+        let mut f = multi_position_fixture(&GenParams::simple(3, 2, 2, SelectionProfile::Uniform));
         // voter_ids are voter-major [v0,v0,v1,v1,v2,v2]; index 0 and 2 are both
         // the "president" position. Point index 0 at voter-1 → voter-1 twice in
         // that position.
@@ -444,7 +449,7 @@ mod tests {
     fn gate_rejects_tampered_ground_truth() {
         // If the per-position aggregate no longer equals the ballot count, the
         // gate refuses (guards against a generator that miscounts selections).
-        let mut f = multi_position_fixture(3, 2, 2, SelectionProfile::Uniform);
+        let mut f = multi_position_fixture(&GenParams::simple(3, 2, 2, SelectionProfile::Uniform));
         f.ground_truth[0] += 1;
         let err = validate_population(&f, 3, 2, 2).expect_err("must reject bad ground truth");
         assert!(err.contains("aggregate"), "unexpected error: {err}");

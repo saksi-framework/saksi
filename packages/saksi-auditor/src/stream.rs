@@ -212,7 +212,7 @@ fn tmp_path(path: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fixtures::{multi_position_fixture, SelectionProfile};
+    use crate::fixtures::{multi_position_fixture, GenParams, SelectionProfile};
 
     /// A temp dir under the crate's target dir — no external tempfile dep.
     fn scratch(name: &str) -> PathBuf {
@@ -224,7 +224,7 @@ mod tests {
     #[test]
     fn stream_round_trips_and_passes_the_gate() {
         let dir = scratch("roundtrip");
-        let f = multi_position_fixture(4, 2, 2, SelectionProfile::Uniform);
+        let f = multi_position_fixture(&GenParams::simple(4, 2, 2, SelectionProfile::Uniform));
         let expected_ballots = f.ballots.len();
 
         write_election_stream(&dir, &f, 2, 2).expect("write stream");
@@ -271,7 +271,7 @@ mod tests {
     #[test]
     fn gate_rejects_a_truncated_ballot_stream() {
         let dir = scratch("truncated");
-        let f = multi_position_fixture(4, 2, 2, SelectionProfile::Uniform);
+        let f = multi_position_fixture(&GenParams::simple(4, 2, 2, SelectionProfile::Uniform));
         write_election_stream(&dir, &f, 2, 2).expect("write stream");
 
         // Simulate a disk-full / killed-mid-write stream: drop the last line
@@ -294,7 +294,7 @@ mod tests {
     #[test]
     fn gate_rejects_a_corrupt_hex_line() {
         let dir = scratch("corrupt");
-        let f = multi_position_fixture(3, 1, 2, SelectionProfile::Uniform);
+        let f = multi_position_fixture(&GenParams::simple(3, 1, 2, SelectionProfile::Uniform));
         write_election_stream(&dir, &f, 1, 2).expect("write stream");
 
         let path = dir.join(BALLOTS_FILE);
@@ -344,7 +344,7 @@ mod tests {
     #[test]
     fn writing_is_atomic_leaving_no_tmp_files_behind() {
         let dir = scratch("atomic");
-        let f = multi_position_fixture(2, 1, 2, SelectionProfile::Uniform);
+        let f = multi_position_fixture(&GenParams::simple(2, 1, 2, SelectionProfile::Uniform));
         write_election_stream(&dir, &f, 1, 2).expect("write stream");
 
         for entry in fs::read_dir(&dir).expect("read dir") {

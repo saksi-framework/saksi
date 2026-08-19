@@ -29,7 +29,7 @@
 
 use std::collections::HashSet;
 
-use crate::fixtures::{multi_position_fixture, SelectionProfile};
+use crate::fixtures::{multi_position_fixture, GenParams, SelectionProfile};
 use crate::{audit, AuditStatus};
 
 // ---------------------------------------------------------------------------
@@ -39,7 +39,7 @@ use crate::{audit, AuditStatus};
 #[test]
 fn malicious_bb_node_dropping_a_committed_ballot_is_detected() {
     // Positive control: the full recorded set audits clean.
-    let full = multi_position_fixture(4, 2, 2, SelectionProfile::Uniform);
+    let full = multi_position_fixture(&GenParams::simple(4, 2, 2, SelectionProfile::Uniform));
     assert!(
         audit(full.artifacts()).passed(),
         "positive control: the untampered recorded set must audit clean"
@@ -50,7 +50,8 @@ fn malicious_bb_node_dropping_a_committed_ballot_is_detected() {
     // no longer sum to the published tally, so the auditor's homomorphic-sum
     // check catches it. (1-org framing: the auditor DETECTS tampering; it does
     // not prevent it — that would need live multi-peer BFT, out of thesis scope.)
-    let mut tampered = multi_position_fixture(4, 2, 2, SelectionProfile::Uniform);
+    let mut tampered =
+        multi_position_fixture(&GenParams::simple(4, 2, 2, SelectionProfile::Uniform));
     tampered.ballots.remove(0); // voter 0's position-0 record
     let report = audit(tampered.artifacts());
     assert_eq!(
@@ -72,7 +73,7 @@ fn malicious_bb_node_reordering_ballots_is_detected_by_ledger_digest() {
     // Reordering does NOT change the order-independent homomorphic tally, so the
     // tally check cannot catch it — the paper's "detected by hash verification"
     // path is the order-dependent ledger digest.
-    let f = multi_position_fixture(4, 2, 2, SelectionProfile::Uniform);
+    let f = multi_position_fixture(&GenParams::simple(4, 2, 2, SelectionProfile::Uniform));
     let recorded = crate::ledger::ledger_digest(&f.ballots);
     // Positive control: recomputing over the same committed order matches.
     assert_eq!(recorded, crate::ledger::ledger_digest(&f.ballots));
@@ -88,7 +89,8 @@ fn malicious_bb_node_reordering_ballots_is_detected_by_ledger_digest() {
 
     // And confirm the tally really is order-blind, so the digest is the ONLY
     // detector of a pure reorder: reverse a fresh fixture's ballots and audit.
-    let mut reordered = multi_position_fixture(4, 2, 2, SelectionProfile::Uniform);
+    let mut reordered =
+        multi_position_fixture(&GenParams::simple(4, 2, 2, SelectionProfile::Uniform));
     reordered.ballots.reverse();
     assert!(
         audit(reordered.artifacts()).passed(),
@@ -103,7 +105,7 @@ fn malicious_bb_node_reordering_ballots_is_detected_by_ledger_digest() {
 #[test]
 fn sub_threshold_decryption_fails_but_full_threshold_succeeds() {
     // Positive control: threshold-many partial decryptions decrypt the tally.
-    let full = multi_position_fixture(3, 1, 2, SelectionProfile::Uniform);
+    let full = multi_position_fixture(&GenParams::simple(3, 1, 2, SelectionProfile::Uniform));
     assert!(
         audit(full.artifacts()).passed(),
         "positive control: full threshold must audit clean"
@@ -112,7 +114,8 @@ fn sub_threshold_decryption_fails_but_full_threshold_succeeds() {
     // Attack: keep fewer than `threshold` (3) partial decryptions per contest so
     // no contest can be recombined. Drop every partial from trustees "3".."5",
     // leaving 2 < threshold.
-    let mut starved = multi_position_fixture(3, 1, 2, SelectionProfile::Uniform);
+    let mut starved =
+        multi_position_fixture(&GenParams::simple(3, 1, 2, SelectionProfile::Uniform));
     starved
         .partial_decryptions
         .retain(|p| p.trustee_id == "1" || p.trustee_id == "2");
@@ -139,7 +142,7 @@ fn sub_threshold_decryption_fails_but_full_threshold_succeeds() {
 #[test]
 fn malicious_admin_altering_a_contest_id_is_detected() {
     // Positive control: honest parameters audit clean.
-    let honest = multi_position_fixture(3, 2, 2, SelectionProfile::Uniform);
+    let honest = multi_position_fixture(&GenParams::simple(3, 2, 2, SelectionProfile::Uniform));
     assert!(
         audit(honest.artifacts()).passed(),
         "positive control: honest parameters must audit clean"
@@ -148,7 +151,8 @@ fn malicious_admin_altering_a_contest_id_is_detected() {
     // Attack: a malicious admin rewrites a contest id after the ballots were
     // proven against the original. The CDS proofs are bound to the original
     // contest id (binding_context), so the mutated parameters break verification.
-    let mut tampered = multi_position_fixture(3, 2, 2, SelectionProfile::Uniform);
+    let mut tampered =
+        multi_position_fixture(&GenParams::simple(3, 2, 2, SelectionProfile::Uniform));
     tampered.parameters.contest_ids[0] = "pos0/tampered".to_owned();
     let report = audit(tampered.artifacts());
     assert_eq!(
@@ -174,7 +178,7 @@ fn on_chain_ballot_record_carries_no_voter_identity() {
     // Acknowledged + out of scope: two ballots from the SAME credential share
     // the commitment, so they are linkable to each other — but not to an
     // identity, and different voters never share a commitment.
-    let f = multi_position_fixture(3, 1, 2, SelectionProfile::Uniform);
+    let f = multi_position_fixture(&GenParams::simple(3, 1, 2, SelectionProfile::Uniform));
 
     let commitments: HashSet<Vec<u8>> = f
         .ballots
@@ -219,7 +223,7 @@ fn only_the_aggregate_is_decrypted_never_an_individual_ballot() {
     // result is contest-granular (the homomorphic aggregate), never a per-ballot
     // plaintext. There is no code path that decrypts a single ciphertext — the
     // Lagrange-combine in `tally.rs` operates on the summed aggregate pad only.
-    let f = multi_position_fixture(5, 1, 2, SelectionProfile::Uniform);
+    let f = multi_position_fixture(&GenParams::simple(5, 1, 2, SelectionProfile::Uniform));
     assert!(audit(f.artifacts()).passed());
 
     // The tally has one total per contest (aggregate granularity), strictly
@@ -255,7 +259,7 @@ fn privacy_linkage_attempt_fails_over_the_anonymity_set() {
     // no on-chain field joins to a registration identifier, so the best the
     // adversary can do is guess, bounded by 1 / (anonymity-set size).
     let voters = 5usize;
-    let f = multi_position_fixture(voters, 1, 2, SelectionProfile::Uniform);
+    let f = multi_position_fixture(&GenParams::simple(voters, 1, 2, SelectionProfile::Uniform));
 
     // The registration list (off-chain, synthetic) — the identifiers the
     // adversary tries to attach to on-chain ballots.
