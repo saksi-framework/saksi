@@ -1,5 +1,7 @@
 {
   "election_id": "stream-fixture-election",
+  "election_name": "Stream Fixture Election",
+  "trustee_names": ["Trustee 1", "Trustee 2", "Trustee 3", "Trustee 4", "Trustee 5"],
   "params": "0a1773747265616d2d666978747572652d656c656374696f6e",
   "dkg": "0a1773747265616d2d666978747572652d656c656374696f6e",
   "issuer_pk": "e2f2ae0a6abc4e71a884a961c500515f58e30b6aa582dd8db6a65945e08d2d76",

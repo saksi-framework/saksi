@@ -62,12 +62,9 @@ pub(crate) struct ElectionFixture {
     pub(crate) voter_ids: Vec<String>,
     /// Display-only election name (stream header metadata; not bound into any
     /// proof). Equals `election_id` for the back-compat `simple` path.
-    // ponytail: read by the stream header in Task 3; allow until then.
-    #[allow(dead_code)]
     pub(crate) election_name: String,
     /// Display-only trustee names, aligned to `parameters.trustee_ids` (stream
     /// header metadata; not on the wire). `"1".."n"` for the back-compat path.
-    #[allow(dead_code)]
     pub(crate) trustee_names: Vec<String>,
 }
 

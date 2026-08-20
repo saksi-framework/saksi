@@ -52,6 +52,15 @@ pub const BALLOTS_FILE: &str = "ballots.ndjson";
 pub struct StreamHeader {
     /// Election id, duplicated out of `params` for cheap identification.
     pub election_id: String,
+    /// Display-only election name (console/header metadata; NOT bound into any
+    /// proof). `#[serde(default)]` so a pre-existing v1 stream without it still
+    /// parses — the field is additive within v1, not a wire break.
+    #[serde(default)]
+    pub election_name: String,
+    /// Display-only trustee names, aligned to the election's trustee ids (header
+    /// metadata; not on the wire). `#[serde(default)]` for the same reason.
+    #[serde(default)]
+    pub trustee_names: Vec<String>,
     /// Hex-encoded `ElectionParameters`.
     pub params: String,
     /// Hex-encoded `DKGTranscript`.
@@ -113,6 +122,8 @@ pub(crate) fn write_election_stream(
     // -- header.json -------------------------------------------------------
     let header = StreamHeader {
         election_id: art.parameters.election_id.clone(),
+        election_name: f.election_name.clone(),
+        trustee_names: f.trustee_names.clone(),
         params: hex::encode(art.parameters.encode_to_vec()),
         dkg: hex::encode(art.dkg_transcript.encode_to_vec()),
         issuer_pk: hex::encode(compress_point(art.issuer_public_key.as_point())),
@@ -233,6 +244,10 @@ mod tests {
         assert_eq!(header.n, expected_ballots, "header.n == ballots written");
         assert_eq!(header.positions, 2);
         assert_eq!(header.candidates, 2);
+        // Display metadata carried through (simple() defaults: name = election_id,
+        // trustee names "1".."5").
+        assert_eq!(header.election_name, "election-2026");
+        assert_eq!(header.trustee_names, vec!["1", "2", "3", "4", "5"]);
         assert_eq!(header.ground_truth.len(), 4, "positions*candidates");
         assert_eq!(header.voter_ids.len(), expected_ballots);
         assert!(!header.params.is_empty() && !header.dkg.is_empty());
@@ -330,6 +345,8 @@ mod tests {
 
         let header = read_header(&dir).expect("pinned header.json parses");
         assert_eq!(header.election_id, "stream-fixture-election");
+        assert_eq!(header.election_name, "Stream Fixture Election");
+        assert_eq!(header.trustee_names.len(), 5);
         assert_eq!(header.n, 4);
         assert_eq!(header.positions, 2);
         assert_eq!(header.candidates, 2);
@@ -342,6 +359,21 @@ mod tests {
             verify_stream(&dir).expect("pinned fixture passes the N-count gate"),
             4
         );
+    }
+
+    #[test]
+    fn header_without_display_fields_still_parses_v1_compat() {
+        // A pre-existing v1 header (written before election_name/trustee_names
+        // existed) must still deserialize — the two fields are additive via
+        // serde(default), not a wire break.
+        let legacy = r#"{
+            "election_id":"e","params":"00","dkg":"00","issuer_pk":"00",
+            "binding_context":"00","partial_decryptions":[],"tally":"00",
+            "ground_truth":[0],"voter_ids":["v"],"positions":1,"candidates":1,"n":1
+        }"#;
+        let h: StreamHeader = serde_json::from_str(legacy).expect("legacy v1 header parses");
+        assert_eq!(h.election_name, "");
+        assert!(h.trustee_names.is_empty());
     }
 
     #[test]
