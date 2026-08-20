@@ -90,6 +90,9 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Test Rust workspace
+        # Includes the saksi-demo gen->audit-stream integration test
+        # (tests/gen_audit_stream.rs) — the Rust<->Go contract gate for the
+        # Research Election Console: it runs the real binary end-to-end.
         run: cargo test --workspace
 
       - name: Set up Go

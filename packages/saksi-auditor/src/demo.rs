@@ -29,7 +29,45 @@ use saksi_protocol::{Ballot, DKGTranscript, ElectionParameters, PartialDecryptio
 use crate::fixtures::{
     happy_path_fixture, multi_position_fixture, ph_position_id, ElectionFixture,
 };
-use crate::{audit, AuditReport, ElectionArtifacts};
+use crate::{audit, AuditReport, AuditStatus, ElectionArtifacts};
+
+/// Machine-readable per-contest correctness for one contest: the seeded
+/// `ground_truth`, the `decoded` tally the auditor verified, `E = decoded −
+/// ground_truth`, and whether this contest passed (audit clean AND `E == 0`).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ContestCorrectness {
+    /// Position-qualified contest id.
+    pub contest: String,
+    /// Seeded ground-truth total for this contest.
+    pub ground_truth: u64,
+    /// Decoded/published tally the auditor verified (equals the homomorphic
+    /// decode when the audit passes; a divergence fails the audit).
+    pub decoded: u64,
+    /// `decoded − ground_truth` (0 on a correct run).
+    #[serde(rename = "E")]
+    pub e: i64,
+    /// This contest is correct: the overall audit passed AND `E == 0`.
+    pub pass: bool,
+}
+
+/// Machine-readable result of auditing a **stream run folder** — the structured
+/// output the console's Verify phase consumes instead of string-parsing the
+/// human-readable audit findings.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct StreamAudit {
+    /// `"pass"` iff the full audit (proofs, threshold, tally, accuracy) passed.
+    pub overall: String,
+    /// Per-contest correctness rows.
+    pub contests: Vec<ContestCorrectness>,
+}
+
+impl StreamAudit {
+    /// Serialize to pretty JSON — the `saksi-demo audit-stream --json` output the
+    /// console's Verify phase parses. Keeps `serde_json` out of `saksi-demo`.
+    pub fn to_json(&self) -> String {
+        serde_json::to_string_pretty(self).expect("StreamAudit serializes")
+    }
+}
 
 /// Re-export the generator's parameter types at the crate's public `demo` surface
 /// so the `saksi-demo` CLI (a separate crate) can construct them — the `fixtures`
@@ -350,6 +388,97 @@ pub fn audit_bundle_json(bundle: &str) -> Result<AuditReport, String> {
     Ok(audit(artifacts))
 }
 
+/// Audits a **stream run folder** (`header.json` + `ballots.ndjson`, the shape
+/// [`write_election_stream_params`] writes) and projects the result into
+/// [`StreamAudit`] — structured per-contest correctness the console's Verify
+/// phase consumes without parsing finding strings.
+///
+/// Reconstructs the auditor's [`ElectionArtifacts`] by hex-decoding the header's
+/// embedded protobuf (params/dkg/issuer_pk/binding_context/partial_decryptions/
+/// tally) plus the streamed ballots, runs the full audit, then reports per
+/// contest `{ground_truth, decoded, E, pass}`. `decoded` is the published tally
+/// the audit verified equals the homomorphic decode; a divergence fails the
+/// audit, so `pass` (= overall clean AND `E == 0`) never reports a false green.
+pub fn audit_stream_dir(dir: &std::path::Path) -> Result<StreamAudit, String> {
+    let header = crate::stream::read_header(dir)?;
+    let hexd = |s: &str, what: &str| hex::decode(s).map_err(|e| format!("{what} not hex: {e}"));
+
+    let parameters = ElectionParameters::decode(&hexd(&header.params, "params")?[..])
+        .map_err(|e| format!("decode params: {e}"))?;
+    let dkg_transcript = DKGTranscript::decode(&hexd(&header.dkg, "dkg")?[..])
+        .map_err(|e| format!("decode dkg: {e}"))?;
+    let issuer_bytes: [u8; 32] = hexd(&header.issuer_pk, "issuer_pk")?
+        .try_into()
+        .map_err(|_| "issuer_pk is not 32 bytes".to_string())?;
+    let issuer_public_key = IssuerPublicKey(
+        point_from_compressed(issuer_bytes).map_err(|_| "issuer_pk is not a valid point")?,
+    );
+    let binding_context = hexd(&header.binding_context, "binding_context")?;
+    let tally = TallyResult::decode(&hexd(&header.tally, "tally")?[..])
+        .map_err(|e| format!("decode tally: {e}"))?;
+    let partial_decryptions: Vec<PartialDecryption> = header
+        .partial_decryptions
+        .iter()
+        .map(|p| {
+            PartialDecryption::decode(&hexd(p, "partial_decryption")?[..])
+                .map_err(|e| format!("decode partial: {e}"))
+        })
+        .collect::<Result<_, String>>()?;
+
+    // Ballots stream from ballots.ndjson (hex-protobuf, one per line).
+    let ballots_path = dir.join(crate::stream::BALLOTS_FILE);
+    let raw = std::fs::read_to_string(&ballots_path)
+        .map_err(|e| format!("read {}: {e}", ballots_path.display()))?;
+    let mut ballots: Vec<Ballot> = Vec::new();
+    for (i, line) in raw.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let bytes = hex::decode(line).map_err(|e| format!("ballot line {} not hex: {e}", i + 1))?;
+        ballots
+            .push(Ballot::decode(&bytes[..]).map_err(|e| format!("decode ballot {}: {e}", i + 1))?);
+    }
+
+    let ground_truth = header.ground_truth.clone();
+    let report = audit(ElectionArtifacts {
+        parameters: &parameters,
+        dkg_transcript: &dkg_transcript,
+        ballots: &ballots,
+        partial_decryptions: &partial_decryptions,
+        tally: &tally,
+        binding_context: &binding_context,
+        issuer_public_key: &issuer_public_key,
+        ground_truth: Some(&ground_truth),
+    });
+    let overall_pass = report.overall == AuditStatus::Pass;
+
+    let contests = parameters
+        .contest_ids
+        .iter()
+        .enumerate()
+        .map(|(c, contest_id)| {
+            let gt = ground_truth.get(c).copied().unwrap_or(0);
+            let decoded = tally.totals.get(c).copied().unwrap_or(0);
+            let e = decoded as i64 - gt as i64;
+            ContestCorrectness {
+                contest: contest_id.clone(),
+                ground_truth: gt,
+                decoded,
+                e,
+                // A tampered proof elsewhere fails the whole audit, so a contest
+                // is correct only when the audit is clean AND its own E == 0.
+                pass: overall_pass && e == 0,
+            }
+        })
+        .collect();
+
+    Ok(StreamAudit {
+        overall: if overall_pass { "pass" } else { "fail" }.to_string(),
+        contests,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -411,6 +540,49 @@ mod tests {
         };
         let err = election_bundle_json_params(&p).expect_err("t>n must be rejected");
         assert!(err.contains("threshold"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn audit_stream_dir_reports_zero_error_on_clean_run() {
+        let dir = std::env::temp_dir().join("saksi-audit-stream-clean");
+        let _ = std::fs::remove_dir_all(&dir);
+        let p = GenParams::simple(6, 2, 2, SelectionProfile::Uniform);
+        write_election_stream_params(&dir, &p).expect("write stream");
+
+        let sa = audit_stream_dir(&dir).expect("audits");
+        assert_eq!(sa.overall, "pass");
+        assert_eq!(sa.contests.len(), 2 * 2, "one row per contest slot");
+        assert!(
+            sa.contests
+                .iter()
+                .all(|c| c.e == 0 && c.decoded == c.ground_truth && c.pass),
+            "clean run: every contest E=0 and pass: {sa:#?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn audit_stream_dir_flags_tampered_ground_truth() {
+        let dir = std::env::temp_dir().join("saksi-audit-stream-tamper");
+        let _ = std::fs::remove_dir_all(&dir);
+        write_election_stream_params(&dir, &GenParams::simple(4, 1, 2, SelectionProfile::Uniform))
+            .expect("write stream");
+
+        // Corrupt the seeded ground truth in the header: the accuracy check must
+        // now fail and the corresponding contest reports E != 0, pass = false.
+        let hp = dir.join(crate::stream::HEADER_FILE);
+        let raw = std::fs::read_to_string(&hp).expect("read header");
+        let mut v: serde_json::Value = serde_json::from_str(&raw).expect("parse header");
+        v["ground_truth"][0] = serde_json::json!(999);
+        std::fs::write(&hp, serde_json::to_string_pretty(&v).expect("reser")).expect("rewrite");
+
+        let sa = audit_stream_dir(&dir).expect("audits (and reports a failure)");
+        assert_eq!(sa.overall, "fail");
+        assert!(
+            sa.contests.iter().any(|c| c.e != 0 && !c.pass),
+            "a tampered contest must report E != 0 and pass = false: {sa:#?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -14,3 +14,7 @@ path = "src/main.rs"
 
 [dependencies]
 saksi-auditor = { path = "../saksi-auditor", features = ["demo"] }
+
+[dev-dependencies]
+# The gen→audit-stream integration test parses the --json correctness output.
+serde_json = "1"
