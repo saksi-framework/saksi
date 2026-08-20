@@ -2,13 +2,47 @@ package campaign
 
 import (
 	"context"
+	"encoding/hex"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+
+	pb "github.com/saksi-framework/saksi/packages/saksi-protocol/go/saksiprotocolv1"
+	"google.golang.org/protobuf/proto"
 )
+
+// writeFakeStream writes a header.json + ballots.ndjson with n real (minimal)
+// protobuf ballots — enough for Generate's CSV derivation to decode.
+func writeFakeStream(t *testing.T, dir string, n int) {
+	t.Helper()
+	var lines []string
+	for i := 0; i < n; i++ {
+		b := &pb.Ballot{
+			ElectionId: "test", PositionId: "president",
+			CredentialPresentation: &pb.CredentialPresentation{
+				Nullifier: &pb.Nullifier{Value: []byte{byte(i + 1)}},
+			},
+		}
+		raw, err := proto.Marshal(b)
+		if err != nil {
+			t.Fatalf("marshal ballot: %v", err)
+		}
+		lines = append(lines, hex.EncodeToString(raw))
+	}
+	if err := os.WriteFile(filepath.Join(dir, "ballots.ndjson"),
+		[]byte(strings.Join(lines, "\n")+"\n"), 0o644); err != nil {
+		t.Fatalf("write ndjson: %v", err)
+	}
+	header := fmt.Sprintf(`{"election_id":"test","election_name":"Test Election",`+
+		`"trustee_names":["A","B","C"],"partial_decryptions":["aa","bb"],`+
+		`"ground_truth":[3,3],"positions":1,"candidates":2,"n":%d}`, n)
+	if err := os.WriteFile(filepath.Join(dir, "header.json"), []byte(header), 0o644); err != nil {
+		t.Fatalf("write header: %v", err)
+	}
+}
 
 func argAfter(args []string, flag string) string {
 	for i, a := range args {
@@ -38,19 +72,30 @@ func TestGenerateWritesStreamFiles(t *testing.T) {
 	var gotArgs []string
 	e.run = func(_ context.Context, _ string, args ...string) ([]byte, error) {
 		gotArgs = args
-		d := argAfter(args, "--stream")
-		_ = os.WriteFile(filepath.Join(d, "header.json"), []byte(`{"n":1}`), 0o644)
-		_ = os.WriteFile(filepath.Join(d, "ballots.ndjson"), []byte("00\n"), 0o644)
+		writeFakeStream(t, argAfter(args, "--stream"), 3)
 		return nil, nil
 	}
 
 	if err := e.Generate(context.Background(), runID, good()); err != nil {
 		t.Fatalf("Generate: %v", err)
 	}
-	for _, f := range []string{"header.json", "ballots.ndjson"} {
+	// Stream files + the derived CSVs are all written.
+	for _, f := range []string{"header.json", "ballots.ndjson", BallotsCSV, ElectionCSV} {
 		if _, err := os.Stat(filepath.Join(dir, f)); err != nil {
 			t.Fatalf("%s not written: %v", f, err)
 		}
+	}
+	// ballots.csv has a header + one row per ballot.
+	bc, _ := os.ReadFile(filepath.Join(dir, BallotsCSV))
+	blines := strings.Split(strings.TrimSpace(string(bc)), "\n")
+	if len(blines) != 4 || !strings.HasPrefix(blines[0], "index,election_id,position_id") {
+		t.Fatalf("ballots.csv malformed: %q", string(bc))
+	}
+	// election.csv is a header + a single summary row.
+	ec, _ := os.ReadFile(filepath.Join(dir, ElectionCSV))
+	if !strings.Contains(string(ec), "election_id,election_name,trustees,threshold") ||
+		len(strings.Split(strings.TrimSpace(string(ec)), "\n")) != 2 {
+		t.Fatalf("election.csv malformed: %q", string(ec))
 	}
 	// The config was mapped to the expected flags.
 	joined := strings.Join(gotArgs, " ")

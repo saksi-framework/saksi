@@ -21,12 +21,16 @@ var webFS embed.FS
 // exportOrder is the downloadable run artifacts, in display order. exportAllowlist
 // is derived from it — no arbitrary path is ever served via /export.
 var exportOrder = []string{
-	RunFile,
-	"header.json",
-	"ballots.ndjson",
+	// Study data — proper CSVs, shown first.
+	ElectionCSV,
+	BallotsCSV,
 	CorrectnessFile,
 	NegativeTestsFile,
 	"perf.csv",
+	// Raw artifacts — kept for re-audit / provenance.
+	"header.json",
+	"ballots.ndjson",
+	RunFile,
 }
 
 var exportAllowlist = func() map[string]bool {

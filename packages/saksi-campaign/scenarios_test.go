@@ -50,6 +50,18 @@ func TestScenariosRejectTheirMutations(t *testing.T) {
 	if err := e.Generate(ctx, runID, c); err != nil {
 		t.Fatalf("generate: %v", err)
 	}
+	// Real ballots flatten into ballots.csv: header + one row per (voter, position).
+	bc, err := os.ReadFile(filepath.Join(srcDir, BallotsCSV))
+	if err != nil {
+		t.Fatalf("ballots.csv: %v", err)
+	}
+	if got := len(strings.Split(strings.TrimSpace(string(bc)), "\n")); got != 1+c.Voters*c.Positions {
+		t.Fatalf("ballots.csv rows = %d, want %d", got, 1+c.Voters*c.Positions)
+	}
+	if _, err := os.Stat(filepath.Join(srcDir, ElectionCSV)); err != nil {
+		t.Fatalf("election.csv not written: %v", err)
+	}
+
 	// Sanity: the clean run audits pass.
 	if sa, err := e.Verify(ctx, runID); err != nil || sa.Overall != "pass" {
 		t.Fatalf("clean run must verify pass: %v %+v", err, sa)

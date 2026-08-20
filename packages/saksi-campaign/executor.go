@@ -102,7 +102,13 @@ func (e *Executor) Generate(ctx context.Context, runID string, c ElectionConfig)
 		e.publish(runID, "generate", "error", err.Error())
 		return err
 	}
-	e.publish(runID, "generate", "done", "ballots generated")
+	// Flatten the stream into CSVs (ballots.csv + election.csv) so every export
+	// is a proper spreadsheet.
+	if err := writeDerivedCSVs(dir, c); err != nil {
+		e.publish(runID, "generate", "error", "csv export failed: "+err.Error())
+		return err
+	}
+	e.publish(runID, "generate", "done", "ballots generated (+ ballots.csv, election.csv)")
 	return nil
 }
 
