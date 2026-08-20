@@ -1,0 +1,91 @@
+// Package campaign is the Research Election Console: a loopback web app that
+// configures an election and runs it in independent phases (Generate | Submit |
+// Verify | Scenarios) over a run-folder store, shelling the parameterized
+// saksi-demo generator/auditor (offline) or driving the Fabric lifecycle
+// (on-chain).
+//
+// All business logic (validation, run state, correctness, scenario verdicts)
+// lives here server-side and is unit-tested; the embedded web UI is a logic-free
+// view (see server.go / web/index.html).
+package campaign
+
+import (
+	"fmt"
+	"strings"
+)
+
+// MaxTrustees is the UI/validation cap on trustee count.
+const MaxTrustees = 15
+
+// OfflineVoterCeiling caps offline-mode voters. Offline generation is not
+// parallelized, so the 50k/483k/1M tiers are on-chain/perf mode only; a
+// researcher clicking a huge offline tier gets a clear error, not a run that
+// never finishes.
+const OfflineVoterCeiling = 10000
+
+// Trustee is one DKG trustee's display identity.
+type Trustee struct {
+	Name string `json:"name"`
+}
+
+// ElectionConfig is the full console configuration for one run. It is POSTed as
+// JSON by the web UI and validated server-side.
+type ElectionConfig struct {
+	Name         string    `json:"name"`
+	Trustees     []Trustee `json:"trustees"`
+	Threshold    int       `json:"threshold"`
+	Positions    int       `json:"positions"`
+	Candidates   int       `json:"candidates"`
+	Voters       int       `json:"voters"`
+	Distribution string    `json:"distribution"` // uniform | skewed
+	Mode         string    `json:"mode"`         // offline | onchain
+}
+
+// Validate returns the first invariant violation, or nil. This is the single
+// source of truth for config validity — the UI mirrors these checks only for
+// instant feedback, never as the gate.
+func (c ElectionConfig) Validate() error {
+	if strings.TrimSpace(c.Name) == "" {
+		return fmt.Errorf("election name must not be empty")
+	}
+	n := len(c.Trustees)
+	if n < 1 || n > MaxTrustees {
+		return fmt.Errorf("trustees must be between 1 and %d (got %d)", MaxTrustees, n)
+	}
+	if c.Threshold < 1 || c.Threshold > n {
+		return fmt.Errorf("threshold must be 1..=%d (got %d)", n, c.Threshold)
+	}
+	for i, t := range c.Trustees {
+		if strings.TrimSpace(t.Name) == "" {
+			return fmt.Errorf("trustee %d has an empty name", i+1)
+		}
+	}
+	if c.Positions < 1 || c.Candidates < 1 || c.Voters < 1 {
+		return fmt.Errorf("positions, candidates, voters must each be >= 1")
+	}
+	switch c.Distribution {
+	case "uniform", "skewed":
+	default:
+		return fmt.Errorf("distribution must be 'uniform' or 'skewed' (got %q)", c.Distribution)
+	}
+	switch c.Mode {
+	case "offline", "onchain":
+	default:
+		return fmt.Errorf("mode must be 'offline' or 'onchain' (got %q)", c.Mode)
+	}
+	if c.Mode == "offline" && c.Voters > OfflineVoterCeiling {
+		return fmt.Errorf(
+			"offline mode is capped at %d voters (got %d); select on-chain/perf mode for larger tiers",
+			OfflineVoterCeiling, c.Voters)
+	}
+	return nil
+}
+
+// TrusteeNames returns the trustee display names in order.
+func (c ElectionConfig) TrusteeNames() []string {
+	names := make([]string, len(c.Trustees))
+	for i, t := range c.Trustees {
+		names[i] = t.Name
+	}
+	return names
+}

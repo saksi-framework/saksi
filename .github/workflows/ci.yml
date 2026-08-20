@@ -15,6 +15,7 @@ env:
     packages/saksi-protocol/go
     packages/saksi-bulletin/chaincode
     packages/saksi-bulletin/client-sdk
+    packages/saksi-campaign
   # Allow Go to fetch and write missing go.sum entries during CI. The repo
   # is in early scaffold and not all modules have committed go.sum yet.
   GOFLAGS: -mod=mod
