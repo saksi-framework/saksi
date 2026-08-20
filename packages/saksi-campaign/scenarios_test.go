@@ -58,8 +58,19 @@ func TestScenariosRejectTheirMutations(t *testing.T) {
 	if got := len(strings.Split(strings.TrimSpace(string(bc)), "\n")); got != 1+c.Voters*c.Positions {
 		t.Fatalf("ballots.csv rows = %d, want %d", got, 1+c.Voters*c.Positions)
 	}
-	if _, err := os.Stat(filepath.Join(srcDir, ElectionCSV)); err != nil {
+	// The evidence columns carry the actual encrypted values + hashes.
+	if !strings.Contains(string(bc), "ballot_sha256,ballot_json") {
+		t.Fatal("ballots.csv missing evidence columns (ballot_sha256, ballot_json)")
+	}
+	if !strings.Contains(string(bc), "ciphertexts") || !strings.Contains(string(bc), "well_formedness_proofs") {
+		t.Fatal("ballots.csv ballot_json must contain the actual ciphertexts + proofs")
+	}
+	ec, err := os.ReadFile(filepath.Join(srcDir, ElectionCSV))
+	if err != nil {
 		t.Fatalf("election.csv not written: %v", err)
+	}
+	if !strings.Contains(string(ec), "ballots_sha256") || !strings.Contains(string(ec), "dkg_sha256") {
+		t.Fatal("election.csv must carry provenance digests")
 	}
 
 	// Sanity: the clean run audits pass.
