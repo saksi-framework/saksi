@@ -14,7 +14,10 @@
 
 use std::process::ExitCode;
 
-use saksi_auditor::demo::{audit_bundle_json, election_bundle_json, election_bundle_json_params};
+use saksi_auditor::demo::{
+    audit_bundle_json, election_bundle_json, election_bundle_json_params, GenParams,
+    SelectionProfile,
+};
 use saksi_auditor::{AuditReport, AuditStatus};
 
 fn main() -> ExitCode {
@@ -104,7 +107,13 @@ fn cmd_gen(args: &[String]) -> ExitCode {
             positions.unwrap_or(3),
             candidates.unwrap_or(3),
         );
-        match election_bundle_json_params(v, p, c, skewed) {
+        let profile = if skewed {
+            SelectionProfile::Skewed
+        } else {
+            SelectionProfile::Uniform
+        };
+        let params = GenParams::simple(v, p, c, profile);
+        match election_bundle_json_params(&params) {
             Ok(json) => {
                 let dist = if skewed { "skewed" } else { "uniform" };
                 eprintln!(

@@ -87,20 +87,39 @@ pub fn election_bundle_json() -> String {
 /// `candidates`, one ballot record per (voter, position); ADR-0007) and returns
 /// it as a JSON bundle — **after** the fail-closed validation gate. A population
 /// that fails the gate returns `Err` and never reaches the network.
-pub fn election_bundle_json_params(
-    voters: usize,
-    positions: usize,
-    candidates: usize,
-    skewed: bool,
-) -> Result<String, String> {
-    let profile = if skewed {
-        SelectionProfile::Skewed
-    } else {
-        SelectionProfile::Uniform
-    };
-    let f = multi_position_fixture(&GenParams::simple(voters, positions, candidates, profile));
-    validate_population(&f, voters, positions, candidates)?;
-    Ok(fixture_to_bundle_json(&f, positions, candidates))
+pub fn election_bundle_json_params(params: &GenParams) -> Result<String, String> {
+    validate_params(params)?;
+    let f = multi_position_fixture(params);
+    validate_population(&f, params.voters, params.positions, params.candidates)?;
+    Ok(fixture_to_bundle_json(
+        &f,
+        params.positions,
+        params.candidates,
+    ))
+}
+
+/// Fail-closed parameter gate applied BEFORE building the fixture (the fixture
+/// itself would panic on `t > n`; this returns a graceful `Err` instead). Checks
+/// the population dimensions, the t-of-n shape, and that `trustee_names` aligns
+/// with the trustee count.
+fn validate_params(p: &GenParams) -> Result<(), String> {
+    if p.voters < 1 || p.positions < 1 || p.candidates < 1 {
+        return Err("voters, positions, candidates must each be >= 1".into());
+    }
+    if p.threshold == 0 || p.threshold > p.trustees {
+        return Err(format!(
+            "threshold must be 1..=trustees (got {}-of-{})",
+            p.threshold, p.trustees
+        ));
+    }
+    if p.trustee_names.len() != p.trustees {
+        return Err(format!(
+            "trustee_names has {} entries, expected {} (one per trustee)",
+            p.trustee_names.len(),
+            p.trustees
+        ));
+    }
+    Ok(())
 }
 
 /// Generates a parameterized multi-position election and writes it as a streamed
@@ -111,19 +130,12 @@ pub fn election_bundle_json_params(
 /// `Err` and nothing is written.
 pub fn write_election_stream_params(
     dir: &std::path::Path,
-    voters: usize,
-    positions: usize,
-    candidates: usize,
-    skewed: bool,
+    params: &GenParams,
 ) -> Result<(), String> {
-    let profile = if skewed {
-        SelectionProfile::Skewed
-    } else {
-        SelectionProfile::Uniform
-    };
-    let f = multi_position_fixture(&GenParams::simple(voters, positions, candidates, profile));
-    validate_population(&f, voters, positions, candidates)?;
-    crate::stream::write_election_stream(dir, &f, positions, candidates)
+    validate_params(params)?;
+    let f = multi_position_fixture(params);
+    validate_population(&f, params.voters, params.positions, params.candidates)?;
+    crate::stream::write_election_stream(dir, &f, params.positions, params.candidates)
 }
 
 /// Fail-closed validation gate (Phase 1): structural invariants that must hold
@@ -357,9 +369,48 @@ mod tests {
     #[test]
     fn multi_position_bundle_generates_validates_and_audits() {
         // Passes the fail-closed gate, then re-audits clean off the wire bytes.
-        let bundle = election_bundle_json_params(4, 3, 3, false).expect("gate passes");
+        let bundle =
+            election_bundle_json_params(&GenParams::simple(4, 3, 3, SelectionProfile::Uniform))
+                .expect("gate passes");
         let report = audit_bundle_json(&bundle).expect("bundle audits");
         assert_eq!(report.overall, AuditStatus::Pass, "{report:#?}");
+    }
+
+    #[test]
+    fn params_entry_generates_and_audits_for_4_of_7() {
+        // A non-default 4-of-7 election round-trips through the gate + audits clean
+        // — proves DkgConfig::new(t,n) and the threshold combine work off-default.
+        let p = GenParams {
+            election_id: "e".into(),
+            election_name: "E".into(),
+            threshold: 4,
+            trustees: 7,
+            trustee_names: (1..=7).map(|i| format!("T{i}")).collect(),
+            voters: 5,
+            positions: 1,
+            candidates: 2,
+            profile: SelectionProfile::Uniform,
+        };
+        let bundle = election_bundle_json_params(&p).expect("gate passes");
+        let report = audit_bundle_json(&bundle).expect("bundle audits");
+        assert_eq!(report.overall, AuditStatus::Pass, "{report:#?}");
+    }
+
+    #[test]
+    fn gate_rejects_threshold_above_trustees() {
+        let p = GenParams {
+            election_id: "e".into(),
+            election_name: "E".into(),
+            threshold: 6,
+            trustees: 5,
+            trustee_names: (1..=5).map(|i| format!("T{i}")).collect(),
+            voters: 3,
+            positions: 1,
+            candidates: 2,
+            profile: SelectionProfile::Uniform,
+        };
+        let err = election_bundle_json_params(&p).expect_err("t>n must be rejected");
+        assert!(err.contains("threshold"), "unexpected error: {err}");
     }
 
     #[test]
@@ -387,7 +438,9 @@ mod tests {
     fn skewed_distribution_generates_validates_and_audits() {
         // The skewed profile must still pass the gate + audit clean (only the
         // per-candidate distribution differs from uniform).
-        let bundle = election_bundle_json_params(6, 3, 3, true).expect("gate passes");
+        let bundle =
+            election_bundle_json_params(&GenParams::simple(6, 3, 3, SelectionProfile::Skewed))
+                .expect("gate passes");
         let report = audit_bundle_json(&bundle).expect("bundle audits");
         assert_eq!(report.overall, AuditStatus::Pass, "{report:#?}");
     }
@@ -396,7 +449,9 @@ mod tests {
     fn audit_scores_e0_accuracy_against_ground_truth() {
         // The generated bundle carries seeded ground truth, so the audit must
         // decode the real tally and confirm it equals that truth (E = 0).
-        let bundle = election_bundle_json_params(6, 3, 3, false).expect("gate passes");
+        let bundle =
+            election_bundle_json_params(&GenParams::simple(6, 3, 3, SelectionProfile::Uniform))
+                .expect("gate passes");
         let report = audit_bundle_json(&bundle).expect("bundle audits");
         assert_eq!(report.overall, AuditStatus::Pass, "{report:#?}");
         assert!(
@@ -414,7 +469,9 @@ mod tests {
         // (untouched) ballots no longer matches it, so E != 0 and the accuracy
         // check fails — proving E=0 compares against the seeded truth, not just
         // the co-generated published tally.
-        let bundle = election_bundle_json_params(6, 2, 2, false).expect("gate passes");
+        let bundle =
+            election_bundle_json_params(&GenParams::simple(6, 2, 2, SelectionProfile::Uniform))
+                .expect("gate passes");
         let mut v: serde_json::Value = serde_json::from_str(&bundle).unwrap();
         let gt = v["ground_truth"].as_array_mut().unwrap();
         let bumped = gt[0].as_u64().unwrap() + 1;

@@ -260,8 +260,11 @@ mod tests {
     fn stream_params_entry_gates_then_writes_a_verifiable_stream() {
         // The CLI-facing entry: build → validation gate → streamed write.
         let dir = scratch("params-entry");
-        crate::demo::write_election_stream_params(&dir, 3, 2, 2, false)
-            .expect("valid population writes a stream");
+        crate::demo::write_election_stream_params(
+            &dir,
+            &GenParams::simple(3, 2, 2, SelectionProfile::Uniform),
+        )
+        .expect("valid population writes a stream");
         // 3 voters × 2 positions = 6 ballots, and the N-count gate passes.
         assert_eq!(verify_stream(&dir).expect("gate passes"), 6);
         assert_eq!(read_header(&dir).expect("header").positions, 2);
