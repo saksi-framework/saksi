@@ -77,6 +77,27 @@ func TestScenariosRejectTheirMutations(t *testing.T) {
 	if sa, err := e.Verify(ctx, runID); err != nil || sa.Overall != "pass" {
 		t.Fatalf("clean run must verify pass: %v %+v", err, sa)
 	}
+	// correctness.csv is the proof: carries the recovered point, aggregate
+	// ciphertext, and artifact hashes — not just the verdict.
+	cc, err := os.ReadFile(filepath.Join(srcDir, CorrectnessFile))
+	if err != nil {
+		t.Fatalf("correctness.csv: %v", err)
+	}
+	ccs := string(cc)
+	for _, col := range []string{"recovered_point", "aggregate_ciphertext", "dkg_sha256", "tally_sha256", "ballots_sha256"} {
+		if !strings.Contains(ccs, col) {
+			t.Fatalf("correctness.csv missing proof column %q", col)
+		}
+	}
+	// At least one contest row, and it carries a 64-hex recovered point.
+	ccLines := strings.Split(strings.TrimSpace(ccs), "\n")
+	if len(ccLines) < 2 {
+		t.Fatalf("correctness.csv has no data rows:\n%s", ccs)
+	}
+	cols := strings.Split(ccLines[1], ",")
+	if len(cols) != 11 || len(cols[6]) != 64 {
+		t.Fatalf("correctness row missing 64-hex recovered_point: %q", ccLines[1])
+	}
 
 	if err := e.RunScenarios(ctx, runID, nil); err != nil {
 		t.Fatalf("run scenarios: %v", err)

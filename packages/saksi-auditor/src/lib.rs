@@ -113,14 +113,25 @@ pub struct ElectionArtifacts<'a> {
 ///
 /// The function never panics on adversarial input — every decoding or
 /// soundness failure is converted into a Fatal finding with status `Fail`.
+/// Audit an election and return only the pass/fail report.
 pub fn audit(artifacts: ElectionArtifacts) -> AuditReport {
+    audit_with_evidence(artifacts).0
+}
+
+/// Audit an election and also return the per-contest tally evidence (the
+/// aggregate ciphertext + recovered plaintext point the decrypt produced), so a
+/// consumer can surface the cryptographic proof of correctness, not just the
+/// verdict. `audit` is the thin wrapper that discards the evidence.
+pub(crate) fn audit_with_evidence(
+    artifacts: ElectionArtifacts,
+) -> (AuditReport, Vec<crate::tally::ContestEvidence>) {
     let mut builder = ReportBuilder::new();
 
     // -- 1. Election parameters shape --------------------------------------
 
     let params_ok = check_parameters(artifacts.parameters, &mut builder);
     if !params_ok {
-        return builder.finish();
+        return (builder.finish(), Vec::new());
     }
 
     // -- 2-4. DKG transcript ----------------------------------------------
@@ -136,7 +147,7 @@ pub fn audit(artifacts: ElectionArtifacts) -> AuditReport {
     // because it doesn't depend on the DKG, then finish.
     let Some(dkg_v) = dkg_verification else {
         check_nullifier_uniqueness(artifacts.ballots, &mut builder);
-        return builder.finish();
+        return (builder.finish(), Vec::new());
     };
 
     let election_public_key = elgamal::PublicKey::from_point(dkg_v.joint_public_key);
@@ -169,7 +180,7 @@ pub fn audit(artifacts: ElectionArtifacts) -> AuditReport {
 
     // -- 8. Homomorphic-sum tally -----------------------------------------
 
-    if let Some(decryption) = decryption {
+    let evidence = if let Some(decryption) = decryption {
         crate::tally::verify_tally(
             artifacts.parameters,
             artifacts.tally,
@@ -177,10 +188,12 @@ pub fn audit(artifacts: ElectionArtifacts) -> AuditReport {
             eligible.len(),
             artifacts.ground_truth,
             &mut builder,
-        );
-    }
+        )
+    } else {
+        Vec::new()
+    };
 
-    builder.finish()
+    (builder.finish(), evidence)
 }
 
 /// Global indices (into `contest_ids`) of the contests a ballot in `position_id`

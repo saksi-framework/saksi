@@ -40,14 +40,25 @@ pub struct ContestCorrectness {
     pub contest: String,
     /// Seeded ground-truth total for this contest.
     pub ground_truth: u64,
-    /// Decoded/published tally the auditor verified (equals the homomorphic
-    /// decode when the audit passes; a divergence fails the audit).
+    /// Value recovered by real threshold decryption of the aggregate ciphertext.
     pub decoded: u64,
     /// `decoded − ground_truth` (0 on a correct run).
     #[serde(rename = "E")]
     pub e: i64,
     /// This contest is correct: the overall audit passed AND `E == 0`.
     pub pass: bool,
+    /// The published tally total (equals `decoded` when the audit passes).
+    #[serde(default)]
+    pub published_tally: u64,
+    /// Hex of the aggregate (homomorphic-summed) ciphertext component `Σ c2` for
+    /// this contest — the encrypted tally the decrypt operates on.
+    #[serde(default)]
+    pub aggregate_ciphertext: String,
+    /// Hex of the recovered plaintext point `M = decoded·G`, the output of
+    /// combining the threshold partial decryptions. Empty if the combine could
+    /// not run. A reader can confirm `M == decoded·G` to verify the decrypt.
+    #[serde(default)]
+    pub recovered_point: String,
 }
 
 /// Machine-readable result of auditing a **stream run folder** — the structured
@@ -441,7 +452,7 @@ pub fn audit_stream_dir(dir: &std::path::Path) -> Result<StreamAudit, String> {
     }
 
     let ground_truth = header.ground_truth.clone();
-    let report = audit(ElectionArtifacts {
+    let (report, evidence) = crate::audit_with_evidence(ElectionArtifacts {
         parameters: &parameters,
         dkg_transcript: &dkg_transcript,
         ballots: &ballots,
@@ -453,14 +464,32 @@ pub fn audit_stream_dir(dir: &std::path::Path) -> Result<StreamAudit, String> {
     });
     let overall_pass = report.overall == AuditStatus::Pass;
 
+    // Index the per-contest crypto evidence by contest id.
+    let ev_by_contest: std::collections::HashMap<&str, &crate::tally::ContestEvidence> = evidence
+        .iter()
+        .map(|e| (e.contest_id.as_str(), e))
+        .collect();
+
     let contests = parameters
         .contest_ids
         .iter()
         .enumerate()
         .map(|(c, contest_id)| {
             let gt = ground_truth.get(c).copied().unwrap_or(0);
-            let decoded = tally.totals.get(c).copied().unwrap_or(0);
+            let published = tally.totals.get(c).copied().unwrap_or(0);
+            let ev = ev_by_contest.get(contest_id.as_str());
+            // `decoded` is the value REAL threshold decryption recovered (the
+            // proof), not the published claim; fall back to published if the
+            // combine could not run.
+            let decoded = ev.and_then(|e| e.decoded).unwrap_or(published);
             let e = decoded as i64 - gt as i64;
+            let aggregate_ciphertext = ev
+                .map(|e| hex::encode(compress_point(&e.aggregate_ciphertext)))
+                .unwrap_or_default();
+            let recovered_point = ev
+                .and_then(|e| e.recovered_point.as_ref())
+                .map(|p| hex::encode(compress_point(p)))
+                .unwrap_or_default();
             ContestCorrectness {
                 contest: contest_id.clone(),
                 ground_truth: gt,
@@ -469,6 +498,9 @@ pub fn audit_stream_dir(dir: &std::path::Path) -> Result<StreamAudit, String> {
                 // A tampered proof elsewhere fails the whole audit, so a contest
                 // is correct only when the audit is clean AND its own E == 0.
                 pass: overall_pass && e == 0,
+                published_tally: published,
+                aggregate_ciphertext,
+                recovered_point,
             }
         })
         .collect();

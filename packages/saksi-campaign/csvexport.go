@@ -138,6 +138,22 @@ type electionHeader struct {
 	BindingContext     string   `json:"binding_context"` // hex NIZK domain
 }
 
+// runDigests returns the SHA-256 of the DKG transcript, the tally, and the
+// whole ballot set for a run — the provenance hashes the correctness CSV carries
+// so each row is bound to specific cryptographic artifacts. Best-effort: a
+// missing header/ballots yields empty hashes rather than failing the phase.
+func runDigests(dir string) (dkgHash, tallyHash, ballotsHash string) {
+	var h electionHeader
+	if readJSON(filepath.Join(dir, "header.json"), &h) == nil {
+		dkgHash = hexDigest(h.Dkg)
+		tallyHash = hexDigest(h.Tally)
+	}
+	if bh, err := ballotsDigest(dir); err == nil {
+		ballotsHash = bh
+	}
+	return
+}
+
 // hexDigest returns the SHA-256 of the bytes a hex string decodes to (empty
 // string in / empty hash out is fine for a missing field).
 func hexDigest(hexStr string) string {

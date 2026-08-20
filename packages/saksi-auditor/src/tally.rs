@@ -18,6 +18,25 @@ use crate::{
     report::ReportBuilder,
 };
 
+/// Per-contest cryptographic evidence produced by the tally verification — the
+/// values a reader needs to independently recompute correctness: the aggregate
+/// (homomorphic-summed) ciphertext component, the point recovered by combining
+/// the threshold partial decryptions, the decoded integer, and the published
+/// tally. Consumed by `audit-stream --json` to fill the correctness CSV.
+// Read only under the `demo` feature (audit_stream_dir); the core lib builds
+// the evidence and discards it via `audit()`.
+#[cfg_attr(not(feature = "demo"), allow(dead_code))]
+pub(crate) struct ContestEvidence {
+    pub(crate) contest_id: String,
+    /// The aggregated ciphertext data component `Σ c2` for this contest.
+    pub(crate) aggregate_ciphertext: RistrettoPoint,
+    /// `M = aggregate − Σ λ_k · share_k`, the recovered plaintext point
+    /// (`None` if the threshold combine could not run for this contest).
+    pub(crate) recovered_point: Option<RistrettoPoint>,
+    /// The integer recovered from `recovered_point` (`None` if it did not decode).
+    pub(crate) decoded: Option<u64>,
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn verify_tally(
     parameters: &ElectionParameters,
@@ -26,7 +45,8 @@ pub(crate) fn verify_tally(
     eligible_ballot_count: usize,
     ground_truth: Option<&[u64]>,
     builder: &mut ReportBuilder,
-) {
+) -> Vec<ContestEvidence> {
+    let mut evidence: Vec<ContestEvidence> = Vec::new();
     // -- shape --------------------------------------------------------------
 
     if tally.version != WIRE_VERSION {
@@ -37,7 +57,7 @@ pub(crate) fn verify_tally(
                 tally.version, WIRE_VERSION
             ),
         );
-        return;
+        return evidence;
     }
     if tally.election_id != parameters.election_id {
         builder.fail(
@@ -47,7 +67,7 @@ pub(crate) fn verify_tally(
                 tally.election_id, parameters.election_id
             ),
         );
-        return;
+        return evidence;
     }
     if tally.totals.len() != parameters.contest_ids.len() {
         builder.fail(
@@ -58,7 +78,7 @@ pub(crate) fn verify_tally(
                 parameters.contest_ids.len()
             ),
         );
-        return;
+        return evidence;
     }
     builder.pass("tally.shape", "tally shape matches parameters");
 
@@ -71,7 +91,7 @@ pub(crate) fn verify_tally(
             "tally.homomorphic_sum",
             "skipped homomorphic sum: threshold not satisfied across all contests",
         );
-        return;
+        return evidence;
     }
 
     // Validate the ground-truth width once; a mismatch disables the accuracy
@@ -105,6 +125,12 @@ pub(crate) fn verify_tally(
                     verified.len()
                 ),
             );
+            evidence.push(ContestEvidence {
+                contest_id: contest_id.clone(),
+                aggregate_ciphertext: decryption.aggregate_data[c],
+                recovered_point: None,
+                decoded: None,
+            });
             continue;
         }
 
@@ -129,6 +155,12 @@ pub(crate) fn verify_tally(
             shared_secret += lambda * share.share_point;
         }
         if bad_lagrange {
+            evidence.push(ContestEvidence {
+                contest_id: contest_id.clone(),
+                aggregate_ciphertext: decryption.aggregate_data[c],
+                recovered_point: None,
+                decoded: None,
+            });
             continue;
         }
 
@@ -137,6 +169,13 @@ pub(crate) fn verify_tally(
         // Recover the integer tally in [0, eligible_ballot_count]: linear scan at
         // small tiers, baby-step giant-step at >= 50k (see decode_tally).
         let decoded = decode_tally(plaintext_point, eligible_ballot_count as u64);
+
+        evidence.push(ContestEvidence {
+            contest_id: contest_id.clone(),
+            aggregate_ciphertext: decryption.aggregate_data[c],
+            recovered_point: Some(plaintext_point),
+            decoded,
+        });
 
         match decoded {
             None => {
@@ -209,6 +248,8 @@ pub(crate) fn verify_tally(
             );
         }
     }
+
+    evidence
 }
 
 /// Tier at or above which tally recovery switches from a linear scan to

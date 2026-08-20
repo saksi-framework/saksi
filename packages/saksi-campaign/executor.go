@@ -18,11 +18,14 @@ const CorrectnessFile = "correctness.csv"
 
 // ContestCorrectness mirrors the Rust `audit-stream --json` per-contest row.
 type ContestCorrectness struct {
-	Contest     string `json:"contest"`
-	GroundTruth uint64 `json:"ground_truth"`
-	Decoded     uint64 `json:"decoded"`
-	E           int64  `json:"E"`
-	Pass        bool   `json:"pass"`
+	Contest             string `json:"contest"`
+	GroundTruth         uint64 `json:"ground_truth"`
+	Decoded             uint64 `json:"decoded"`
+	E                   int64  `json:"E"`
+	Pass                bool   `json:"pass"`
+	PublishedTally      uint64 `json:"published_tally"`
+	AggregateCiphertext string `json:"aggregate_ciphertext"`
+	RecoveredPoint      string `json:"recovered_point"`
 }
 
 // StreamAudit mirrors the Rust `audit-stream --json` document.
@@ -135,7 +138,8 @@ func (e *Executor) Verify(ctx context.Context, runID string) (StreamAudit, error
 		return StreamAudit{}, fmt.Errorf("audit-stream crashed: %v (output: %s)",
 			runErr, truncate(out, 200))
 	}
-	if err := writeCorrectnessCSV(filepath.Join(dir, CorrectnessFile), sa); err != nil {
+	dkgHash, tallyHash, ballotsHash := runDigests(dir)
+	if err := writeCorrectnessCSV(filepath.Join(dir, CorrectnessFile), sa, dkgHash, tallyHash, ballotsHash); err != nil {
 		return sa, err
 	}
 	if sa.Overall == "pass" {
@@ -172,14 +176,23 @@ func (e *Executor) Submit(ctx context.Context, runID string, c ElectionConfig) e
 	return nil
 }
 
-func writeCorrectnessCSV(path string, sa StreamAudit) error {
+// writeCorrectnessCSV writes the per-contest proof of correctness: the seeded
+// ground truth, the value REAL threshold decryption recovered (decoded), E, and
+// the cryptographic evidence needed to re-verify it — the recovered plaintext
+// point, the aggregate (encrypted) tally it came from, and the run's artifact
+// hashes (DKG, tally, ballot-set). Each row is self-contained proof.
+func writeCorrectnessCSV(path string, sa StreamAudit, dkgHash, tallyHash, ballotsHash string) error {
 	f, err := os.Create(path)
 	if err != nil {
 		return fmt.Errorf("create %s: %w", path, err)
 	}
 	defer f.Close()
 	w := csv.NewWriter(f)
-	if err := w.Write([]string{"contest", "ground_truth", "decoded", "E", "pass"}); err != nil {
+	if err := w.Write([]string{
+		"contest", "ground_truth", "decoded", "E", "pass",
+		"published_tally", "recovered_point", "aggregate_ciphertext",
+		"dkg_sha256", "tally_sha256", "ballots_sha256",
+	}); err != nil {
 		return err
 	}
 	for _, c := range sa.Contests {
@@ -189,6 +202,12 @@ func writeCorrectnessCSV(path string, sa StreamAudit) error {
 			strconv.FormatUint(c.Decoded, 10),
 			strconv.FormatInt(c.E, 10),
 			strconv.FormatBool(c.Pass),
+			strconv.FormatUint(c.PublishedTally, 10),
+			c.RecoveredPoint,
+			c.AggregateCiphertext,
+			dkgHash,
+			tallyHash,
+			ballotsHash,
 		}
 		if err := w.Write(row); err != nil {
 			return err

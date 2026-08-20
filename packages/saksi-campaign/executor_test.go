@@ -126,7 +126,7 @@ func TestVerifyWritesCorrectnessCSV(t *testing.T) {
 		t.Fatalf("correctness.csv not written: %v", err)
 	}
 	got := string(data)
-	if !strings.HasPrefix(got, "contest,ground_truth,decoded,E,pass\n") {
+	if !strings.HasPrefix(got, "contest,ground_truth,decoded,E,pass,published_tally,recovered_point,aggregate_ciphertext,dkg_sha256,tally_sha256,ballots_sha256\n") {
 		t.Fatalf("bad csv header: %q", got)
 	}
 	if !strings.Contains(got, "president/cand0,3,3,0,true") {
