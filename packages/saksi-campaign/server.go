@@ -7,7 +7,9 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"os"
 	"path"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -16,16 +18,24 @@ import (
 //go:embed web/index.html
 var webFS embed.FS
 
-// exportAllowlist is the set of run artifacts that may be downloaded via
-// /export — no arbitrary path is ever served.
-var exportAllowlist = map[string]bool{
-	RunFile:           true,
-	"header.json":     true,
-	"ballots.ndjson":  true,
-	CorrectnessFile:   true,
-	NegativeTestsFile: true,
-	"perf.csv":        true,
+// exportOrder is the downloadable run artifacts, in display order. exportAllowlist
+// is derived from it — no arbitrary path is ever served via /export.
+var exportOrder = []string{
+	RunFile,
+	"header.json",
+	"ballots.ndjson",
+	CorrectnessFile,
+	NegativeTestsFile,
+	"perf.csv",
 }
+
+var exportAllowlist = func() map[string]bool {
+	m := make(map[string]bool, len(exportOrder))
+	for _, a := range exportOrder {
+		m[a] = true
+	}
+	return m
+}()
 
 // Server owns the HTTP surface. All business logic lives in the executor/store;
 // handlers only decode, validate, dispatch, and enforce the single-run lock +
@@ -266,16 +276,35 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// runView is a run record enriched with the downloadable artifacts that
+// currently exist for it, so the History UI can offer per-run CSV downloads
+// (correctness / negative-tests) and mark which rows have results to load.
+type runView struct {
+	RunRecord
+	Artifacts []string `json:"artifacts"`
+}
+
 func (s *Server) handleRuns(w http.ResponseWriter, r *http.Request) {
 	recs, err := s.store.List()
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	if recs == nil {
-		recs = []RunRecord{}
+	views := make([]runView, 0, len(recs))
+	for _, rec := range recs {
+		dir, err := s.store.Dir(rec.RunID)
+		if err != nil {
+			continue
+		}
+		var arts []string
+		for _, name := range exportOrder { // exportOrder = stable display order
+			if _, err := os.Stat(filepath.Join(dir, name)); err == nil {
+				arts = append(arts, name)
+			}
+		}
+		views = append(views, runView{RunRecord: rec, Artifacts: arts})
 	}
-	writeJSONResp(w, http.StatusOK, recs)
+	writeJSONResp(w, http.StatusOK, views)
 }
 
 func (s *Server) handleExport(w http.ResponseWriter, r *http.Request) {

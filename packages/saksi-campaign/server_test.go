@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -93,6 +95,29 @@ func TestRunsListsCreatedRun(t *testing.T) {
 	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/runs", nil))
 	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "midterm") {
 		t.Fatalf("runs did not list the created run: %d %s", rec.Code, rec.Body)
+	}
+}
+
+func TestRunsReportsPresentArtifacts(t *testing.T) {
+	s, h, _ := testServer(t, nil)
+	_, dir, err := s.store.Create(good(), time.Now())
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	// Simulate a completed Verify (correctness.csv present) — a fresh run has none.
+	if err := os.WriteFile(filepath.Join(dir, CorrectnessFile),
+		[]byte("contest,ground_truth,decoded,E,pass\n"), 0o644); err != nil {
+		t.Fatalf("write csv: %v", err)
+	}
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/runs", nil))
+	body := rec.Body.String()
+	if !strings.Contains(body, `"artifacts"`) || !strings.Contains(body, CorrectnessFile) {
+		t.Fatalf("/runs should report the present correctness.csv: %s", body)
+	}
+	// run.json always exists; ballots.ndjson does not (never generated here).
+	if strings.Contains(body, "ballots.ndjson") {
+		t.Fatalf("/runs should not list absent artifacts: %s", body)
 	}
 }
 
