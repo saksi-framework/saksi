@@ -1,0 +1,279 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Research Election Console</title>
+<style>
+  :root {
+    --bg: #f6f7f9; --panel: #ffffff; --ink: #1a1c20; --muted: #61656c;
+    --line: #e3e6ea; --accent: #2f6fed; --ok: #1a8a4c; --bad: #c23b3b;
+    --logbg: #0e1116; --logink: #d6dae0; --chip: #eef1f6;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg:#0e1013; --panel:#171a1f; --ink:#e7eaee; --muted:#98a0ab;
+      --line:#272b31; --accent:#5b8bff; --ok:#4cc47f; --bad:#f06a6a;
+      --logbg:#05070a; --logink:#c8ccd2; --chip:#20242b;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin:0; font:14px/1.5 system-ui,-apple-system,Segoe UI,Roboto,sans-serif;
+         background:var(--bg); color:var(--ink); }
+  header { padding:18px 24px; border-bottom:1px solid var(--line); background:var(--panel); }
+  header h1 { margin:0; font-size:18px; letter-spacing:.2px; }
+  header p { margin:4px 0 0; color:var(--muted); font-size:12.5px; }
+  main { display:grid; grid-template-columns: 360px 1fr; gap:20px; padding:20px 24px; max-width:1200px; }
+  @media (max-width: 860px){ main{ grid-template-columns:1fr; } }
+  .panel { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:16px; }
+  .panel h2 { margin:0 0 12px; font-size:13px; text-transform:uppercase; letter-spacing:.6px; color:var(--muted); }
+  label { display:block; font-size:12.5px; color:var(--muted); margin:10px 0 4px; }
+  input, select { width:100%; padding:8px 10px; border:1px solid var(--line); border-radius:7px;
+                  background:var(--bg); color:var(--ink); font:inherit; }
+  .row { display:flex; gap:10px; }
+  .row > div { flex:1; }
+  .trustee { display:flex; gap:8px; align-items:center; margin:6px 0; }
+  .trustee input { flex:1; }
+  button { font:inherit; border:1px solid var(--line); background:var(--panel); color:var(--ink);
+           padding:8px 12px; border-radius:7px; cursor:pointer; }
+  button:hover { border-color:var(--accent); }
+  button.primary { background:var(--accent); border-color:var(--accent); color:#fff; }
+  button.small { padding:4px 9px; font-size:12px; }
+  button:disabled { opacity:.5; cursor:not-allowed; }
+  .presets { display:flex; flex-wrap:wrap; gap:6px; margin-top:6px; }
+  .presets button { padding:4px 9px; font-size:12px; }
+  .phasebar { display:flex; flex-wrap:wrap; gap:8px; margin-bottom:14px; }
+  .phase { position:relative; }
+  .phase .dot { display:inline-block; width:7px; height:7px; border-radius:50%; background:var(--line); margin-right:6px; vertical-align:middle; }
+  .phase.running .dot { background:var(--accent); animation:pulse 1s infinite; }
+  .phase.done .dot { background:var(--ok); }
+  .phase.failed .dot { background:var(--bad); }
+  @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.3} }
+  #log { background:var(--logbg); color:var(--logink); border-radius:8px; padding:12px;
+         font:12px/1.55 ui-monospace,SFMono-Regular,Menlo,monospace; height:210px; overflow:auto; white-space:pre-wrap; }
+  #log .error { color:#ff8f8f; } #log .done { color:#7fe0a3; }
+  table { width:100%; border-collapse:collapse; font-size:13px; margin-top:8px; }
+  th,td { text-align:left; padding:6px 8px; border-bottom:1px solid var(--line); }
+  th { color:var(--muted); font-weight:600; font-size:11.5px; text-transform:uppercase; letter-spacing:.4px; }
+  .pass { color:var(--ok); font-weight:600; } .fail { color:var(--bad); font-weight:600; }
+  .chip { display:inline-block; background:var(--chip); border-radius:20px; padding:2px 9px; font-size:12px; }
+  .muted { color:var(--muted); }
+  .err { color:var(--bad); font-size:12.5px; margin-top:8px; }
+  a { color:var(--accent); }
+  .stack { display:flex; flex-direction:column; gap:20px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Research Election Console</h1>
+  <p>Configure an election, run it in phases, cross-check correctness — offline or on-chain. Loopback research tool.</p>
+</header>
+<main>
+  <!-- CONFIG -->
+  <section class="panel" id="configPanel">
+    <h2>Election</h2>
+    <label for="name">Election name</label>
+    <input id="name" value="Demo Election" />
+
+    <label>Trustees &amp; threshold</label>
+    <div id="trustees"></div>
+    <button class="small" id="addTrustee" type="button">+ add trustee</button>
+    <div class="row" style="margin-top:8px">
+      <div><label for="threshold">Threshold (t)</label><input id="threshold" type="number" min="1" value="2" /></div>
+      <div><label>of trustees (n)</label><input id="nDisplay" disabled value="3" /></div>
+    </div>
+
+    <div class="row">
+      <div><label for="positions">Positions</label><input id="positions" type="number" min="1" value="2" /></div>
+      <div><label for="candidates">Candidates</label><input id="candidates" type="number" min="1" value="2" /></div>
+    </div>
+
+    <label for="voters">Voters (scale)</label>
+    <input id="voters" type="number" min="1" value="10" />
+    <div class="presets" id="presets"></div>
+
+    <div class="row">
+      <div><label for="distribution">Distribution</label>
+        <select id="distribution"><option value="uniform">uniform</option><option value="skewed">skewed</option></select></div>
+      <div><label for="mode">Mode</label>
+        <select id="mode"><option value="offline">offline</option><option value="onchain">on-chain</option></select></div>
+    </div>
+    <div class="err" id="configErr"></div>
+  </section>
+
+  <!-- RUN -->
+  <section class="stack">
+    <div class="panel">
+      <h2>Run <span id="runIdChip" class="chip muted" style="float:right"></span></h2>
+      <div class="phasebar">
+        <button class="primary" id="btnRunAll">▶ Run all</button>
+        <span class="phase" data-phase="generate"><span class="dot"></span><button id="btnGenerate">Generate</button></span>
+        <span class="phase" data-phase="submit"><span class="dot"></span><button id="btnSubmit">Submit</button></span>
+        <span class="phase" data-phase="verify"><span class="dot"></span><button id="btnVerify">Verify</button></span>
+        <span class="phase" data-phase="scenarios"><span class="dot"></span><button id="btnScenarios">Scenarios</button></span>
+        <button class="small" id="btnCancel" disabled>Cancel</button>
+      </div>
+      <div id="log" aria-live="polite"></div>
+    </div>
+
+    <div class="panel" id="resultsPanel" style="display:none">
+      <h2>Correctness <span id="overallChip" class="chip" style="float:right"></span></h2>
+      <div id="results"></div>
+      <div id="exports" style="margin-top:10px"></div>
+    </div>
+
+    <div class="panel">
+      <h2>History</h2>
+      <div id="history"><p class="muted">No runs yet.</p></div>
+    </div>
+  </section>
+</main>
+
+<script>
+"use strict";
+// Logic-free view: this script only wires the DOM, POSTs config, streams SSE,
+// and renders responses. ALL validation / run-state / correctness lives on the
+// server (Go). No client-side t<=n check — the server is the gate.
+const $ = (id) => document.getElementById(id);
+const PRESETS = [1, 10, 100, 1000, 10000, 50000, 483000, 1000000];
+const OFFLINE_CEILING = 10000;
+let currentRun = null, es = null;
+
+function renderTrustees(names) {
+  const box = $("trustees"); box.innerHTML = "";
+  names.forEach((nm, i) => {
+    const row = document.createElement("div"); row.className = "trustee";
+    const inp = document.createElement("input"); inp.value = nm; inp.dataset.trustee = "1";
+    const del = document.createElement("button"); del.textContent = "×"; del.className = "small"; del.type = "button";
+    del.onclick = () => { inp.parentElement.remove(); syncN(); };
+    row.append(inp, del); box.append(row);
+  });
+  syncN();
+}
+function trusteeNames() { return [...document.querySelectorAll('[data-trustee]')].map(i => i.value); }
+function syncN() { $("nDisplay").value = document.querySelectorAll('[data-trustee]').length; }
+
+function renderPresets() {
+  const box = $("presets"); box.innerHTML = "";
+  const offline = $("mode").value === "offline";
+  PRESETS.forEach(n => {
+    const b = document.createElement("button"); b.type = "button"; b.textContent = n.toLocaleString();
+    const blocked = offline && n > OFFLINE_CEILING;
+    b.disabled = blocked; if (blocked) b.title = "on-chain / perf mode only";
+    b.onclick = () => { $("voters").value = n; };
+    box.append(b);
+  });
+}
+
+function config() {
+  return {
+    name: $("name").value,
+    trustees: trusteeNames().map(n => ({ name: n })),
+    threshold: +$("threshold").value,
+    positions: +$("positions").value,
+    candidates: +$("candidates").value,
+    voters: +$("voters").value,
+    distribution: $("distribution").value,
+    mode: $("mode").value,
+  };
+}
+
+function log(msg, cls) {
+  const el = $("log"); const line = document.createElement("div");
+  if (cls) line.className = cls; line.textContent = msg;
+  el.append(line); el.scrollTop = el.scrollHeight;
+}
+function setPhase(phase, state) {
+  const el = document.querySelector(`.phase[data-phase="${phase}"]`);
+  if (el) el.className = "phase " + state;
+}
+function resetPhases() { ["generate","submit","verify","scenarios"].forEach(p => setPhase(p, "")); }
+
+function openStream(runID) {
+  if (es) es.close();
+  es = new EventSource("/events?run=" + encodeURIComponent(runID));
+  es.onmessage = (ev) => {
+    const e = JSON.parse(ev.data);
+    log(`[${e.phase}] ${e.msg}`, e.level);
+    if (e.level === "done") setPhase(e.phase, "done");
+    else if (e.level === "error") setPhase(e.phase, "failed");
+    else setPhase(e.phase, "running");
+    if (e.phase === "verify" && e.level === "done") loadResults(runID);
+    if (e.level === "done" || e.level === "error") $("btnCancel").disabled = false;
+  };
+}
+
+async function post(path, body) {
+  $("configErr").textContent = "";
+  const res = await fetch(path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+  if (!res.ok) { const t = await res.text(); $("configErr").textContent = t.trim(); throw new Error(t); }
+  return res.json();
+}
+
+async function startWithConfig(path) {
+  resetPhases(); $("resultsPanel").style.display = "none"; $("log").innerHTML = "";
+  try {
+    const { run_id } = await post(path, config());
+    currentRun = run_id; $("runIdChip").textContent = run_id;
+    $("btnCancel").disabled = false;
+    openStream(run_id);
+  } catch (_) {}
+}
+async function phase(path) {
+  if (!currentRun) { $("configErr").textContent = "Generate a run first."; return; }
+  try { await post(path, { run_id: currentRun }); } catch (_) {}
+}
+
+async function loadResults(runID) {
+  try {
+    const res = await fetch(`/export/${runID}/correctness.csv`);
+    if (!res.ok) return;
+    const rows = (await res.text()).trim().split("\n").slice(1).map(r => r.split(","));
+    let pass = true;
+    let html = "<table><tr><th>Contest</th><th>Ground truth</th><th>Decoded</th><th>E</th><th>Result</th></tr>";
+    rows.forEach(([c, gt, dec, e, p]) => {
+      const ok = p === "true"; if (!ok) pass = false;
+      html += `<tr><td>${c}</td><td>${gt}</td><td>${dec}</td><td>${e}</td><td class="${ok?'pass':'fail'}">${ok?'PASS':'FAIL'}</td></tr>`;
+    });
+    html += "</table>";
+    $("results").innerHTML = html;
+    const chip = $("overallChip"); chip.textContent = pass ? "E = 0 · PASS" : "FAIL";
+    chip.className = "chip " + (pass ? "pass" : "fail");
+    $("exports").innerHTML = ["run.json","header.json","ballots.ndjson","correctness.csv","negative-tests.csv"]
+      .map(a => `<a href="/export/${runID}/${a}" download>${a}</a>`).join(" &nbsp;·&nbsp; ");
+    $("resultsPanel").style.display = "block";
+    loadHistory();
+  } catch (_) {}
+}
+
+async function loadHistory() {
+  try {
+    const recs = await (await fetch("/runs")).json();
+    if (!recs.length) { $("history").innerHTML = '<p class="muted">No runs yet.</p>'; return; }
+    let html = "<table><tr><th>Election</th><th>Scale</th><th>t-of-n</th><th>Mode</th><th>When</th></tr>";
+    recs.forEach(r => {
+      const c = r.config;
+      html += `<tr><td>${c.name}</td><td>${c.voters.toLocaleString()}</td>`
+            + `<td>${c.threshold}-of-${c.trustees.length}</td><td>${c.mode}</td>`
+            + `<td class="muted">${new Date(r.created_at).toLocaleString()}</td></tr>`;
+    });
+    $("history").innerHTML = html + "</table>";
+  } catch (_) {}
+}
+
+// --- wiring ---
+$("addTrustee").onclick = () => { const n = trusteeNames(); n.push("Trustee " + (n.length + 1)); renderTrustees(n); };
+$("mode").onchange = renderPresets;
+$("btnRunAll").onclick = () => startWithConfig("/run-all");
+$("btnGenerate").onclick = () => startWithConfig("/generate");
+$("btnSubmit").onclick = () => phase("/submit");
+$("btnVerify").onclick = () => phase("/verify");
+$("btnScenarios").onclick = () => { if (currentRun) post("/scenarios", { run_id: currentRun, list: [] }).catch(()=>{}); };
+$("btnCancel").onclick = () => { if (currentRun) post("/cancel", { run_id: currentRun }).catch(()=>{}); };
+
+renderTrustees(["Trustee 1", "Trustee 2", "Trustee 3"]);
+renderPresets();
+loadHistory();
+</script>
+</body>
+</html>
