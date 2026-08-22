@@ -1,16 +1,20 @@
 package campaign
 
 import (
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 
 	clientsdk "github.com/saksi-framework/saksi/packages/saksi-bulletin/client-sdk"
+	pb "github.com/saksi-framework/saksi/packages/saksi-protocol/go/saksiprotocolv1"
+	"google.golang.org/protobuf/proto"
 )
 
 // fakeChainReader is the chainReader mock. Errors are per-method so table
@@ -20,16 +24,46 @@ type fakeChainReader struct {
 	statusErr    error
 	tally        string
 	tallyErr     error
+	election     string // hex-encoded ElectionParameters returned by GetElection
+	electionErr  error
 	nullifiers   clientsdk.NullifierPage
 	nullifierErr error
 }
 
 func (f *fakeChainReader) GetElectionStatus(string) (string, error) { return f.status, f.statusErr }
-func (f *fakeChainReader) GetElection(string) (string, error)       { return "", nil }
+func (f *fakeChainReader) GetElection(string) (string, error)       { return f.election, f.electionErr }
 func (f *fakeChainReader) GetDKGTranscript(string) (string, error)  { return "", nil }
 func (f *fakeChainReader) GetTally(string) (string, error)          { return f.tally, f.tallyErr }
 func (f *fakeChainReader) ListNullifiers(string, int, string) (clientsdk.NullifierPage, error) {
 	return f.nullifiers, f.nullifierErr
+}
+
+// hexTallyResult builds a real TallyResult proto with totals for
+// "president/cand0", "president/cand1", "vp/cand0" and hex-encodes it.
+func hexTallyResult(t *testing.T) string {
+	t.Helper()
+	raw, err := proto.Marshal(&pb.TallyResult{
+		ElectionId: "run-1",
+		Totals:     []uint64{7, 3, 5},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return hex.EncodeToString(raw)
+}
+
+// hexElectionParams builds the matching ElectionParameters (contest ids
+// aligned index-for-index with hexTallyResult's totals) and hex-encodes it.
+func hexElectionParams(t *testing.T) string {
+	t.Helper()
+	raw, err := proto.Marshal(&pb.ElectionParameters{
+		ElectionId: "run-1",
+		ContestIds: []string{"president/cand0", "president/cand1", "vp/cand0"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return hex.EncodeToString(raw)
 }
 
 // writeFixtureTrail writes a 2-event trail.json into dir, mirroring what
@@ -51,10 +85,11 @@ func writeFixtureTrail(t *testing.T, dir string) {
 
 func TestBuildTrail(t *testing.T) {
 	cases := []struct {
-		name       string
-		reader     *fakeChainReader
-		operator   bool
-		wantSealed bool
+		name        string
+		reader      *fakeChainReader
+		operator    bool
+		wantSealed  bool
+		wantResults map[string]map[string]uint64
 	}{
 		{
 			name:       "tally absent seals",
@@ -65,10 +100,15 @@ func TestBuildTrail(t *testing.T) {
 			name: "tally present opens with events and live proof",
 			reader: &fakeChainReader{
 				status:     "closed",
-				tally:      "aabbcc",
+				tally:      hexTallyResult(t),
+				election:   hexElectionParams(t),
 				nullifiers: clientsdk.NullifierPage{Nullifiers: []string{"n0", "n1"}},
 			},
 			wantSealed: false,
+			wantResults: map[string]map[string]uint64{
+				"president": {"cand0": 7, "cand1": 3},
+				"vp":        {"cand0": 5},
+			},
 		},
 		{
 			name:       "reader error seals",
@@ -106,6 +146,9 @@ func TestBuildTrail(t *testing.T) {
 				if got.Live != nil {
 					t.Fatalf("sealed response must carry no live proof, got %+v", got.Live)
 				}
+				if got.Results != nil {
+					t.Fatalf("sealed response must carry no results, got %+v", got.Results)
+				}
 				return
 			}
 			if len(got.Events) != 2 {
@@ -116,6 +159,9 @@ func TestBuildTrail(t *testing.T) {
 			}
 			if got.Live.Partial {
 				t.Fatalf("live proof should not be partial when all reads succeed: %+v", got.Live)
+			}
+			if tc.wantResults != nil && !reflect.DeepEqual(got.Results, tc.wantResults) {
+				t.Fatalf("Results = %+v, want %+v", got.Results, tc.wantResults)
 			}
 		})
 	}
@@ -192,6 +238,9 @@ func TestHandleTrailAPISealedWithoutOperator(t *testing.T) {
 	}
 	if !resp.Sealed {
 		t.Fatalf("want sealed, got %+v", resp)
+	}
+	if resp.Results != nil {
+		t.Fatalf("sealed response must carry no results, got %+v", resp.Results)
 	}
 }
 

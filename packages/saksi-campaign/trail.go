@@ -7,8 +7,11 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strings"
 
 	clientsdk "github.com/saksi-framework/saksi/packages/saksi-bulletin/client-sdk"
+	pb "github.com/saksi-framework/saksi/packages/saksi-protocol/go/saksiprotocolv1"
+	"google.golang.org/protobuf/proto"
 )
 
 // chainReader is what the trail needs from the chain. *clientsdk.BulletinClient
@@ -30,6 +33,11 @@ type trailResponse struct {
 	Election string       `json:"election_id"`
 	Events   []TrailEvent `json:"events,omitempty"` // from trail.json (recorded receipts)
 	Live     *liveProof   `json:"live,omitempty"`   // fresh chain reads proving the records exist NOW
+	// Results is the decoded tally: contest id -> candidate label -> vote
+	// count. Only ever populated alongside a non-empty Live.TallyHex (never
+	// on a sealed response); nil (never an empty map) if decoding failed —
+	// the failure is instead surfaced as Live.Partial/PartialReason.
+	Results map[string]map[string]uint64 `json:"results,omitempty"`
 }
 
 // liveProof is a fresh, on-chain-only re-read taken at render time (never
@@ -101,6 +109,28 @@ func buildTrail(reader chainReader, led clientsdk.Ledger, runDir, electionID str
 		}
 	}
 
+	// Decode the human-readable results alongside the raw tally_hex evidence.
+	// Only attempted when a tally actually exists (tallied); a decode failure
+	// never fails the response — it just leaves Results nil and adds a
+	// partial reason, same as the other best-effort live reads above.
+	var results map[string]map[string]uint64
+	if tallied {
+		paramsHex, paramsErr := reader.GetElection(electionID)
+		if paramsErr != nil {
+			log.Printf("trail: election %q GetElection: %v", electionID, paramsErr)
+			if !partial {
+				partial, partialReason = true, "tally decode failed"
+			}
+		} else if decoded, decErr := decodeTally(tallyHex, paramsHex); decErr != nil {
+			log.Printf("trail: election %q decodeTally: %v", electionID, decErr)
+			if !partial {
+				partial, partialReason = true, "tally decode failed"
+			}
+		} else {
+			results = decoded
+		}
+	}
+
 	return trailResponse{
 		Sealed:   false,
 		Status:   displayStatus,
@@ -115,7 +145,65 @@ func buildTrail(reader chainReader, led clientsdk.Ledger, runDir, electionID str
 			Partial:       partial,
 			PartialReason: partialReason,
 		},
+		Results: results,
 	}, nil
+}
+
+// decodeTally decodes a hex-encoded saksi.protocol.v1.TallyResult against its
+// hex-encoded saksi.protocol.v1.ElectionParameters and returns the
+// human-readable results: contest id -> candidate label -> vote count.
+//
+// Contest ids are position-qualified as "<position>/cand<N>" (one contest per
+// candidate per position — see saksi-auditor's fixture generator), so each
+// entry in TallyResult.totals is a single candidate's vote count; this
+// splits that flat, index-aligned pair of slices back into the nested shape.
+// A contest id with no "/" (not the demo generator's convention, but not
+// invalid wire data either) is kept as its own section under the synthetic
+// label "cand0" rather than treated as an error.
+func decodeTally(tallyHex, paramsHex string) (map[string]map[string]uint64, error) {
+	rawTally, err := hex.DecodeString(tallyHex)
+	if err != nil {
+		return nil, fmt.Errorf("tally is not valid hex: %w", err)
+	}
+	var tally pb.TallyResult
+	if err := proto.Unmarshal(rawTally, &tally); err != nil {
+		return nil, fmt.Errorf("decode tally: %w", err)
+	}
+
+	rawParams, err := hex.DecodeString(paramsHex)
+	if err != nil {
+		return nil, fmt.Errorf("election params are not valid hex: %w", err)
+	}
+	var params pb.ElectionParameters
+	if err := proto.Unmarshal(rawParams, &params); err != nil {
+		return nil, fmt.Errorf("decode election params: %w", err)
+	}
+
+	totals := tally.GetTotals()
+	contestIDs := params.GetContestIds()
+	if len(totals) != len(contestIDs) {
+		return nil, fmt.Errorf("tally has %d totals, election has %d contests", len(totals), len(contestIDs))
+	}
+
+	results := make(map[string]map[string]uint64)
+	for i, contestID := range contestIDs {
+		position, candidate := splitContestID(contestID)
+		if results[position] == nil {
+			results[position] = make(map[string]uint64)
+		}
+		results[position][candidate] = totals[i]
+	}
+	return results, nil
+}
+
+// splitContestID splits a "<position>/cand<N>" contest id into its position
+// and candidate label. A contest id with no "/" is its own position with the
+// synthetic candidate label "cand0" (the only value that contest carries).
+func splitContestID(contestID string) (position, candidate string) {
+	if idx := strings.LastIndex(contestID, "/"); idx >= 0 {
+		return contestID[:idx], contestID[idx+1:]
+	}
+	return contestID, "cand0"
 }
 
 // readTrailEvents reads trail.json from the run folder. A missing file is not

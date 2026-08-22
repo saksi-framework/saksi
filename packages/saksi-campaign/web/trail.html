@@ -79,6 +79,18 @@
   .trow.expanded .trow-detail { display:block; }
 
   .err { color:var(--bad); font-size:12px; }
+
+  #results .contest { margin-bottom:14px; }
+  #results .contest:last-child { margin-bottom:0; }
+  #results .contest h3 { margin:0 0 6px; font-size:13px; font-weight:650; color:var(--ink); }
+  #results table { width:100%; border-collapse:collapse; font-size:13px; }
+  #results td { padding:6px 4px; border-bottom:1px solid var(--line-2); }
+  #results tr:last-child td { border-bottom:none; }
+  #results td.count { text-align:right; font-variant-numeric:tabular-nums; font-weight:600; }
+
+  details.evidence { margin-top:14px; }
+  details.evidence summary { cursor:pointer; font-size:12px; color:var(--muted); }
+  details.evidence .kv { margin-top:8px; }
 </style>
 </head>
 <body>
@@ -110,8 +122,12 @@
     </section>
 
     <section class="panel">
-      <h2>Tally</h2>
-      <div class="kv"><span class="k">tally hex</span><span id="tallyHex" class="mono hash" title="click to copy full tally hex"></span></div>
+      <h2>Results</h2>
+      <div id="results"></div>
+      <details class="evidence">
+        <summary>On-chain evidence (tally hex)</summary>
+        <div class="kv"><span class="k">tally hex</span><span id="tallyHex" class="mono hash" title="click to copy full tally hex"></span></div>
+      </details>
     </section>
   </div>
 
@@ -208,6 +224,44 @@ function renderTimeline(events) {
   });
 }
 
+function renderResults(results) {
+  const box = $("results");
+  box.textContent = "";
+  const contests = Object.keys(results || {}).sort();
+  if (contests.length === 0) {
+    const p = document.createElement("p");
+    p.style.color = "var(--muted)";
+    p.style.fontSize = "13px";
+    p.style.margin = "0";
+    p.textContent = "No decoded results available.";
+    box.append(p);
+    return;
+  }
+  contests.forEach((contest) => {
+    const section = document.createElement("div");
+    section.className = "contest";
+
+    const h3 = document.createElement("h3");
+    h3.textContent = contest;
+    section.append(h3);
+
+    const table = document.createElement("table");
+    const candidates = Object.keys(results[contest] || {}).sort();
+    candidates.forEach((candidate) => {
+      const row = document.createElement("tr");
+      const nameCell = document.createElement("td");
+      nameCell.textContent = candidate;
+      const countCell = document.createElement("td");
+      countCell.className = "count tnum";
+      countCell.textContent = String(results[contest][candidate]);
+      row.append(nameCell, countCell);
+      table.append(row);
+    });
+    section.append(table);
+    box.append(section);
+  });
+}
+
 function render(data) {
   if (data.sealed) {
     $("sealed-banner").style.display = "block";
@@ -233,6 +287,7 @@ function render(data) {
   }
 
   renderTimeline(data.events);
+  renderResults(data.results);
 
   $("tallyHex").textContent = truncMid(live.tally_hex || "");
   $("tallyHex").onclick = () => copyText(live.tally_hex || "");
