@@ -70,7 +70,7 @@ func main() {
 	store := campaign.NewRunStore(*runsDir)
 	hub := campaign.NewHub()
 	exec := campaign.NewExecutor(store, hub, *demoBin, *consBin, fabric)
-	handler := campaign.NewServer(store, exec, hub, allowedHosts(*addr, allow), *timeout)
+	handler := campaign.NewServer(store, exec, hub, fabric, allowedHosts(*addr, allow), *timeout)
 
 	fmt.Printf("Research Election Console\n")
 	fmt.Printf("  serving   http://%s\n", displayHost(*addr))

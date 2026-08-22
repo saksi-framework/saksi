@@ -20,11 +20,8 @@ func testServer(t *testing.T, allowHosts []string) (*Server, http.Handler, *Exec
 	exec := NewExecutor(store, hub, "saksi-demo", "", FabricConfig{})
 	// Default fake runner: succeed, writing nothing.
 	exec.run = func(_ context.Context, _ string, _ ...string) ([]byte, error) { return nil, nil }
-	h := NewServer(store, exec, hub, allowHosts, time.Minute)
-	// NewServer returns the guarded handler; reach the Server via a fresh build
-	// for direct store access in assertions.
-	s := &Server{store: store, exec: exec, hub: hub}
-	return s, h, exec
+	s := NewServer(store, exec, hub, FabricConfig{}, allowHosts, time.Minute)
+	return s, s, exec
 }
 
 func postJSON(path string, v any) *http.Request {

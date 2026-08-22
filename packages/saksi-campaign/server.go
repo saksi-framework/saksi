@@ -5,6 +5,7 @@ import (
 	"embed"
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -13,6 +14,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	clientsdk "github.com/saksi-framework/saksi/packages/saksi-bulletin/client-sdk"
 )
 
 //go:embed web/index.html
@@ -48,24 +51,37 @@ type Server struct {
 	store      *RunStore
 	exec       *Executor
 	hub        *Hub
+	fabric     FabricConfig
 	timeout    time.Duration
 	allowHosts map[string]bool
+	handler    http.Handler
 
 	mu   sync.Mutex
 	busy map[string]context.CancelFunc // run id -> cancel of its running phase
+
+	chainMu   sync.Mutex
+	chainConn *clientsdk.Connection // lazily opened, cached across /api/trail requests
+
+	// dial resolves the chain reader + ledger for /api/trail. Defaults to
+	// dialChain (lazy-connect via fabric); tests override it to inject fakes.
+	dial func() (chainReader, clientsdk.Ledger, error)
 }
 
-// NewServer returns the console HTTP handler. allowHosts is the set of Host
-// header values accepted (DNS-rebinding defense); timeout bounds each phase.
-func NewServer(store *RunStore, exec *Executor, hub *Hub, allowHosts []string, timeout time.Duration) http.Handler {
+// NewServer returns the console HTTP handler. fabric configures the live
+// Fabric network /api/trail reads from (zero-value = every trail request 502s
+// as unreachable). allowHosts is the set of Host header values accepted
+// (DNS-rebinding defense); timeout bounds each phase.
+func NewServer(store *RunStore, exec *Executor, hub *Hub, fabric FabricConfig, allowHosts []string, timeout time.Duration) *Server {
 	s := &Server{
 		store:      store,
 		exec:       exec,
 		hub:        hub,
+		fabric:     fabric,
 		timeout:    timeout,
 		allowHosts: make(map[string]bool),
 		busy:       make(map[string]context.CancelFunc),
 	}
+	s.dial = s.dialChain
 	for _, h := range allowHosts {
 		s.allowHosts[h] = true
 	}
@@ -80,7 +96,18 @@ func NewServer(store *RunStore, exec *Executor, hub *Hub, allowHosts []string, t
 	mux.HandleFunc("/events", s.handleEvents)
 	mux.HandleFunc("/runs", s.handleRuns)
 	mux.HandleFunc("/export/", s.handleExport)
-	return s.guard(mux)
+	mux.HandleFunc("/api/trail/", s.handleTrailAPI)
+	mux.HandleFunc("/trail/", s.handleTrailPage)
+	s.handler = s.guard(mux)
+	return s
+}
+
+// ServeHTTP makes *Server itself the http.Handler main.go passes to
+// ListenAndServe, while keeping the concrete type available to tests (and to
+// buildTrail's connection caching) that NewServer's former http.Handler return
+// type hid.
+func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	s.handler.ServeHTTP(w, r)
 }
 
 // guard enforces the DNS-rebinding + cross-origin-POST defenses. A bare
@@ -324,6 +351,70 @@ func (s *Server) handleExport(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	http.ServeFile(w, r, path.Join(dir, artifact))
+}
+
+// handleTrailAPI serves the on-chain audit trail for an election (== run id).
+// Sealed until the tally is published (buildTrail's gate), unless the caller
+// passes ?operator=1 from a loopback address.
+func (s *Server) handleTrailAPI(w http.ResponseWriter, r *http.Request) {
+	electionID := strings.TrimPrefix(r.URL.Path, "/api/trail/")
+	if electionID == "" {
+		http.Error(w, "missing election id", http.StatusBadRequest)
+		return
+	}
+	dir, err := s.store.Dir(electionID)
+	if err != nil {
+		http.Error(w, "invalid election id", http.StatusBadRequest)
+		return
+	}
+	operator := r.URL.Query().Get("operator") == "1" && isLoopback(r.RemoteAddr)
+
+	reader, led, err := s.dial()
+	if err != nil {
+		http.Error(w, "chain unreachable: "+err.Error(), http.StatusBadGateway)
+		return
+	}
+	resp, err := buildTrail(reader, led, dir, electionID, operator)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	writeJSONResp(w, http.StatusOK, resp)
+}
+
+// handleTrailPage serves the public trail view. Rendering lands in a later
+// task; the route is registered now so it lives alongside the API route.
+func (s *Server) handleTrailPage(w http.ResponseWriter, r *http.Request) {
+	http.Error(w, "trail page lands in a later task", http.StatusNotImplemented)
+}
+
+// dialChain lazily opens ONE Fabric connection and caches it for reuse across
+// requests. A connect failure is never cached — the next request retries.
+func (s *Server) dialChain() (chainReader, clientsdk.Ledger, error) {
+	s.chainMu.Lock()
+	defer s.chainMu.Unlock()
+	if s.chainConn != nil {
+		return s.chainConn.Bulletin, s.chainConn.Ledger(), nil
+	}
+	conn, err := s.fabric.Connect()
+	if err != nil {
+		return nil, nil, err
+	}
+	s.chainConn = conn
+	return conn.Bulletin, conn.Ledger(), nil
+}
+
+// isLoopback reports whether remoteAddr (an http.Request.RemoteAddr, "host:port")
+// resolves to a loopback address. Operator mode is honored only for loopback
+// callers — the --allow-host guard can widen the Host allowlist for LAN
+// outsiders, but that must never grant the operator (unsealed) view.
+func isLoopback(remoteAddr string) bool {
+	host, _, err := net.SplitHostPort(remoteAddr)
+	if err != nil {
+		host = remoteAddr
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 // --- helpers ---------------------------------------------------------------
