@@ -43,6 +43,11 @@ type Connection struct {
 	Bulletin *BulletinClient
 }
 
+// Gateway exposes the underlying fabric-gateway client so callers can reach
+// networks and system chaincodes (e.g. qscc) the BulletinClient doesn't wrap.
+// THROWAWAY (QSCC spike): promoted to a designed API in the audit-trail work.
+func (c *Connection) Gateway() *client.Gateway { return c.gateway }
+
 // Close releases the gateway and the underlying gRPC connection.
 func (c *Connection) Close() error {
 	c.gateway.Close()

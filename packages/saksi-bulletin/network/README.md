@@ -45,12 +45,18 @@ From this directory:
 ./network.sh down
 ```
 
-`run-one-transaction.sh` submits the protocol golden ballot
-([`../../saksi-protocol/test-vectors/ballot-v1.hex`](../../saksi-protocol/test-vectors/ballot-v1.hex))
+`run-one-transaction.sh` stands up the fixture election (CreateElection +
+PublishDKGTranscript via `cmd/saksi-console --setup-only`) and then submits one
+REAL ballot from the checked-in bundle fixture
+([`../../saksi-protocol/test-vectors/bundle-v1.json`](../../saksi-protocol/test-vectors/bundle-v1.json))
 via the client SDK's `cmd/submit-ballot`, using the Org1 `User1` identity the
 test-network generated, then evaluates `GetBallot` and confirms the bulletin
-board returned the same ballot. Submitting the same ballot twice is rejected by
-the chaincode's nullifier-uniqueness check (no double vote).
+board returned the same ballot. The chaincode verifies CDS proofs on-chain at
+endorsement (ADR-0007), so the wire-format golden vector (`ballot-v1.hex`,
+placeholder crypto) cannot commit — the real fixture is required. Submitting
+the same ballot twice is rejected by the chaincode's nullifier-uniqueness
+check (no double vote); tear the network down/up (or set `SAKSI_BUNDLE` to a
+fresh `saksi-demo gen` bundle) to re-run. Requires `jq`.
 
 ### What each piece does
 
@@ -67,7 +73,7 @@ the chaincode's nullifier-uniqueness check (no double vote).
 | `FABRIC_SAMPLES` | sibling of the repo | fabric-samples checkout |
 | `SAKSI_CHANNEL` | `saksi` | channel name |
 | `SAKSI_CC_NAME` | `saksi-bulletin` | chaincode name |
-| `SAKSI_BALLOT` | golden vector | hex ballot file to submit |
+| `SAKSI_BUNDLE` | `bundle-v1.json` fixture | election bundle (from `saksi-demo gen`) to set up + submit from |
 
 ## Target topology (per locked architecture)
 
