@@ -11,6 +11,7 @@ import (
 	"encoding/asn1"
 	"fmt"
 	"math/big"
+	"time"
 
 	"github.com/hyperledger/fabric-gateway/pkg/client"
 	"github.com/hyperledger/fabric-protos-go-apiv2/common"
@@ -24,6 +25,9 @@ type Receipt struct {
 	BlockHash    []byte
 	DataHash     []byte
 	PreviousHash []byte
+	// Timestamp is the client's proposal time from the transaction's
+	// ChannelHeader (not consensus/commit time). Zero if not found.
+	Timestamp time.Time
 }
 
 // asn1Header mirrors fabric protoutil's ASN.1 block-header encoding.
@@ -108,7 +112,41 @@ func (l *ledger) LedgerReceipt(txID string) (Receipt, error) {
 	if err := proto.Unmarshal(blockBytes, &block); err != nil {
 		return Receipt{}, fmt.Errorf("decode block: %w", err)
 	}
-	return receiptFromBlock(txID, &block), nil
+	receipt := receiptFromBlock(txID, &block)
+	if ts, ok := txTimestamp(&block, txID); ok {
+		receipt.Timestamp = ts
+	}
+	return receipt, nil
+}
+
+// txTimestamp walks a block's envelopes looking for txID and returns the
+// client proposal time recorded in its ChannelHeader. A malformed or
+// non-matching envelope is skipped rather than treated as fatal: a missing
+// timestamp should never fail receipt retrieval.
+func txTimestamp(block *common.Block, txID string) (time.Time, bool) {
+	for _, envBytes := range block.GetData().GetData() {
+		var env common.Envelope
+		if err := proto.Unmarshal(envBytes, &env); err != nil {
+			continue
+		}
+		var payload common.Payload
+		if err := proto.Unmarshal(env.GetPayload(), &payload); err != nil {
+			continue
+		}
+		var chdr common.ChannelHeader
+		if err := proto.Unmarshal(payload.GetHeader().GetChannelHeader(), &chdr); err != nil {
+			continue
+		}
+		if chdr.GetTxId() != txID {
+			continue
+		}
+		ts := chdr.GetTimestamp()
+		if ts == nil {
+			return time.Time{}, false
+		}
+		return ts.AsTime(), true
+	}
+	return time.Time{}, false
 }
 
 func (l *ledger) ChainInfo() (uint64, []byte, error) {

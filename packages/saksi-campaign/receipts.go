@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"time"
 
 	clientsdk "github.com/saksi-framework/saksi/packages/saksi-bulletin/client-sdk"
 )
@@ -18,7 +19,7 @@ type TrailEvent struct {
 	Receipt clientsdk.Receipt `json:"receipt"`
 }
 
-const receiptsCSVHeader = "event,ref,tx_id,block_number,block_hash,data_hash,previous_hash"
+const receiptsCSVHeader = "event,ref,tx_id,block_number,block_hash,data_hash,previous_hash,timestamp"
 
 // appendReceipt appends the event to receipts.csv (creating it with a header)
 // and rewrites trail.json with the full ordered event list.
@@ -39,9 +40,13 @@ func appendReceipt(runDir string, ev TrailEvent) error {
 		}
 	}
 	r := ev.Receipt
-	if _, err := fmt.Fprintf(f, "%s,%s,%s,%d,%s,%s,%s\n",
+	ts := ""
+	if !r.Timestamp.IsZero() {
+		ts = r.Timestamp.Format(time.RFC3339)
+	}
+	if _, err := fmt.Fprintf(f, "%s,%s,%s,%d,%s,%s,%s,%s\n",
 		ev.Event, ev.Ref, r.TxID, r.BlockNumber,
-		hex.EncodeToString(r.BlockHash), hex.EncodeToString(r.DataHash), hex.EncodeToString(r.PreviousHash)); err != nil {
+		hex.EncodeToString(r.BlockHash), hex.EncodeToString(r.DataHash), hex.EncodeToString(r.PreviousHash), ts); err != nil {
 		return err
 	}
 

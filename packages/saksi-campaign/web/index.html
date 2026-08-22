@@ -252,6 +252,14 @@ function showTrailPanel(runID, mode) {
   $("trailPanel").style.display = mode === "onchain" ? "block" : "none";
   $("trailLink").href = "/trail/" + encodeURIComponent(runID);
 }
+function eventTimeShortText(ts) {
+  // Go zero time marshals as "0001-01-01T00:00:00Z" when absent; treat any
+  // implausibly old year as absent.
+  if (!ts) return "";
+  const d = new Date(ts);
+  if (isNaN(d.getTime()) || d.getFullYear() < 2000) return "";
+  return d.toLocaleTimeString();
+}
 function renderTrailRows(events) {
   const box = $("trailRows");
   if (!events || !events.length) { box.innerHTML = '<p class="muted small">Waiting for on-chain events…</p>'; return; }
@@ -264,6 +272,11 @@ function renderTrailRows(events) {
     const c = document.createElement("span"); c.textContent = "block #" + (r.BlockNumber ?? "?");
     const d = document.createElement("span"); d.className = "tx"; d.textContent = truncMid(r.TxID || "");
     row.append(a, b, c, d);
+    const timeText = eventTimeShortText(r.Timestamp);
+    if (timeText) {
+      const e = document.createElement("span"); e.className = "muted"; e.textContent = timeText;
+      row.append(e);
+    }
     box.append(row);
   });
 }

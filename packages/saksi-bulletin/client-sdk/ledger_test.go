@@ -3,8 +3,11 @@ package clientsdk
 import (
 	"encoding/hex"
 	"testing"
+	"time"
 
 	"github.com/hyperledger/fabric-protos-go-apiv2/common"
+	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
 func mustHex(t *testing.T, s string) []byte {
@@ -38,5 +41,65 @@ func TestReceiptFromBlock(t *testing.T) {
 	}
 	if hex.EncodeToString(r.BlockHash) != "5f896f60ee4a5a755dacd92ba162a707299621442683754c2469de8a123c43da" {
 		t.Fatalf("bad block hash: %x", r.BlockHash)
+	}
+}
+
+// buildEnvelope builds a marshaled common.Envelope carrying the given txID
+// and timestamp in its ChannelHeader, mirroring what a real proposal produces.
+func buildEnvelope(t *testing.T, txID string, ts *timestamppb.Timestamp) []byte {
+	t.Helper()
+	chdr, err := proto.Marshal(&common.ChannelHeader{TxId: txID, Timestamp: ts})
+	if err != nil {
+		t.Fatalf("marshal channel header: %v", err)
+	}
+	payload, err := proto.Marshal(&common.Payload{Header: &common.Header{ChannelHeader: chdr}})
+	if err != nil {
+		t.Fatalf("marshal payload: %v", err)
+	}
+	env, err := proto.Marshal(&common.Envelope{Payload: payload})
+	if err != nil {
+		t.Fatalf("marshal envelope: %v", err)
+	}
+	return env
+}
+
+func TestTxTimestampFound(t *testing.T) {
+	want := time.Date(2026, 8, 22, 12, 30, 0, 0, time.UTC)
+	block := &common.Block{
+		Data: &common.BlockData{
+			Data: [][]byte{
+				buildEnvelope(t, "other-tx", timestamppb.New(want.Add(-time.Hour))),
+				buildEnvelope(t, "tx-abc", timestamppb.New(want)),
+			},
+		},
+	}
+	got, ok := txTimestamp(block, "tx-abc")
+	if !ok {
+		t.Fatal("txTimestamp: not found, want found")
+	}
+	if !got.Equal(want) {
+		t.Fatalf("txTimestamp = %v, want %v", got, want)
+	}
+}
+
+func TestTxTimestampNotFound(t *testing.T) {
+	block := &common.Block{
+		Data: &common.BlockData{
+			Data: [][]byte{buildEnvelope(t, "other-tx", timestamppb.New(time.Now()))},
+		},
+	}
+	if _, ok := txTimestamp(block, "tx-abc"); ok {
+		t.Fatal("txTimestamp: found, want not found")
+	}
+}
+
+func TestTxTimestampMalformedEnvelopeSkipped(t *testing.T) {
+	block := &common.Block{
+		Data: &common.BlockData{
+			Data: [][]byte{[]byte("not a valid envelope"), buildEnvelope(t, "tx-abc", timestamppb.New(time.Now()))},
+		},
+	}
+	if _, ok := txTimestamp(block, "tx-abc"); !ok {
+		t.Fatal("txTimestamp: expected to find tx after skipping malformed envelope")
 	}
 }

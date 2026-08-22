@@ -106,6 +106,7 @@
     <section class="panel">
       <h2>Timeline</h2>
       <div id="timeline"></div>
+      <p style="margin:10px 0 0; font-size:12px; color:var(--muted)">Event times are client proposal timestamps recorded in each transaction's channel header.</p>
     </section>
 
     <section class="panel">
@@ -127,6 +128,15 @@ function b64ToHex(b64) {
   let hex = "";
   for (let i = 0; i < bin.length; i++) hex += bin.charCodeAt(i).toString(16).padStart(2, "0");
   return hex;
+}
+
+function eventTimeText(ts) {
+  // Go zero time marshals as "0001-01-01T00:00:00Z" when the receipt has no
+  // recorded timestamp; treat any implausibly old year as absent.
+  if (!ts) return "";
+  const d = new Date(ts);
+  if (isNaN(d.getTime()) || d.getFullYear() < 2000) return "";
+  return d.toLocaleString();
 }
 
 function truncMid(s, head, tail) {
@@ -162,6 +172,8 @@ function renderTimeline(events) {
     summary.className = "trow-summary";
     summary.tabIndex = 0;
 
+    const timeText = eventTimeText(r.Timestamp);
+
     const evName = document.createElement("span"); evName.className = "ev"; evName.textContent = ev.event || "";
     const ref = document.createElement("span"); ref.className = "ref"; ref.textContent = ev.ref || "";
     const block = document.createElement("span"); block.className = "blk"; block.textContent = "block #" + (r.BlockNumber ?? "?");
@@ -170,6 +182,10 @@ function renderTimeline(events) {
     tx.addEventListener("click", (e) => { e.stopPropagation(); copyText(txID); });
     const bh = document.createElement("span"); bh.className = "mono"; bh.textContent = truncMid(blockHashHex);
     summary.append(evName, ref, block, tx, bh);
+    if (timeText) {
+      const time = document.createElement("span"); time.className = "blk"; time.textContent = timeText;
+      summary.append(time);
+    }
 
     const detail = document.createElement("div");
     detail.className = "trow-detail";
@@ -178,6 +194,10 @@ function renderTimeline(events) {
     const dDh = document.createElement("div"); dDh.textContent = "data hash: " + dataHashHex;
     const dPh = document.createElement("div"); dPh.textContent = "previous hash: " + prevHashHex;
     detail.append(dTx, dBh, dDh, dPh);
+    if (timeText) {
+      const dTime = document.createElement("div"); dTime.textContent = "time: " + timeText;
+      detail.append(dTime);
+    }
 
     const toggle = () => row.classList.toggle("expanded");
     summary.addEventListener("click", toggle);
