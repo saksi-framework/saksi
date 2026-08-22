@@ -63,7 +63,7 @@ func newRun(t *testing.T, mode string) (*Executor, string, string) {
 	if err != nil {
 		t.Fatalf("create run: %v", err)
 	}
-	e := NewExecutor(store, NewHub(), "saksi-demo", "")
+	e := NewExecutor(store, NewHub(), "saksi-demo", "", FabricConfig{})
 	return e, runID, dir
 }
 
@@ -189,7 +189,7 @@ func TestSubmitOnchainDrivesTheDriver(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create: %v", err)
 	}
-	e := NewExecutor(store, NewHub(), "saksi-demo", "console-driver")
+	e := NewExecutor(store, NewHub(), "saksi-demo", "console-driver", FabricConfig{})
 	var gotName string
 	var gotArgs []string
 	e.run = func(_ context.Context, name string, args ...string) ([]byte, error) {

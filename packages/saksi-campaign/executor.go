@@ -61,14 +61,17 @@ type Executor struct {
 	hub     *Hub
 	demoBin string // path to the saksi-demo binary (Generate/Verify)
 	consBin string // path to the on-chain console driver (Submit); "" = none
+	fabric  FabricConfig
 	run     Runner
 }
 
 // NewExecutor wires the production runner. demoBin is the saksi-demo path;
 // consBin is the on-chain driver (may be "" — on-chain Submit then errors
-// clearly instead of hanging).
-func NewExecutor(store *RunStore, hub *Hub, demoBin, consBin string) *Executor {
-	return &Executor{store: store, hub: hub, demoBin: demoBin, consBin: consBin, run: execRunner}
+// clearly instead of hanging). fabric is the live-network connection config
+// (zero-value = on-chain gateway mode unavailable; unused for now, consumed by
+// a later task).
+func NewExecutor(store *RunStore, hub *Hub, demoBin, consBin string, fabric FabricConfig) *Executor {
+	return &Executor{store: store, hub: hub, demoBin: demoBin, consBin: consBin, fabric: fabric, run: execRunner}
 }
 
 func (e *Executor) publish(runID, phase, level, msg string) {

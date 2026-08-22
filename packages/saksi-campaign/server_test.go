@@ -17,7 +17,7 @@ func testServer(t *testing.T, allowHosts []string) (*Server, http.Handler, *Exec
 	t.Helper()
 	store := NewRunStore(t.TempDir())
 	hub := NewHub()
-	exec := NewExecutor(store, hub, "saksi-demo", "")
+	exec := NewExecutor(store, hub, "saksi-demo", "", FabricConfig{})
 	// Default fake runner: succeed, writing nothing.
 	exec.run = func(_ context.Context, _ string, _ ...string) ([]byte, error) { return nil, nil }
 	h := NewServer(store, exec, hub, allowHosts, time.Minute)

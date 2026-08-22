@@ -45,7 +45,7 @@ func TestScenariosRejectTheirMutations(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create: %v", err)
 	}
-	e := NewExecutor(store, NewHub(), demo, "")
+	e := NewExecutor(store, NewHub(), demo, "", FabricConfig{})
 
 	if err := e.Generate(ctx, runID, c); err != nil {
 		t.Fatalf("generate: %v", err)
