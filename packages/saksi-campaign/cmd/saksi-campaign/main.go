@@ -76,7 +76,9 @@ func main() {
 	fmt.Printf("  serving   http://%s\n", displayHost(*addr))
 	fmt.Printf("  runs      %s\n", *runsDir)
 	fmt.Printf("  saksi-demo %s\n", *demoBin)
-	if *consBin == "" {
+	if fabric.Enabled() {
+		fmt.Printf("  on-chain  fabric gateway %s (channel %s)\n", fabric.PeerEndpoint, fabric.Channel)
+	} else if *consBin == "" {
 		fmt.Printf("  on-chain  (no driver configured — offline mode only)\n")
 	}
 	if err := http.ListenAndServe(*addr, handler); err != nil {

@@ -232,10 +232,11 @@ const PRESETS = [1, 10, 100, 1000, 10000, 50000, 483000, 1000000];
 const OFFLINE_CEILING = 10000;
 // Data files: study CSVs first (prominent), then raw artifacts.
 const FILE_ORDER = ["election.csv", "ballots.csv", "correctness.csv", "negative-tests.csv", "perf.csv",
-                    "header.json", "ballots.ndjson", "run.json"];
+                    "header.json", "ballots.ndjson", "run.json", "receipts.csv", "trail.json"];
 const FILE_LABEL = { "election.csv":"election.csv", "ballots.csv":"ballots.csv",
                      "correctness.csv":"correctness.csv", "negative-tests.csv":"negatives.csv", "perf.csv":"perf.csv",
-                     "header.json":"header.json (raw)", "ballots.ndjson":"ballots.ndjson (raw)", "run.json":"run.json (raw)" };
+                     "header.json":"header.json (raw)", "ballots.ndjson":"ballots.ndjson (raw)", "run.json":"run.json (raw)",
+                     "receipts.csv":"Ledger receipts (CSV)", "trail.json":"Trail events (JSON)" };
 // Every .csv is study data → prominent; the raw audit/provenance files are quiet.
 const STUDY = new Set(["election.csv", "ballots.csv", "correctness.csv", "negative-tests.csv", "perf.csv"]);
 let currentRun = null, es = null, currentMode = "offline", runBusy = false, trailTimer = null;

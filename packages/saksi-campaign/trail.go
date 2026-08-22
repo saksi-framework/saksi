@@ -21,7 +21,7 @@ type chainReader interface {
 	GetElection(electionID string) (string, error)
 	GetDKGTranscript(electionID string) (string, error)
 	GetTally(electionID string) (string, error)
-	ListNullifiers(electionID string, pageSize int, bookmark string) (clientsdk.NullifierPage, error)
+	CountCommittedBallots(electionID string) (int, error)
 }
 
 var _ chainReader = (*clientsdk.BulletinClient)(nil)
@@ -57,11 +57,6 @@ type liveProof struct {
 
 const trailJSONFile = "trail.json"
 
-// nullifierListPageSize mirrors client-sdk's own page cap; the trail's live
-// proof only needs the count, so one page is enough for the demo scale this
-// console targets.
-const nullifierListPageSize = 10000
-
 // buildTrail assembles the trail view for an election. The gate is fail-closed
 // on the tally, not the lifecycle status: the chaincode never sets a "tallied"
 // status (PublishTally requires — and leaves — status "closed"), so "has a
@@ -96,9 +91,9 @@ func buildTrail(reader chainReader, led clientsdk.Ledger, runDir, electionID str
 	var partial bool
 	var partialReason string
 
-	page, err := reader.ListNullifiers(electionID, nullifierListPageSize, "")
+	nullifierCount, err := reader.CountCommittedBallots(electionID)
 	if err != nil {
-		log.Printf("trail: election %q ListNullifiers: %v", electionID, err)
+		log.Printf("trail: election %q CountCommittedBallots: %v", electionID, err)
 		partial, partialReason = true, "nullifier count unavailable"
 	}
 	height, tip, err := led.ChainInfo()
@@ -138,7 +133,7 @@ func buildTrail(reader chainReader, led clientsdk.Ledger, runDir, electionID str
 		Events:   events,
 		Live: &liveProof{
 			StatusNow:     displayStatus,
-			NullifierRows: len(page.Nullifiers),
+			NullifierRows: nullifierCount,
 			TallyHex:      tallyHex,
 			ChainHeight:   height,
 			TipHash:       hex.EncodeToString(tip),

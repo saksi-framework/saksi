@@ -34,6 +34,8 @@ var exportOrder = []string{
 	"header.json",
 	"ballots.ndjson",
 	RunFile,
+	"receipts.csv",
+	trailJSONFile,
 }
 
 var exportAllowlist = func() map[string]bool {

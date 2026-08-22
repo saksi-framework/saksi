@@ -26,7 +26,7 @@ type fakeChainReader struct {
 	tallyErr     error
 	election     string // hex-encoded ElectionParameters returned by GetElection
 	electionErr  error
-	nullifiers   clientsdk.NullifierPage
+	nullifiers   int
 	nullifierErr error
 }
 
@@ -34,7 +34,7 @@ func (f *fakeChainReader) GetElectionStatus(string) (string, error) { return f.s
 func (f *fakeChainReader) GetElection(string) (string, error)       { return f.election, f.electionErr }
 func (f *fakeChainReader) GetDKGTranscript(string) (string, error)  { return "", nil }
 func (f *fakeChainReader) GetTally(string) (string, error)          { return f.tally, f.tallyErr }
-func (f *fakeChainReader) ListNullifiers(string, int, string) (clientsdk.NullifierPage, error) {
+func (f *fakeChainReader) CountCommittedBallots(string) (int, error) {
 	return f.nullifiers, f.nullifierErr
 }
 
@@ -103,7 +103,7 @@ func TestBuildTrail(t *testing.T) {
 				status:     "closed",
 				tally:      hexTallyResult(t),
 				election:   hexElectionParams(t, []string{"president/cand0", "president/cand1", "vp/cand0"}),
-				nullifiers: clientsdk.NullifierPage{Nullifiers: []string{"n0", "n1"}},
+				nullifiers: 2,
 			},
 			wantSealed: false,
 			wantResults: map[string]map[string]uint64{
@@ -168,7 +168,7 @@ func TestBuildTrail(t *testing.T) {
 	}
 }
 
-func TestBuildTrailPartialLiveProofOnListNullifiersError(t *testing.T) {
+func TestBuildTrailPartialLiveProofOnCountCommittedBallotsError(t *testing.T) {
 	dir := t.TempDir()
 	writeFixtureTrail(t, dir)
 	reader := &fakeChainReader{
@@ -187,7 +187,7 @@ func TestBuildTrailPartialLiveProofOnListNullifiersError(t *testing.T) {
 		t.Fatal("want a live proof")
 	}
 	if !got.Live.Partial {
-		t.Fatalf("want Partial=true when ListNullifiers errors, got %+v", got.Live)
+		t.Fatalf("want Partial=true when CountCommittedBallots errors, got %+v", got.Live)
 	}
 	if got.Live.PartialReason == "" {
 		t.Fatal("want a non-empty PartialReason")
@@ -203,7 +203,7 @@ func TestBuildTrailPartialLiveProofOnTallyDecodeFailure(t *testing.T) {
 		election: hexElectionParams(t, []string{ // only 2 contest ids -> length mismatch
 			"president/cand0", "president/cand1",
 		}),
-		nullifiers: clientsdk.NullifierPage{Nullifiers: []string{"n0"}},
+		nullifiers: 1,
 	}
 	got, err := buildTrail(reader, &fakeLedger{}, dir, "run-1", false)
 	if err != nil {
@@ -290,7 +290,7 @@ func TestHandleTrailAPILoopbackOperatorUnsealed(t *testing.T) {
 	s.dial = func() (chainReader, clientsdk.Ledger, error) {
 		return &fakeChainReader{
 			status:     "open",
-			nullifiers: clientsdk.NullifierPage{Nullifiers: []string{"n0"}},
+			nullifiers: 1,
 		}, &fakeLedger{}, nil
 	}
 
