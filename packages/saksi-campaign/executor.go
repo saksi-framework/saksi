@@ -11,6 +11,8 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+
+	clientsdk "github.com/saksi-framework/saksi/packages/saksi-bulletin/client-sdk"
 )
 
 // CorrectnessFile is the per-contest cross-check CSV written by Verify.
@@ -153,9 +155,11 @@ func (e *Executor) Verify(ctx context.Context, runID string) (StreamAudit, error
 	return sa, nil
 }
 
-// Submit is a no-op offline (documented) and drives the on-chain lifecycle when
-// the mode is on-chain. On-chain requires a reachable Fabric network; without a
-// configured driver it returns a clear error rather than hanging.
+// Submit is a no-op offline (documented). On-chain, when a live Fabric network
+// is configured (FabricConfig.Enabled), it shells `saksi-demo gen` to produce a
+// one-blob bundle for this run, connects, and drives the full lifecycle via
+// submitOnChain. Without a live network it falls back to the legacy console
+// driver (consBin), which errors clearly rather than hanging if unconfigured.
 func (e *Executor) Submit(ctx context.Context, runID string, c ElectionConfig) error {
 	if c.Mode == "offline" {
 		e.publish(runID, "submit", "done", "offline mode: nothing submitted on-chain")
@@ -164,6 +168,34 @@ func (e *Executor) Submit(ctx context.Context, runID string, c ElectionConfig) e
 	dir, err := e.store.Dir(runID)
 	if err != nil {
 		return err
+	}
+	if e.fabric.Enabled() {
+		bundlePath := filepath.Join(dir, "bundle.json")
+		args := []string{
+			"gen",
+			"--voters", strconv.Itoa(c.Voters),
+			"--positions", strconv.Itoa(c.Positions),
+			"--candidates", strconv.Itoa(c.Candidates),
+			"--trustees", strconv.Itoa(len(c.Trustees)),
+			"--threshold", strconv.Itoa(c.Threshold),
+			"--election-id", runID,
+			"--election-name", c.Name,
+			"--trustee-names", strings.Join(c.TrusteeNames(), ","),
+			"--distribution", c.Distribution,
+			bundlePath,
+		}
+		e.publish(runID, "submit", "info", "generating on-chain bundle…")
+		if _, err := e.run(ctx, e.demoBin, args...); err != nil {
+			e.publish(runID, "submit", "error", "bundle generation failed: "+err.Error())
+			return err
+		}
+		conn, err := e.fabric.Connect()
+		if err != nil {
+			e.publish(runID, "submit", "error", "connect to Fabric: "+err.Error())
+			return err
+		}
+		defer conn.Close()
+		return e.submitOnChain(ctx, runID, c, conn.Ledger(), bundlePath)
 	}
 	if e.consBin == "" {
 		err := fmt.Errorf("on-chain submit requires a reachable Fabric network (no driver configured)")
@@ -176,6 +208,80 @@ func (e *Executor) Submit(ctx context.Context, runID string, c ElectionConfig) e
 		return err
 	}
 	e.publish(runID, "submit", "done", "submitted + reconciled on-chain")
+	return nil
+}
+
+// onChainBundle mirrors the JSON emitted by `saksi-demo gen` (fields the
+// on-chain lifecycle needs; same shape as cmd/saksi-console's bundle).
+type onChainBundle struct {
+	ElectionID         string   `json:"election_id"`
+	Params             string   `json:"params"`
+	DKG                string   `json:"dkg"`
+	Ballots            []string `json:"ballots"`
+	PartialDecryptions []string `json:"partial_decryptions"`
+	Tally              string   `json:"tally"`
+}
+
+// submitOnChain drives the full election lifecycle over led in order —
+// CreateElection, PublishDKGTranscript, SubmitBallot×each, CloseElection,
+// SubmitPartialDecryption×each, PublishTally — recording a receipt after every
+// committed step (appendReceipt) so a mid-lifecycle failure leaves the
+// already-committed steps' evidence on disk. Chaincode arg forms mirror
+// cmd/saksi-console/main.go's calls.
+func (e *Executor) submitOnChain(ctx context.Context, runID string, c ElectionConfig, led clientsdk.Ledger, bundlePath string) error {
+	raw, err := os.ReadFile(bundlePath)
+	if err != nil {
+		return fmt.Errorf("read bundle: %w", err)
+	}
+	var b onChainBundle
+	if err := json.Unmarshal(raw, &b); err != nil {
+		return fmt.Errorf("parse bundle: %w", err)
+	}
+	runDir, err := e.store.Dir(runID)
+	if err != nil {
+		return err
+	}
+
+	step := func(event, ref, fn string, args ...string) error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		_, receipt, err := led.SubmitWithReceipt(fn, args...)
+		if err != nil {
+			e.publish(runID, "submit", "error", fmt.Sprintf("%s %s: %v", event, ref, err))
+			return fmt.Errorf("%s: %w", event, err)
+		}
+		if err := appendReceipt(runDir, TrailEvent{Event: event, Ref: ref, Receipt: receipt}); err != nil {
+			return err
+		}
+		e.publish(runID, "submit", "info", fmt.Sprintf("%s %s committed: block %d tx %s",
+			event, ref, receipt.BlockNumber, receipt.TxID))
+		return nil
+	}
+
+	if err := step("CreateElection", "", "CreateElection", b.Params); err != nil {
+		return err
+	}
+	if err := step("PublishDKGTranscript", "", "PublishDKGTranscript", b.DKG); err != nil {
+		return err
+	}
+	for i, ballot := range b.Ballots {
+		if err := step("SubmitBallot", strconv.Itoa(i), "SubmitBallot", ballot); err != nil {
+			return err
+		}
+	}
+	if err := step("CloseElection", "", "CloseElection", b.ElectionID); err != nil {
+		return err
+	}
+	for i, pd := range b.PartialDecryptions {
+		if err := step("SubmitPartialDecryption", strconv.Itoa(i), "SubmitPartialDecryption", b.ElectionID, pd); err != nil {
+			return err
+		}
+	}
+	if err := step("PublishTally", "", "PublishTally", b.Tally); err != nil {
+		return err
+	}
+	e.publish(runID, "submit", "done", "full lifecycle committed on-chain")
 	return nil
 }
 
