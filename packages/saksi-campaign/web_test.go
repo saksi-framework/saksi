@@ -37,7 +37,7 @@ func TestTrailPageServesSelfContainedUI(t *testing.T) {
 		t.Fatalf("GET /trail/some-run want 200, got %d", rec.Code)
 	}
 	body := rec.Body.String()
-	for _, want := range []string{`id="sealed-banner"`, `id="timeline"`} {
+	for _, want := range []string{`id="sealed-banner"`, `id="timeline"`, `id="results"`} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("trail UI is missing %q", want)
 		}

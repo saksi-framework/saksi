@@ -52,13 +52,14 @@ func hexTallyResult(t *testing.T) string {
 	return hex.EncodeToString(raw)
 }
 
-// hexElectionParams builds the matching ElectionParameters (contest ids
-// aligned index-for-index with hexTallyResult's totals) and hex-encodes it.
-func hexElectionParams(t *testing.T) string {
+// hexElectionParams builds ElectionParameters with the given contest ids
+// (aligned index-for-index with hexTallyResult's totals when there are 3,
+// deliberately mismatched otherwise) and hex-encodes it.
+func hexElectionParams(t *testing.T, contestIDs []string) string {
 	t.Helper()
 	raw, err := proto.Marshal(&pb.ElectionParameters{
 		ElectionId: "run-1",
-		ContestIds: []string{"president/cand0", "president/cand1", "vp/cand0"},
+		ContestIds: contestIDs,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -101,7 +102,7 @@ func TestBuildTrail(t *testing.T) {
 			reader: &fakeChainReader{
 				status:     "closed",
 				tally:      hexTallyResult(t),
-				election:   hexElectionParams(t),
+				election:   hexElectionParams(t, []string{"president/cand0", "president/cand1", "vp/cand0"}),
 				nullifiers: clientsdk.NullifierPage{Nullifiers: []string{"n0", "n1"}},
 			},
 			wantSealed: false,
@@ -190,6 +191,38 @@ func TestBuildTrailPartialLiveProofOnListNullifiersError(t *testing.T) {
 	}
 	if got.Live.PartialReason == "" {
 		t.Fatal("want a non-empty PartialReason")
+	}
+}
+
+func TestBuildTrailPartialLiveProofOnTallyDecodeFailure(t *testing.T) {
+	dir := t.TempDir()
+	writeFixtureTrail(t, dir)
+	reader := &fakeChainReader{
+		status: "closed",
+		tally:  hexTallyResult(t), // 3 totals: president/cand0,cand1, vp/cand0
+		election: hexElectionParams(t, []string{ // only 2 contest ids -> length mismatch
+			"president/cand0", "president/cand1",
+		}),
+		nullifiers: clientsdk.NullifierPage{Nullifiers: []string{"n0"}},
+	}
+	got, err := buildTrail(reader, &fakeLedger{}, dir, "run-1", false)
+	if err != nil {
+		t.Fatalf("buildTrail: %v", err)
+	}
+	if got.Sealed {
+		t.Fatal("want open (tally published)")
+	}
+	if got.Results != nil {
+		t.Fatalf("want Results nil on decode failure, got %+v", got.Results)
+	}
+	if got.Live == nil {
+		t.Fatal("want a live proof")
+	}
+	if !got.Live.Partial {
+		t.Fatalf("want Partial=true when tally decode fails, got %+v", got.Live)
+	}
+	if got.Live.PartialReason != "tally decode failed" {
+		t.Fatalf("PartialReason = %q, want %q", got.Live.PartialReason, "tally decode failed")
 	}
 }
 
