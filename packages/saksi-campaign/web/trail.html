@@ -1,0 +1,238 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Election Trail</title>
+<style>
+  :root {
+    --bg:#f4f6f8; --panel:#ffffff; --panel-2:#fbfcfd; --ink:#181b20; --muted:#5c6470;
+    --line:#e4e8ec; --line-2:#eef1f4; --accent:#2f6fed; --accent-weak:#e8effe; --accent-ink:#1a4ed0;
+    --ok:#17864a; --ok-weak:#e3f4ea; --bad:#c53434; --bad-weak:#fbe9e9;
+    --radius:12px; --radius-sm:8px;
+    --shadow:0 1px 2px rgba(16,24,40,.05), 0 4px 12px rgba(16,24,40,.04);
+    --mono:ui-monospace,"SF Mono",SFMono-Regular,Menlo,Consolas,monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg:#0c0e11; --panel:#15181d; --panel-2:#181c22; --ink:#e8ebef; --muted:#98a1ad;
+      --line:#262b32; --line-2:#20242a; --accent:#5b8bff; --accent-weak:#1a2740; --accent-ink:#a9c4ff;
+      --ok:#4cc47f; --ok-weak:#132a1f; --bad:#f0736f; --bad-weak:#301a1c;
+      --shadow:0 1px 2px rgba(0,0,0,.4), 0 6px 18px rgba(0,0,0,.28);
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg:#0c0e11; --panel:#15181d; --panel-2:#181c22; --ink:#e8ebef; --muted:#98a1ad;
+    --line:#262b32; --line-2:#20242a; --accent:#5b8bff; --accent-weak:#1a2740; --accent-ink:#a9c4ff;
+    --ok:#4cc47f; --ok-weak:#132a1f; --bad:#f0736f; --bad-weak:#301a1c;
+    --shadow:0 1px 2px rgba(0,0,0,.4), 0 6px 18px rgba(0,0,0,.28);
+  }
+  * { box-sizing:border-box; }
+  :focus-visible { outline:2px solid var(--accent); outline-offset:2px; border-radius:4px; }
+  body { margin:0; background:var(--bg); color:var(--ink);
+         font:14px/1.55 system-ui,-apple-system,"Segoe UI",Roboto,Inter,sans-serif;
+         -webkit-font-smoothing:antialiased; }
+  .tnum { font-variant-numeric:tabular-nums; }
+  .mono { font-family:var(--mono); }
+
+  header { padding:20px 28px; border-bottom:1px solid var(--line); background:var(--panel);
+           display:flex; align-items:baseline; gap:14px; flex-wrap:wrap; }
+  header h1 { margin:0; font-size:19px; font-weight:650; letter-spacing:-0.02em; }
+  header .sub { color:var(--muted); font-size:12px; font-family:var(--mono); }
+  header button { margin-left:auto; }
+
+  main { padding:24px 28px 40px; max-width:860px; margin:0 auto; display:flex; flex-direction:column; gap:18px; }
+
+  .panel { background:var(--panel); border:1px solid var(--line); border-radius:var(--radius);
+           padding:18px 18px 20px; box-shadow:var(--shadow); }
+
+  h2 { margin:0 0 12px; font-size:12px; font-weight:650; text-transform:uppercase; letter-spacing:.08em; color:var(--muted); }
+
+  button { font:inherit; border:1px solid var(--line); background:var(--panel); color:var(--ink);
+           padding:8px 13px; border-radius:var(--radius-sm); cursor:pointer;
+           transition:border-color .12s, background .12s, color .12s; }
+  button:hover:not(:disabled) { border-color:var(--accent); color:var(--accent); }
+
+  .pill { display:inline-block; padding:2px 9px; border-radius:999px; font-size:12px; font-weight:600;
+          border:1px solid var(--line); color:var(--muted); }
+
+  #sealed-banner { text-align:center; padding:48px 24px; }
+  #sealed-banner p { max-width:520px; margin:0 auto 14px; color:var(--ink); font-size:15px; }
+
+  .kv { display:flex; gap:8px; align-items:baseline; margin:4px 0; font-size:13px; }
+  .kv .k { color:var(--muted); min-width:110px; }
+  .warn { color:var(--bad); font-size:12px; margin-top:8px; }
+
+  .hash { cursor:pointer; color:var(--accent); }
+  .hash:hover { color:var(--accent-ink); }
+
+  .trow { border-bottom:1px solid var(--line-2); }
+  .trow:last-child { border-bottom:none; }
+  .trow-summary { display:flex; flex-wrap:wrap; gap:14px; align-items:center; padding:10px 4px;
+                  cursor:pointer; font-size:13px; }
+  .trow-summary:hover { background:var(--panel-2); }
+  .trow-summary .ev { font-weight:600; min-width:150px; }
+  .trow-summary .ref { color:var(--muted); }
+  .trow-summary .blk { color:var(--muted); font-family:var(--mono); font-size:12px; }
+  .trow-detail { display:none; padding:0 4px 12px; font-size:12px; color:var(--muted); }
+  .trow-detail div { margin:3px 0; word-break:break-all; }
+  .trow.expanded .trow-detail { display:block; }
+
+  .err { color:var(--bad); font-size:12px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Election Trail</h1>
+  <span class="sub" id="electionSub"></span>
+  <button id="btnRefresh" type="button">Refresh</button>
+</header>
+
+<main>
+  <div id="sealed-banner" class="panel" style="display:none">
+    <p>Election in progress — results are not yet unlocked. This page opens when enough trustees have published the tally.</p>
+    <span class="pill" id="sealedStatusPill"></span>
+  </div>
+
+  <div id="openView" style="display:none">
+    <section class="panel">
+      <h2>Election</h2>
+      <div class="kv"><span class="k">Election ID</span><span id="electionId" class="mono"></span></div>
+      <div class="kv"><span class="k">Chain height</span><span id="chainHeight" class="tnum"></span></div>
+      <div class="kv"><span class="k">Tip hash</span><span id="tipHash" class="mono hash" title="click to copy full hash"></span></div>
+      <div class="warn" id="partialWarn" style="display:none"></div>
+    </section>
+
+    <section class="panel">
+      <h2>Timeline</h2>
+      <div id="timeline"></div>
+    </section>
+
+    <section class="panel">
+      <h2>Tally</h2>
+      <div class="kv"><span class="k">tally hex</span><span id="tallyHex" class="mono hash" title="click to copy full tally hex"></span></div>
+    </section>
+  </div>
+
+  <div id="errorBox" class="err" style="display:none"></div>
+</main>
+
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+
+function b64ToHex(b64) {
+  if (!b64) return "";
+  const bin = atob(b64);
+  let hex = "";
+  for (let i = 0; i < bin.length; i++) hex += bin.charCodeAt(i).toString(16).padStart(2, "0");
+  return hex;
+}
+
+function truncMid(s, head, tail) {
+  s = s || ""; head = head || 10; tail = tail || 8;
+  if (s.length <= head + tail + 1) return s;
+  return s.slice(0, head) + "…" + s.slice(-tail);
+}
+
+function copyText(text) {
+  if (!text) return;
+  navigator.clipboard?.writeText(text).catch(() => {});
+}
+
+function electionIDFromPath() {
+  const parts = location.pathname.split("/").filter(Boolean); // ["trail", "<id>"]
+  return decodeURIComponent(parts[1] || "");
+}
+
+function renderTimeline(events) {
+  const box = $("timeline");
+  box.textContent = "";
+  (events || []).forEach((ev) => {
+    const r = ev.receipt || {};
+    const txID = r.TxID || "";
+    const blockHashHex = b64ToHex(r.BlockHash);
+    const dataHashHex = b64ToHex(r.DataHash);
+    const prevHashHex = b64ToHex(r.PreviousHash);
+
+    const row = document.createElement("div");
+    row.className = "trow";
+
+    const summary = document.createElement("div");
+    summary.className = "trow-summary";
+    summary.tabIndex = 0;
+
+    const evName = document.createElement("span"); evName.className = "ev"; evName.textContent = ev.event || "";
+    const ref = document.createElement("span"); ref.className = "ref"; ref.textContent = ev.ref || "";
+    const block = document.createElement("span"); block.className = "blk"; block.textContent = "block #" + (r.BlockNumber ?? "?");
+    const tx = document.createElement("span"); tx.className = "mono hash"; tx.textContent = truncMid(txID);
+    tx.title = "click to copy full tx id";
+    tx.addEventListener("click", (e) => { e.stopPropagation(); copyText(txID); });
+    const bh = document.createElement("span"); bh.className = "mono"; bh.textContent = truncMid(blockHashHex);
+    summary.append(evName, ref, block, tx, bh);
+
+    const detail = document.createElement("div");
+    detail.className = "trow-detail";
+    const dTx = document.createElement("div"); dTx.textContent = "tx id: " + txID;
+    const dBh = document.createElement("div"); dBh.textContent = "block hash: " + blockHashHex;
+    const dDh = document.createElement("div"); dDh.textContent = "data hash: " + dataHashHex;
+    const dPh = document.createElement("div"); dPh.textContent = "previous hash: " + prevHashHex;
+    detail.append(dTx, dBh, dDh, dPh);
+
+    const toggle = () => row.classList.toggle("expanded");
+    summary.addEventListener("click", toggle);
+    summary.addEventListener("keydown", (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); toggle(); } });
+
+    row.append(summary, detail);
+    box.append(row);
+  });
+}
+
+function render(data) {
+  if (data.sealed) {
+    $("sealed-banner").style.display = "block";
+    $("openView").style.display = "none";
+    $("sealedStatusPill").textContent = data.status || "unknown";
+    return;
+  }
+  $("sealed-banner").style.display = "none";
+  $("openView").style.display = "block";
+  $("electionId").textContent = data.election_id || "";
+  $("electionSub").textContent = data.election_id || "";
+
+  const live = data.live || {};
+  $("chainHeight").textContent = String(live.chain_height ?? "?");
+  $("tipHash").textContent = truncMid(live.tip_hash || "");
+  $("tipHash").onclick = () => copyText(live.tip_hash || "");
+
+  if (live.partial) {
+    $("partialWarn").style.display = "block";
+    $("partialWarn").textContent = "Partial data: " + (live.partial_reason || "unknown reason");
+  } else {
+    $("partialWarn").style.display = "none";
+  }
+
+  renderTimeline(data.events);
+
+  $("tallyHex").textContent = truncMid(live.tally_hex || "");
+  $("tallyHex").onclick = () => copyText(live.tally_hex || "");
+}
+
+async function load() {
+  const id = electionIDFromPath();
+  $("errorBox").style.display = "none";
+  try {
+    const res = await fetch("/api/trail/" + encodeURIComponent(id));
+    if (!res.ok) throw new Error("request failed: " + res.status);
+    render(await res.json());
+  } catch (e) {
+    $("errorBox").style.display = "block";
+    $("errorBox").textContent = "Failed to load trail: " + e.message;
+  }
+}
+
+$("btnRefresh").onclick = load;
+load();
+</script>
+</body>
+</html>

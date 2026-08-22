@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	clientsdk "github.com/saksi-framework/saksi/packages/saksi-bulletin/client-sdk"
@@ -263,11 +264,14 @@ func TestHandleTrailAPIUnknownRunIs400(t *testing.T) {
 	}
 }
 
-func TestHandleTrailPageNotYetImplemented(t *testing.T) {
+func TestHandleTrailPageServesHTML(t *testing.T) {
 	_, h, _ := testServer(t, nil)
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/trail/run-1", nil))
-	if rec.Code != http.StatusNotImplemented {
-		t.Fatalf("want 501, got %d", rec.Code)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("want 200, got %d: %s", rec.Code, rec.Body)
+	}
+	if ct := rec.Header().Get("Content-Type"); !strings.Contains(ct, "text/html") {
+		t.Fatalf("want text/html, got %q", ct)
 	}
 }

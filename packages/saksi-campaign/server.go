@@ -18,7 +18,7 @@ import (
 	clientsdk "github.com/saksi-framework/saksi/packages/saksi-bulletin/client-sdk"
 )
 
-//go:embed web/index.html
+//go:embed web/index.html web/trail.html
 var webFS embed.FS
 
 // exportOrder is the downloadable run artifacts, in display order. exportAllowlist
@@ -382,10 +382,16 @@ func (s *Server) handleTrailAPI(w http.ResponseWriter, r *http.Request) {
 	writeJSONResp(w, http.StatusOK, resp)
 }
 
-// handleTrailPage serves the public trail view. Rendering lands in a later
-// task; the route is registered now so it lives alongside the API route.
+// handleTrailPage serves the public trail view (self-contained HTML; it
+// fetches /api/trail/<id> client-side using the URL path itself).
 func (s *Server) handleTrailPage(w http.ResponseWriter, r *http.Request) {
-	http.Error(w, "trail page lands in a later task", http.StatusNotImplemented)
+	data, err := webFS.ReadFile("web/trail.html")
+	if err != nil {
+		http.Error(w, "ui unavailable", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	_, _ = w.Write(data)
 }
 
 // dialChain lazily opens ONE Fabric connection and caches it for reuse across

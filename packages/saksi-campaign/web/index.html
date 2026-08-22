@@ -130,6 +130,12 @@
   .verdict .dot2 { width:7px; height:7px; border-radius:50%; background:currentColor; }
   td.res-pass { color:var(--ok); font-weight:650; } td.res-fail { color:var(--bad); font-weight:650; }
 
+  .trail-row { display:flex; flex-wrap:wrap; gap:12px; align-items:center; padding:6px 0;
+               border-bottom:1px solid var(--line-2); font-size:12.5px; }
+  .trail-row:last-child { border-bottom:none; }
+  .trail-row .ev { font-weight:600; min-width:140px; }
+  .trail-row .tx { font-family:var(--mono); color:var(--muted); }
+
   .muted { color:var(--muted); } .small { font-size:12px; }
   .err { color:var(--bad); font-size:12px; margin-top:10px; min-height:1.2em; }
   a { color:var(--accent); }
@@ -201,6 +207,12 @@
       <div class="table-wrap" id="results"></div>
       <div class="files" id="exports" style="margin-top:14px"></div>
     </section>
+
+    <section class="panel" id="trailPanel" style="display:none">
+      <div class="phead"><h2>Trail</h2><span class="meta small muted" id="trailStatus"></span></div>
+      <div id="trailRows"><p class="muted small">Waiting for on-chain events…</p></div>
+      <a id="trailLink" class="small" target="_blank" rel="noopener" style="display:inline-block;margin-top:10px">Open public trail page &rarr;</a>
+    </section>
   </div>
 
   <!-- HISTORY (full width) -->
@@ -226,9 +238,55 @@ const FILE_LABEL = { "election.csv":"election.csv", "ballots.csv":"ballots.csv",
                      "header.json":"header.json (raw)", "ballots.ndjson":"ballots.ndjson (raw)", "run.json":"run.json (raw)" };
 // Every .csv is study data → prominent; the raw audit/provenance files are quiet.
 const STUDY = new Set(["election.csv", "ballots.csv", "correctness.csv", "negative-tests.csv", "perf.csv"]);
-let currentRun = null, es = null;
+let currentRun = null, es = null, currentMode = "offline", runBusy = false, trailTimer = null;
 
 const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;" }[c]));
+
+// --- operator Trail panel (onchain runs only; the public /trail page is the showpiece) ---
+function truncMid(s, head, tail) {
+  s = s || ""; head = head || 8; tail = tail || 6;
+  return s.length <= head + tail + 1 ? s : s.slice(0, head) + "…" + s.slice(-tail);
+}
+function showTrailPanel(runID, mode) {
+  currentMode = mode;
+  $("trailPanel").style.display = mode === "onchain" ? "block" : "none";
+  $("trailLink").href = "/trail/" + encodeURIComponent(runID);
+}
+function renderTrailRows(events) {
+  const box = $("trailRows");
+  if (!events || !events.length) { box.innerHTML = '<p class="muted small">Waiting for on-chain events…</p>'; return; }
+  box.innerHTML = "";
+  events.forEach((ev) => {
+    const r = ev.receipt || {};
+    const row = document.createElement("div"); row.className = "trail-row";
+    const a = document.createElement("span"); a.className = "ev"; a.textContent = ev.event || "";
+    const b = document.createElement("span"); b.textContent = ev.ref || "";
+    const c = document.createElement("span"); c.textContent = "block #" + (r.BlockNumber ?? "?");
+    const d = document.createElement("span"); d.className = "tx"; d.textContent = truncMid(r.TxID || "");
+    row.append(a, b, c, d);
+    box.append(row);
+  });
+}
+async function loadTrail(runID) {
+  try {
+    const res = await fetch(`/api/trail/${encodeURIComponent(runID)}?operator=1`);
+    if (!res.ok) return;
+    const data = await res.json();
+    $("trailStatus").textContent = data.sealed ? (data.status || "") : ((data.live && data.live.status_now) || "");
+    renderTrailRows(data.events);
+  } catch (_) {}
+}
+function stopTrailPoll() { if (trailTimer) { clearInterval(trailTimer); trailTimer = null; } }
+function startTrailPoll(runID) {
+  stopTrailPoll();
+  if (currentMode !== "onchain" || document.hidden) return;
+  loadTrail(runID);
+  trailTimer = setInterval(() => loadTrail(runID), 3000);
+}
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden) stopTrailPoll();
+  else if (runBusy && currentRun) startTrailPoll(currentRun);
+});
 
 function fileChips(runID, arts) {
   if (!arts || !arts.length) return '<span class="muted small">— run a phase to produce data —</span>';
@@ -299,7 +357,12 @@ function openStream(runID) {
     else setPhase(e.phase, "running");
     if (e.phase === "verify" && e.level === "done") loadResults(runID);
     if ((e.phase === "scenarios") && (e.level === "done" || e.level === "error")) loadHistory();
-    if (e.level === "done" || e.level === "error") $("btnCancel").disabled = false;
+    if (e.level === "done" || e.level === "error") {
+      $("btnCancel").disabled = false;
+      runBusy = false;
+      stopTrailPoll();
+      if (currentMode === "onchain") loadTrail(runID); // one final fetch
+    }
   };
 }
 
@@ -312,16 +375,24 @@ async function post(path, body) {
 
 async function startWithConfig(path) {
   resetPhases(); $("resultsPanel").style.display = "none"; $("log").innerHTML = "";
+  const cfg = config();
   try {
-    const { run_id } = await post(path, config());
+    const { run_id } = await post(path, cfg);
     currentRun = run_id; $("runIdChip").textContent = run_id;
     $("btnCancel").disabled = false;
+    showTrailPanel(run_id, cfg.mode);
+    runBusy = true;
+    startTrailPoll(run_id);
     openStream(run_id);
   } catch (_) {}
 }
 async function phase(path) {
   if (!currentRun) { $("configErr").textContent = "Generate a run first."; return; }
-  try { await post(path, { run_id: currentRun }); } catch (_) {}
+  try {
+    await post(path, { run_id: currentRun });
+    runBusy = true;
+    startTrailPoll(currentRun);
+  } catch (_) {}
 }
 
 async function artifactsFor(runID) {
@@ -369,7 +440,7 @@ async function loadHistory() {
       const c = r.config, arts = r.artifacts || [];
       const canLoad = arts.includes("correctness.csv");
       const mode = c.mode === "onchain" ? '<span class="pill on">on-chain</span>' : '<span class="pill">offline</span>';
-      html += `<tr class="${canLoad ? "rowsel" : ""}"${canLoad ? ` data-run="${esc(r.run_id)}" tabindex="0"` : ""}>`
+      html += `<tr class="${canLoad ? "rowsel" : ""}"${canLoad ? ` data-run="${esc(r.run_id)}" data-mode="${esc(c.mode)}" tabindex="0"` : ""}>`
             + `<td class="name">${esc(c.name)}</td>`
             + `<td class="num">${c.voters.toLocaleString()}</td>`
             + `<td class="tnum">${c.threshold}-of-${c.trustees.length}</td>`
@@ -385,6 +456,8 @@ async function loadHistory() {
         const id = tr.dataset.run;
         currentRun = id; $("runIdChip").textContent = id;
         loadResults(id);
+        showTrailPanel(id, tr.dataset.mode);
+        if (tr.dataset.mode === "onchain") { runBusy = false; stopTrailPoll(); loadTrail(id); }
         $("resultsPanel").scrollIntoView({ behavior: "smooth", block: "nearest" });
       };
       tr.addEventListener("click", open);
