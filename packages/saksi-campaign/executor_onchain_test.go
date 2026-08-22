@@ -26,8 +26,10 @@ func (f *fakeLedger) SubmitWithReceipt(fn string, args ...string) ([]byte, clien
 	f.nextBlk++
 	return nil, clientsdk.Receipt{TxID: fmt.Sprintf("tx-%d", f.nextBlk), BlockNumber: f.nextBlk}, nil
 }
-func (f *fakeLedger) LedgerReceipt(string) (clientsdk.Receipt, error) { return clientsdk.Receipt{}, nil }
-func (f *fakeLedger) ChainInfo() (uint64, []byte, error)             { return f.nextBlk + 1, nil, nil }
+func (f *fakeLedger) LedgerReceipt(string) (clientsdk.Receipt, error) {
+	return clientsdk.Receipt{}, nil
+}
+func (f *fakeLedger) ChainInfo() (uint64, []byte, error) { return f.nextBlk + 1, nil, nil }
 
 // writeTestBundle writes a minimal bundle: 2 ballots, 2 partial decryptions.
 // The hex payloads are opaque to the orchestrator — any string works against
