@@ -33,13 +33,18 @@ type trailResponse struct {
 }
 
 // liveProof is a fresh, on-chain-only re-read taken at render time (never
-// stale, never carries voter identity — none exists on-chain).
+// stale, never carries voter identity — none exists on-chain). Partial marks
+// that one of the underlying reads failed, so NullifierRows/ChainHeight/TipHash
+// may be stale zero-values rather than a real chain state of zero — without
+// this flag those are indistinguishable.
 type liveProof struct {
 	StatusNow     string `json:"status_now"`
 	NullifierRows int    `json:"nullifier_count"`
 	TallyHex      string `json:"tally_hex,omitempty"`
 	ChainHeight   uint64 `json:"chain_height"`
 	TipHash       string `json:"tip_hash"`
+	Partial       bool   `json:"partial,omitempty"`
+	PartialReason string `json:"partial_reason,omitempty"`
 }
 
 const trailJSONFile = "trail.json"
@@ -80,13 +85,20 @@ func buildTrail(reader chainReader, led clientsdk.Ledger, runDir, electionID str
 		return trailResponse{}, err
 	}
 
+	var partial bool
+	var partialReason string
+
 	page, err := reader.ListNullifiers(electionID, nullifierListPageSize, "")
 	if err != nil {
 		log.Printf("trail: election %q ListNullifiers: %v", electionID, err)
+		partial, partialReason = true, "nullifier count unavailable"
 	}
 	height, tip, err := led.ChainInfo()
 	if err != nil {
 		log.Printf("trail: election %q ChainInfo: %v", electionID, err)
+		if !partial {
+			partial, partialReason = true, "chain height/tip unavailable"
+		}
 	}
 
 	return trailResponse{
@@ -100,6 +112,8 @@ func buildTrail(reader chainReader, led clientsdk.Ledger, runDir, electionID str
 			TallyHex:      tallyHex,
 			ChainHeight:   height,
 			TipHash:       hex.EncodeToString(tip),
+			Partial:       partial,
+			PartialReason: partialReason,
 		},
 	}, nil
 }

@@ -376,7 +376,7 @@ func (s *Server) handleTrailAPI(w http.ResponseWriter, r *http.Request) {
 	}
 	resp, err := buildTrail(reader, led, dir, electionID, operator)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		writeJSONResp(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
 	}
 	writeJSONResp(w, http.StatusOK, resp)

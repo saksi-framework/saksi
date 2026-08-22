@@ -113,7 +113,36 @@ func TestBuildTrail(t *testing.T) {
 			if got.Live == nil {
 				t.Fatal("open response must carry a live proof")
 			}
+			if got.Live.Partial {
+				t.Fatalf("live proof should not be partial when all reads succeed: %+v", got.Live)
+			}
 		})
+	}
+}
+
+func TestBuildTrailPartialLiveProofOnListNullifiersError(t *testing.T) {
+	dir := t.TempDir()
+	writeFixtureTrail(t, dir)
+	reader := &fakeChainReader{
+		status:       "closed",
+		tally:        "aabbcc",
+		nullifierErr: errors.New("peer unavailable"),
+	}
+	got, err := buildTrail(reader, &fakeLedger{}, dir, "run-1", false)
+	if err != nil {
+		t.Fatalf("buildTrail: %v", err)
+	}
+	if got.Sealed {
+		t.Fatal("want open (tally published)")
+	}
+	if got.Live == nil {
+		t.Fatal("want a live proof")
+	}
+	if !got.Live.Partial {
+		t.Fatalf("want Partial=true when ListNullifiers errors, got %+v", got.Live)
+	}
+	if got.Live.PartialReason == "" {
+		t.Fatal("want a non-empty PartialReason")
 	}
 }
 
