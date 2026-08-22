@@ -36,8 +36,10 @@ type ConnectionConfig struct {
 
 // Connection is an open gateway connection. Call Close when finished.
 type Connection struct {
-	gateway  *client.Gateway
-	grpcConn *grpc.ClientConn
+	gateway   *client.Gateway
+	grpcConn  *grpc.ClientConn
+	channel   string
+	chaincode string
 
 	// Bulletin is the ready-to-use bulletin-board client.
 	Bulletin *BulletinClient
@@ -45,7 +47,6 @@ type Connection struct {
 
 // Gateway exposes the underlying fabric-gateway client so callers can reach
 // networks and system chaincodes (e.g. qscc) the BulletinClient doesn't wrap.
-// THROWAWAY (QSCC spike): promoted to a designed API in the audit-trail work.
 func (c *Connection) Gateway() *client.Gateway { return c.gateway }
 
 // Close releases the gateway and the underlying gRPC connection.
@@ -89,9 +90,11 @@ func Connect(cfg ConnectionConfig) (*Connection, error) {
 
 	contract := gateway.GetNetwork(cfg.Channel).GetContract(cfg.Chaincode)
 	return &Connection{
-		gateway:  gateway,
-		grpcConn: grpcConn,
-		Bulletin: NewBulletinClient(contract),
+		gateway:   gateway,
+		grpcConn:  grpcConn,
+		channel:   cfg.Channel,
+		chaincode: cfg.Chaincode,
+		Bulletin:  NewBulletinClient(contract),
 	}, nil
 }
 
