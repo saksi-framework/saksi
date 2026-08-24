@@ -49,6 +49,11 @@
   .sub { color:var(--muted); font-size:12px }
   .tag { margin-left:auto; font-size:11px; text-transform:uppercase; letter-spacing:.06em;
          color:var(--muted); border:1px solid var(--line); border-radius:999px; padding:3px 10px }
+  .idchip { display:inline-flex; align-items:center; gap:8px; font-size:11px;
+            border:1px solid var(--line); border-radius:999px; padding:3px 6px 3px 11px }
+  .idchip code { font-family:var(--mono); font-size:11px; color:var(--ink) }
+  .idchip button { padding:2px 8px; font-size:10px; border-radius:999px }
+  .idchip a { font-size:10px; text-decoration:none; padding-right:5px }
   a { color:var(--accent-ink) }
 
   main { max-width:1080px; margin:0 auto; padding:22px 28px 48px }
@@ -214,7 +219,12 @@
 <header>
   <h1>Election Wizard</h1>
   <span class="sub">BalotaChain on the Saksi framework</span>
-  <span class="tag"><a href="/">classic console</a></span>
+  <span class="idchip" id="idChip" style="display:none">
+    <code id="idChipVal"></code>
+    <button type="button" id="idChipCopy" title="Copy election id">copy</button>
+    <a id="idChipTrail" href="#" title="Public trail">trail ↗</a>
+  </span>
+  <span class="tag"><a href="/trail/">all elections</a> · <a href="/">classic console</a></span>
 </header>
 
 <main>
@@ -261,7 +271,8 @@
           <option value="offline">offline — full crypto, no ledger</option>
           <option value="onchain">on-chain — commits to Fabric</option>
           <option value="groundtruth">ground truth only — no encryption</option>
-        </select></div>
+        </select>
+        <div class="small muted" id="modeHint" style="margin-top:4px"></div></div>
     </div>
 
     <div class="err" id="configErr"></div>
@@ -418,6 +429,24 @@ const QUIPS = {
 
 let step = 0, runID = null, cfg = null, es = null, quipTimer = null, trailTimer = null, ceremonyTimer = null;
 let attacks = [];   // the scenario catalog for this run, with verdicts as they land
+let caps = { fabric: false };   // what the SERVER can do, not what the page assumes
+
+/* ---- election id chip -------------------------------------------------- */
+// The run id IS the election id, and it is what /trail/<id> needs. It used to
+// appear only in step 2's header and vanish on the next step.
+function showIDChip() {
+  if (!runID) { $("idChip").style.display = "none"; return; }
+  $("idChipVal").textContent = runID;
+  $("idChipTrail").href = "/trail/" + encodeURIComponent(runID);
+  $("idChip").style.display = "inline-flex";
+}
+$("idChipCopy").onclick = async () => {
+  try {
+    await navigator.clipboard.writeText(runID || "");
+    $("idChipCopy").textContent = "copied";
+    setTimeout(() => { $("idChipCopy").textContent = "copy"; }, 1200);
+  } catch (_) { /* clipboard blocked; the id is selectable on screen anyway */ }
+};
 
 /* ---- step rail -------------------------------------------------------- */
 function renderRail() {
@@ -466,8 +495,23 @@ function startQuips(el, kind) {
   quipTimer = setInterval(() => { i = (i + 1) % lines.length; el.textContent = lines[i]; }, 2600);
 }
 function stopQuips() { if (quipTimer) { clearInterval(quipTimer); quipTimer = null; } }
-function showLoader(n, kind) { $("load" + n).style.display = "flex"; startQuips($("loadTxt" + n), kind); }
-function hideLoader(n) { $("load" + n).style.display = "none"; stopQuips(); }
+// A phase that finishes instantly reads as though nothing happened. Hold the
+// spinner for a minimum so the step is legible — a floor, never a delay: work
+// that already takes longer is not padded.
+const LOADER_MIN_MS = 1500;
+const reducedMotion = window.matchMedia?.("(prefers-reduced-motion: reduce)").matches;
+const loaderShownAt = {};
+
+function showLoader(n, kind) {
+  loaderShownAt[n] = Date.now();
+  $("load" + n).style.display = "flex";
+  startQuips($("loadTxt" + n), kind);
+}
+function hideLoader(n) {
+  const elapsed = Date.now() - (loaderShownAt[n] || 0);
+  const wait = reducedMotion ? 0 : Math.max(0, LOADER_MIN_MS - elapsed);
+  setTimeout(() => { $("load" + n).style.display = "none"; stopQuips(); }, wait);
+}
 
 /* ---- setup form ------------------------------------------------------- */
 function renderTrustees(names) {
@@ -568,6 +612,7 @@ async function startRun() {
   try { res = await post("/generate", cfg, "configErr"); } catch (_) { return; }
   runID = res.run_id;
   $("runChip").textContent = runID;
+  showIDChip();
   $("log").innerHTML = ""; $("genFiles").innerHTML = ""; $("genStats").innerHTML = "";
   $("next1").disabled = true;
   $("gtNote").style.display = cfg.mode === "groundtruth" ? "block" : "none";
@@ -640,7 +685,11 @@ async function runCheck() {
 /* ---- step 3: encrypt + record ------------------------------------------ */
 async function startSaksi() {
   go(3);
-  $("modeChip").textContent = cfg.mode === "onchain" ? "committing to Fabric" : "local — no ledger";
+  // Read from what the server can do, never from what was selected — the chip
+  // used to claim "committing to Fabric" on a run that executed locally.
+  $("modeChip").textContent = (cfg.mode === "onchain" && caps.fabric)
+    ? "committing to " + (caps.peer || "Fabric")
+    : "local — no ledger";
   $("next2").disabled = true;
   showLoader(2, "saksi");
   try { await post("/ceremony/start", { run_id: runID }, "err2"); } catch (_) { hideLoader(2); return; }
@@ -952,8 +1001,24 @@ $("next5").onclick = () => {
 };
 $("atkRerun").onclick = () => runAttack(step - ATTACK_STEP);
 $("btnRestart").onclick = () => {
-  closeStream(); stopTimers(); runID = null; cfg = null; attacks = []; go(0);
+  closeStream(); stopTimers(); runID = null; cfg = null; attacks = []; showIDChip(); go(0);
 };
+
+// Ask the server what it can actually do before offering on-chain. Without
+// this the page offered a mode the server could not honour, and the run
+// silently executed locally while the UI said it was committing to Fabric.
+(async () => {
+  try { caps = await getJSON("/api/capabilities"); } catch (_) {}
+  const opt = document.querySelector('#mode option[value="onchain"]');
+  if (opt && !caps.fabric) {
+    opt.disabled = true;
+    opt.textContent = "on-chain — no Fabric network configured";
+    $("modeHint").textContent =
+      "Start the console with --fabric-tls-cert, --fabric-cert and --fabric-key to enable on-chain mode.";
+  } else if (opt) {
+    opt.textContent = "on-chain — commits to " + (caps.peer || "Fabric");
+  }
+})();
 
 renderTrustees(["COMELEC", "Civil Society Watch", "University IT"]);
 renderPresets();

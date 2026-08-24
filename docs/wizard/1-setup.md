@@ -49,6 +49,26 @@ reasonable load. Neither is a sensible choice for demonstrating a result.
 All three are documented in `../synthetic-data-generation.md` and walked through
 in `../selection-rule-explained.md`.
 
+### Pick enough voters for the races to differ
+
+`realistic` reserves a share of the electorate per position (10/15/20%) to
+separate the candidates. When the electorate is small relative to the candidate
+count, that reserve hits its floor of `C(C+1)` and every position apportions
+identically — so all three races come out with the same numbers.
+
+Measured, the point where the three stay reliably distinct is:
+
+| Candidates | Voters needed |
+|---|---|
+| 4 | ~180+ |
+| 6 | ~330+ |
+| 12 | ~1,000+ |
+
+Below that the ballot is still valid and every race still has a clear winner —
+they simply look alike. **For a demonstration where President, Vice President
+and Senator should read as different races, use at least a thousand voters at
+twelve candidates.**
+
 ## Senate seats
 
 The Senate is a multi-seat race: the top `senate_seats` candidates are elected,

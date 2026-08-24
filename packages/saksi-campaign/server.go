@@ -110,6 +110,8 @@ func NewServer(store *RunStore, exec *Executor, hub *Hub, fabric FabricConfig, a
 	mux.HandleFunc("/api/ceremony/", s.handleCeremonyStatus)
 	mux.HandleFunc("/api/check/", s.handleCheck)
 	mux.HandleFunc("/api/scenarios/", s.handleScenarioList)
+	mux.HandleFunc("/api/capabilities", s.handleCapabilities)
+	mux.HandleFunc("/api/trail", s.handleTrailIndex)
 	s.handler = s.guard(mux)
 	return s
 }
@@ -197,6 +199,12 @@ func (s *Server) dispatch(w http.ResponseWriter, runID string, fn func(context.C
 func (s *Server) handleGenerate(w http.ResponseWriter, r *http.Request) {
 	c, ok := decodeConfig(w, r)
 	if !ok {
+		return
+	}
+	// Refuse an on-chain run with no network here, at step 1, rather than
+	// letting it get as far as the ceremony and quietly execute locally.
+	if c.Mode == "onchain" && !s.fabric.Enabled() {
+		http.Error(w, errNoFabric().Error(), http.StatusBadRequest)
 		return
 	}
 	runID, _, err := s.store.Create(c, time.Now())
@@ -641,6 +649,33 @@ func (s *Server) handleCeremonyStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSONResp(w, http.StatusOK, state)
+}
+
+// handleCapabilities tells the UI what this console can actually do, so the
+// page never offers a mode the server cannot honour. Without it the wizard
+// hardcoded all three modes and an on-chain selection silently ran offline.
+func (s *Server) handleCapabilities(w http.ResponseWriter, r *http.Request) {
+	writeJSONResp(w, http.StatusOK, struct {
+		Fabric  bool   `json:"fabric"`
+		Peer    string `json:"peer,omitempty"`
+		Channel string `json:"channel,omitempty"`
+	}{
+		Fabric:  s.fabric.Enabled(),
+		Peer:    s.fabric.PeerEndpoint,
+		Channel: s.fabric.Channel,
+	})
+}
+
+// handleTrailIndex lists every election this console has recorded, each checked
+// against the ledger. The chaincode has no ListElections — only per-election
+// getters — so this is the run store cross-referenced with the chain rather
+// than an enumeration of the ledger itself.
+func (s *Server) handleTrailIndex(w http.ResponseWriter, r *http.Request) {
+	rows, chain := s.trailIndex()
+	writeJSONResp(w, http.StatusOK, struct {
+		Chain bool            `json:"chain"`
+		Rows  []trailIndexRow `json:"rows"`
+	}{Chain: chain, Rows: rows})
 }
 
 // handleScenarioList serves the attack catalog for a run: every registered

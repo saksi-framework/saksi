@@ -157,12 +157,34 @@ func (e *Executor) generateBundle(ctx context.Context, runID string, c ElectionC
 // CeremonyStart generates the bundle once and, on-chain, runs the lifecycle
 // prefix up to and including CloseElection. It deliberately stops there: the
 // next move belongs to the trustees.
+// errNoFabric explains why an on-chain run cannot proceed. Selecting on-chain
+// without a configured network used to fall through to the local path and
+// report success, while the page said "committing to Fabric" — a run that
+// looked committed and was not. Failing here is the whole point.
+func errNoFabric() error {
+	return fmt.Errorf(
+		"on-chain mode needs a Fabric network: start the console with " +
+			"--fabric-tls-cert, --fabric-cert and --fabric-key (and --fabric-peer " +
+			"if the peer is not at the default endpoint)")
+}
+
+// localCeremonyOK reports whether running the ceremony without a ledger is what
+// the operator actually asked for. offline and ground-truth runs never involve
+// a chain; an on-chain run without one is a misconfiguration, not a fallback.
+func localCeremonyOK(c ElectionConfig) bool {
+	return c.Mode != "onchain"
+}
+
 func (e *Executor) CeremonyStart(ctx context.Context, runID string, c ElectionConfig) error {
 	path, err := e.generateBundle(ctx, runID, c)
 	if err != nil {
 		return err
 	}
 	if !e.fabric.Enabled() {
+		if !localCeremonyOK(c) {
+			e.publish(runID, "ceremony", "error", errNoFabric().Error())
+			return errNoFabric()
+		}
 		e.publish(runID, "ceremony", "done",
 			"local ceremony ready — no ledger; the threshold gate is enforced by this console")
 		return e.writeCeremony(runID, c, nil)
@@ -204,6 +226,9 @@ func (e *Executor) CeremonySubmit(ctx context.Context, runID string, c ElectionC
 
 	name := trusteeDisplayName(c, trusteeID)
 	if !e.fabric.Enabled() {
+		if !localCeremonyOK(c) {
+			return errNoFabric()
+		}
 		e.publish(runID, "ceremony", "info",
 			fmt.Sprintf("%s contributed %d partial decryptions (local ceremony)", name, len(mine)))
 		return e.markSubmitted(runID, c, trusteeID)
@@ -251,6 +276,9 @@ func (e *Executor) CeremonyPublish(ctx context.Context, runID string, c Election
 		return err
 	}
 	if !e.fabric.Enabled() {
+		if !localCeremonyOK(c) {
+			return errNoFabric()
+		}
 		e.publish(runID, "ceremony", "done",
 			fmt.Sprintf("threshold met (%d of %d) — tally unlocked", state.Submitted, state.Threshold))
 		return e.markPublished(runID, c)

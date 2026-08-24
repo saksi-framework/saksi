@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	clientsdk "github.com/saksi-framework/saksi/packages/saksi-bulletin/client-sdk"
 	pb "github.com/saksi-framework/saksi/packages/saksi-protocol/go/saksiprotocolv1"
@@ -216,4 +217,65 @@ func readTrailEvents(runDir string) ([]TrailEvent, error) {
 		return nil, fmt.Errorf("decode trail.json: %w", err)
 	}
 	return events, nil
+}
+
+// trailIndexRow is one election on the /trail index.
+type trailIndexRow struct {
+	ElectionID string    `json:"election_id"`
+	CreatedAt  time.Time `json:"created_at"`
+	Mode       string    `json:"mode"`
+	Voters     int       `json:"voters"`
+	OnChain    bool      `json:"on_chain"`
+	Status     string    `json:"status,omitempty"`
+	Ballots    int       `json:"ballots,omitempty"`
+	Tallied    bool      `json:"tallied"`
+}
+
+// trailIndex lists every election this console recorded, each checked against
+// the ledger. The bool reports whether a chain was reachable at all.
+//
+// SCOPE, and it is stated on the page too: the chaincode exposes no
+// ListElections — only per-election getters — so this cannot enumerate the
+// ledger. An election submitted by some other client would not appear here.
+// Adding a paginated range query over the `election` composite key (mirroring
+// ListNullifiers) is the honest fix, and needs a chaincode redeploy.
+func (s *Server) trailIndex() ([]trailIndexRow, bool) {
+	recs, err := s.store.List()
+	if err != nil {
+		log.Printf("trail index: list runs: %v", err)
+		return nil, false
+	}
+
+	// One connection attempt for the whole page. Offline this fails, and every
+	// row is reported as not-on-chain rather than the page erroring.
+	reader, _, dialErr := s.dial()
+	chain := dialErr == nil
+
+	rows := make([]trailIndexRow, 0, len(recs))
+	for _, rec := range recs {
+		row := trailIndexRow{
+			ElectionID: rec.RunID,
+			CreatedAt:  rec.CreatedAt,
+			Mode:       rec.Config.Mode,
+			Voters:     rec.Config.Voters,
+		}
+		if chain {
+			// GetElection succeeding is the test for "committed": the status
+			// read is display only, exactly as buildTrail treats it.
+			if _, err := reader.GetElection(rec.RunID); err == nil {
+				row.OnChain = true
+				if st, err := reader.GetElectionStatus(rec.RunID); err == nil {
+					row.Status = st
+				}
+				if n, err := reader.CountCommittedBallots(rec.RunID); err == nil {
+					row.Ballots = n
+				}
+				if t, err := reader.GetTally(rec.RunID); err == nil && t != "" {
+					row.Tallied = true
+				}
+			}
+		}
+		rows = append(rows, row)
+	}
+	return rows, chain
 }

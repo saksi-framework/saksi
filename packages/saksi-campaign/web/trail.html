@@ -55,6 +55,14 @@
 
   .pill { display:inline-block; padding:2px 9px; border-radius:999px; font-size:12px; font-weight:600;
           border:1px solid var(--line); color:var(--muted); }
+  .pill.ok { border-color:transparent; background:var(--ok-weak,#e3f4ea); color:var(--ok,#17864a); }
+
+  .idxrow { display:flex; align-items:baseline; gap:12px; flex-wrap:wrap;
+            padding:11px 0; border-bottom:1px solid var(--line); }
+  .idxrow:last-child { border-bottom:0; }
+  .idxrow a { text-decoration:none; font-weight:600; }
+  .idxrow a:hover { text-decoration:underline; }
+  .idxstate { margin-left:auto; display:flex; gap:6px; flex-wrap:wrap; }
 
   #sealed-banner { text-align:center; padding:48px 24px; }
   #sealed-banner p { max-width:520px; margin:0 auto 14px; color:var(--ink); font-size:15px; }
@@ -131,12 +139,26 @@
     </section>
   </div>
 
+  <div id="indexView" style="display:none">
+    <section class="panel">
+      <h2>Elections</h2>
+      <p class="sub" id="indexNote"></p>
+      <div id="indexRows"></div>
+      <p class="sub" style="margin-top:14px">
+        This lists elections <b>this console recorded</b>, each checked against the ledger.
+        The chaincode exposes no <code>ListElections</code> — only per-election lookups — so an
+        election submitted by another client would not appear here.
+      </p>
+    </section>
+  </div>
+
   <div id="errorBox" class="err" style="display:none"></div>
 </main>
 
 <script>
 "use strict";
 const $ = (id) => document.getElementById(id);
+const esc = (v) => String(v).replace(/[&<>"]/g, (c) => ({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;" }[c]));
 
 function b64ToHex(b64) {
   if (!b64) return "";
@@ -293,16 +315,48 @@ function render(data) {
   $("tallyHex").onclick = () => copyText(live.tally_hex || "");
 }
 
+// With no id in the path this page is an index of every election the console
+// has recorded; with one it is that election's trail. Same URL space, so a row
+// links straight to /trail/<id>.
+function renderIndex(doc) {
+  const rows = doc.rows || [];
+  $("electionSub").textContent = rows.length + (rows.length === 1 ? " election" : " elections");
+  $("indexNote").textContent = doc.chain
+    ? "Live status read from the ledger."
+    : "No Fabric network reachable — on-chain status unavailable, so every election is shown as not committed.";
+
+  if (!rows.length) {
+    $("indexRows").innerHTML = "<p class='sub'>No elections yet. Run one from the wizard.</p>";
+  } else {
+    $("indexRows").innerHTML = rows.map((r) => {
+      const state = !doc.chain ? "<span class='pill'>no chain</span>"
+        : r.on_chain
+          ? "<span class='pill ok'>on chain" + (r.status ? " · " + esc(r.status) : "") + "</span>"
+          : "<span class='pill'>not committed</span>";
+      const tally = r.tallied ? "<span class='pill ok'>tally published</span>" : "";
+      const ballots = r.ballots ? r.ballots.toLocaleString() + " ballots" : "";
+      return `<div class="idxrow">
+        <a href="/trail/${encodeURIComponent(r.election_id)}"><code>${esc(r.election_id)}</code></a>
+        <span class="sub">${esc(r.mode || "")}${r.voters ? " · " + r.voters.toLocaleString() + " voters" : ""}${ballots ? " · " + ballots : ""}</span>
+        <span class="idxstate">${state}${tally}</span>
+      </div>`;
+    }).join("");
+  }
+  $("indexView").style.display = "block";
+}
+
 async function load() {
   const id = electionIDFromPath();
   $("errorBox").style.display = "none";
+  const url = id ? "/api/trail/" + encodeURIComponent(id) : "/api/trail";
   try {
-    const res = await fetch("/api/trail/" + encodeURIComponent(id));
+    const res = await fetch(url);
     if (!res.ok) throw new Error("request failed: " + res.status);
-    render(await res.json());
+    const doc = await res.json();
+    if (id) { render(doc); } else { renderIndex(doc); }
   } catch (e) {
     $("errorBox").style.display = "block";
-    $("errorBox").textContent = "Failed to load trail: " + e.message;
+    $("errorBox").textContent = "Failed to load: " + e.message;
   }
 }
 
