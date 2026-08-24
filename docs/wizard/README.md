@@ -78,6 +78,10 @@ all of it is downloadable from the wizard's file chips.
 ## Related
 
 - [`../synthetic-data-generation.md`](../synthetic-data-generation.md) — the
-  generator in full: selection rule, schemas, reproducing any tier.
+  generator in full: selection rules, schemas, reproducing any tier.
+- [`../selection-rule-explained.md`](../selection-rule-explained.md) — the three
+  selection profiles walked through line by line, with traced values.
+- [`../rust-python-cross-reference.md`](../rust-python-cross-reference.md) —
+  both languages side by side.
 - [`../research-election-console-runbook.md`](../research-election-console-runbook.md)
   — building and running the console.

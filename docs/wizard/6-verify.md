@@ -34,18 +34,28 @@ Contest ids arrive as `<position>/cand<k>` (e.g. `president/cand0`) and are
 grouped by the part before the slash. Candidate indices are rendered 1-based, to
 match the `CAND_PRES_01` convention the ground-truth tables use.
 
+### Seats: the Senate elects several
+
+President and Vice President elect one candidate each. The Senate elects its top
+`senate_seats`, marked `ELECTED` with a cut line drawn beneath the last of them.
+
+Each voter still cast exactly one senatorial vote — the seats decide how the
+counts are read, not how they were produced. See [1-setup.md](1-setup.md).
+
 ### Ties are reported, not resolved
 
-If more than one candidate holds the top count, the board reports
-`tied — n-way` and declares no winner.
+If more than one candidate holds the top count — or, in a multi-seat race, if
+more candidates are level at the cut than there are seats left — the board says
+so and awards nothing.
 
-This is not defensive padding. The `uniform` profile divides the electorate
-evenly by construction, so a 20-voter, 4-candidate uniform election decrypts to
-exactly **5/5/5/5** — verified against real threshold-decrypted output, not
-assumed. Sorting the rows and printing the first as "winner" would invent a
-result the data does not support.
+This is not defensive padding. Under `uniform` a 20-voter, 4-candidate election
+decrypts to exactly **5/5/5/5**, verified against real threshold-decrypted
+output. Sorting the rows and printing the first as "winner" would invent a result
+the data does not support.
 
-Use `skewed` for a demonstration with a winner. See [1-setup.md](1-setup.md).
+The `realistic` profile produces strictly decreasing counts, so its races always
+decide and the cut is always clean. **Use it for a demonstration**; the tie path
+exists for the round-robin profiles, which cannot decide a result at all.
 
 ## The correctness table
 

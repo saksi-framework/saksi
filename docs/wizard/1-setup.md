@@ -13,7 +13,8 @@ what *will* be generated.
 | Positions | Races on the ballot | ≥ 1 |
 | Candidates | Candidates per position | ≥ 1 |
 | Voters | Population size | ≥ 1; presets for each paper tier |
-| Distribution | `uniform` or `skewed` | Shapes the result — see below |
+| Distribution | `realistic`, `uniform`, or `skewed` | Decides whether the election has a winner — see below |
+| Senate seats | How many senators are elected | `0` = single-winner; `1..candidates-1` for a multi-seat race |
 | Mode | `offline`, `onchain`, `groundtruth` | Decides which later steps apply |
 
 Trustee names are real inputs, not decoration: they become the institutions on
@@ -25,22 +26,43 @@ by default).
 This choice decides whether the election has a winner at all.
 
 ```
-uniform   1000 voters, 4 candidates -> 250, 250, 250, 250   (exact 4-way tie)
-skewed    1000 voters, 4 candidates -> 500, 167, 167, 166   (candidate 1 wins)
+1000 voters, 4 candidates
+  uniform     250  250  250  250      exact four-way tie
+  skewed      500  167  167  166      winner, but two losers tied
+  realistic   639  270   81   10      every rank distinct
 ```
 
-`uniform` assigns candidates round-robin, so it divides the electorate **exactly
-evenly** whenever the voter count is a multiple of the candidate count. That is
-not a quirk of a particular run — it is what the profile means. A 20-voter,
-4-candidate uniform election decrypts to 5/5/5/5, and the bulletin board in step
-6 correctly reports it as a tie rather than nominating a winner.
+**Use `realistic`.** It is the only profile that decides a result: counts
+strictly decrease, so a single-winner race has one winner and a multi-seat race
+cuts cleanly at rank N. It also gives each position a different shape, so
+President, Vice President and Senator do not read as the same race three times.
 
-**For a demonstration, choose `skewed`.** It produces a clear front-runner with
-exactly half the vote, which is what an audience expects an election to look
-like. Use `uniform` deliberately if you want to show the tie handling.
+`uniform` divides the electorate evenly by construction and therefore **ties at
+rank one, always**. `skewed` gives a clear front-runner but splits the losers
+evenly, so a top-N cut is tied at every scale — 3.5M voters does not help.
 
-Both profiles are documented in
-[`../synthetic-data-generation.md`](../synthetic-data-generation.md).
+Both are kept because the manuscript's performance comparisons are stated in
+terms of them, and for a throughput measurement an even split is a perfectly
+reasonable load. Neither is a sensible choice for demonstrating a result.
+
+All three are documented in `../synthetic-data-generation.md` and walked through
+in `../selection-rule-explained.md`.
+
+## Senate seats
+
+The Senate is a multi-seat race: the top `senate_seats` candidates are elected,
+while President and Vice President stay single-winner. `0` makes the Senate
+single-winner too.
+
+Each voter still selects **exactly one** senator — this is Single
+Non-Transferable Vote, not a ballot on which a voter marks twelve names. That
+distinction is what makes it free: the CDS proof still shows each ciphertext
+encrypts 0 or 1, and the auditor's gate still requires each position's aggregate
+to equal the ballot count. Seats decide how the result is *read*, never how it
+is produced, so the value never reaches the generator.
+
+Must be `0 <= senate_seats < candidates`: a cut needs at least one candidate
+below it, or every candidate is elected and the race decides nothing.
 
 ## Validation
 
@@ -48,8 +70,8 @@ Both profiles are documented in
 and it runs server-side — the form cannot talk the backend into an invalid run.
 It rejects: an empty election or trustee name, a trustee count outside
 1..`MaxTrustees`, a threshold outside `1..n`, any of positions / candidates /
-voters below 1, a distribution that is not `uniform` or `skewed`, and a mode that
-is not one of the three.
+voters below 1, a distribution that is not `uniform`, `skewed`, or `realistic`, a senate-seat
+count outside `0..candidates-1`, and a mode that is not one of the three.
 
 ### The 10,000-voter offline ceiling
 

@@ -79,38 +79,73 @@ restating its four generation parameters. There is no seed to record, lose, or
 mistranscribe — a stronger guarantee than seeded pseudorandomness, not a weaker
 one.
 
-**The two profiles**, as the paper's Appendix A defines them:
+**The three profiles:**
 
-| Profile | Shape |
-|---|---|
-| `uniform` | selections spread evenly across the candidate set |
-| `skewed` | candidate 1 takes exactly half the vote; the rest split the remainder |
+| Profile | Shape | Decides a winner? |
+|---|---|---|
+| `uniform` | selections spread evenly across the candidate set | **No** — ties at rank one |
+| `skewed` | candidate 1 takes exactly half; the rest split the remainder | Winner yes; **all losers tie** |
+| `realistic` | strictly decreasing counts, a different shape per position | **Yes** |
 
-At the full ZAMBASULTA tier the skew is exact: 1,762,039 of 3,524,078 — precisely
-half — to candidate 1, with the remaining three candidates within one vote of
-each other.
+`uniform` and `skewed` are the two the paper's Appendix A defines, and they back
+the performance comparisons. `realistic` was added because neither of them can
+decide an election.
 
-### A known limit of this test data
+### Why the round-robin profiles cannot decide a result
 
-The rule is a round-robin, so **every position ends up with a near-identical set
-of totals** — permutations of one another, differing by a vote or two:
+`uniform` divides the electorate evenly by construction, so at 1000 voters and 4
+candidates it returns 250, 250, 250, 250 — an exact four-way tie, every time.
+
+`skewed` gives a clear front-runner but splits the losers evenly among
+themselves, so a multi-seat cut lands in the middle of identical numbers **at
+every scale**:
 
 ```
-PRESIDENT       1762039  587347  587346  587346
-VICE_PRESIDENT  1762039  587346  587347  587346
-SENATOR         1762039  587346  587346  587347
+1000 voters, 12 candidates     500  46  46  46  46  46 …
+3,524,078 voters, 12 candidates  1762039  160186  160186  160186 …
 ```
 
-Totals that interchangeable mean the accuracy check cannot discriminate between
-contests: a component that confused one contest for another would still satisfy
-`E = 0`. The legacy 6-voter fixture avoids this deliberately — its comment says
-its values were *"picked so the tally is non-trivial and the two contests have
-different totals (catches off-by-one or contest-mixing bugs in the auditor)"* —
-but the parameterized generator does not carry the property forward.
+More voters does not help — dividing the remainder evenly is the point of the
+profile.
 
-This is a limitation of the **test data**, not of the protocol: contest-mixing
-is simply not a failure mode this evaluation probes. It is recorded here so it
-is declared rather than discovered.
+Both are also **rotations** of one position onto the next, so every position
+carried the same multiset of totals: President and Vice President came out with
+identical numbers in a different order, and a component that confused one
+contest for another would still have satisfied `E = 0`.
+
+### `realistic`
+
+Apportions each position by an integer weight curve `w_k = (C - k)^s`, with the
+exponent `s` set by the position, then adds a one-vote ladder. The counts sum to
+exactly the voter count and **strictly decrease by construction**:
+
+```
+1000 voters, 4 candidates
+  PRESIDENT       639  270   81   10
+  VICE_PRESIDENT  533  300  134   33
+  SENATOR         401  300  200   99
+
+3,524,078 voters, 12 candidates
+  PRESIDENT       1000914  770960  579235  422264  296571  198681 …
+  VICE_PRESIDENT   780715  656018  542165  439154  346987  265662 …
+  SENATOR          542167  496986  451805  406625  361444  316263 …
+```
+
+Every rank is distinct, so a cut at any N is clean, and the three positions have
+genuinely different shapes — which also closes the contest-mixing gap the
+round-robin profiles left open.
+
+The arithmetic is integer throughout. Floating point would make the output
+depend on the machine's rounding, so an Apple Silicon run could produce a
+different population from an x86 one — destroying the reproducibility the whole
+generator exists to provide.
+
+Distinct shapes need enough voters to express: measured, the boundary is around
+`C(C-1)/2 + 2C` — 12 voters at 4 candidates, 73 at 12, 685 at 37. Below it there
+is only one way to distribute and all three curves land on it. A clear winner
+holds at every voter count regardless.
+
+The rule is walked through line by line in `selection-rule-explained.md`.
 
 ---
 

@@ -14,7 +14,7 @@ covers only what the wizard step does with it.
 
 ```
 saksi-demo gen --stream <run-dir> --voters N --positions P --candidates C \
-    --trustees N --threshold T --election-id <run-id> --distribution skewed
+    --trustees N --threshold T --election-id <run-id> --distribution realistic
 ```
 
 In `groundtruth` mode it shells `gen-ground-truth` instead, which writes only the
@@ -68,11 +68,10 @@ of the same plaintext population as the stream written here. Same counts, differ
 ciphertexts. This is why step 4 must never silently regenerate a bundle
 mid-ceremony — see [4-encrypt.md](4-encrypt.md).
 
-## A stated limitation
+## A stated limitation, now narrowed
 
-The selection rule is a round-robin, and the position index only *rotates* the
-assignment. Every position therefore ends up with the same multiset of totals in
-a different order:
+Under `uniform` and `skewed` the position index only *rotates* the assignment, so
+every position ends up with the same multiset of totals:
 
 ```
 PRESIDENT       1762039  587347  587346  587346
@@ -81,6 +80,9 @@ SENATOR         1762039  587346  587346  587347
 ```
 
 A component that confused one contest for another would still satisfy `E = 0`.
-Contest-mixing is not a failure mode this data probes. It is a limitation of the
-**test data**, not of the protocol, and it is recorded here so it is declared
-rather than discovered.
+
+**The `realistic` profile does not have this weakness** — each position gets a
+different weight curve, so the shapes genuinely differ and contest-mixing becomes
+detectable. The limitation now applies only to the two round-robin profiles,
+which are retained for the performance comparisons rather than for deciding
+results.
