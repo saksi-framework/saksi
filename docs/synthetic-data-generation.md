@@ -49,6 +49,17 @@ Every selection comes from one pure function. No RNG, no stored seed:
 ```rust
 // packages/saksi-auditor/src/fixtures.rs
 
+/// Scrambles `(voter_idx, position)` into a well-spread pseudorandom number.
+/// SplitMix64's finalizer: four operations, no state, no seed.
+fn mix(voter_idx: usize, p: usize) -> u64 {
+    let mut x = (voter_idx as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ (p as u64).wrapping_add(1);
+    x ^= x >> 30;
+    x = x.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    x ^= x >> 27;
+    x = x.wrapping_mul(0x94d0_49bb_1331_11eb);
+    x ^ (x >> 31)
+}
+
 /// Deterministic 1-of-C selection under a fixed profile (reproducible).
 pub(crate) fn select_candidate(
     profile: SelectionProfile,
@@ -59,14 +70,14 @@ pub(crate) fn select_candidate(
     if candidates <= 1 {
         return 0;
     }
+    let h = mix(voter_idx, p);
     match profile {
-        SelectionProfile::Uniform => (voter_idx + p) % candidates,
-        // Half the voters pick candidate 0; the rest spread over 1..C.
+        SelectionProfile::Uniform => (h % candidates as u64) as usize,
         SelectionProfile::Skewed => {
-            if voter_idx % 2 == 0 {
+            if h & 1 == 0 {
                 0
             } else {
-                1 + ((voter_idx / 2 + p) % (candidates - 1))
+                1 + ((h >> 8) % (candidates as u64 - 1)) as usize
             }
         }
     }
@@ -79,16 +90,29 @@ restating its four generation parameters. There is no seed to record, lose, or
 mistranscribe — a stronger guarantee than seeded pseudorandomness, not a weaker
 one.
 
-**The two profiles**, as the paper's Appendix A defines them:
+**Why a hash and not plain arithmetic.** An earlier version selected with
+`(voter_idx + p) % candidates`. That is deterministic too, but it is a
+round-robin: every position ended up with a near-identical set of totals,
+differing by a vote or two. Totals that interchangeable mean the accuracy check
+cannot discriminate — a component that confused one contest for another would
+still have satisfied `E = 0`. Mixing gives each contest its own distinctive
+totals, so the check has something to catch.
+
+**The two profiles:**
 
 | Profile | Shape |
 |---|---|
-| `uniform` | selections spread evenly across the candidate set |
-| `skewed` | candidate 1 takes exactly half the vote; the rest split the remainder |
+| `uniform` | every candidate equally likely |
+| `skewed` | candidate 1 takes roughly half; the rest share the remainder |
 
-At the full ZAMBASULTA tier the skew is exact: 1,762,039 of 3,524,078 — precisely
-half — to candidate 1, with the remaining three candidates within one vote of
-each other.
+At the full ZAMBASULTA tier the skew lands near half without being suspiciously
+exact, and no two positions agree:
+
+```
+PRESIDENT       1,762,232   585,899   588,562   587,385
+VICE_PRESIDENT  1,762,295   586,840   586,650   588,293
+SENATOR         1,763,309   586,042   587,193   587,534
+```
 
 ---
 
@@ -189,11 +213,11 @@ selection column named `PRESIDENT`.
 
 ```csv
 position,candidate,ground_truth_count
-PRESIDENT,CAND_PRES_01,1762039
-PRESIDENT,CAND_PRES_02,587347
-PRESIDENT,CAND_PRES_03,587346
-PRESIDENT,CAND_PRES_04,587346
-VICE_PRESIDENT,CAND_VICE_01,1762039
+PRESIDENT,CAND_PRES_01,1762232
+PRESIDENT,CAND_PRES_02,585899
+PRESIDENT,CAND_PRES_03,588562
+PRESIDENT,CAND_PRES_04,587385
+VICE_PRESIDENT,CAND_VICE_01,1762295
 ...
 ```
 
