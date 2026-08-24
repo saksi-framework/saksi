@@ -1,0 +1,354 @@
+# Synthetic data generation
+
+How BalotaChain/Saksi produces the synthetic voter populations the evaluation
+runs on, what each artifact contains, and how to reproduce any of it.
+
+This is **Stage 4** of the thesis methodology (DSRM Figure 3.1): seed a
+population and its known vote-to-candidate counts, pass a validation gate, and
+only then hand the data to **Stage 5**, the encrypted election. The separation
+matters — it is what lets a reader inspect the input *before* any cryptography
+touches it, and what gives the accuracy metric `E = Σ|Tᵢ − Gᵢ|` an independent
+`G` to compare against.
+
+---
+
+## 1. The two paths
+
+Both produce the same population. They differ only in whether the expensive
+cryptography runs.
+
+```
+                    ┌─ gen --stream ────────► header.json + ballots.ndjson
+saksi-demo ─────────┤                         (real ElGamal ciphertexts,
+                    │                          CDS proofs, DKG, credentials)
+                    │                              +
+                    │                         ground-truth-*.csv
+                    │
+                    └─ gen-ground-truth ────► ground-truth-*.csv only
+                                              (no crypto at all)
+```
+
+`gen --stream` is the full generator: it issues a blind-signed credential per
+voter, runs the DKG, encrypts every selection under the joint key, and attaches
+a CDS OR-proof per candidate. It also writes the ground-truth CSVs.
+
+`gen-ground-truth` writes **only** the plaintext tables. No DKG, no credentials,
+no ciphertexts, no proofs. This is what makes the capstone tiers tractable:
+3,524,078 voters × 3 positions generates in **0.6 seconds**, where the same
+population through the full cryptographic path is hours of work.
+
+Both replay the identical selection function, so the populations are
+bit-identical — verified by `diff`, not by assumption.
+
+---
+
+## 2. How a vote is chosen
+
+Every selection comes from one pure function. No RNG, no stored seed:
+
+```rust
+// packages/saksi-auditor/src/fixtures.rs
+
+/// Deterministic 1-of-C selection under a fixed profile (reproducible).
+pub(crate) fn select_candidate(
+    profile: SelectionProfile,
+    voter_idx: usize,
+    p: usize,
+    candidates: usize,
+) -> usize {
+    if candidates <= 1 {
+        return 0;
+    }
+    match profile {
+        SelectionProfile::Uniform => (voter_idx + p) % candidates,
+        // Half the voters pick candidate 0; the rest spread over 1..C.
+        SelectionProfile::Skewed => {
+            if voter_idx % 2 == 0 {
+                0
+            } else {
+                1 + ((voter_idx / 2 + p) % (candidates - 1))
+            }
+        }
+    }
+}
+```
+
+**Reproducibility.** Because the choice is derived arithmetically from the voter
+index, position index, and profile, a population is reproduced exactly by
+restating its four generation parameters. There is no seed to record, lose, or
+mistranscribe — a stronger guarantee than seeded pseudorandomness, not a weaker
+one.
+
+**The two profiles**, as the paper's Appendix A defines them:
+
+| Profile | Shape |
+|---|---|
+| `uniform` | selections spread evenly across the candidate set |
+| `skewed` | candidate 1 takes exactly half the vote; the rest split the remainder |
+
+At the full ZAMBASULTA tier the skew is exact: 1,762,039 of 3,524,078 — precisely
+half — to candidate 1, with the remaining three candidates within one vote of
+each other.
+
+---
+
+## 3. The ballot model, and its limits
+
+The current model is **one selection per position, per voter**:
+
+- Every voter votes in **every** position. Abstention is not modelled.
+- Every position has the **same** number of candidates (`--candidates C`).
+- Every position is **single-winner** — the voter picks exactly one.
+
+This matches the manuscript's Appendix A (*"three positions: President, Vice
+President, Senator, single-winner each"*, *"fixed set of K candidates"*).
+
+**What it does not model**, stated plainly because it is a real scope limit:
+
+- Different candidate counts per position. A real Philippine ballot has roughly
+  ten presidential candidates and dozens of senatorial ones.
+- Multi-winner races. The actual Senate race elects 12 of ~37. Supporting that
+  needs more than a config flag: the CDS proof proves each ciphertext encrypts
+  0 or 1, and the validation gate asserts each position's ground-truth total
+  equals its ballot count. A 12-winner contest needs a proof that a voter's
+  selections *sum to 12* — new cryptography, and a rework of the gate.
+- Abstention / undervoting.
+
+None of these affect the properties under evaluation (integrity, privacy,
+threshold decryption, verifiability), which is why the simplification is
+acceptable — but it should be declared, not discovered.
+
+---
+
+## 4. Contest indexing
+
+A "contest" is one (position, candidate) slot. Ground truth is a flat vector
+over those slots:
+
+```rust
+// packages/saksi-auditor/src/fixtures.rs
+//
+// Each entry is `(position_index, selected_candidate)`; it contributes `+1` to
+// contest slot `position_index * candidates + selected_candidate`.
+pub(crate) fn tally_selections(
+    selections: &[(usize, usize)],
+    contest_count: usize,
+    candidates: usize,
+) -> Vec<u64> {
+    let mut totals = vec![0u64; contest_count];
+    for &(p, selected) in selections {
+        totals[p * candidates + selected] += 1;
+    }
+    totals
+}
+```
+
+So for `positions = 3, candidates = 4`:
+
+```
+contest_count = positions × candidates = 12
+
+slot  0..3   president/cand0 … president/cand3
+slot  4..7   vice-president/cand0 … vice-president/cand3
+slot  8..11  senator/cand0 … senator/cand3
+```
+
+Contest ids are position-qualified strings (`"president/cand0"`), built in the
+same order, so `contest_ids[i]` names slot `i`.
+
+**Crucially, the ground truth is derived from a separate record of what each
+voter chose — never accumulated inside the ciphertext-building loop.** If a bug
+made the crypto encrypt a different bit than the voter selected, the decrypted
+tally would diverge from this vector and `E = 0` would fail, instead of both
+sharing the same wrong value and passing.
+
+---
+
+## 5. The output files
+
+### `ground-truth-ballots.csv` — wide, one row per voter
+
+```csv
+voter_id,scale_group,ballot_complexity,PRESIDENT,VICE_PRESIDENT,SENATOR
+V-000001,3524078,multi,CAND_PRES_01,CAND_VICE_01,CAND_SEN_01
+V-000002,3524078,multi,CAND_PRES_02,CAND_VICE_03,CAND_SEN_04
+V-000003,3524078,multi,CAND_PRES_01,CAND_VICE_01,CAND_SEN_01
+```
+
+| Column | Meaning |
+|---|---|
+| `voter_id` | `V-%06d`, 1-based |
+| `scale_group` | the tier's voter count (constant per file) |
+| `ballot_complexity` | `single` when `positions == 1`, else `multi` |
+| one column per position | that voter's selection, `CAND_{PRES\|VICE\|SEN\|POS<n>}_{NN}` |
+
+The header is built from `--positions`, so a single-position run emits one
+selection column named `PRESIDENT`.
+
+### `ground-truth-summary.csv` — long, one row per contest slot
+
+```csv
+position,candidate,ground_truth_count
+PRESIDENT,CAND_PRES_01,1762039
+PRESIDENT,CAND_PRES_02,587347
+PRESIDENT,CAND_PRES_03,587346
+PRESIDENT,CAND_PRES_04,587346
+VICE_PRESIDENT,CAND_VICE_01,1762039
+...
+```
+
+Each position's counts sum to the voter count. This column is the `Gᵢ` that
+`correctness.csv` compares the decrypted tally against.
+
+### Streaming
+
+Rows are written one at a time through a `BufWriter`; no run ever holds all rows
+in memory. Label tables are precomputed once per run rather than formatted per
+row — at 3.5M voters that avoids ~10.6M redundant string constructions.
+
+---
+
+## 6. Reproducing any tier
+
+### From the CLI
+
+```bash
+# Ground truth only — no crypto, any scale
+saksi-demo gen-ground-truth \
+  --voters 3524078 \
+  --positions 3 \
+  --candidates 4 \
+  --distribution skewed \
+  --election-id zambasulta-mp \
+  --out-dir ./out
+
+# Full cryptographic generation (also writes the ground-truth CSVs)
+saksi-demo gen --stream ./run \
+  --voters 1000 --positions 3 --candidates 4 \
+  --trustees 3 --threshold 2 \
+  --trustee-names COMELEC,Watchdog,University \
+  --election-id demo --election-name "Demo Election" \
+  --distribution skewed
+```
+
+### From the console
+
+Pick **ground truth only** as the mode. Because that path runs no cryptography,
+the 10,000-voter offline ceiling does not apply to it and the capstone presets
+(1,921,917 and 3,524,078) are selectable:
+
+```go
+// packages/saksi-campaign/config.go
+//
+// OfflineVoterCeiling caps offline-mode voters. Offline generation is not
+// parallelized, so the 50k/483k/1M tiers are on-chain/perf mode only […]
+const OfflineVoterCeiling = 10000
+
+// The check is scoped to offline, so ground-truth runs are unaffected:
+if c.Mode == "offline" && c.Voters > OfflineVoterCeiling {
+    return fmt.Errorf(
+        "offline mode is capped at %d voters (got %d); select on-chain/perf mode for larger tiers",
+        OfflineVoterCeiling, c.Voters)
+}
+```
+
+Both CSVs then appear as download chips on the run.
+
+---
+
+## 7. Verifying the generator is honest
+
+Three checks, all reproducible.
+
+**a. The two paths agree.** Same parameters through both generators must produce
+byte-identical tables:
+
+```bash
+saksi-demo gen --stream ./crypto --voters 50 --positions 3 --candidates 4 \
+  --trustees 3 --threshold 2 --election-id x --election-name x \
+  --trustee-names a,b,c --distribution skewed
+saksi-demo gen-ground-truth --out-dir ./gtonly --voters 50 --positions 3 \
+  --candidates 4 --election-id x --distribution skewed
+
+diff ./crypto/ground-truth-ballots.csv  ./gtonly/ground-truth-ballots.csv
+diff ./crypto/ground-truth-summary.csv  ./gtonly/ground-truth-summary.csv
+```
+
+**b. The plaintext matches what decryption recovers.** Audit the encrypted run
+and compare against the CSV written before encryption:
+
+```bash
+saksi-demo audit-stream ./crypto --json
+```
+
+```
+overall: pass
+  president/cand0        ground_truth= 25  decoded= 25  E=0  pass=True
+  president/cand1        ground_truth=  9  decoded=  9  E=0  pass=True
+  ...
+```
+
+The `ground_truth` column is the same number as `ground-truth-summary.csv`, and
+`decoded` is what real threshold decryption of the ElGamal ciphertexts produced.
+`E = 0` on every contest means the encryption round-tripped the population
+exactly.
+
+**c. Totals are internally consistent.** Every position's counts must sum to the
+voter count:
+
+```bash
+awk -F, 'NR>1 {s[$1]+=$3} END {for (p in s) print p, s[p]}' ground-truth-summary.csv
+```
+
+```
+PRESIDENT 3524078
+VICE_PRESIDENT 3524078
+SENATOR 3524078
+```
+
+---
+
+## 8. Scale reference
+
+Measured on the development machine, multi-position (3 positions × 4
+candidates), ground-truth-only path:
+
+| Tier | Voters | Rows | `ground-truth-ballots.csv` | Time |
+|---|---|---|---|---|
+| Precinct | 1,000 | 1,000 | ~60 KB | instant |
+| Barangay | 10,000 | 10,000 | ~600 KB | instant |
+| Municipal | 50,000 | 50,000 | ~3 MB | instant |
+| Zamboanga City | 483,000 | 483,000 | ~30 MB | < 1 s |
+| Provincial | 1,000,000 | 1,000,000 | ~62 MB | < 1 s |
+| Capstone | 1,921,917 | 1,921,917 | ~119 MB | < 1 s |
+| **Full ZAMBASULTA** | **3,524,078** | **3,524,078** | **217 MB** | **0.6 s** |
+
+Note the largest file exceeds Excel's 1,048,576-row limit. Use the summary CSV
+for review, or read the ballots file with `pandas`, `awk`, or PowerShell.
+
+The full cryptographic path is **not** comparable — it does per-voter credential
+issuance and per-candidate proofs, and is the subject of the separate
+performance evaluation.
+
+---
+
+## 9. Where the code lives
+
+| Concern | File |
+|---|---|
+| Selection rule, contest indexing, fixture generation | `packages/saksi-auditor/src/fixtures.rs` |
+| Ground-truth CSV writer | `packages/saksi-auditor/src/ground_truth.rs` |
+| Stream writer (`header.json`, `ballots.ndjson`) | `packages/saksi-auditor/src/stream.rs` |
+| Validation gate | `packages/saksi-auditor/src/demo.rs` (`validate_population`) |
+| CLI entry points | `packages/saksi-demo/src/main.rs` |
+| Console modes and phase orchestration | `packages/saksi-campaign/{config,executor}.go` |
+| Derived study CSVs | `packages/saksi-campaign/csvexport.go` |
+
+## 10. Related
+
+- `docs/appendix-a-replacement-draft.md` (balotachain) — the manuscript text
+  these artifacts back.
+- The validation gate that every generated population must pass before it may be
+  used: exactly `voters × positions` ballots, pairwise-distinct nullifiers,
+  in-range selections, per-position ground truth equal to the ballot count, and
+  voter ids unique per voter and repeated once per position.
