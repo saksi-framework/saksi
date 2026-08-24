@@ -36,6 +36,32 @@ This machine (Linux laptop-server) is **dev-only**. Build + run the console on t
 
 Verify: `rustc --version && cargo --version && go version`.
 
+### macOS (Apple Silicon and Intel)
+
+Both binaries are verified to build for `darwin/arm64` and `darwin/amd64`; the
+stack is pure Rust and pure Go, with no C dependency of its own and no cgo. The
+commands in this runbook are the same on macOS as on Linux — nothing below is
+platform-specific.
+
+The one prerequisite Apple does not ship by default is the linker Rust needs:
+
+```bash
+xcode-select --install     # once per machine; skip if Xcode is installed
+```
+
+`protoc` is **not** needed — `protoc-bin-vendored` carries an Apple Silicon
+build and the Rust build selects it automatically.
+
+Homebrew is the shortest route to the toolchains if they are not present:
+
+```bash
+brew install go
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+```
+
+Locally built binaries are not quarantined by Gatekeeper, so no
+right-click-to-open dance is required.
+
 ## 2. Get the code
 
 ```bash
