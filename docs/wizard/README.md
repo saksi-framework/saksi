@@ -18,6 +18,11 @@ a panel asks while watching it.
 | 6 | Verify | Independent audit, the declared result, and E = 0 | [6-verify.md](6-verify.md) |
 | 7 | Attacks | Seven attacks, one step each, each run live | [7-attacks.md](7-attacks.md) |
 
+**In depth:** [`deep-dive.md`](deep-dive.md) covers all seven steps in one
+document, naming the functions each one runs, the artifacts each writes, and
+where every guarantee is enforced. Read that before defending the demonstration;
+the per-step files above are the gentler version.
+
 ## The one-paragraph version
 
 A population of synthetic voters is generated from four parameters with no
