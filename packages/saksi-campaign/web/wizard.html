@@ -224,8 +224,23 @@
     <div class="actions"><button id="back1">← Back</button><div class="right"><button class="primary" id="next1" disabled>Continue →</button></div></div>
   </section>
 
-  <!-- 3 ─ Saksi ---------------------------------------------------------- -->
+  <!-- 3 ─ Validation gate ------------------------------------------------ -->
   <section class="step panel" data-step="2">
+    <div class="phead"><h2>Checking the data</h2><span id="checkChip"></span></div>
+    <p class="small muted" style="margin-top:0">
+      Before anything is encrypted, the generated population is audited against itself: the ballot
+      table is recounted from scratch and held against the published tally. A miscount, a truncated
+      file, or a missing voter surfaces here rather than as a clean-looking result later.
+    </p>
+    <div class="loader" id="load2b"><span class="spin"></span><span id="loadTxt2b" aria-hidden="true"></span></div>
+    <div id="checks"></div>
+    <div id="digest" class="small muted" style="margin-top:12px;font-family:var(--mono);word-break:break-all"></div>
+    <div class="err" id="err2b"></div>
+    <div class="actions"><button id="back2b">← Back</button><div class="right"><button class="primary" id="next2b" disabled>Continue →</button></div></div>
+  </section>
+
+  <!-- 3 ─ Saksi ---------------------------------------------------------- -->
+  <section class="step panel" data-step="3">
     <div class="phead"><h2>Encrypting &amp; recording</h2><span class="meta small" id="modeChip"></span></div>
     <p class="small muted" style="margin-top:0">
       Each ballot is encrypted under the joint election key with a zero-knowledge proof that it is
@@ -238,7 +253,7 @@
   </section>
 
   <!-- 4 ─ Ceremony ------------------------------------------------------- -->
-  <section class="step panel" data-step="3">
+  <section class="step panel" data-step="4">
     <div class="phead"><h2>Threshold decryption ceremony</h2><span class="meta small" id="quorumChip"></span></div>
     <p class="small muted" style="margin-top:0">
       No single institution can read the result. Each holds one share of the key and contributes a
@@ -255,7 +270,7 @@
   </section>
 
   <!-- 5 ─ Verify --------------------------------------------------------- -->
-  <section class="step panel" data-step="4">
+  <section class="step panel" data-step="5">
     <div class="phead"><h2>Independent verification</h2><span id="overallChip"></span></div>
     <p class="small muted" style="margin-top:0">
       The verifier re-derives the result from the published record alone and compares it against the
@@ -280,7 +295,7 @@
 const $ = (id) => document.getElementById(id);
 const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;" }[c]));
 
-const STEPS = ["Set up", "Ballots", "Encrypt", "Trustees", "Verify"];
+const STEPS = ["Set up", "Ballots", "Check", "Encrypt", "Trustees", "Verify"];
 const PRESETS = [1, 10, 100, 1000, 10000, 50000, 483000, 1000000, 1921917, 3524078];
 const OFFLINE_CEILING = 10000;
 const FILE_ORDER = ["election.csv","ballots.csv","correctness.csv","negative-tests.csv",
@@ -299,6 +314,7 @@ const QUIPS = {
   generate: ["Filling out ballots…","Marking the precinct…","Sealing the envelopes…","Rounding up voters…"],
   saksi:    ["Cooking up Saksi…","Teaching the ledger to keep a secret…","Proving without revealing…","Scrambling the ballot box…"],
   ceremony: ["Gathering the trustees…","Waiting on the key holders…"],
+  check:    ["Recounting every ballot…","Making sure nobody got lost…","Cross-checking the tally…"],
   verify:   ["Recounting, cryptographically…","Re-checking every proof…","Doing the maths twice…"],
 };
 
@@ -313,7 +329,7 @@ function renderRail() {
 }
 // Ground-truth runs produce no ciphertexts, so the encrypt / ceremony / verify
 // steps genuinely do not apply to them.
-function skipped(i) { return cfg && cfg.mode === "groundtruth" && i >= 2; }
+function skipped(i) { return cfg && cfg.mode === "groundtruth" && i >= 3; }
 
 function go(n) {
   step = n;
@@ -461,12 +477,50 @@ async function finishGenerate() {
     <div><b>${esc(cfg.distribution)}</b>distribution</div>`;
   $("genFiles").innerHTML = fileChips(runID, await artifactsFor(runID));
   $("next1").disabled = false;
-  $("next1").textContent = cfg.mode === "groundtruth" ? "Done — files ready" : "Continue →";
+  $("next1").textContent = "Check the data →";
+}
+
+/* ---- step 3: the data-validation gate ---------------------------------- */
+// Figure 3.1 puts an "all records valid?" decision between generation and the
+// encrypted demonstration. This is that gate, made visible: the ballot table is
+// recounted from scratch and held against the published tally.
+async function runCheck() {
+  go(2);
+  $("checks").innerHTML = ""; $("digest").textContent = ""; $("checkChip").textContent = "";
+  $("next2b").disabled = true;
+  showLoader("2b", "check");
+  let rep;
+  try { rep = await getJSON(`/api/check/${encodeURIComponent(runID)}`); }
+  catch (e) { hideLoader("2b"); $("err2b").textContent = String(e.message || e); return; }
+  hideLoader("2b");
+
+  $("checks").innerHTML = rep.checks.map((c) => `
+    <div style="display:flex;gap:10px;align-items:flex-start;padding:9px 0;border-bottom:1px solid var(--line-2)">
+      <span class="pill ${c.pass ? "ok" : ""}" style="${c.pass ? "" : "background:var(--bad-weak);color:var(--bad);border-color:transparent"}">
+        ${c.pass ? "✓" : "✗"}</span>
+      <div><div style="font-weight:600">${esc(c.name)}</div>
+           <div class="small muted">${esc(c.detail)}</div></div>
+    </div>`).join("");
+
+  $("checkChip").className = "verdict " + (rep.pass ? "pass" : "fail");
+  $("checkChip").innerHTML = `<span class="dot2"></span>${rep.pass ? "all checks passed" : "FAILED"}`;
+
+  if (rep.ground_truth_ballots_sha256) {
+    $("digest").innerHTML =
+      `<div style="margin-bottom:3px"><b>ballots sha256</b> ${esc(rep.ground_truth_ballots_sha256)}</div>` +
+      `<div><b>tally sha256</b> ${esc(rep.ground_truth_summary_sha256)}</div>`;
+  }
+
+  // A population that fails the gate must not proceed — that is what
+  // "fail-closed" means, and it is the whole point of having the gate.
+  $("next2b").disabled = !rep.pass;
+  $("next2b").textContent = cfg.mode === "groundtruth" ? "Done — files ready" : "Encrypt →";
+  if (!rep.pass) $("err2b").textContent = "This population must not proceed to encryption.";
 }
 
 /* ---- step 3: encrypt + record ------------------------------------------ */
 async function startSaksi() {
-  go(2);
+  go(3);
   $("modeChip").textContent = cfg.mode === "onchain" ? "committing to Fabric" : "local — no ledger";
   $("next2").disabled = true;
   showLoader(2, "saksi");
@@ -500,7 +554,7 @@ async function renderTrail() {
 
 /* ---- step 4: the ceremony ---------------------------------------------- */
 async function startCeremony() {
-  go(3);
+  go(4);
   await refreshCeremony();
   stopTimers();
   ceremonyTimer = setInterval(refreshCeremony, 4000);
@@ -558,7 +612,7 @@ async function refreshCeremony() {
 
 /* ---- step 5: verify ---------------------------------------------------- */
 async function startVerify() {
-  go(4);
+  go(5);
   showLoader(4, "verify");
   $("results").style.display = "none";
   try { await post("/verify", { run_id: runID }, "err4"); } catch (_) { hideLoader(4); return; }
@@ -595,17 +649,19 @@ $("addTrustee").onclick = () => { const n = trusteeNames(); n.push("Trustee " + 
 $("mode").onchange = renderPresets;
 $("btnStart").onclick = startRun;
 $("back1").onclick = () => go(0);
-$("next1").onclick = () => { if (cfg.mode === "groundtruth") go(1); else startSaksi(); };
-$("back2").onclick = () => go(1);
+$("next1").onclick = runCheck;
+$("back2b").onclick = () => go(1);
+$("next2b").onclick = () => { if (cfg.mode === "groundtruth") go(2); else startSaksi(); };
+$("back2").onclick = () => go(2);
 $("next2").onclick = startCeremony;
-$("back3").onclick = () => { stopTimers(); go(2); };
+$("back3").onclick = () => { stopTimers(); go(3); };
 $("btnPublish").onclick = async () => {
   $("btnPublish").disabled = true;
   try { await post("/ceremony/publish", { run_id: runID }, "err3"); } catch (_) { $("btnPublish").disabled = false; return; }
   setTimeout(refreshCeremony, 700);
 };
 $("next3").onclick = () => { stopTimers(); startVerify(); };
-$("back4").onclick = () => go(3);
+$("back4").onclick = () => go(4);
 $("btnScenarios").onclick = async () => {
   $("btnScenarios").disabled = true;
   try { await post("/scenarios", { run_id: runID, list: [] }, "err4"); } catch (_) {}

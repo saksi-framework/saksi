@@ -37,6 +37,7 @@ var exportOrder = []string{
 	"ballots.ndjson",
 	RunFile,
 	"receipts.csv",
+	CheckFile,
 	trailJSONFile,
 }
 
@@ -107,6 +108,7 @@ func NewServer(store *RunStore, exec *Executor, hub *Hub, fabric FabricConfig, a
 	mux.HandleFunc("/ceremony/submit", s.handleCeremonySubmit)
 	mux.HandleFunc("/ceremony/publish", s.handleCeremonyPublish)
 	mux.HandleFunc("/api/ceremony/", s.handleCeremonyStatus)
+	mux.HandleFunc("/api/check/", s.handleCheck)
 	s.handler = s.guard(mux)
 	return s
 }
@@ -638,4 +640,26 @@ func (s *Server) handleCeremonyStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSONResp(w, http.StatusOK, state)
+}
+
+// handleCheck runs the data-validation gate over a run's ground-truth tables —
+// the "all records valid?" decision the methodology places between generation
+// and the encrypted demonstration.
+func (s *Server) handleCheck(w http.ResponseWriter, r *http.Request) {
+	runID, err := validRun(s, strings.TrimPrefix(r.URL.Path, "/api/check/"))
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	rec, err := s.record(runID)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusNotFound)
+		return
+	}
+	rep, err := s.exec.RunCheck(runID, rec.Config)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	writeJSONResp(w, http.StatusOK, rep)
 }

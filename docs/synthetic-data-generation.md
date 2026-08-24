@@ -256,7 +256,61 @@ Both CSVs then appear as download chips on the run.
 
 ---
 
-## 7. Verifying the generator is honest
+## 7. The data-validation gate
+
+The methodology (Figure 3.1) places an *"all records valid?"* decision between
+generation and the encrypted demonstration: only data confirmed complete,
+well-formed, and internally consistent proceeds. That gate exists in two halves.
+
+**Inside the generator (Rust, fail-closed).** `validate_population` refuses to
+emit a population unless: there are exactly `voters × positions` ballots with
+`voters` per position; every nullifier is pairwise distinct; every ballot carries
+exactly `candidates` ciphertexts and proofs; each position's ground-truth
+aggregate equals its ballot count; and voter ids are unique per voter and
+repeated once per position. A violation returns `Err` and nothing is written.
+
+**Over the written tables (Go, visible).** `GET /api/check/<runID>` re-audits
+what actually landed on disk — recounting the per-voter ballot table from
+scratch and holding the result against the published summary. This catches what
+the in-process gate cannot: a truncated file, a torn write, an edited CSV, a
+summary that no longer matches its ballots.
+
+| Check | Catches |
+|---|---|
+| Ballot table shape | wrong column count for the declared positions |
+| Voter ids unique and sequential | a duplicated row, a gap, a copied voter |
+| Every selection is a real candidate | a selection outside the declared set |
+| Every voter accounted for | a truncated or padded table |
+| Recount matches the published tally | a summary that disagrees with its own ballots |
+| No votes lost or invented | a position whose votes don't sum to the voter count |
+| Population fingerprinted | records SHA-256 of both tables |
+
+The recount streams the file a line at a time and tracks voter ordinals against
+the row number, so memory stays flat regardless of scale — auditing all
+3,524,078 rows takes **under a second**:
+
+```
+VERDICT: PASS | rows audited: 3,524,078
+  OK  Voter ids unique and sequential: V-000001 through V-3524078, no duplicates or gaps
+  OK  Recount matches the published tally: all 12 contests agree, recounted from the ballot table
+  OK  No votes lost or invented: each of the 3 positions totals exactly 3,524,078
+```
+
+The report is written to `ground-truth-check.json` in the run folder and is a
+downloadable artifact. **A population that fails the gate cannot advance to
+encryption in the wizard** — that is what fail-closed means.
+
+### Why the fingerprint matters
+
+Encryption is randomized: the same population encrypted twice produces different
+ciphertexts, by design. So the ciphertexts cannot prove which plaintext
+population an encrypted run was built from. The digests recorded here can — a
+published ground-truth table and a later encrypted run are linked by re-running
+the check and comparing hashes, without re-running the generator.
+
+---
+
+## 8. Verifying the generator is honest
 
 Three checks, all reproducible.
 
@@ -308,7 +362,7 @@ SENATOR 3524078
 
 ---
 
-## 8. Scale reference
+## 9. Scale reference
 
 Measured on the development machine, multi-position (3 positions × 4
 candidates), ground-truth-only path:
@@ -332,7 +386,7 @@ performance evaluation.
 
 ---
 
-## 9. Where the code lives
+## 10. Where the code lives
 
 | Concern | File |
 |---|---|
@@ -344,7 +398,7 @@ performance evaluation.
 | Console modes and phase orchestration | `packages/saksi-campaign/{config,executor}.go` |
 | Derived study CSVs | `packages/saksi-campaign/csvexport.go` |
 
-## 10. Related
+## 11. Related
 
 - `docs/appendix-a-replacement-draft.md` (balotachain) — the manuscript text
   these artifacts back.
