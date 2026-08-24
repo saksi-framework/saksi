@@ -109,6 +109,7 @@ func NewServer(store *RunStore, exec *Executor, hub *Hub, fabric FabricConfig, a
 	mux.HandleFunc("/ceremony/publish", s.handleCeremonyPublish)
 	mux.HandleFunc("/api/ceremony/", s.handleCeremonyStatus)
 	mux.HandleFunc("/api/check/", s.handleCheck)
+	mux.HandleFunc("/api/scenarios/", s.handleScenarioList)
 	s.handler = s.guard(mux)
 	return s
 }
@@ -640,6 +641,29 @@ func (s *Server) handleCeremonyStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSONResp(w, http.StatusOK, state)
+}
+
+// handleScenarioList serves the attack catalog for a run: every registered
+// scenario's briefing plus its verdict, if it has been run. The wizard renders
+// one step per entry, so the briefing shown to the audience is the same text
+// the mutation code carries.
+func (s *Server) handleScenarioList(w http.ResponseWriter, r *http.Request) {
+	runID, err := validRun(s, strings.TrimPrefix(r.URL.Path, "/api/scenarios/"))
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	dir, err := s.store.Dir(runID)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusNotFound)
+		return
+	}
+	list, err := ScenarioListings(dir)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	writeJSONResp(w, http.StatusOK, list)
 }
 
 // handleCheck runs the data-validation gate over a run's ground-truth tables —

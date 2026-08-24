@@ -17,6 +17,12 @@ import (
 // NegativeTestsFile is the per-run negative/vulnerability results CSV.
 const NegativeTestsFile = "negative-tests.csv"
 
+// ScenarioStateFile accumulates scenario verdicts across calls. The CSV is a
+// derived export and is rewritten in full from this file, so running scenarios
+// one at a time (as the wizard does, a step per attack) cannot truncate the
+// export to whichever subset happened to run last.
+const ScenarioStateFile = "scenarios.json"
+
 // Layer names the verifier that PROVABLY rejects an attack, so a scenario is
 // only ever asserted against the layer that actually catches it (asserting
 // otherwise would be a false FAIL, not a finding).
@@ -207,7 +213,14 @@ func (e *Executor) RunScenarios(ctx context.Context, runID string, list []string
 	for _, sc := range selected {
 		results = append(results, e.runOneScenario(ctx, runID, srcDir, sc))
 	}
-	if err := writeNegativeTestsCSV(filepath.Join(srcDir, NegativeTestsFile), results); err != nil {
+
+	// Merge into the accumulated set before exporting: a caller running a
+	// single scenario must not erase the verdicts of the other six.
+	merged, err := mergeScenarioResults(srcDir, results)
+	if err != nil {
+		return err
+	}
+	if err := writeNegativeTestsCSV(filepath.Join(srcDir, NegativeTestsFile), merged); err != nil {
 		return err
 	}
 	fails := 0
@@ -430,6 +443,102 @@ func copyStream(srcDir, dstDir string) error {
 		}
 	}
 	return nil
+}
+
+// ScenarioListing is one attack as the wizard renders it: the briefing (what
+// the attack does, what it targets, what Saksi is expected to do about it)
+// joined with this run's verdict, if it has been exercised yet.
+//
+// The briefing text is served from Registry() rather than duplicated in the
+// page so it cannot drift away from the code that performs the mutation.
+type ScenarioListing struct {
+	ID       string `json:"id"`
+	Property string `json:"property"`
+	Layer    string `json:"layer"`
+	Action   string `json:"action"`
+	Expected string `json:"expected"`
+	Verdict  string `json:"verdict"` // "" until the scenario has been run
+	Actual   string `json:"actual"`
+}
+
+// ScenarioListings returns every registered attack for a run, in Registry
+// order, each carrying its verdict if one has been recorded.
+func ScenarioListings(dir string) ([]ScenarioListing, error) {
+	done, err := readScenarioResults(dir)
+	if err != nil {
+		return nil, err
+	}
+	byID := make(map[string]ScenarioResult, len(done))
+	for _, r := range done {
+		byID[r.Scenario] = r
+	}
+
+	reg := Registry()
+	out := make([]ScenarioListing, 0, len(reg))
+	for _, sc := range reg {
+		l := ScenarioListing{
+			ID: sc.ID, Property: sc.Property, Layer: sc.Layer.String(),
+			Action: sc.Action, Expected: sc.Expected,
+		}
+		if r, ok := byID[sc.ID]; ok {
+			l.Verdict, l.Actual = r.Verdict, r.Actual
+		}
+		out = append(out, l)
+	}
+	return out, nil
+}
+
+// readScenarioResults returns the verdicts accumulated for a run so far. A
+// missing file is not an error — it is a run whose scenarios have not been
+// exercised yet.
+func readScenarioResults(dir string) ([]ScenarioResult, error) {
+	data, err := os.ReadFile(filepath.Join(dir, ScenarioStateFile))
+	if os.IsNotExist(err) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	var out []ScenarioResult
+	if err := json.Unmarshal(data, &out); err != nil {
+		return nil, fmt.Errorf("parse %s: %w", ScenarioStateFile, err)
+	}
+	return out, nil
+}
+
+// mergeScenarioResults upserts fresh results into the accumulated set and
+// persists it, returning the whole set ordered by Registry() so the CSV export
+// has a stable row order no matter what sequence produced the verdicts.
+func mergeScenarioResults(dir string, fresh []ScenarioResult) ([]ScenarioResult, error) {
+	prior, err := readScenarioResults(dir)
+	if err != nil {
+		return nil, err
+	}
+	byID := make(map[string]ScenarioResult, len(prior)+len(fresh))
+	for _, r := range prior {
+		byID[r.Scenario] = r
+	}
+	// Fresh results replace prior ones: re-running a scenario updates its row
+	// rather than appending a second one for the same id.
+	for _, r := range fresh {
+		byID[r.Scenario] = r
+	}
+
+	var merged []ScenarioResult
+	for _, sc := range Registry() {
+		if r, ok := byID[sc.ID]; ok {
+			merged = append(merged, r)
+		}
+	}
+
+	data, err := json.MarshalIndent(merged, "", "  ")
+	if err != nil {
+		return nil, err
+	}
+	if err := os.WriteFile(filepath.Join(dir, ScenarioStateFile), data, 0o644); err != nil {
+		return nil, err
+	}
+	return merged, nil
 }
 
 func writeNegativeTestsCSV(path string, results []ScenarioResult) error {

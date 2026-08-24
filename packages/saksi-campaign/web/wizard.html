@@ -157,6 +157,49 @@
   .kv { display:flex; gap:22px; flex-wrap:wrap; margin-top:4px }
   .kv div { font-size:12px; color:var(--muted) }
   .kv b { display:block; font-size:19px; color:var(--ink); font-weight:650; font-variant-numeric:tabular-nums }
+
+  /* bulletin board — the declared result, above the correctness proof */
+  .board { display:grid; gap:14px; margin:4px 0 18px }
+  .race { border:1px solid var(--line); border-radius:var(--radius); background:var(--panel-2); padding:14px 16px }
+  .race h3 { margin:0 0 2px; font-size:14px; letter-spacing:-.01em }
+  .race .turnout { font-size:11px; color:var(--muted); font-family:var(--mono); margin-bottom:11px }
+  .cand { display:grid; grid-template-columns:1fr auto; gap:3px 12px; align-items:baseline; margin-bottom:9px }
+  .cand:last-child { margin-bottom:0 }
+  .cand .nm { font-size:13px }
+  .cand .ct { font-size:13px; font-variant-numeric:tabular-nums; color:var(--muted) }
+  .cand .ct b { color:var(--ink); font-weight:650 }
+  .cand .bar { grid-column:1 / -1; height:6px; margin-top:1px }
+  .cand.lead .nm { font-weight:650 }
+  .cand.lead .bar > i { background:var(--ok) }
+  .crown { font-size:10px; text-transform:uppercase; letter-spacing:.06em; font-weight:700;
+           color:var(--ok); background:var(--ok-weak); border-radius:999px; padding:2px 8px; margin-left:7px }
+  .crown.tie { color:var(--warn); background:var(--warn-weak) }
+
+  /* attack sub-rail — one dot per scenario, beneath the protocol rail */
+  .arail { display:flex; gap:5px; flex-wrap:wrap; margin:-12px 0 20px; padding-left:2px }
+  .adot { display:flex; align-items:center; gap:6px; font-size:11px; padding:5px 9px;
+          border:1px solid var(--line); border-radius:999px; background:var(--panel); color:var(--muted) }
+  .adot .n { width:15px; height:15px; border-radius:50%; background:var(--line-2);
+             display:grid; place-items:center; font-size:9px; font-weight:700 }
+  .adot.active { border-color:var(--accent); background:var(--accent-weak); color:var(--ink) }
+  .adot.active .n { background:var(--accent); color:#fff }
+  .adot.pass .n { background:var(--ok); color:#fff }
+  .adot.fail .n { background:var(--bad); color:#fff }
+  .adot.na { opacity:.55 } .adot.na .n { background:var(--warn); color:#fff }
+
+  /* attack briefing */
+  .brief { display:grid; gap:11px; margin:2px 0 16px }
+  .brief > div { border:1px solid var(--line); border-left:3px solid var(--line);
+                 border-radius:var(--radius-sm); background:var(--panel-2); padding:10px 13px }
+  .brief .lab { font-size:10px; text-transform:uppercase; letter-spacing:.07em; color:var(--muted);
+                font-weight:700; margin-bottom:3px }
+  .brief .aims { border-left-color:var(--bad) }
+  .brief .want { border-left-color:var(--ok) }
+  .brief code { font-family:var(--mono); font-size:12px }
+  .ctrl { display:flex; align-items:center; gap:9px; font-size:13px; margin:3px 0 }
+  .ctrl .tick { width:16px; height:16px; border-radius:50%; display:grid; place-items:center;
+                font-size:10px; font-weight:700; background:var(--line-2); color:var(--muted); flex:none }
+  .ctrl.on .tick { background:var(--ok); color:#fff }
 </style>
 </head>
 <body>
@@ -168,6 +211,7 @@
 
 <main>
   <div class="rail" id="rail"></div>
+  <div class="arail" id="arail" style="display:none"></div>
 
   <!-- 1 ─ Setup ---------------------------------------------------------- -->
   <section class="step on panel" data-step="0">
@@ -277,12 +321,36 @@
       ground truth seeded before the election. <b>E</b> is the total disagreement — it must be zero.
     </p>
     <div class="loader" id="load4"><span class="spin"></span><span id="loadTxt4" aria-hidden="true"></span></div>
+
+    <div id="boardWrap" style="display:none">
+      <h3 style="margin:18px 0 3px;font-size:14px">Bulletin board — declared result</h3>
+      <p class="small muted" style="margin:0 0 12px">
+        Every count below was recovered by <b>threshold decryption of the homomorphic aggregate</b>.
+        No individual ballot was decrypted to produce them.
+      </p>
+      <div class="board" id="board"></div>
+    </div>
+
+    <h3 style="margin:18px 0 3px;font-size:14px">Correctness — the proof behind the result</h3>
     <div class="table-wrap" id="results" style="display:none"></div>
     <div class="files" id="exports"></div>
     <div class="err" id="err4"></div>
     <div class="actions"><button id="back4">← Back</button><div class="right">
-      <button id="btnScenarios">Run attack scenarios</button>
-      <button class="primary" id="btnRestart">New election</button></div></div>
+      <button id="btnRestart">New election</button>
+      <button class="primary" id="btnScenarios">Test it against attacks →</button></div></div>
+  </section>
+
+  <!-- 7 ─ Attacks (one step per scenario; this section is re-rendered) ----- -->
+  <section class="step panel" data-step="6">
+    <div class="phead"><h2 id="atkTitle">Attack</h2><span id="atkVerdict"></span></div>
+    <p class="small muted" style="margin-top:0" id="atkCount"></p>
+    <div class="brief" id="atkBrief"></div>
+    <div id="atkRun"></div>
+    <div class="loader" id="load5"><span class="spin"></span><span id="loadTxt5" aria-hidden="true"></span></div>
+    <div class="err" id="err5"></div>
+    <div class="actions"><button id="back5">← Back</button><div class="right">
+      <button id="atkRerun" style="display:none">Run again</button>
+      <button class="primary" id="next5">Next →</button></div></div>
   </section>
 </main>
 
@@ -295,7 +363,19 @@
 const $ = (id) => document.getElementById(id);
 const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;" }[c]));
 
-const STEPS = ["Set up", "Ballots", "Check", "Encrypt", "Trustees", "Verify"];
+// The six protocol steps plus the attack phase. Attacks are addressed as
+// step ATTACK_STEP + index, but all render into the one data-step="6" section.
+const STEPS = ["Set up", "Ballots", "Check", "Encrypt", "Trustees", "Verify", "Attacks"];
+const ATTACK_STEP = 6;
+
+// Contest ids arrive as "<position>/cand<k>" (fixtures.rs). Both halves are
+// rendered for humans; the position ids are the generator's, not free text.
+const POS_LABEL = { "president": "President", "vice-president": "Vice President", "senator": "Senator" };
+const posLabel = (id) =>
+  POS_LABEL[id] || id.replace(/^position-(\d+)$/, (_, n) => "Position " + n).replace(/-/g, " ");
+// cand0 is the first candidate on the ballot; label it 1-based to match the
+// CAND_PRES_01 convention the ground-truth tables use.
+const candLabel = (id) => { const m = /^cand(\d+)$/.exec(id); return m ? "Candidate " + (+m[1] + 1) : id; };
 const PRESETS = [1, 10, 100, 1000, 10000, 50000, 483000, 1000000, 1921917, 3524078];
 const OFFLINE_CEILING = 10000;
 const FILE_ORDER = ["election.csv","ballots.csv","correctness.csv","negative-tests.csv",
@@ -316,24 +396,45 @@ const QUIPS = {
   ceremony: ["Gathering the trustees…","Waiting on the key holders…"],
   check:    ["Recounting every ballot…","Making sure nobody got lost…","Cross-checking the tally…"],
   verify:   ["Recounting, cryptographically…","Re-checking every proof…","Doing the maths twice…"],
+  attack:   ["Tampering with the evidence…","Forging a ballot…","Trying to vote twice…","Poking the ledger…","Seeing what breaks…"],
 };
 
 let step = 0, runID = null, cfg = null, es = null, quipTimer = null, trailTimer = null, ceremonyTimer = null;
+let attacks = [];   // the scenario catalog for this run, with verdicts as they land
 
 /* ---- step rail -------------------------------------------------------- */
 function renderRail() {
+  const here = Math.min(step, ATTACK_STEP); // every attack lives under "Attacks"
   $("rail").innerHTML = STEPS.map((label, i) => {
-    const cls = i === step ? "active" : i < step ? "done" : (skipped(i) ? "skip" : "");
-    return `<div class="rstep ${cls}"><span class="n">${i < step ? "✓" : i + 1}</span>${esc(label)}</div>`;
+    const cls = i === here ? "active" : i < here ? "done" : (skipped(i) ? "skip" : "");
+    return `<div class="rstep ${cls}"><span class="n">${i < here ? "✓" : i + 1}</span>${esc(label)}</div>`;
+  }).join("");
+  renderARail();
+}
+
+// The attack sub-rail: one dot per scenario so the verdicts stay visible at a
+// glance while each attack is still its own step.
+function renderARail() {
+  const box = $("arail");
+  if (step < ATTACK_STEP || !attacks.length) { box.style.display = "none"; return; }
+  box.style.display = "flex";
+  box.innerHTML = attacks.map((a, i) => {
+    const na = a.layer === "chaincode" || a.verdict === "SKIPPED";
+    const cls = i === step - ATTACK_STEP ? "active"
+      : a.verdict === "PASS" ? "pass" : a.verdict === "FAIL" ? "fail" : na ? "na" : "";
+    const mark = a.verdict === "PASS" ? "✓" : a.verdict === "FAIL" ? "!" : na ? "⊘" : i + 1;
+    return `<div class="adot ${cls}"><span class="n">${mark}</span>${esc(a.id)}</div>`;
   }).join("");
 }
+
 // Ground-truth runs produce no ciphertexts, so the encrypt / ceremony / verify
-// steps genuinely do not apply to them.
+// steps — and the attacks, which mutate ciphertexts — do not apply to them.
 function skipped(i) { return cfg && cfg.mode === "groundtruth" && i >= 3; }
 
 function go(n) {
   step = n;
-  document.querySelectorAll(".step").forEach((el) => el.classList.toggle("on", +el.dataset.step === n));
+  const section = Math.min(n, ATTACK_STEP);
+  document.querySelectorAll(".step").forEach((el) => el.classList.toggle("on", +el.dataset.step === section));
   renderRail();
   window.scrollTo({ top: 0, behavior: "smooth" });
 }
@@ -640,8 +741,148 @@ async function loadResults() {
     $("results").style.display = "block";
     $("overallChip").className = "verdict " + (pass ? "pass" : "fail");
     $("overallChip").innerHTML = `<span class="dot2"></span>${pass ? "E = 0 · PASS" : "FAIL"}`;
+    renderBoard(rows);
     $("exports").innerHTML = fileChips(runID, await artifactsFor(runID));
   } catch (_) {}
+}
+
+/* ---- bulletin board ---------------------------------------------------- */
+// Renders the decoded column of correctness.csv as the declared result. The
+// numbers are the ones threshold decryption recovered, so this is the election
+// outcome, not a restatement of the seeded ground truth.
+function renderBoard(rows) {
+  const races = new Map();
+  for (const r of rows) {
+    const [pos, cand] = String(r[0]).split("/");
+    if (!races.has(pos)) races.set(pos, []);
+    races.get(pos).push({ cand: cand || r[0], votes: Number(r[2]) || 0 });
+  }
+  if (!races.size) { $("boardWrap").style.display = "none"; return; }
+
+  $("board").innerHTML = [...races].map(([pos, cands]) => {
+    const total = cands.reduce((a, c) => a + c.votes, 0);
+    const top = Math.max(...cands.map((c) => c.votes));
+    // Collect EVERY candidate on the top count. The uniform profile splits the
+    // electorate evenly by construction, so an exact tie is a normal outcome —
+    // announcing the first row as the winner would invent a result.
+    const leaders = cands.filter((c) => c.votes === top);
+    const tied = leaders.length > 1;
+    const crown = tied
+      ? `<span class="crown tie">tied · ${leaders.length}-way</span>`
+      : `<span class="crown">winner</span>`;
+
+    const body = cands.map((c) => {
+      const lead = c.votes === top;
+      const pct = total ? (c.votes / total) * 100 : 0;
+      return `<div class="cand${lead ? " lead" : ""}">
+        <span class="nm">${esc(candLabel(c.cand))}${lead ? crown : ""}</span>
+        <span class="ct"><b>${c.votes.toLocaleString()}</b> · ${pct.toFixed(1)}%</span>
+        <span class="bar"><i style="width:${pct.toFixed(2)}%"></i></span></div>`;
+    }).join("");
+
+    return `<div class="race"><h3>${esc(posLabel(pos))}</h3>
+      <div class="turnout">${total.toLocaleString()} votes counted${tied ? " · no outright winner" : ""}</div>
+      ${body}</div>`;
+  }).join("");
+  $("boardWrap").style.display = "block";
+}
+
+/* ---- step 7..N: attacks, one per step ---------------------------------- */
+async function loadAttacks() {
+  const res = await fetch(`/api/scenarios/${encodeURIComponent(runID)}`);
+  attacks = res.ok ? await res.json() : [];
+}
+
+async function startAttacks() {
+  await loadAttacks();
+  if (!attacks.length) return;
+  await showAttack(0);
+}
+
+// Opening an attack step runs it, unless it already has a verdict (so Back and
+// Next can walk the phase without re-running everything).
+async function showAttack(i) {
+  go(ATTACK_STEP + i);
+  const a = attacks[i];
+  $("atkTitle").textContent = a.id;
+  $("atkCount").textContent = `Attack ${i + 1} of ${attacks.length} · ${a.property}`;
+  $("err5").textContent = "";
+  $("next5").textContent = i === attacks.length - 1 ? "Finish →" : "Next →";
+
+  $("atkBrief").innerHTML = `
+    <div class="aims"><div class="lab">What the attacker does</div>${esc(a.action)}</div>
+    <div class="want"><div class="lab">What Saksi should do</div>${esc(a.expected)}</div>
+    <div><div class="lab">Guarantee at stake</div>${esc(a.property)}</div>`;
+
+  // Chaincode-layer attacks are not detectable by the offline auditor at all,
+  // so running one here would prove nothing. Say where it IS caught instead.
+  if (a.layer === "chaincode") {
+    $("atkVerdict").className = "pill warn";
+    $("atkVerdict").textContent = "not run offline";
+    $("atkRun").innerHTML = `<div class="note">This attack is rejected at <b>on-chain endorsement</b>,
+      not by the offline auditor — ordering is the chaincode's guarantee, and the offline record
+      carries no ordering to check. It is exercised by the <code>fabric</code> CI job against a live
+      network. Shown here so the boundary between the two verifiers is explicit rather than hidden.</div>`;
+    $("atkRerun").style.display = "none";
+    renderARail();
+    return;
+  }
+
+  if (a.verdict) { paintAttack(a); return; }
+  await runAttack(i);
+}
+
+async function runAttack(i) {
+  const a = attacks[i];
+  $("atkVerdict").className = ""; $("atkVerdict").textContent = "";
+  $("atkRun").innerHTML = `
+    <div class="ctrl" id="ctrl1"><span class="tick">1</span>Auditing the untouched copy (control)</div>
+    <div class="ctrl" id="ctrl2"><span class="tick">2</span>Applying the mutation, then auditing again</div>`;
+  $("atkRerun").style.display = "none";
+  showLoader(5, "attack");
+  try {
+    await post("/scenarios", { run_id: runID, list: [a.id] }, "err5");
+  } catch (_) {
+    // A 409 means another phase holds the run's lock. Leave a way back in
+    // rather than stranding the step with no result and no button.
+    hideLoader(5);
+    $("atkRerun").style.display = "inline-block";
+    return;
+  }
+
+  openStream(runID, async (e) => {
+    if (e.phase !== "scenarios") return;
+    if (e.level === "done" || e.level === "error") {
+      hideLoader(5);
+      await loadAttacks();
+      paintAttack(attacks[i]);
+      $("exports").innerHTML = fileChips(runID, await artifactsFor(runID));
+    }
+  });
+}
+
+function paintAttack(a) {
+  // SKIPPED is neither a pass nor a failure — the attack never ran, so calling
+  // it "not rejected" would report a security failure that did not happen.
+  if (a.verdict === "SKIPPED") {
+    $("atkVerdict").className = "pill warn";
+    $("atkVerdict").textContent = "not run";
+    $("atkRun").innerHTML = `<div class="note">${esc(a.actual || "This scenario did not run.")}</div>`;
+    $("atkRerun").style.display = "inline-block";
+    renderARail();
+    return;
+  }
+  const pass = a.verdict === "PASS";
+  $("atkVerdict").className = "verdict " + (pass ? "pass" : "fail");
+  $("atkVerdict").innerHTML = `<span class="dot2"></span>${pass ? "attack rejected" : "NOT REJECTED"}`;
+  $("atkRun").innerHTML = `
+    <div class="ctrl on"><span class="tick">✓</span>Control passed — the untouched copy audits clean,
+      so any rejection below is caused by the mutation and nothing else</div>
+    <div class="ctrl ${pass ? "on" : ""}"><span class="tick">${pass ? "✓" : "!"}</span>${esc(a.actual || "")}</div>
+    ${pass ? "" : `<div class="note">A mutated run audited clean. This is a real finding:
+      the guarantee "<b>${esc(a.property)}</b>" did not hold.</div>`}`;
+  $("atkRerun").style.display = "inline-block";
+  renderARail();
 }
 
 /* ---- wiring ------------------------------------------------------------ */
@@ -664,11 +905,20 @@ $("next3").onclick = () => { stopTimers(); startVerify(); };
 $("back4").onclick = () => go(4);
 $("btnScenarios").onclick = async () => {
   $("btnScenarios").disabled = true;
-  try { await post("/scenarios", { run_id: runID, list: [] }, "err4"); } catch (_) {}
-  setTimeout(async () => { $("exports").innerHTML = fileChips(runID, await artifactsFor(runID));
-                           $("btnScenarios").disabled = false; }, 2500);
+  try { await startAttacks(); } finally { $("btnScenarios").disabled = false; }
 };
-$("btnRestart").onclick = () => { closeStream(); stopTimers(); runID = null; cfg = null; go(0); };
+$("back5").onclick = () => {
+  const i = step - ATTACK_STEP;
+  if (i > 0) showAttack(i - 1); else go(5);
+};
+$("next5").onclick = () => {
+  const i = step - ATTACK_STEP;
+  if (i < attacks.length - 1) showAttack(i + 1); else go(5);
+};
+$("atkRerun").onclick = () => runAttack(step - ATTACK_STEP);
+$("btnRestart").onclick = () => {
+  closeStream(); stopTimers(); runID = null; cfg = null; attacks = []; go(0);
+};
 
 renderTrustees(["COMELEC", "Civil Society Watch", "University IT"]);
 renderPresets();
