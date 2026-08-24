@@ -90,6 +90,28 @@ At the full ZAMBASULTA tier the skew is exact: 1,762,039 of 3,524,078 — precis
 half — to candidate 1, with the remaining three candidates within one vote of
 each other.
 
+### A known limit of this test data
+
+The rule is a round-robin, so **every position ends up with a near-identical set
+of totals** — permutations of one another, differing by a vote or two:
+
+```
+PRESIDENT       1762039  587347  587346  587346
+VICE_PRESIDENT  1762039  587346  587347  587346
+SENATOR         1762039  587346  587346  587347
+```
+
+Totals that interchangeable mean the accuracy check cannot discriminate between
+contests: a component that confused one contest for another would still satisfy
+`E = 0`. The legacy 6-voter fixture avoids this deliberately — its comment says
+its values were *"picked so the tally is non-trivial and the two contests have
+different totals (catches off-by-one or contest-mixing bugs in the auditor)"* —
+but the parameterized generator does not carry the property forward.
+
+This is a limitation of the **test data**, not of the protocol: contest-mixing
+is simply not a failure mode this evaluation probes. It is recorded here so it
+is declared rather than discovered.
+
 ---
 
 ## 3. The ballot model, and its limits
