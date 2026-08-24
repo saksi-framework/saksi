@@ -18,7 +18,7 @@ import (
 	clientsdk "github.com/saksi-framework/saksi/packages/saksi-bulletin/client-sdk"
 )
 
-//go:embed web/index.html web/trail.html
+//go:embed web/index.html web/trail.html web/wizard.html
 var webFS embed.FS
 
 // exportOrder is the downloadable run artifacts, in display order. exportAllowlist
@@ -102,6 +102,11 @@ func NewServer(store *RunStore, exec *Executor, hub *Hub, fabric FabricConfig, a
 	mux.HandleFunc("/export/", s.handleExport)
 	mux.HandleFunc("/api/trail/", s.handleTrailAPI)
 	mux.HandleFunc("/trail/", s.handleTrailPage)
+	mux.HandleFunc("/wizard", s.handleWizard)
+	mux.HandleFunc("/ceremony/start", s.handleCeremonyStart)
+	mux.HandleFunc("/ceremony/submit", s.handleCeremonySubmit)
+	mux.HandleFunc("/ceremony/publish", s.handleCeremonyPublish)
+	mux.HandleFunc("/api/ceremony/", s.handleCeremonyStatus)
 	s.handler = s.guard(mux)
 	return s
 }
@@ -522,4 +527,115 @@ func writeJSONResp(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(v)
+}
+
+func (s *Server) handleWizard(w http.ResponseWriter, r *http.Request) {
+	data, err := webFS.ReadFile("web/wizard.html")
+	if err != nil {
+		http.Error(w, "ui unavailable", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	_, _ = w.Write(data)
+}
+
+// ceremonyRun resolves the run named in the body and refuses ground-truth runs,
+// which have no ciphertexts to decrypt.
+func (s *Server) ceremonyRun(w http.ResponseWriter, r *http.Request) (RunRecord, bool) {
+	runID, ok := s.runIDFromBody(w, r)
+	if !ok {
+		return RunRecord{}, false
+	}
+	if !s.ballotPhaseAllowed(w, runID, "the trustee ceremony") {
+		return RunRecord{}, false
+	}
+	rec, err := s.record(runID)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusNotFound)
+		return RunRecord{}, false
+	}
+	return rec, true
+}
+
+func (s *Server) handleCeremonyStart(w http.ResponseWriter, r *http.Request) {
+	rec, ok := s.ceremonyRun(w, r)
+	if !ok {
+		return
+	}
+	s.dispatch(w, rec.RunID, func(ctx context.Context) {
+		_ = s.exec.CeremonyStart(ctx, rec.RunID, rec.Config)
+	})
+}
+
+func (s *Server) handleCeremonySubmit(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		RunID   string `json:"run_id"`
+		Trustee string `json:"trustee_id"`
+	}
+	if !decodeJSON(w, r, &body) {
+		return
+	}
+	runID, err := validRun(s, body.RunID)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if !s.ballotPhaseAllowed(w, runID, "the trustee ceremony") {
+		return
+	}
+	rec, err := s.record(runID)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusNotFound)
+		return
+	}
+	if strings.TrimSpace(body.Trustee) == "" {
+		http.Error(w, "trustee_id is required", http.StatusBadRequest)
+		return
+	}
+	s.dispatch(w, runID, func(ctx context.Context) {
+		_ = s.exec.CeremonySubmit(ctx, runID, rec.Config, body.Trustee)
+	})
+}
+
+// handleCeremonyPublish enforces the threshold BEFORE dispatching, so a
+// below-quorum attempt is rejected outright rather than failing asynchronously
+// where the UI would only learn about it from the log.
+func (s *Server) handleCeremonyPublish(w http.ResponseWriter, r *http.Request) {
+	rec, ok := s.ceremonyRun(w, r)
+	if !ok {
+		return
+	}
+	state, err := s.exec.CeremonyStatus(rec.RunID, rec.Config)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if !state.Unlocked {
+		http.Error(w, fmt.Sprintf(
+			"the tally needs %d of %d trustees; %d have contributed so far",
+			state.Threshold, len(state.Trustees), state.Submitted), http.StatusConflict)
+		return
+	}
+	s.dispatch(w, rec.RunID, func(ctx context.Context) {
+		_ = s.exec.CeremonyPublish(ctx, rec.RunID, rec.Config)
+	})
+}
+
+func (s *Server) handleCeremonyStatus(w http.ResponseWriter, r *http.Request) {
+	runID, err := validRun(s, strings.TrimPrefix(r.URL.Path, "/api/ceremony/"))
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	rec, err := s.record(runID)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusNotFound)
+		return
+	}
+	state, err := s.exec.CeremonyStatus(runID, rec.Config)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	writeJSONResp(w, http.StatusOK, state)
 }

@@ -271,60 +271,89 @@ type onChainBundle struct {
 // already-committed steps' evidence on disk. Chaincode arg forms mirror
 // cmd/saksi-console/main.go's calls.
 func (e *Executor) submitOnChain(ctx context.Context, runID string, c ElectionConfig, led clientsdk.Ledger, bundlePath string) error {
-	raw, err := os.ReadFile(bundlePath)
-	if err != nil {
-		return fmt.Errorf("read bundle: %w", err)
-	}
-	var b onChainBundle
-	if err := json.Unmarshal(raw, &b); err != nil {
-		return fmt.Errorf("parse bundle: %w", err)
-	}
-	runDir, err := e.store.Dir(runID)
+	b, step, err := e.lifecycle(runID, led, bundlePath, "submit")
 	if err != nil {
 		return err
 	}
+	if err := e.setupOnChain(ctx, b, step); err != nil {
+		return err
+	}
+	for i, pd := range b.PartialDecryptions {
+		if err := step(ctx, "SubmitPartialDecryption", strconv.Itoa(i), "SubmitPartialDecryption", b.ElectionID, pd); err != nil {
+			return err
+		}
+	}
+	if err := step(ctx, "PublishTally", "", "PublishTally", b.Tally); err != nil {
+		return err
+	}
+	e.publish(runID, "submit", "done", "full lifecycle committed on-chain")
+	return nil
+}
 
-	step := func(event, ref, fn string, args ...string) error {
+// lifecycleStep commits one chaincode call, records its ledger receipt, and
+// streams a progress line. Shared by the all-in-one Submit path and the
+// step-at-a-time ceremony path so both produce identical receipts and events.
+type lifecycleStep func(ctx context.Context, event, ref, fn string, args ...string) error
+
+// lifecycle loads the run's cached bundle and returns it with a step function
+// bound to this run. phase names the SSE phase the steps publish under
+// ("submit" for the all-in-one path, "ceremony" for the trustee ceremony).
+//
+// The bundle is READ, never regenerated: `saksi-demo gen` draws from OsRng, so
+// a second generation would produce different shares — and CreateElection would
+// then reject the run as a duplicate. Every ceremony click must see the same
+// bundle the election was created from.
+func (e *Executor) lifecycle(runID string, led clientsdk.Ledger, bundlePath, phase string) (*onChainBundle, lifecycleStep, error) {
+	raw, err := os.ReadFile(bundlePath)
+	if err != nil {
+		return nil, nil, fmt.Errorf("read bundle: %w", err)
+	}
+	var b onChainBundle
+	if err := json.Unmarshal(raw, &b); err != nil {
+		return nil, nil, fmt.Errorf("parse bundle: %w", err)
+	}
+	runDir, err := e.store.Dir(runID)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	step := func(ctx context.Context, event, ref, fn string, args ...string) error {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
 		_, receipt, err := led.SubmitWithReceipt(fn, args...)
 		if err != nil {
-			e.publish(runID, "submit", "error", fmt.Sprintf("%s %s: %v", event, ref, err))
+			e.publish(runID, phase, "error", fmt.Sprintf("%s %s: %v", event, ref, err))
 			return fmt.Errorf("%s: %w", event, err)
 		}
 		if err := appendReceipt(runDir, TrailEvent{Event: event, Ref: ref, Receipt: receipt}); err != nil {
 			return err
 		}
-		e.publish(runID, "submit", "info", fmt.Sprintf("%s %s committed: block %d tx %s",
+		e.publish(runID, phase, "info", fmt.Sprintf("%s %s committed: block %d tx %s",
 			event, ref, receipt.BlockNumber, receipt.TxID))
 		return nil
 	}
+	return &b, step, nil
+}
 
-	if err := step("CreateElection", "", "CreateElection", b.Params); err != nil {
+// setupOnChain runs the lifecycle prefix that must precede any trustee action:
+// CreateElection, PublishDKGTranscript, every SubmitBallot, then CloseElection.
+// It stops there — the chaincode only accepts partial decryptions once the
+// election is closed (contract.go's status gate), and the ceremony hands the
+// next move to the trustees.
+func (e *Executor) setupOnChain(ctx context.Context, b *onChainBundle, step lifecycleStep) error {
+	if err := step(ctx, "CreateElection", "", "CreateElection", b.Params); err != nil {
 		return err
 	}
-	if err := step("PublishDKGTranscript", "", "PublishDKGTranscript", b.DKG); err != nil {
+	if err := step(ctx, "PublishDKGTranscript", "", "PublishDKGTranscript", b.DKG); err != nil {
 		return err
 	}
 	for i, ballot := range b.Ballots {
-		if err := step("SubmitBallot", strconv.Itoa(i), "SubmitBallot", ballot); err != nil {
+		if err := step(ctx, "SubmitBallot", strconv.Itoa(i), "SubmitBallot", ballot); err != nil {
 			return err
 		}
 	}
-	if err := step("CloseElection", "", "CloseElection", b.ElectionID); err != nil {
-		return err
-	}
-	for i, pd := range b.PartialDecryptions {
-		if err := step("SubmitPartialDecryption", strconv.Itoa(i), "SubmitPartialDecryption", b.ElectionID, pd); err != nil {
-			return err
-		}
-	}
-	if err := step("PublishTally", "", "PublishTally", b.Tally); err != nil {
-		return err
-	}
-	e.publish(runID, "submit", "done", "full lifecycle committed on-chain")
-	return nil
+	return step(ctx, "CloseElection", "", "CloseElection", b.ElectionID)
 }
 
 // writeCorrectnessCSV writes the per-contest proof of correctness: the seeded

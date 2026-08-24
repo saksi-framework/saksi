@@ -1,0 +1,622 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Election Wizard</title>
+<style>
+  /* Token block mirrors web/index.html so both pages stay one visual system.
+     Each page is self-contained (no build step), the same way trail.html is. */
+  :root {
+    --bg:#f4f6f8; --panel:#ffffff; --panel-2:#fbfcfd; --ink:#181b20; --muted:#5c6470;
+    --line:#e4e8ec; --line-2:#eef1f4; --accent:#2f6fed; --accent-weak:#e8effe; --accent-ink:#1a4ed0;
+    --ok:#17864a; --ok-weak:#e3f4ea; --bad:#c53434; --bad-weak:#fbe9e9;
+    --warn:#8a6100; --warn-weak:#fdf1dc;
+    --logbg:#0e1116; --logink:#d6dae0;
+    --radius:12px; --radius-sm:8px;
+    --shadow:0 1px 2px rgba(16,24,40,.05), 0 4px 12px rgba(16,24,40,.04);
+    --mono:ui-monospace,"SF Mono",SFMono-Regular,Menlo,Consolas,monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg:#0c0e11; --panel:#15181d; --panel-2:#181c22; --ink:#e8ebef; --muted:#98a1ad;
+      --line:#262b32; --line-2:#20242a; --accent:#5b8bff; --accent-weak:#1a2740; --accent-ink:#a9c4ff;
+      --ok:#4cc47f; --ok-weak:#132a1f; --bad:#f0736f; --bad-weak:#301a1c;
+      --warn:#e0b062; --warn-weak:#2b2312;
+      --logbg:#05070a; --logink:#c8ccd2;
+      --shadow:0 1px 2px rgba(0,0,0,.4), 0 6px 18px rgba(0,0,0,.28);
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg:#0c0e11; --panel:#15181d; --panel-2:#181c22; --ink:#e8ebef; --muted:#98a1ad;
+    --line:#262b32; --line-2:#20242a; --accent:#5b8bff; --accent-weak:#1a2740; --accent-ink:#a9c4ff;
+    --ok:#4cc47f; --ok-weak:#132a1f; --bad:#f0736f; --bad-weak:#301a1c;
+    --warn:#e0b062; --warn-weak:#2b2312;
+    --logbg:#05070a; --logink:#c8ccd2;
+    --shadow:0 1px 2px rgba(0,0,0,.4), 0 6px 18px rgba(0,0,0,.28);
+  }
+  * { box-sizing:border-box }
+  html { scrollbar-width:thin; scrollbar-color:var(--line) transparent }
+  ::selection { background:var(--accent-weak) }
+  :focus-visible { outline:2px solid var(--accent); outline-offset:2px; border-radius:4px }
+  body { margin:0; background:var(--bg); color:var(--ink);
+         font:14px/1.55 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+         -webkit-font-smoothing:antialiased }
+  .tnum { font-variant-numeric:tabular-nums }
+
+  header { display:flex; align-items:center; gap:12px; padding:16px 28px; border-bottom:1px solid var(--line) }
+  header h1 { font-size:15px; margin:0; font-weight:650; letter-spacing:-.01em }
+  .sub { color:var(--muted); font-size:12px }
+  .tag { margin-left:auto; font-size:11px; text-transform:uppercase; letter-spacing:.06em;
+         color:var(--muted); border:1px solid var(--line); border-radius:999px; padding:3px 10px }
+  a { color:var(--accent-ink) }
+
+  main { max-width:1080px; margin:0 auto; padding:22px 28px 48px }
+  .panel { background:var(--panel); border:1px solid var(--line); border-radius:var(--radius);
+           padding:18px 18px 20px; box-shadow:var(--shadow) }
+  .phead { display:flex; align-items:baseline; justify-content:space-between; gap:12px; margin-bottom:14px }
+  h2 { font-size:12px; font-weight:650; text-transform:uppercase; letter-spacing:.08em;
+       color:var(--muted); margin:0 }
+  .meta { font-size:12px; color:var(--muted); font-family:var(--mono) }
+  .muted { color:var(--muted) } .small { font-size:12px }
+
+  /* ---- step rail ------------------------------------------------------- */
+  .rail { display:flex; gap:6px; flex-wrap:wrap; margin-bottom:20px }
+  .rstep { display:flex; align-items:center; gap:8px; padding:8px 12px; border:1px solid var(--line);
+           border-radius:999px; background:var(--panel); font-size:12px; color:var(--muted);
+           transition:border-color .15s, background .15s, color .15s }
+  .rstep .n { width:19px; height:19px; border-radius:50%; background:var(--line-2); color:var(--muted);
+              display:grid; place-items:center; font-size:11px; font-weight:650; flex:none }
+  .rstep.active { border-color:var(--accent); color:var(--ink); background:var(--accent-weak) }
+  .rstep.active .n { background:var(--accent); color:#fff }
+  .rstep.done { color:var(--ink) }
+  .rstep.done .n { background:var(--ok); color:#fff }
+  .rstep.skip { opacity:.5 }
+
+  .step { display:none } .step.on { display:block }
+
+  label { display:block; font-size:12px; color:var(--muted); margin:13px 0 5px }
+  input, select { width:100%; padding:8px 10px; border:1px solid var(--line); border-radius:var(--radius-sm);
+                  background:var(--panel-2); color:var(--ink); font:inherit;
+                  transition:border-color .12s, box-shadow .12s }
+  input:focus, select:focus { outline:none; border-color:var(--accent); box-shadow:0 0 0 3px var(--accent-weak) }
+  input:disabled { color:var(--muted); background:var(--line-2) }
+  .grid2 { display:grid; grid-template-columns:1fr 1fr; gap:10px }
+  .grid3 { display:grid; grid-template-columns:1fr 1fr 1fr; gap:10px }
+  @media (max-width:720px){ .grid2,.grid3 { grid-template-columns:1fr } }
+  .trustee { display:flex; gap:8px; align-items:center; margin-bottom:6px }
+  .trustee input { flex:1 }
+
+  button { padding:8px 13px; border:1px solid var(--line); background:var(--panel); color:var(--ink);
+           border-radius:var(--radius-sm); font:inherit; cursor:pointer;
+           transition:border-color .12s, background .12s, color .12s }
+  button:hover:not(:disabled) { border-color:var(--accent) }
+  button.primary { background:var(--accent); border-color:var(--accent); color:#fff; font-weight:600 }
+  button.small { padding:5px 10px; font-size:12px }
+  button:disabled { opacity:.45; cursor:not-allowed }
+  .actions { display:flex; gap:9px; align-items:center; margin-top:20px; flex-wrap:wrap }
+  .actions .right { margin-left:auto; display:flex; gap:9px }
+  .presets { display:flex; flex-wrap:wrap; gap:6px; margin-top:7px }
+  .presets button { padding:4px 10px; font-size:12px }
+
+  .pill { display:inline-block; font-size:11px; border:1px solid var(--line); border-radius:999px;
+          padding:2px 9px; color:var(--muted) }
+  .pill.on { background:var(--accent-weak); border-color:transparent; color:var(--accent-ink) }
+  .pill.ok { background:var(--ok-weak); border-color:transparent; color:var(--ok) }
+  .pill.warn { background:var(--warn-weak); border-color:transparent; color:var(--warn) }
+
+  #log { background:var(--logbg); color:var(--logink); border-radius:var(--radius-sm); padding:11px 13px;
+         height:190px; overflow:auto; white-space:pre-wrap; font:12px/1.5 var(--mono); margin-top:12px }
+  #log div { padding:1px 0 } #log .error { color:#ff9490 } #log .done { color:#79e0a3 }
+
+  /* ---- loader ---------------------------------------------------------- */
+  .loader { display:flex; align-items:center; gap:10px; color:var(--muted); font-size:13px; min-height:22px }
+  .spin { width:13px; height:13px; border-radius:50%; border:2px solid var(--line);
+          border-top-color:var(--accent); animation:spin .7s linear infinite; flex:none }
+  @keyframes spin { to { transform:rotate(360deg) } }
+  @media (prefers-reduced-motion: reduce) { .spin { animation:none } }
+
+  /* ---- trustee cards --------------------------------------------------- */
+  .cards { display:grid; grid-template-columns:repeat(auto-fill,minmax(215px,1fr)); gap:12px; margin-top:6px }
+  .tcard { border:1px solid var(--line); border-radius:var(--radius); padding:14px; background:var(--panel-2);
+           display:flex; flex-direction:column; gap:9px; transition:border-color .15s, background .15s }
+  .tcard.submitted { border-color:var(--ok); background:var(--ok-weak) }
+  .tcard .who { font-weight:600; line-height:1.3 }
+  .tcard .role { font-size:11px; color:var(--muted) }
+  .quorum { display:flex; align-items:center; gap:11px; margin:4px 0 14px }
+  .bar { flex:1; height:7px; border-radius:999px; background:var(--line-2); overflow:hidden }
+  .bar > i { display:block; height:100%; background:var(--accent); width:0; transition:width .35s ease }
+  .bar.met > i { background:var(--ok) }
+
+  .note { border:1px solid var(--line); border-left:3px solid var(--warn); background:var(--warn-weak);
+          border-radius:var(--radius-sm); padding:10px 12px; font-size:12px; margin-top:14px; color:var(--ink) }
+  .locked { text-align:center; padding:28px 18px; color:var(--muted); border:1px dashed var(--line);
+            border-radius:var(--radius); margin-top:14px }
+
+  .table-wrap { overflow-x:auto; border:1px solid var(--line); border-radius:var(--radius-sm) }
+  table { width:100%; border-collapse:collapse; font-size:13px }
+  th { text-align:left; font-size:11px; text-transform:uppercase; letter-spacing:.05em; color:var(--muted);
+       font-weight:600; padding:8px 11px; border-bottom:1px solid var(--line); background:var(--panel) }
+  td { padding:8px 11px; border-bottom:1px solid var(--line-2) }
+  tr:last-child td { border-bottom:none }
+  td.num, th.num { text-align:right; font-variant-numeric:tabular-nums }
+  .verdict { display:inline-flex; align-items:center; gap:7px; font-size:12px; font-weight:600;
+             border-radius:999px; padding:3px 11px }
+  .verdict.pass { background:var(--ok-weak); color:var(--ok) }
+  .verdict.fail { background:var(--bad-weak); color:var(--bad) }
+  .verdict .dot2 { width:7px; height:7px; border-radius:50%; background:currentColor }
+  td.res-pass { color:var(--ok); font-weight:600 } td.res-fail { color:var(--bad); font-weight:600 }
+
+  .files { display:flex; flex-wrap:wrap; gap:7px; margin-top:13px }
+  .fchip { display:inline-flex; align-items:center; gap:6px; font-size:12px; text-decoration:none;
+           border:1px solid var(--line); border-radius:999px; padding:5px 11px; color:var(--ink);
+           transition:border-color .12s, background .12s, color .12s }
+  .fchip:hover { border-color:var(--accent) }
+  .fchip.key { background:var(--accent-weak); border-color:transparent; color:var(--accent-ink) }
+  .err { color:var(--bad); font-size:12px; min-height:1.2em; margin-top:8px }
+  .kv { display:flex; gap:22px; flex-wrap:wrap; margin-top:4px }
+  .kv div { font-size:12px; color:var(--muted) }
+  .kv b { display:block; font-size:19px; color:var(--ink); font-weight:650; font-variant-numeric:tabular-nums }
+</style>
+</head>
+<body>
+<header>
+  <h1>Election Wizard</h1>
+  <span class="sub">BalotaChain on the Saksi framework</span>
+  <span class="tag"><a href="/">classic console</a></span>
+</header>
+
+<main>
+  <div class="rail" id="rail"></div>
+
+  <!-- 1 ─ Setup ---------------------------------------------------------- -->
+  <section class="step on panel" data-step="0">
+    <div class="phead"><h2>Set up the election</h2><span class="meta small" id="setupHint">everything the run needs</span></div>
+
+    <label for="name">Election name</label>
+    <input id="name" value="Demo Election" />
+
+    <label>Trustees <span class="muted small">— the institutions that jointly hold the decryption key</span></label>
+    <div id="trustees"></div>
+    <button class="small" id="addTrustee" type="button">+ Add trustee</button>
+
+    <div class="grid2">
+      <div><label for="threshold">Threshold (t) — how many must agree to decrypt</label>
+        <input id="threshold" type="number" min="1" value="2" class="tnum" /></div>
+      <div><label for="nDisplay">Trustees (n)</label>
+        <input id="nDisplay" disabled class="tnum" /></div>
+    </div>
+
+    <div class="grid3">
+      <div><label for="positions">Positions</label><input id="positions" type="number" min="1" value="3" class="tnum" /></div>
+      <div><label for="candidates">Candidates each</label><input id="candidates" type="number" min="1" value="4" class="tnum" /></div>
+      <div><label for="voters">Voters</label><input id="voters" type="number" min="1" value="10" class="tnum" /></div>
+    </div>
+    <div class="presets" id="presets"></div>
+
+    <div class="grid2">
+      <div><label for="distribution">Vote distribution</label>
+        <select id="distribution"><option value="uniform">uniform</option><option value="skewed">skewed</option></select></div>
+      <div><label for="mode">Mode</label>
+        <select id="mode">
+          <option value="offline">offline — full crypto, no ledger</option>
+          <option value="onchain">on-chain — commits to Fabric</option>
+          <option value="groundtruth">ground truth only — no encryption</option>
+        </select></div>
+    </div>
+
+    <div class="err" id="configErr"></div>
+    <div class="actions"><div class="right"><button class="primary" id="btnStart">Generate ballots →</button></div></div>
+  </section>
+
+  <!-- 2 ─ Generate ------------------------------------------------------- -->
+  <section class="step panel" data-step="1">
+    <div class="phead"><h2>Generating ballots</h2><span class="meta small" id="runChip"></span></div>
+    <div class="loader" id="load1"><span class="spin"></span><span id="loadTxt1" aria-hidden="true"></span></div>
+    <div class="kv" id="genStats"></div>
+    <div id="log" aria-live="polite"></div>
+    <div class="files" id="genFiles"></div>
+    <div class="note" id="gtNote" style="display:none">
+      These are the plaintext ballots, generated <b>before</b> any encryption — the population the
+      encrypted election is built from, downloadable and checkable now.
+    </div>
+    <div class="err" id="err1"></div>
+    <div class="actions"><button id="back1">← Back</button><div class="right"><button class="primary" id="next1" disabled>Continue →</button></div></div>
+  </section>
+
+  <!-- 3 ─ Saksi ---------------------------------------------------------- -->
+  <section class="step panel" data-step="2">
+    <div class="phead"><h2>Encrypting &amp; recording</h2><span class="meta small" id="modeChip"></span></div>
+    <p class="small muted" style="margin-top:0">
+      Each ballot is encrypted under the joint election key with a zero-knowledge proof that it is
+      well-formed, then the election is closed so no further ballots can be accepted.
+    </p>
+    <div class="loader" id="load2"><span class="spin"></span><span id="loadTxt2" aria-hidden="true"></span></div>
+    <div id="trailBox" style="display:none;margin-top:12px"></div>
+    <div class="err" id="err2"></div>
+    <div class="actions"><button id="back2">← Back</button><div class="right"><button class="primary" id="next2" disabled>To the trustees →</button></div></div>
+  </section>
+
+  <!-- 4 ─ Ceremony ------------------------------------------------------- -->
+  <section class="step panel" data-step="3">
+    <div class="phead"><h2>Threshold decryption ceremony</h2><span class="meta small" id="quorumChip"></span></div>
+    <p class="small muted" style="margin-top:0">
+      No single institution can read the result. Each holds one share of the key and contributes a
+      partial decryption; the tally can only be opened once enough of them do.
+    </p>
+    <div class="quorum"><div class="bar" id="qbar"><i></i></div><span class="small muted tnum" id="qtext"></span></div>
+    <div class="cards" id="cards"></div>
+    <div class="note" id="gateNote"></div>
+    <div id="tallyBox"></div>
+    <div class="err" id="err3"></div>
+    <div class="actions"><button id="back3">← Back</button><div class="right">
+      <button class="primary" id="btnPublish" disabled>Publish tally</button>
+      <button id="next3" disabled>Verify →</button></div></div>
+  </section>
+
+  <!-- 5 ─ Verify --------------------------------------------------------- -->
+  <section class="step panel" data-step="4">
+    <div class="phead"><h2>Independent verification</h2><span id="overallChip"></span></div>
+    <p class="small muted" style="margin-top:0">
+      The verifier re-derives the result from the published record alone and compares it against the
+      ground truth seeded before the election. <b>E</b> is the total disagreement — it must be zero.
+    </p>
+    <div class="loader" id="load4"><span class="spin"></span><span id="loadTxt4" aria-hidden="true"></span></div>
+    <div class="table-wrap" id="results" style="display:none"></div>
+    <div class="files" id="exports"></div>
+    <div class="err" id="err4"></div>
+    <div class="actions"><button id="back4">← Back</button><div class="right">
+      <button id="btnScenarios">Run attack scenarios</button>
+      <button class="primary" id="btnRestart">New election</button></div></div>
+  </section>
+</main>
+
+<script>
+"use strict";
+// The wizard walks one election through its protocol order. It drives the same
+// endpoints as the classic console at "/" — nothing here is a parallel
+// implementation of the protocol, only a different way through it.
+
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;" }[c]));
+
+const STEPS = ["Set up", "Ballots", "Encrypt", "Trustees", "Verify"];
+const PRESETS = [1, 10, 100, 1000, 10000, 50000, 483000, 1000000, 1921917, 3524078];
+const OFFLINE_CEILING = 10000;
+const FILE_ORDER = ["election.csv","ballots.csv","correctness.csv","negative-tests.csv",
+                    "ground-truth-ballots.csv","ground-truth-summary.csv","perf.csv",
+                    "header.json","ballots.ndjson","run.json","receipts.csv","trail.json"];
+const FILE_LABEL = { "election.csv":"election.csv","ballots.csv":"ballots.csv",
+  "correctness.csv":"correctness.csv","negative-tests.csv":"negatives.csv","perf.csv":"perf.csv",
+  "ground-truth-ballots.csv":"Ground truth — ballots","ground-truth-summary.csv":"Ground truth — tally",
+  "header.json":"header.json (raw)","ballots.ndjson":"ballots.ndjson (raw)","run.json":"run.json (raw)",
+  "receipts.csv":"Ledger receipts","trail.json":"Trail events" };
+const STUDY = new Set(["election.csv","ballots.csv","correctness.csv","negative-tests.csv",
+                       "ground-truth-ballots.csv","ground-truth-summary.csv","perf.csv"]);
+
+// Decorative only — aria-hidden, so a screen reader hears the log, not this.
+const QUIPS = {
+  generate: ["Filling out ballots…","Marking the precinct…","Sealing the envelopes…","Rounding up voters…"],
+  saksi:    ["Cooking up Saksi…","Teaching the ledger to keep a secret…","Proving without revealing…","Scrambling the ballot box…"],
+  ceremony: ["Gathering the trustees…","Waiting on the key holders…"],
+  verify:   ["Recounting, cryptographically…","Re-checking every proof…","Doing the maths twice…"],
+};
+
+let step = 0, runID = null, cfg = null, es = null, quipTimer = null, trailTimer = null, ceremonyTimer = null;
+
+/* ---- step rail -------------------------------------------------------- */
+function renderRail() {
+  $("rail").innerHTML = STEPS.map((label, i) => {
+    const cls = i === step ? "active" : i < step ? "done" : (skipped(i) ? "skip" : "");
+    return `<div class="rstep ${cls}"><span class="n">${i < step ? "✓" : i + 1}</span>${esc(label)}</div>`;
+  }).join("");
+}
+// Ground-truth runs produce no ciphertexts, so the encrypt / ceremony / verify
+// steps genuinely do not apply to them.
+function skipped(i) { return cfg && cfg.mode === "groundtruth" && i >= 2; }
+
+function go(n) {
+  step = n;
+  document.querySelectorAll(".step").forEach((el) => el.classList.toggle("on", +el.dataset.step === n));
+  renderRail();
+  window.scrollTo({ top: 0, behavior: "smooth" });
+}
+
+/* ---- quips ------------------------------------------------------------ */
+function startQuips(el, kind) {
+  const lines = QUIPS[kind] || [];
+  if (!lines.length) return;
+  let i = 0;
+  el.textContent = lines[0];
+  stopQuips();
+  quipTimer = setInterval(() => { i = (i + 1) % lines.length; el.textContent = lines[i]; }, 2600);
+}
+function stopQuips() { if (quipTimer) { clearInterval(quipTimer); quipTimer = null; } }
+function showLoader(n, kind) { $("load" + n).style.display = "flex"; startQuips($("loadTxt" + n), kind); }
+function hideLoader(n) { $("load" + n).style.display = "none"; stopQuips(); }
+
+/* ---- setup form ------------------------------------------------------- */
+function renderTrustees(names) {
+  const box = $("trustees"); box.innerHTML = "";
+  names.forEach((n, i) => {
+    const row = document.createElement("div"); row.className = "trustee";
+    const inp = document.createElement("input");
+    inp.value = n; inp.dataset.trustee = "1"; inp.setAttribute("aria-label", "Trustee " + (i + 1));
+    const rm = document.createElement("button");
+    rm.type = "button"; rm.className = "small"; rm.textContent = "×";
+    rm.title = "remove"; rm.onclick = () => { row.remove(); syncN(); };
+    row.append(inp, rm); box.append(row);
+  });
+  syncN();
+}
+const trusteeNames = () => [...document.querySelectorAll("[data-trustee]")].map((i) => i.value);
+function syncN() { $("nDisplay").value = trusteeNames().length; }
+
+function renderPresets() {
+  const box = $("presets"); box.innerHTML = "";
+  const offline = $("mode").value === "offline";
+  PRESETS.forEach((n) => {
+    const b = document.createElement("button");
+    b.type = "button"; b.className = "tnum"; b.textContent = n.toLocaleString();
+    // The ceiling exists because offline generation runs unparallelized crypto;
+    // ground-truth mode runs none, so the capstone tiers are reachable there.
+    const blocked = offline && n > OFFLINE_CEILING;
+    b.disabled = blocked;
+    if (blocked) b.title = "on-chain or ground-truth mode only";
+    b.onclick = () => { $("voters").value = n; };
+    box.append(b);
+  });
+}
+
+const config = () => ({
+  name: $("name").value,
+  trustees: trusteeNames().map((n) => ({ name: n })),
+  threshold: +$("threshold").value,
+  positions: +$("positions").value,
+  candidates: +$("candidates").value,
+  voters: +$("voters").value,
+  distribution: $("distribution").value,
+  mode: $("mode").value,
+});
+
+/* ---- net -------------------------------------------------------------- */
+async function post(path, body, errEl) {
+  if (errEl) $(errEl).textContent = "";
+  const res = await fetch(path, { method: "POST", headers: { "Content-Type": "application/json" },
+                                  body: JSON.stringify(body) });
+  if (!res.ok) {
+    const t = await res.text();
+    if (errEl) $(errEl).textContent = t.trim();
+    throw new Error(t);
+  }
+  return res.json();
+}
+const getJSON = async (u) => { const r = await fetch(u); if (!r.ok) throw new Error(await r.text()); return r.json(); };
+
+async function artifactsFor(id) {
+  try {
+    const runs = await getJSON("/runs");
+    return (runs.find((r) => r.run_id === id) || {}).artifacts || [];
+  } catch (_) { return []; }
+}
+function fileChips(id, arts) {
+  if (!arts.length) return '<span class="muted small">— nothing yet —</span>';
+  return FILE_ORDER.filter((a) => arts.includes(a)).map((a) =>
+    `<a class="fchip${STUDY.has(a) ? " key" : ""}" href="/export/${encodeURIComponent(id)}/${a}" download>${esc(FILE_LABEL[a] || a)}</a>`
+  ).join("");
+}
+
+function log(msg, cls) {
+  const el = $("log"), d = document.createElement("div");
+  d.className = cls || ""; d.textContent = msg;
+  el.append(d); el.scrollTop = el.scrollHeight;
+}
+
+// One stream per run. Closed on teardown so a long session doesn't leak
+// EventSources — a bug the classic console still has.
+function openStream(id, onEvent) {
+  closeStream();
+  es = new EventSource("/events?run=" + encodeURIComponent(id));
+  es.onmessage = (ev) => { try { onEvent(JSON.parse(ev.data)); } catch (_) {} };
+}
+function closeStream() { if (es) { es.close(); es = null; } }
+window.addEventListener("beforeunload", () => { closeStream(); stopQuips(); stopTimers(); });
+function stopTimers() {
+  if (trailTimer) { clearInterval(trailTimer); trailTimer = null; }
+  if (ceremonyTimer) { clearInterval(ceremonyTimer); ceremonyTimer = null; }
+}
+
+/* ---- step 2: generate -------------------------------------------------- */
+async function startRun() {
+  cfg = config();
+  let res;
+  try { res = await post("/generate", cfg, "configErr"); } catch (_) { return; }
+  runID = res.run_id;
+  $("runChip").textContent = runID;
+  $("log").innerHTML = ""; $("genFiles").innerHTML = ""; $("genStats").innerHTML = "";
+  $("next1").disabled = true;
+  $("gtNote").style.display = cfg.mode === "groundtruth" ? "block" : "none";
+  showLoader(1, "generate");
+  go(1);
+
+  openStream(runID, async (e) => {
+    if (e.phase === "generate") {
+      log(`${e.msg}`, e.level);
+      if (e.level === "done" || e.level === "error") {
+        hideLoader(1);
+        if (e.level === "done") await finishGenerate();
+        else $("err1").textContent = "Generation failed — see the log above.";
+      }
+    }
+  });
+}
+
+async function finishGenerate() {
+  const ballots = cfg.voters * cfg.positions;
+  $("genStats").innerHTML = `
+    <div><b class="tnum">${cfg.voters.toLocaleString()}</b>voters</div>
+    <div><b class="tnum">${cfg.positions}</b>positions</div>
+    <div><b class="tnum">${cfg.candidates}</b>candidates each</div>
+    <div><b class="tnum">${ballots.toLocaleString()}</b>ballots</div>
+    <div><b>${esc(cfg.distribution)}</b>distribution</div>`;
+  $("genFiles").innerHTML = fileChips(runID, await artifactsFor(runID));
+  $("next1").disabled = false;
+  $("next1").textContent = cfg.mode === "groundtruth" ? "Done — files ready" : "Continue →";
+}
+
+/* ---- step 3: encrypt + record ------------------------------------------ */
+async function startSaksi() {
+  go(2);
+  $("modeChip").textContent = cfg.mode === "onchain" ? "committing to Fabric" : "local — no ledger";
+  $("next2").disabled = true;
+  showLoader(2, "saksi");
+  try { await post("/ceremony/start", { run_id: runID }, "err2"); } catch (_) { hideLoader(2); return; }
+
+  openStream(runID, (e) => {
+    if (e.phase !== "ceremony") return;
+    if (e.level === "done") {
+      hideLoader(2);
+      $("next2").disabled = false;
+      renderTrail();
+    } else if (e.level === "error") {
+      hideLoader(2);
+      $("err2").textContent = e.msg;
+    }
+  });
+}
+
+async function renderTrail() {
+  if (cfg.mode !== "onchain") return;
+  const box = $("trailBox");
+  box.style.display = "block";
+  try {
+    const d = await getJSON(`/api/trail/${encodeURIComponent(runID)}?operator=1`);
+    const evs = (d.events || []).slice(-6);
+    box.innerHTML = `<div class="small muted" style="margin-bottom:6px">last ledger events</div>` +
+      evs.map((ev) => `<div class="small"><span class="pill on">${esc(ev.event)}</span>
+        <span class="muted tnum"> block ${esc(ev.receipt?.BlockNumber ?? "?")}</span></div>`).join("");
+  } catch (_) { box.style.display = "none"; }
+}
+
+/* ---- step 4: the ceremony ---------------------------------------------- */
+async function startCeremony() {
+  go(3);
+  await refreshCeremony();
+  stopTimers();
+  ceremonyTimer = setInterval(refreshCeremony, 4000);
+}
+
+async function refreshCeremony() {
+  let st;
+  try { st = await getJSON(`/api/ceremony/${encodeURIComponent(runID)}`); } catch (_) { return; }
+
+  const n = st.trustees.length, k = st.submitted, t = st.threshold;
+  $("qtext").textContent = `${k} of ${t} required · ${n} trustees hold a share`;
+  $("quorumChip").textContent = st.on_chain ? "on-chain ceremony" : "local ceremony";
+  const bar = $("qbar");
+  bar.classList.toggle("met", st.unlocked);
+  bar.firstElementChild.style.width = Math.min(100, (k / Math.max(1, t)) * 100) + "%";
+
+  $("cards").innerHTML = st.trustees.map((tr) => `
+    <div class="tcard${tr.submitted ? " submitted" : ""}">
+      <div><div class="who">${esc(tr.name)}</div><div class="role">holds 1 of ${n} key shares</div></div>
+      <div>${tr.submitted
+        ? '<span class="pill ok">✓ contributed</span>'
+        : '<span class="pill">awaiting</span>'}</div>
+      <button class="small${tr.submitted ? "" : " primary"}" data-trustee-id="${esc(tr.id)}"
+        ${tr.submitted ? "disabled" : ""}>${tr.submitted ? "Done" : "Submit share"}</button>
+    </div>`).join("");
+
+  document.querySelectorAll("[data-trustee-id]").forEach((b) => {
+    b.onclick = async () => {
+      b.disabled = true; b.textContent = "Submitting…";
+      try { await post("/ceremony/submit", { run_id: runID, trustee_id: b.dataset.trusteeId }, "err3"); }
+      catch (_) { b.disabled = false; b.textContent = "Submit share"; return; }
+      setTimeout(refreshCeremony, 700);
+    };
+  });
+
+  $("gateNote").innerHTML = st.on_chain
+    ? `The threshold is enforced by this console and proven by the independent verifier, which counts
+       distinct verified trustees. The chaincode validates each share it accepts but does not itself
+       count them before publishing.`
+    : `Local ceremony — real cryptographic shares, no ledger. The threshold gate is enforced here.`;
+
+  $("btnPublish").disabled = !st.unlocked || st.published;
+  $("next3").disabled = !st.published;
+
+  if (st.published) {
+    stopTimers();
+    $("tallyBox").innerHTML = `<div class="locked" style="border-style:solid;color:var(--ink)">
+      <span class="verdict pass"><span class="dot2"></span>Tally published</span>
+      <div class="small muted" style="margin-top:8px">${k} of ${n} trustees contributed.</div></div>`;
+  } else {
+    $("tallyBox").innerHTML = `<div class="locked">🔒 The tally stays sealed until
+      ${t} of ${n} trustees have contributed.</div>`;
+  }
+}
+
+/* ---- step 5: verify ---------------------------------------------------- */
+async function startVerify() {
+  go(4);
+  showLoader(4, "verify");
+  $("results").style.display = "none";
+  try { await post("/verify", { run_id: runID }, "err4"); } catch (_) { hideLoader(4); return; }
+  openStream(runID, async (e) => {
+    if (e.phase === "verify" && (e.level === "done" || e.level === "error")) {
+      hideLoader(4);
+      await loadResults();
+    }
+  });
+}
+
+async function loadResults() {
+  try {
+    const res = await fetch(`/export/${encodeURIComponent(runID)}/correctness.csv`);
+    if (!res.ok) return;
+    const rows = (await res.text()).trim().split("\n").slice(1).map((r) => r.split(","));
+    let pass = true;
+    const body = rows.map(([c, gt, dec, e, p]) => {
+      const ok = p === "true"; pass = pass && ok;
+      return `<tr><td>${esc(c)}</td><td class="num">${esc(gt)}</td><td class="num">${esc(dec)}</td>
+              <td class="num">${esc(e)}</td><td class="${ok ? "res-pass" : "res-fail"}">${ok ? "PASS" : "FAIL"}</td></tr>`;
+    }).join("");
+    $("results").innerHTML = `<table><thead><tr><th>Contest</th><th class="num">Ground truth</th>
+      <th class="num">Decoded</th><th class="num">E</th><th>Result</th></tr></thead><tbody>${body}</tbody></table>`;
+    $("results").style.display = "block";
+    $("overallChip").className = "verdict " + (pass ? "pass" : "fail");
+    $("overallChip").innerHTML = `<span class="dot2"></span>${pass ? "E = 0 · PASS" : "FAIL"}`;
+    $("exports").innerHTML = fileChips(runID, await artifactsFor(runID));
+  } catch (_) {}
+}
+
+/* ---- wiring ------------------------------------------------------------ */
+$("addTrustee").onclick = () => { const n = trusteeNames(); n.push("Trustee " + (n.length + 1)); renderTrustees(n); };
+$("mode").onchange = renderPresets;
+$("btnStart").onclick = startRun;
+$("back1").onclick = () => go(0);
+$("next1").onclick = () => { if (cfg.mode === "groundtruth") go(1); else startSaksi(); };
+$("back2").onclick = () => go(1);
+$("next2").onclick = startCeremony;
+$("back3").onclick = () => { stopTimers(); go(2); };
+$("btnPublish").onclick = async () => {
+  $("btnPublish").disabled = true;
+  try { await post("/ceremony/publish", { run_id: runID }, "err3"); } catch (_) { $("btnPublish").disabled = false; return; }
+  setTimeout(refreshCeremony, 700);
+};
+$("next3").onclick = () => { stopTimers(); startVerify(); };
+$("back4").onclick = () => go(3);
+$("btnScenarios").onclick = async () => {
+  $("btnScenarios").disabled = true;
+  try { await post("/scenarios", { run_id: runID, list: [] }, "err4"); } catch (_) {}
+  setTimeout(async () => { $("exports").innerHTML = fileChips(runID, await artifactsFor(runID));
+                           $("btnScenarios").disabled = false; }, 2500);
+};
+$("btnRestart").onclick = () => { closeStream(); stopTimers(); runID = null; cfg = null; go(0); };
+
+renderTrustees(["COMELEC", "Civil Society Watch", "University IT"]);
+renderPresets();
+renderRail();
+</script>
+</body>
+</html>
