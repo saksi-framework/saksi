@@ -44,7 +44,12 @@ bit-identical — verified by `diff`, not by assumption.
 
 ## 2. How a vote is chosen
 
-Every selection comes from one pure function. No RNG, no stored seed:
+Two mechanisms, depending on the profile. Neither uses an RNG or a stored seed.
+
+### The round-robin profiles: voter → candidate
+
+`uniform` and `skewed` compute a voter's choice directly, with modular
+arithmetic:
 
 ```rust
 // packages/saksi-auditor/src/fixtures.rs
@@ -73,11 +78,70 @@ pub(crate) fn select_candidate(
 }
 ```
 
-**Reproducibility.** Because the choice is derived arithmetically from the voter
-index, position index, and profile, a population is reproduced exactly by
-restating its four generation parameters. There is no seed to record, lose, or
-mistranscribe — a stronger guarantee than seeded pseudorandomness, not a weaker
-one.
+This never needs to know how many voters exist — each voter is decided in
+isolation.
+
+That independence is exactly why these profiles tie. When every voter is decided
+by modular arithmetic on their own index, the totals are not something the rule
+controls; they are a by-product, and what a round-robin leaves behind is an even
+division. **Strictly decreasing totals cannot be produced by reasoning one voter
+at a time.**
+
+### `realistic`: result → voter
+
+So the third profile inverts the question. Instead of asking "what does this
+voter pick?", it decides the whole race first and then works out which slice of
+it each voter falls into.
+
+```
+1. quotas for the entire position     [639, 270, 81, 10]   (sums to 1000)
+2. cumulative brackets                [639, 909, 990, 1000]
+3. voter 7  ->  r = (7 * 619) % 1000 = 333
+4. 333 lands in the first bracket  ->  candidate 0
+```
+
+Step 1 is where the guarantee lives: the quotas are constructed to sum exactly
+to the electorate and to strictly decrease, so the result is decided before a
+single voter is placed. Steps 3–4 only distribute voters into totals that were
+already fixed.
+
+The multiplier in step 3 is a stride coprime with the voter count. Brackets are
+contiguous, so without it the first 639 rows of the export would all read
+`CAND_PRES_01` and the table would look like a sorted list rather than an
+electorate. Coprimality makes the multiply a **permutation** — it reorders
+voters without ever collapsing two onto one slot, so the realized counts still
+equal the quotas exactly.
+
+Three practical differences follow:
+
+| | `uniform` / `skewed` | `realistic` |
+|---|---|---|
+| Inputs | profile, voter, position, candidates | **also the voter count** |
+| Shape | one expression | quotas precomputed once, then a binary search per voter |
+| Totals | emerge from the arithmetic | chosen up front and guaranteed |
+
+The last row is the whole point of the change.
+
+Because `realistic` cannot answer for one voter without having decided the
+entire race, it is a `SelectionPlan` built once per run rather than a bare
+function — recomputing quotas per voter would be `O(V·C log C)`, hopeless at the
+3.5M tier. Both generator paths build the same plan from the same parameters,
+which is what keeps their tables byte-identical.
+
+The construction is walked through line by line in
+`selection-rule-explained.md`.
+
+**Reproducibility.** Both mechanisms are arithmetic all the way down, so a
+population is reproduced exactly by restating its generation parameters —
+voters, positions, candidates, distribution. There is no seed to record, lose,
+or mistranscribe: a stronger guarantee than seeded pseudorandomness, not a
+weaker one.
+
+The arithmetic is integer-only, which is part of the same guarantee. Floating
+point would make the apportionment depend on the machine's rounding, so a run on
+Apple Silicon could produce a different population from one on x86 — and a
+population that only reproduces on the machine that made it is not reproducible
+at all.
 
 **The three profiles:**
 
