@@ -31,6 +31,12 @@ func sha256Hex(b []byte) string {
 const (
 	BallotsCSV  = "ballots.csv"
 	ElectionCSV = "election.csv"
+	// Stage-4 plaintext tables (paper Appendix A), written by the Rust
+	// generator on every run — the population that produced the ciphertexts,
+	// readable before any decryption. Names must match
+	// saksi-auditor/src/ground_truth.rs.
+	GroundTruthBallotsCSV = "ground-truth-ballots.csv"
+	GroundTruthSummaryCSV = "ground-truth-summary.csv"
 )
 
 // writeDerivedCSVs flattens the generated stream (header.json + ballots.ndjson)

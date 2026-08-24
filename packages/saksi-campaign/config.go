@@ -38,8 +38,15 @@ type ElectionConfig struct {
 	Candidates   int       `json:"candidates"`
 	Voters       int       `json:"voters"`
 	Distribution string    `json:"distribution"` // uniform | skewed
-	Mode         string    `json:"mode"`         // offline | onchain
+	Mode         string    `json:"mode"`         // offline | onchain | groundtruth
 }
+
+// ModeGroundTruth generates ONLY the Stage-4 plaintext ground-truth tables
+// (paper Appendix A) — no DKG, no credentials, no encryption, no proofs, and
+// nothing submitted on-chain. Because it runs no cryptography, it is not
+// subject to OfflineVoterCeiling, which is what makes the capstone tiers
+// (1,921,917 and 3,524,078 voters) reachable from the console.
+const ModeGroundTruth = "groundtruth"
 
 // Validate returns the first invariant violation, or nil. This is the single
 // source of truth for config validity — the UI mirrors these checks only for
@@ -69,9 +76,9 @@ func (c ElectionConfig) Validate() error {
 		return fmt.Errorf("distribution must be 'uniform' or 'skewed' (got %q)", c.Distribution)
 	}
 	switch c.Mode {
-	case "offline", "onchain":
+	case "offline", "onchain", ModeGroundTruth:
 	default:
-		return fmt.Errorf("mode must be 'offline' or 'onchain' (got %q)", c.Mode)
+		return fmt.Errorf("mode must be 'offline', 'onchain', or %q (got %q)", ModeGroundTruth, c.Mode)
 	}
 	if c.Mode == "offline" && c.Voters > OfflineVoterCeiling {
 		return fmt.Errorf(

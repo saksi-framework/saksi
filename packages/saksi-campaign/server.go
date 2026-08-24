@@ -29,6 +29,8 @@ var exportOrder = []string{
 	BallotsCSV,
 	CorrectnessFile,
 	NegativeTestsFile,
+	GroundTruthBallotsCSV,
+	GroundTruthSummaryCSV,
 	"perf.csv",
 	// Raw artifacts — kept for re-audit / provenance.
 	"header.json",
@@ -202,7 +204,29 @@ func (s *Server) handleVerify(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	if !s.ballotPhaseAllowed(w, runID, "verify") {
+		return
+	}
 	s.dispatch(w, runID, func(ctx context.Context) { _, _ = s.exec.Verify(ctx, runID) })
+}
+
+// ballotPhaseAllowed rejects phases that need encrypted ballots when the run
+// was generated in ground-truth mode, which produces none. Refusing here — with
+// the reason — beats letting the phase fail deep inside on a missing
+// ballots.ndjson.
+func (s *Server) ballotPhaseAllowed(w http.ResponseWriter, runID, phase string) bool {
+	rec, err := s.record(runID)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusNotFound)
+		return false
+	}
+	if groundTruthOnly(rec.Config) {
+		http.Error(w, fmt.Sprintf(
+			"%s needs encrypted ballots; this run was generated in %q mode, which produces plaintext ground truth only",
+			phase, ModeGroundTruth), http.StatusConflict)
+		return false
+	}
+	return true
 }
 
 func (s *Server) handleSubmit(w http.ResponseWriter, r *http.Request) {
@@ -232,6 +256,11 @@ func (s *Server) handleRunAll(w http.ResponseWriter, r *http.Request) {
 		if err := s.exec.Generate(ctx, runID, c); err != nil {
 			return
 		}
+		// Ground-truth runs stop after Generate: Submit and Verify both need
+		// encrypted ballots, which this mode never produces.
+		if groundTruthOnly(c) {
+			return
+		}
 		if err := s.exec.Submit(ctx, runID, c); err != nil {
 			return
 		}
@@ -250,6 +279,9 @@ func (s *Server) handleScenarios(w http.ResponseWriter, r *http.Request) {
 	runID, err := validRun(s, body.RunID)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if !s.ballotPhaseAllowed(w, runID, "scenarios") {
 		return
 	}
 	s.dispatch(w, runID, func(ctx context.Context) {

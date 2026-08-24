@@ -188,3 +188,66 @@ func TestForbiddenHostRejected(t *testing.T) {
 		t.Fatalf("forbidden host should be 403, got %d", rec.Code)
 	}
 }
+
+// A ground-truth run has no encrypted ballots, so Verify and Scenarios must
+// refuse it with an explanation rather than failing later on a missing
+// ballots.ndjson.
+func TestBallotPhasesRefuseGroundTruthRuns(t *testing.T) {
+	s, h, _ := testServer(t, nil)
+	c := good()
+	c.Mode = ModeGroundTruth
+	c.Voters = 3_524_078 // capstone tier: also proves the ceiling does not fire
+	runID, _, err := s.store.Create(c, time.Now())
+	if err != nil {
+		t.Fatalf("ground-truth run must be creatable at capstone scale: %v", err)
+	}
+
+	for _, tc := range []struct {
+		name, path string
+		body       any
+	}{
+		{"verify", "/verify", map[string]string{"run_id": runID}},
+		{"scenarios", "/scenarios", map[string]any{"run_id": runID, "list": []string{}}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			w := httptest.NewRecorder()
+			h.ServeHTTP(w, postJSON(tc.path, tc.body))
+			if w.Code != http.StatusConflict {
+				t.Fatalf("%s on a ground-truth run: got %d, want %d", tc.name, w.Code, http.StatusConflict)
+			}
+			if !strings.Contains(w.Body.String(), ModeGroundTruth) {
+				t.Fatalf("refusal should name the mode, got %q", w.Body.String())
+			}
+		})
+	}
+}
+
+// Ground-truth mode shells gen-ground-truth, not gen --stream, and must not
+// try to derive ballots.csv/election.csv from ciphertexts that do not exist.
+func TestGenerateGroundTruthShellsTheRightSubcommand(t *testing.T) {
+	s, _, exec := testServer(t, nil)
+	var got []string
+	exec.run = func(_ context.Context, _ string, args ...string) ([]byte, error) {
+		got = args
+		return nil, nil
+	}
+	c := good()
+	c.Mode = ModeGroundTruth
+	runID, _, err := s.store.Create(c, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := exec.Generate(context.Background(), runID, c); err != nil {
+		t.Fatalf("ground-truth generate failed: %v", err)
+	}
+	if len(got) == 0 || got[0] != "gen-ground-truth" {
+		t.Fatalf("want gen-ground-truth subcommand, got %v", got)
+	}
+	for _, forbidden := range []string{"--stream", "--trustees", "--threshold"} {
+		for _, a := range got {
+			if a == forbidden {
+				t.Fatalf("%s must not be passed on the ground-truth path: %v", forbidden, got)
+			}
+		}
+	}
+}

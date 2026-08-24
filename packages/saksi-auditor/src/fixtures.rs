@@ -429,7 +429,12 @@ pub(crate) fn tally_selections(
 }
 
 /// Deterministic 1-of-C selection under a fixed profile (reproducible).
-fn select_candidate(
+///
+/// `pub(crate)` so the ground-truth CSV writer can replay the same selections
+/// without running the cryptographic generator (see `ground_truth.rs`). It is a
+/// pure function of its arguments, so replaying it is bit-identical to what
+/// `multi_position_fixture` records.
+pub(crate) fn select_candidate(
     profile: SelectionProfile,
     voter_idx: usize,
     p: usize,

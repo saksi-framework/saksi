@@ -91,6 +91,9 @@ func (e *Executor) Generate(ctx context.Context, runID string, c ElectionConfig)
 	if err != nil {
 		return err
 	}
+	if c.Mode == ModeGroundTruth {
+		return e.generateGroundTruth(ctx, runID, c, dir)
+	}
 	args := []string{
 		"gen", "--stream", dir,
 		"--voters", strconv.Itoa(c.Voters),
@@ -119,6 +122,40 @@ func (e *Executor) Generate(ctx context.Context, runID string, c ElectionConfig)
 	e.publish(runID, "generate", "done", "ballots generated (+ ballots.csv, election.csv)")
 	return nil
 }
+
+// generateGroundTruth shells `saksi-demo gen-ground-truth`, producing only the
+// Stage-4 plaintext tables (paper Appendix A / Figure 3.1) and no ciphertexts.
+//
+// The other phases have nothing to act on afterwards — there are no ballots to
+// submit, audit, or mutate — so Submit/Verify/Scenarios refuse this mode
+// explicitly rather than failing obscurely on missing files. Skipping
+// writeDerivedCSVs is deliberate for the same reason: ballots.csv and
+// election.csv describe ciphertexts that were never produced.
+func (e *Executor) generateGroundTruth(ctx context.Context, runID string, c ElectionConfig, dir string) error {
+	args := []string{
+		"gen-ground-truth",
+		"--out-dir", dir,
+		"--voters", strconv.Itoa(c.Voters),
+		"--positions", strconv.Itoa(c.Positions),
+		"--candidates", strconv.Itoa(c.Candidates),
+		"--election-id", runID,
+		"--distribution", c.Distribution,
+	}
+	e.publish(runID, "generate", "info", fmt.Sprintf(
+		"generating ground truth for %d voters × %d positions × %d candidates (no encryption)…",
+		c.Voters, c.Positions, c.Candidates))
+	if _, err := e.run(ctx, e.demoBin, args...); err != nil {
+		e.publish(runID, "generate", "error", err.Error())
+		return err
+	}
+	e.publish(runID, "generate", "done",
+		"ground truth generated (ground-truth-ballots.csv, ground-truth-summary.csv)")
+	return nil
+}
+
+// groundTruthOnly reports whether the run produced plaintext ground truth and
+// nothing else, so a phase that needs ballots can refuse with a clear reason.
+func groundTruthOnly(c ElectionConfig) bool { return c.Mode == ModeGroundTruth }
 
 // Verify shells `saksi-demo audit-stream <dir> --json`, then writes
 // correctness.csv from the STRUCTURED output (no finding-string parsing).
@@ -161,6 +198,11 @@ func (e *Executor) Verify(ctx context.Context, runID string) (StreamAudit, error
 // submitOnChain. Without a live network it falls back to the legacy console
 // driver (consBin), which errors clearly rather than hanging if unconfigured.
 func (e *Executor) Submit(ctx context.Context, runID string, c ElectionConfig) error {
+	if groundTruthOnly(c) {
+		e.publish(runID, "submit", "done",
+			"ground-truth mode: no ballots were encrypted, so there is nothing to submit")
+		return nil
+	}
 	if c.Mode == "offline" {
 		e.publish(runID, "submit", "done", "offline mode: nothing submitted on-chain")
 		return nil

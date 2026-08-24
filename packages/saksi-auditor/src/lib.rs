@@ -61,6 +61,9 @@ pub(crate) mod fixtures;
 pub mod demo;
 
 #[cfg(feature = "demo")]
+pub mod ground_truth;
+
+#[cfg(feature = "demo")]
 pub mod stream;
 
 use std::collections::HashMap;

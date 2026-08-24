@@ -95,6 +95,20 @@ func TestValidateEnforcesOfflineCeiling(t *testing.T) {
 	}
 }
 
+// The ceiling exists because offline generation runs unparallelized crypto.
+// Ground-truth mode runs none, so the capstone tiers must pass validation —
+// that is the whole reason the mode exists.
+func TestValidateAllowsCapstoneTiersInGroundTruthMode(t *testing.T) {
+	c := good()
+	c.Mode = ModeGroundTruth
+	for _, voters := range []int{OfflineVoterCeiling + 1, 1_921_917, 3_524_078} {
+		c.Voters = voters
+		if err := c.Validate(); err != nil {
+			t.Fatalf("ground-truth mode must accept %d voters: %v", voters, err)
+		}
+	}
+}
+
 func TestTrusteeNames(t *testing.T) {
 	c := good()
 	names := c.TrusteeNames()

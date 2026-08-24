@@ -184,7 +184,13 @@ pub fn write_election_stream_params(
     validate_params(params)?;
     let f = multi_position_fixture(params);
     validate_population(&f, params.voters, params.positions, params.candidates)?;
-    crate::stream::write_election_stream(dir, &f, params.positions, params.candidates)
+    crate::stream::write_election_stream(dir, &f, params.positions, params.candidates)?;
+    // The Stage-4 ground-truth tables (paper Appendix A) ship alongside every
+    // generated run, so the plaintext population that produced these ciphertexts
+    // is inspectable without re-running anything. Selections are replayed from
+    // the same pure `select_candidate` the fixture used, so the two agree by
+    // construction; the replay costs nothing beside the crypto above it.
+    crate::ground_truth::write_ground_truth_csvs(dir, params)
 }
 
 /// Fail-closed validation gate (Phase 1): structural invariants that must hold

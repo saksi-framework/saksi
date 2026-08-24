@@ -21,12 +21,14 @@ use saksi_auditor::demo::{
     audit_bundle_json, audit_stream_dir, election_bundle_json, election_bundle_json_params,
     write_election_stream_params, GenParams, SelectionProfile,
 };
+use saksi_auditor::ground_truth::write_ground_truth_csvs;
 use saksi_auditor::{AuditReport, AuditStatus};
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(String::as_str) {
         Some("gen") => cmd_gen(&args[2..]),
+        Some("gen-ground-truth") => cmd_gen_ground_truth(&args[2..]),
         Some("audit") => cmd_audit(args.get(2).map(String::as_str)),
         Some("audit-stream") => cmd_audit_stream(&args[2..]),
         _ => {
@@ -34,6 +36,8 @@ fn main() -> ExitCode {
                 "usage: saksi-demo <gen [--voters N] [--positions P] [--candidates C] \
                  [--distribution uniform|skewed] [--election-id S] [--election-name S] \
                  [--threshold T] [--trustees N] [--trustee-names a,b,c] [--stream DIR] [outfile] \
+                 | gen-ground-truth [--voters N] [--positions P] [--candidates C] \
+                 [--distribution uniform|skewed] [--election-id S] --out-dir DIR \
                  | audit <bundle.json> | audit-stream <dir> [--json]>"
             );
             ExitCode::FAILURE
@@ -191,6 +195,78 @@ fn parse_gen_args(args: &[String]) -> Result<ParsedGen, String> {
         target,
         parameterized,
     })
+}
+
+/// `gen-ground-truth` — write ONLY the Stage-4 plaintext ground-truth tables
+/// (paper Appendix A), running no cryptography.
+///
+/// This is the same population `gen` would produce, minus every expensive step:
+/// no DKG, no blind-signed credentials, no ElGamal ciphertexts, no CDS proofs.
+/// That is what makes the capstone tiers (1,921,917 and 3,524,078 voters)
+/// reachable here — the cost is linear in `voters × positions` with no crypto
+/// in the loop, so the console's offline voter ceiling does not apply.
+///
+/// Reuses `parse_gen_args`, so the population flags are spelled identically to
+/// `gen`; `--out-dir` names the destination and the DKG-shaped flags
+/// (`--trustees`, `--threshold`, `--trustee-names`) are accepted but unused,
+/// since no key generation happens on this path.
+fn cmd_gen_ground_truth(args: &[String]) -> ExitCode {
+    let mut out_dir: Option<String> = None;
+    let mut rest: Vec<String> = Vec::with_capacity(args.len());
+    let mut i = 0;
+    while i < args.len() {
+        if args[i] == "--out-dir" {
+            match args.get(i + 1) {
+                Some(v) => out_dir = Some(v.clone()),
+                None => {
+                    eprintln!("--out-dir needs a value");
+                    return ExitCode::FAILURE;
+                }
+            }
+            i += 2;
+            continue;
+        }
+        rest.push(args[i].clone());
+        i += 1;
+    }
+
+    let Some(dir) = out_dir else {
+        eprintln!("--out-dir is required");
+        return ExitCode::FAILURE;
+    };
+
+    let parsed = match parse_gen_args(&rest) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    if matches!(parsed.target, GenTarget::Stream(_)) {
+        eprintln!("gen-ground-truth writes to --out-dir; --stream is not accepted");
+        return ExitCode::FAILURE;
+    }
+
+    let params = parsed.params;
+    match write_ground_truth_csvs(std::path::Path::new(&dir), &params) {
+        Ok(()) => {
+            eprintln!(
+                "wrote ground truth ({} voters × {} positions × {} candidates, {}) -> {dir}",
+                params.voters,
+                params.positions,
+                params.candidates,
+                match params.profile {
+                    SelectionProfile::Uniform => "uniform",
+                    SelectionProfile::Skewed => "skewed",
+                }
+            );
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("ground-truth generation failed: {e}");
+            ExitCode::FAILURE
+        }
+    }
 }
 
 fn cmd_gen(args: &[String]) -> ExitCode {
