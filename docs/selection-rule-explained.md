@@ -14,7 +14,7 @@ reason the other two cannot is worth understanding before using them.
 |---|---|---|
 | `uniform` | even split across all candidates | **No** — ties at rank one |
 | `skewed` | candidate 1 takes half, rest split the remainder evenly | Winner yes; **losers all tie** |
-| `realistic` | strictly decreasing, different shape per position | **Yes** |
+| `realistic` | skewed, plus a reserved slice spread down the ranks | **Yes** |
 
 ---
 
@@ -109,139 +109,130 @@ purpose.
 
 ## Part 2 — `realistic`, the profile that decides
 
-The goal: counts that **strictly decrease**, sum to exactly the voter count, and
-differ in shape from one position to the next.
+The goal was narrow: keep the old distribution, just stop it tying. So this
+profile is the skewed rule with a correction bolted on, not a new rule.
 
-### Step 1 — the ladder floor
+### The whole idea in three lines
+
+```
+1. most voters vote by the OLD skewed rule, untouched
+2. a reserved slice is handed out down the ranks, 4:3:2:1
+3. add the two together
+```
+
+Traced for real, 1000 voters and 4 candidates, President:
+
+```
+reserve = max(10% of 1000, C(C+1)) = 100
+
+  900 voters, old skewed rule   [450, 150, 150, 150]   <- the tie
+  100 reserved, split 4:3:2:1   [ 40,  30,  20,  10]   <- the fix
+                                ---------------------
+  total                         [490, 180, 170, 160]   sums to 1000
+```
+
+The old rule left three candidates level on 150. The reserved slice separates
+them by 10 votes each, and the totals still come to exactly 1000 because the
+reserved voters were taken *out* of the round-robin rather than invented.
+
+That last point matters: **you cannot simply add a vote to break a tie.** Every
+voter votes exactly once, and the validation gate checks that each position's
+counts sum to the electorate. Extra votes have to come from somewhere, so they
+are held back at the start.
+
+### The code
 
 ```rust
-let ladder = c * (c - 1) / 2;
+let pct = 10 + 5 * (p % 3);
+let reserve = (voters * pct / 100).max(c * (c + 1)).min(voters);
+
+let mut q = vec![0usize; c];
+for v in 0..(voters - reserve) {
+    q[select_candidate(SelectionProfile::Skewed, v, p, c)] += 1;   // unchanged
+}
+
+let w: Vec<usize> = (0..c).map(|k| c - k).collect();               // 4,3,2,1
+let total: usize = w.iter().sum();
+let mut a: Vec<usize> = w.iter().map(|&x| reserve * x / total).collect();
+for k in 0..(reserve - a.iter().sum::<usize>()) { a[k % c] += 1; }
+for k in 0..c { q[k] += a[k]; }
 ```
 
-To give `C` candidates distinct non-negative counts, the smallest possible
-budget is `0 + 1 + … + (C-1)`. Below that, distinct counts are **arithmetically
-impossible**, not merely inconvenient — so that case falls back to funding the
-top ranks first, which still leaves the winner unambiguous.
+### The two floors, and why each exists
 
-### Step 2 — a weight curve whose steepness depends on the position
+**`.max(c * (c + 1))`** — the reserved slice must be big enough that its spread
+exceeds the round-robin's own wobble. A round-robin can leave adjacent
+candidates one vote apart in either direction; if the spread were also one vote,
+it could cancel out and leave them level anyway. `C(C+1)` guarantees at least
+two votes of separation per rank.
+
+**The winner guard** — with a very small electorate even that can fail, so a
+final check moves one vote up if the top two are level:
 
 ```rust
-let s = 3 - (p % 3);                 // 3 = steep, 2 = moderate, 1 = linear
-let w: Vec<u128> = (0..c).map(|k| ((c - k) as u128).pow(s)).collect();
+if c > 1 && q[0] <= q[1] {
+    for k in (1..c).rev() {
+        if q[k] > 0 { q[k] -= 1; q[0] += 1; break; }
+    }
+}
 ```
 
-`w_k = (C - k)^s`. A high exponent concentrates votes at the top; `s = 1` is a
-straight line. President gets the steep curve, Vice President moderate, Senator
-linear — flat enough that a multi-seat race is genuinely contested.
+Taking the vote from the lowest-ranked candidate holding one keeps the sum
+exact. This makes **a clear winner unconditional** — true at every voter count
+from 1 upward, not merely at demo scale.
 
-### Step 3 — apportion the bulk, largest remainder
+### Why the reserve widens by position
 
-```rust
-let mut a: Vec<usize> = w.iter().map(|&x| (bulk * x / total) as usize).collect();
-// … the leftover votes go to the largest fractional remainders
-```
-
-Standard largest-remainder apportionment, exactly as seats are allocated to
-parties under proportional representation.
-
-**All of it is integer arithmetic**, and that is deliberate. Floating point
-would be a reproducibility hazard: a last-bit difference between an x86 machine
-and an Apple Silicon one could flip a remainder comparison and produce a
-*different population on a different computer* — destroying the one property
-this generator exists to have.
-
-### Step 4 — sort, then add the ladder
-
-```rust
-a.sort_unstable_by(|x, y| y.cmp(x));
-(0..c).map(|k| a[k] + (c - 1 - k)).collect()
-```
-
-This is the trick. Sorting descending guarantees `a[k] >= a[k+1]`. Adding the
-descending ladder `(C-1-k)` then gives
+`pct = 10 + 5 * (p % 3)` — President reserves 10%, Vice President 15%, Senator
+20%. Without it all three races would come out identical, since they would
+differ only by the round-robin's one-vote rotation.
 
 ```
-q[k] - q[k+1] = (a[k] - a[k+1]) + 1  >=  1
-```
-
-so the counts are **strictly decreasing by construction, not by luck**. And
-since the ladder sums to exactly the amount subtracted from the budget in step
-1, the quotas sum to exactly the voter count — no vote invented, none lost.
-
-### What it produces
-
-```
-V=1000, C=4     President  639  270   81   10
-                Vice Pres  533  300  134   33
-                Senator    401  300  200   99
+V=1000, C=4     President  490  180  170  160
+                Vice Pres  485  186  172  157
+                Senator    480  193  173  154
 
 V=3,524,078, C=12
-                President  1000914  770960  579235  422264  296571  198681 …
-                Vice Pres   780715  656018  542165  439154  346987  265662 …
-                Senator     542167  496986  451805  406625  361444  316263 …
+                President  1640053  193866  189348  184829  180311 …
+                Vice Pres  1579059  210705  203929  197152  190375 …
+                Senator    1518066  227545  218509  209474  200438 …
 ```
 
-Every race has one winner. Every rank is distinct, so a cut at any N is clean.
-And the three positions have visibly different shapes — a decisive presidential
-race, a closer VP race, a broad Senate field.
+The front-runner still takes roughly half, so it still reads as the old skewed
+shape — the losers are simply no longer tied, and the Senate cut at any rank is
+clean.
 
-### Step 5 — placing voters in the brackets
+### Placing voters in the brackets
 
-Quotas say *how many* votes each candidate gets; the stride decides *which*
-voters cast them.
-
-```rust
-let r = (voter_idx.wrapping_mul(self.stride) + p) % self.voters;
-cum.partition_point(|&c| c <= r).min(self.candidates - 1)
-```
-
-The stride is coprime with the voter count, which makes multiplying by it a
-**permutation** — it reorders voters without ever colliding two onto one slot,
-so the realized counts equal the quotas exactly. Without it the first 639 rows
-of the export would all read `CAND_PRES_01` and the table would look like a
-sorted list rather than an electorate.
-
-```python
->>> plan = SelectionPlan("realistic", 1000, 3, 4)
->>> [plan.select(v, 0) for v in range(8)]
-[0, 0, 0, 1, 0, 0, 1, 0]
->>> [plan.select(v, 2) for v in range(8)]
-[0, 1, 0, 2, 1, 0, 2, 0]
-```
-
-Position 0 leans heavily on candidate 0, as its steep curve should; position 2
-spreads. Both are the intended shapes, arriving voter by voter.
-
-### Why a plan object rather than a pure function
-
-`realistic` cannot answer "who does voter 7 pick?" without first computing the
-whole position's quotas. Doing that per voter would be `O(V·C log C)` — hopeless
-at 3.5M. `SelectionPlan` computes the brackets once and answers each voter with
-a binary search.
-
-Both generator paths — the cryptographic one and the plaintext one — build the
-same plan from the same parameters, which is what keeps their tables
-byte-identical.
+Quotas say *how many* votes each candidate gets; a stride decides *which* voters
+cast them. The stride is coprime with the voter count, which makes multiplying
+by it a **permutation** — it reorders voters without collapsing two onto one
+slot, so the realized counts equal the quotas exactly. Without it the first 490
+rows of the export would all read `CAND_PRES_01`.
 
 ---
 
-## What this fixed
+## What this fixes, and what it does not
 
-Under the round-robin profiles, the position index only *rotated* the
-assignment, so every position carried the **same multiset of totals**. President
-and Vice President came out with identical numbers in a different order, and a
-component that confused one contest for another would still have satisfied
-`E = 0`.
+**Fixed: ties.** Every race has one winner, at every voter count. Every rank is
+distinct once the electorate can afford it — measured, from 8 voters at 4
+candidates and 72 at 12. A multi-seat cut at any rank N is therefore clean.
 
-`realistic` gives each position a different weight curve, so the shapes genuinely
-differ and that gap closes. It needs enough voters to express the difference —
-measured, the boundary is around `C(C-1)/2 + 2C`: 12 voters at 4 candidates, 73
-at 12, 685 at 37. Below it there is only one way to distribute and all three
-curves land on it.
+**Not fixed: contest-mixing.** The three positions usually differ, but this
+design does **not** guarantee it. At certain voter counts the different reserve
+percentages happen to land on the same multiset of totals — measured at about
+8.6% of configurations at 12 candidates, scattered rather than below a
+threshold. On such a configuration a component that confused one contest for
+another would still satisfy `E = 0`.
+
+That is a deliberate trade. Guaranteeing distinct shapes needs a per-position
+weight curve — materially more code, and further from the distribution the
+manuscript already describes. Contest-mixing is not a failure mode this
+evaluation probes, so it stays declared rather than closed.
 
 `uniform` and `skewed` are unchanged, byte for byte. They back the manuscript's
-performance comparisons, where an even split is a perfectly reasonable load and
-the tie is irrelevant.
+performance comparisons, where an even split is a reasonable load and the tie is
+irrelevant.
 
 ## Related
 

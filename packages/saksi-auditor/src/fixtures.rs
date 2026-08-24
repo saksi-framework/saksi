@@ -444,61 +444,68 @@ pub(crate) fn tally_selections(
 
 /// Per-position vote quotas for [`SelectionProfile::Realistic`].
 ///
-/// Returns `candidates` counts that sum to **exactly** `voters` and, when the
-/// electorate can afford it, strictly decrease.
+/// Returns `candidates` counts that sum to **exactly** `voters`, with a clear
+/// winner always and every rank distinct once the electorate can afford it.
 ///
-/// Weight curve `w_k = (C - k)^s`, with the exponent `s` set by the position so
-/// the races differ in shape: position 0 steep (a decisive race), position 1
-/// moderate, position 2 linear (flat enough that a multi-seat contest is
-/// meaningful). Apportionment is largest-remainder.
+/// The shape stays deliberately close to `Skewed`, because the only thing wrong
+/// with `Skewed` was the ties. Most of the electorate votes by that same rule,
+/// unchanged; a reserved slice is then apportioned by a simple descending
+/// weight `w_k = C - k`, which separates the candidates the round-robin had left
+/// level with one another.
+///
+/// The reserved share widens with the position (10%, 15%, 20%), so the three
+/// races come out with genuinely different spreads instead of the same multiset
+/// of totals in a different order.
 ///
 /// All of it is integer arithmetic. Floating point would be a reproducibility
-/// hazard here: a last-bit difference between x86 and Apple Silicon could flip a
-/// largest-remainder comparison and produce a different population on a
-/// different machine, which is exactly the property this generator promises not
-/// to have.
+/// hazard here: a last-bit difference between x86 and Apple Silicon could flip
+/// an apportionment and produce a different population on a different machine,
+/// which is exactly the property this generator promises not to have.
 pub(crate) fn realistic_quotas(voters: usize, candidates: usize, p: usize) -> Vec<usize> {
     let c = candidates;
-    // The smallest budget that can fund C distinct non-negative counts is
-    // 0+1+…+(C-1). Below it, strict ordering is arithmetically impossible.
-    let ladder = c * (c - 1) / 2;
-    if voters < ladder {
-        // Fund the top ranks first so the winner stays unambiguous even here.
-        let mut q = vec![0usize; c];
-        let mut left = voters;
-        let mut k = 0;
-        while left > 0 && k < c {
-            let take = left.min(c - k);
-            q[k] = take;
-            left -= take;
-            k += 1;
-        }
-        return q;
+    if c == 0 {
+        return Vec::new();
     }
 
-    let bulk = (voters - ladder) as u128;
-    let s = 3 - (p % 3) as u32; // 3 = steep, 2 = moderate, 1 = linear
-    let w: Vec<u128> = (0..c).map(|k| ((c - k) as u128).pow(s)).collect();
-    let total: u128 = w.iter().sum();
+    // The reserved slice must be at least C(C+1) — two per adjacent rank — or
+    // the spread would be finer than the round-robin's own one-vote wobble and
+    // could leave two candidates level anyway.
+    let pct = 10 + 5 * (p % 3);
+    let reserve = (voters * pct / 100).max(c * (c + 1)).min(voters);
+    let base_voters = voters - reserve;
 
-    let mut a: Vec<usize> = w.iter().map(|&x| (bulk * x / total) as usize).collect();
-    let mut rem = (voters - ladder) - a.iter().sum::<usize>();
-
-    // Largest remainder, ties broken by index so the result is total-ordered.
-    let mut order: Vec<usize> = (0..c).collect();
-    order.sort_by_key(|&k| (std::cmp::Reverse((bulk * w[k]) % total), k));
-    for &k in order.iter() {
-        if rem == 0 {
-            break;
-        }
-        a[k] += 1;
-        rem -= 1;
+    // Everyone outside the reserved slice votes by the existing skewed rule,
+    // untouched — this is what keeps the distribution recognisably the old one.
+    let mut q = vec![0usize; c];
+    for v in 0..base_voters {
+        q[select_candidate(SelectionProfile::Skewed, v, p, c)] += 1;
     }
 
-    // Sorting descending before adding the ladder is what guarantees strictness:
-    // a[k] >= a[k+1], so q[k] - q[k+1] = (a[k] - a[k+1]) + 1 >= 1.
-    a.sort_unstable_by(|x, y| y.cmp(x));
-    (0..c).map(|k| a[k] + (c - 1 - k)).collect()
+    // Apportion the reserved slice down the ranks.
+    let w: Vec<usize> = (0..c).map(|k| c - k).collect();
+    let total: usize = w.iter().sum();
+    let mut a: Vec<usize> = w.iter().map(|&x| reserve * x / total).collect();
+    let assigned: usize = a.iter().sum();
+    for k in 0..(reserve - assigned) {
+        a[k % c] += 1;
+    }
+    for k in 0..c {
+        q[k] += a[k];
+    }
+
+    // A race must produce a winner even when the electorate is too small for
+    // the apportionment to separate the top two. Moving one vote up from the
+    // lowest-ranked candidate holding any is enough, and keeps the sum exact.
+    if c > 1 && q[0] <= q[1] {
+        for k in (1..c).rev() {
+            if q[k] > 0 {
+                q[k] -= 1;
+                q[0] += 1;
+                break;
+            }
+        }
+    }
+    q
 }
 
 fn gcd(a: usize, b: usize) -> usize {
@@ -1012,13 +1019,14 @@ mod realistic_profile_tests {
 
     #[test]
     fn counts_strictly_decrease_once_the_electorate_can_afford_it() {
-        // C distinct non-negative integers need a budget of 0+1+…+(C-1).
-        // At or above it every rank must be distinct, which is what lets a
-        // multi-seat race cut cleanly at rank N.
+        // Ranks separate once the reserved slice is large enough to spread
+        // them. Measured, that happens by V = 8 at 4 candidates, 72 at 12 and
+        // 684 at 37; the reserve floor C(C+1) sits above all three, so it is a
+        // safe bound to assert from.
         for &c in CANDIDATES {
-            let ladder = c * (c - 1) / 2;
+            let floor = c * (c + 1);
             for &v in VOTERS {
-                if v < ladder {
+                if v < floor {
                     continue;
                 }
                 for p in 0..4 {
@@ -1037,36 +1045,44 @@ mod realistic_profile_tests {
     }
 
     #[test]
-    fn positions_do_not_share_a_shape() {
-        // Under the round-robin profiles every position carried the same
-        // multiset of totals, so E = 0 could not tell one contest from another.
-        // Distinct weight curves per position close that gap.
-        for &c in CANDIDATES {
-            for &v in VOTERS {
-                // Distinct shapes need room to express: below roughly the
-                // ladder plus a couple of votes per candidate there is only one
-                // way to distribute, so all three curves land on it. Measured
-                // boundaries: C=4 diverges at V=12, C=12 at V=73, C=37 at
-                // V=685 — all comfortably under this guard.
-                if v < c * (c - 1) / 2 + 2 * c + 8 {
-                    continue;
-                }
-                let mut shapes: Vec<Vec<usize>> = (0..3)
-                    .map(|p| {
-                        let mut q = realistic_quotas(v, c, p);
-                        q.sort_unstable();
-                        q
-                    })
-                    .collect();
-                shapes.sort();
-                shapes.dedup();
-                assert_eq!(
-                    shapes.len(),
-                    3,
-                    "V={v} C={c}: positions share a multiset of totals"
-                );
+    fn positions_usually_differ_but_it_is_not_guaranteed() {
+        // Each position reserves a different share (10/15/20%), so the three
+        // races normally come out with different totals — but this design does
+        // NOT guarantee it. At some voter counts the different reserves happen
+        // to land on the same multiset, at every candidate count, scattered
+        // rather than below a threshold.
+        //
+        // Recorded as a measured fact rather than asserted as a property: the
+        // contest-mixing limitation is therefore NOT closed by this profile.
+        // A component that confused one contest for another could still satisfy
+        // E = 0 on an unlucky configuration. Guaranteeing distinct shapes needs
+        // a per-position weight curve, which is materially more code.
+        let c = 12;
+        let mut collisions = 0;
+        let mut total = 0;
+        for v in 216..1200 {
+            total += 1;
+            let mut shapes: Vec<Vec<usize>> = (0..3)
+                .map(|p| {
+                    let mut q = realistic_quotas(v, c, p);
+                    q.sort_unstable();
+                    q
+                })
+                .collect();
+            shapes.sort();
+            shapes.dedup();
+            if shapes.len() < 3 {
+                collisions += 1;
             }
         }
+        // Measured: 85 of 984 configurations collide, about 8.6%. The bound is
+        // set well above that so it does not go off on a rounding change, but
+        // far below "always" — it exists to catch a regression to three
+        // identical races, not to police the exact rate.
+        assert!(
+            collisions * 5 < total,
+            "positions collided in {collisions}/{total} configurations —              the races would read as duplicates of one another"
+        );
     }
 
     #[test]

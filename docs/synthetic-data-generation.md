@@ -94,19 +94,19 @@ voter pick?", it decides the whole race first and then works out which slice of
 it each voter falls into.
 
 ```
-1. quotas for the entire position     [639, 270, 81, 10]   (sums to 1000)
-2. cumulative brackets                [639, 909, 990, 1000]
+1. quotas for the entire position     [490, 180, 170, 160]  (sums to 1000)
+2. cumulative brackets                [490, 670, 840, 1000]
 3. voter 7  ->  r = (7 * 619) % 1000 = 333
 4. 333 lands in the first bracket  ->  candidate 0
 ```
 
-Step 1 is where the guarantee lives: the quotas are constructed to sum exactly
-to the electorate and to strictly decrease, so the result is decided before a
-single voter is placed. Steps 3–4 only distribute voters into totals that were
-already fixed.
+Step 1 is where the guarantee lives: the quotas are built from the old skewed
+rule plus a reserved slice spread down the ranks, so they sum exactly to the
+electorate and no two are level. The result is settled before a single voter is
+placed; steps 3–4 only distribute voters into totals that were already fixed.
 
 The multiplier in step 3 is a stride coprime with the voter count. Brackets are
-contiguous, so without it the first 639 rows of the export would all read
+contiguous, so without it the first 490 rows of the export would all read
 `CAND_PRES_01` and the table would look like a sorted list rather than an
 electorate. Coprimality makes the multiply a **permutation** — it reorders
 voters without ever collapsing two onto one slot, so the realized counts still
@@ -149,7 +149,7 @@ at all.
 |---|---|---|
 | `uniform` | selections spread evenly across the candidate set | **No** — ties at rank one |
 | `skewed` | candidate 1 takes exactly half; the rest split the remainder | Winner yes; **all losers tie** |
-| `realistic` | strictly decreasing counts, a different shape per position | **Yes** |
+| `realistic` | skewed, plus a reserved slice spread down the ranks | **Yes** |
 
 `uniform` and `skewed` are the two the paper's Appendix A defines, and they back
 the performance comparisons. `realistic` was added because neither of them can
@@ -179,35 +179,57 @@ contest for another would still have satisfied `E = 0`.
 
 ### `realistic`
 
-Apportions each position by an integer weight curve `w_k = (C - k)^s`, with the
-exponent `s` set by the position, then adds a one-vote ladder. The counts sum to
-exactly the voter count and **strictly decrease by construction**:
+Keeps the skewed distribution and fixes only what was wrong with it. Most of the
+electorate votes by that same rule, unchanged; a reserved slice is held back and
+handed out down the ranks, which separates the candidates the round-robin left
+level.
+
+```
+1000 voters, 4 candidates, President — reserve = 10%
+
+  900 voters, old skewed rule   [450, 150, 150, 150]   <- the tie
+  100 reserved, split 4:3:2:1   [ 40,  30,  20,  10]   <- the fix
+                                ---------------------
+  total                         [490, 180, 170, 160]
+```
+
+The reserved voters are taken *out* of the round-robin, not invented, so the
+counts still sum to exactly the electorate. That constraint is not negotiable:
+every voter votes once, and the validation gate checks each position's total
+against the ballot count.
+
+The reserved share widens with the position — 10%, 15%, 20% — so the three races
+do not come out identical:
 
 ```
 1000 voters, 4 candidates
-  PRESIDENT       639  270   81   10
-  VICE_PRESIDENT  533  300  134   33
-  SENATOR         401  300  200   99
+  PRESIDENT       490  180  170  160
+  VICE_PRESIDENT  485  186  172  157
+  SENATOR         480  193  173  154
 
 3,524,078 voters, 12 candidates
-  PRESIDENT       1000914  770960  579235  422264  296571  198681 …
-  VICE_PRESIDENT   780715  656018  542165  439154  346987  265662 …
-  SENATOR          542167  496986  451805  406625  361444  316263 …
+  PRESIDENT       1640053  193866  189348  184829  180311 …
+  VICE_PRESIDENT  1579059  210705  203929  197152  190375 …
+  SENATOR         1518066  227545  218509  209474  200438 …
 ```
 
-Every rank is distinct, so a cut at any N is clean, and the three positions have
-genuinely different shapes — which also closes the contest-mixing gap the
-round-robin profiles left open.
+The front-runner still takes roughly half, so it still reads as the old skewed
+shape. What changed is that the losers are no longer tied, so a single-winner
+race has one winner and a multi-seat cut at any rank is clean.
+
+A final guard moves one vote up if a very small electorate still leaves the top
+two level, which makes a clear winner **unconditional** — true from one voter
+upward.
 
 The arithmetic is integer throughout. Floating point would make the output
 depend on the machine's rounding, so an Apple Silicon run could produce a
-different population from an x86 one — destroying the reproducibility the whole
-generator exists to provide.
+different population from an x86 one.
 
-Distinct shapes need enough voters to express: measured, the boundary is around
-`C(C-1)/2 + 2C` — 12 voters at 4 candidates, 73 at 12, 685 at 37. Below it there
-is only one way to distribute and all three curves land on it. A clear winner
-holds at every voter count regardless.
+**What this does not fix.** The three positions usually differ, but it is not
+guaranteed: at roughly 8.6% of configurations the different reserve percentages
+land on the same multiset of totals. On those, a component that confused one
+contest for another would still satisfy `E = 0`. Contest-mixing therefore
+remains a declared limitation of the test data rather than a closed one.
 
 The rule is walked through line by line in `selection-rule-explained.md`.
 

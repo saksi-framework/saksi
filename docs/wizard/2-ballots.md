@@ -81,8 +81,7 @@ SENATOR         1762039  587346  587346  587347
 
 A component that confused one contest for another would still satisfy `E = 0`.
 
-**The `realistic` profile does not have this weakness** — each position gets a
-different weight curve, so the shapes genuinely differ and contest-mixing becomes
-detectable. The limitation now applies only to the two round-robin profiles,
-which are retained for the performance comparisons rather than for deciding
-results.
+`realistic` reserves a different share of the electorate per position (10/15/20%),
+so its three races usually differ — but **not** guaranteed: at roughly 8.6% of
+configurations they still land on the same multiset. The limitation is narrowed,
+not closed, and it stays declared for that reason.

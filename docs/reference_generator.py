@@ -17,7 +17,7 @@ Three profiles:
 
   uniform     round-robin; divides the electorate evenly, so it ties at rank one
   skewed      candidate 1 takes half; the rest split the remainder evenly
-  realistic   strictly decreasing counts, a different shape per position
+  realistic   skewed, plus a reserved slice spread down the ranks to break ties
 
 Only `realistic` can decide an election outright. The other two are kept
 because the manuscript's performance comparisons are stated in terms of them.
@@ -59,46 +59,56 @@ def select_candidate(profile: str, voter_idx: int, p: int, candidates: int) -> i
 def realistic_quotas(voters: int, candidates: int, p: int):
     """Per-position vote quotas for the "realistic" profile.
 
-    Returns `candidates` counts summing to EXACTLY `voters`, strictly
-    decreasing whenever the electorate can afford it.
+    Returns `candidates` counts summing to EXACTLY `voters`, with a clear winner
+    always and every rank distinct once the electorate can afford it.
 
-    Weight curve w_k = (C - k) ** s, with the exponent s set by the position so
-    the races differ in shape: position 0 steep (a decisive race), position 1
-    moderate, position 2 linear (flat enough that a multi-seat contest is
-    meaningful). Apportionment is largest-remainder.
+    The shape stays deliberately close to "skewed", because the only thing wrong
+    with skewed was the ties. Most of the electorate votes by that same rule,
+    unchanged; a reserved slice is then apportioned by a simple descending
+    weight w_k = C - k, which separates the candidates the round-robin had left
+    level with one another.
 
-    All integer arithmetic. Floating point would be a reproducibility hazard: a
-    last-bit difference between machines could flip a largest-remainder
-    comparison and produce a different population somewhere else.
+    The reserved share widens with the position (10%, 15%, 20%), so the three
+    races usually come out with different spreads. That is NOT guaranteed —
+    see the note in the module docstring.
+
+    All integer arithmetic, so the result does not depend on the machine.
     """
     c = candidates
-    # The smallest budget that can fund C distinct non-negative counts is
-    # 0+1+...+(C-1). Below it, strict ordering is arithmetically impossible.
-    ladder = c * (c - 1) // 2
-    if voters < ladder:
-        # Fund the top ranks first so the winner stays unambiguous even here.
-        q = [0] * c
-        left, k = voters, 0
-        while left > 0 and k < c:
-            take = min(left, c - k)
-            q[k] = take
-            left -= take
-            k += 1
-        return q
+    if c == 0:
+        return []
 
-    bulk = voters - ladder
-    s = 3 - (p % 3)  # 3 = steep, 2 = moderate, 1 = linear
-    w = [(c - k) ** s for k in range(c)]
+    # The reserved slice must be at least C(C+1) — two per adjacent rank — or
+    # the spread would be finer than the round-robin's own one-vote wobble and
+    # could leave two candidates level anyway.
+    pct = 10 + 5 * (p % 3)
+    reserve = min(max(voters * pct // 100, c * (c + 1)), voters)
+    base_voters = voters - reserve
+
+    # Everyone outside the reserved slice votes by the existing skewed rule,
+    # untouched — this is what keeps the distribution recognisably the old one.
+    q = [0] * c
+    for v in range(base_voters):
+        q[select_candidate("skewed", v, p, c)] += 1
+
+    # Apportion the reserved slice down the ranks.
+    w = [c - k for k in range(c)]
     total = sum(w)
-    a = [bulk * x // total for x in w]
-    rem = bulk - sum(a)
-    frac = [(bulk * w[k]) % total for k in range(c)]
-    for k in sorted(range(c), key=lambda k: (-frac[k], k))[:rem]:
-        a[k] += 1
-    # Sorting descending before adding the ladder is what guarantees
-    # strictness: a[k] >= a[k+1], so q[k] - q[k+1] = (a[k] - a[k+1]) + 1 >= 1.
-    a.sort(reverse=True)
-    return [a[k] + (c - 1 - k) for k in range(c)]
+    a = [reserve * x // total for x in w]
+    for k in range(reserve - sum(a)):
+        a[k % c] += 1
+    for k in range(c):
+        q[k] += a[k]
+
+    # A race must produce a winner even when the electorate is too small for the
+    # apportionment to separate the top two.
+    if c > 1 and q[0] <= q[1]:
+        for k in range(c - 1, 0, -1):
+            if q[k] > 0:
+                q[k] -= 1
+                q[0] += 1
+                break
+    return q
 
 
 def _gcd(a: int, b: int) -> int:

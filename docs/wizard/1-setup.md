@@ -29,13 +29,14 @@ This choice decides whether the election has a winner at all.
 1000 voters, 4 candidates
   uniform     250  250  250  250      exact four-way tie
   skewed      500  167  167  166      winner, but two losers tied
-  realistic   639  270   81   10      every rank distinct
+  realistic   490  180  170  160      every rank distinct
 ```
 
 **Use `realistic`.** It is the only profile that decides a result: counts
 strictly decrease, so a single-winner race has one winner and a multi-seat race
-cuts cleanly at rank N. It also gives each position a different shape, so
-President, Vice President and Senator do not read as the same race three times.
+cuts cleanly at rank N. It keeps the skewed shape — the front-runner still takes
+roughly half — and reserves a different share per position so the three races
+usually do not read as the same race three times.
 
 `uniform` divides the electorate evenly by construction and therefore **ties at
 rank one, always**. `skewed` gives a clear front-runner but splits the losers

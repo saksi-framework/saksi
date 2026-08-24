@@ -31,12 +31,11 @@ Two places, both handled.
 float. `voter_idx / 2` must become `voter_idx // 2`. Using `/` fails on the
 following `%`.
 
-**Nothing is floating point.** The `realistic` profile apportions with `u128`
-integer arithmetic and compares remainders as integers. This is not a stylistic
-choice — a float would make the output depend on the machine's rounding, so an
-Apple Silicon run could produce a different population from an x86 one. The
-Python mirrors it exactly, using `//` and `%` on Python's arbitrary-precision
-integers.
+**Nothing is floating point.** The `realistic` profile apportions its reserved
+slice with plain integer division. This is not a stylistic choice — a float
+would make the output depend on the machine's rounding, so an Apple Silicon run
+could produce a different population from an x86 one. The Python mirrors it
+using `//`, so both agree exactly.
 
 ---
 
@@ -53,92 +52,81 @@ integers.
 
 | # | Rust | Python | Note |
 |---|---|---|---|
-| 1 | `let ladder = c * (c - 1) / 2;` | `ladder = c * (c - 1) // 2` | Smallest budget that funds C distinct counts |
-| 2 | `if voters < ladder { … }` | `if voters < ladder: …` | Below it, distinct counts are impossible; fund top ranks first |
-| 3 | `let s = 3 - (p % 3);` | `s = 3 - (p % 3)` | Weight steepness per position: 3 steep, 2 moderate, 1 linear |
-| 4 | `((c - k) as u128).pow(s)` | `(c - k) ** s` | The weight curve |
-| 5 | `(bulk * x / total) as usize` | `bulk * x // total` | Integer apportionment |
-| 6 | `(bulk * w[k]) % total` | `(bulk * w[k]) % total` | Remainders compared as integers, never floats |
-| 7 | `a.sort_unstable_by(\|x, y\| y.cmp(x));` | `a.sort(reverse=True)` | Sorting first is what makes the next line strict |
-| 8 | `a[k] + (c - 1 - k)` | `a[k] + (c - 1 - k)` | The ladder: guarantees `q[k] > q[k+1]` |
+| 1 | `let pct = 10 + 5 * (p % 3);` | `pct = 10 + 5 * (p % 3)` | Reserved share widens per position |
+| 2 | `(voters * pct / 100).max(c*(c+1)).min(voters)` | `min(max(voters * pct // 100, c*(c+1)), voters)` | Floor `C(C+1)` keeps the spread above the round-robin's one-vote wobble |
+| 3 | `q[select_candidate(Skewed, v, p, c)] += 1` | same | Most voters use the **old rule, unchanged** |
+| 4 | `(0..c).map(\|k\| c - k)` | `[c - k for k in range(c)]` | Descending weights: 4, 3, 2, 1 |
+| 5 | `reserve * x / total` | `reserve * x // total` | Integer apportionment of the reserved slice |
+| 6 | `a[k % c] += 1` | same | Leftovers go to the top ranks in order |
+| 7 | `if q[0] <= q[1] { … }` | same | Winner guard: moves one vote up, keeping the sum exact |
 
-Rust uses `u128` for the apportionment products; Python's integers are
-arbitrary-precision, so the arithmetic agrees with no special handling. At the
-capstone tier the largest product is about `3.5e6 × 37³ ≈ 1.8e11`, comfortably
-inside both.
+Both are integer arithmetic end to end, so an Apple Silicon run and an x86 run
+produce the same bytes.
 
 **Side by side:**
 
 ```rust
 pub(crate) fn realistic_quotas(voters: usize, candidates: usize, p: usize) -> Vec<usize> {
     let c = candidates;
-    let ladder = c * (c - 1) / 2;
-    if voters < ladder {
-        let mut q = vec![0usize; c];
-        let mut left = voters;
-        let mut k = 0;
-        while left > 0 && k < c {
-            let take = left.min(c - k);
-            q[k] = take;
-            left -= take;
-            k += 1;
+    if c == 0 { return Vec::new(); }
+
+    let pct = 10 + 5 * (p % 3);
+    let reserve = (voters * pct / 100).max(c * (c + 1)).min(voters);
+
+    let mut q = vec![0usize; c];
+    for v in 0..(voters - reserve) {
+        q[select_candidate(SelectionProfile::Skewed, v, p, c)] += 1;
+    }
+
+    let w: Vec<usize> = (0..c).map(|k| c - k).collect();
+    let total: usize = w.iter().sum();
+    let mut a: Vec<usize> = w.iter().map(|&x| reserve * x / total).collect();
+    let assigned: usize = a.iter().sum();
+    for k in 0..(reserve - assigned) { a[k % c] += 1; }
+    for k in 0..c { q[k] += a[k]; }
+
+    if c > 1 && q[0] <= q[1] {
+        for k in (1..c).rev() {
+            if q[k] > 0 { q[k] -= 1; q[0] += 1; break; }
         }
-        return q;
     }
-
-    let bulk = (voters - ladder) as u128;
-    let s = 3 - (p % 3) as u32;
-    let w: Vec<u128> = (0..c).map(|k| ((c - k) as u128).pow(s)).collect();
-    let total: u128 = w.iter().sum();
-
-    let mut a: Vec<usize> = w.iter().map(|&x| (bulk * x / total) as usize).collect();
-    let mut rem = (voters - ladder) - a.iter().sum::<usize>();
-
-    let mut order: Vec<usize> = (0..c).collect();
-    order.sort_by_key(|&k| (std::cmp::Reverse((bulk * w[k]) % total), k));
-    for &k in order.iter() {
-        if rem == 0 { break; }
-        a[k] += 1;
-        rem -= 1;
-    }
-
-    a.sort_unstable_by(|x, y| y.cmp(x));
-    (0..c).map(|k| a[k] + (c - 1 - k)).collect()
+    q
 }
 ```
 
 ```python
-def realistic_quotas(voters: int, candidates: int, p: int):
+def realistic_quotas(voters, candidates, p):
     c = candidates
-    ladder = c * (c - 1) // 2
-    if voters < ladder:
-        q = [0] * c
-        left, k = voters, 0
-        while left > 0 and k < c:
-            take = min(left, c - k)
-            q[k] = take
-            left -= take
-            k += 1
-        return q
+    if c == 0:
+        return []
 
-    bulk = voters - ladder
-    s = 3 - (p % 3)
-    w = [(c - k) ** s for k in range(c)]
+    pct = 10 + 5 * (p % 3)
+    reserve = min(max(voters * pct // 100, c * (c + 1)), voters)
+
+    q = [0] * c
+    for v in range(voters - reserve):
+        q[select_candidate("skewed", v, p, c)] += 1
+
+    w = [c - k for k in range(c)]
     total = sum(w)
-    a = [bulk * x // total for x in w]
-    rem = bulk - sum(a)
-    frac = [(bulk * w[k]) % total for k in range(c)]
-    for k in sorted(range(c), key=lambda k: (-frac[k], k))[:rem]:
-        a[k] += 1
-    a.sort(reverse=True)
-    return [a[k] + (c - 1 - k) for k in range(c)]
+    a = [reserve * x // total for x in w]
+    for k in range(reserve - sum(a)):
+        a[k % c] += 1
+    for k in range(c):
+        q[k] += a[k]
+
+    if c > 1 and q[0] <= q[1]:
+        for k in range(c - 1, 0, -1):
+            if q[k] > 0:
+                q[k] -= 1
+                q[0] += 1
+                break
+    return q
 ```
 
-The tie-break in step 7 matters for equivalence: Rust sorts by
-`(Reverse(remainder), index)` and Python by `(-frac, index)`. Both are total
-orders on the same keys, so the same candidates receive the leftover votes. A
-tie-break on remainder alone would leave the order unspecified and the two
-implementations free to disagree.
+Step 3 is the reason the translation is easy to trust: it calls the same
+`select_candidate` both languages already agreed on, so the only new code is a
+plain integer apportionment.
 
 ## `SelectionPlan` — placing voters in the brackets
 
@@ -166,7 +154,7 @@ CSV labels them 1-based (`CAND_PRES_01` is index 0).
 [0, 1, 0, 2, 0, 3]
 >>> plan = SelectionPlan("realistic", 1000, 3, 4)
 >>> [plan.select(v, 0) for v in range(8)]
-[0, 0, 0, 1, 0, 0, 1, 0]
+[0, 1, 0, 3, 0, 0, 2, 0]
 ```
 
 Totals at 1000 voters, 4 candidates:
@@ -174,7 +162,7 @@ Totals at 1000 voters, 4 candidates:
 ```
 uniform     250  250  250  250      four-way tie
 skewed      500  167  167  166      winner, but two losers tied
-realistic   639  270   81   10      every rank distinct
+realistic   490  180  170  160      every rank distinct
 ```
 
 ## The properties these rules preserve
