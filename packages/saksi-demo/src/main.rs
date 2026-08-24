@@ -3,7 +3,7 @@
 //! Subcommands:
 //!
 //! - `gen [flags] [outfile]` — write a demo election. Flags:
-//!   `--voters N --positions P --candidates C --distribution uniform|skewed`
+//!   `--voters N --positions P --candidates C --distribution uniform|skewed|realistic`
 //!   (population), `--election-id S --election-name S --threshold T --trustees N
 //!   --trustee-names a,b,c` (identity + t-of-n DKG), and `--stream <dir>` to emit
 //!   a streamed `header.json` + `ballots.ndjson` run folder instead of a one-blob
@@ -34,10 +34,10 @@ fn main() -> ExitCode {
         _ => {
             eprintln!(
                 "usage: saksi-demo <gen [--voters N] [--positions P] [--candidates C] \
-                 [--distribution uniform|skewed] [--election-id S] [--election-name S] \
+                 [--distribution uniform|skewed|realistic] [--election-id S] [--election-name S] \
                  [--threshold T] [--trustees N] [--trustee-names a,b,c] [--stream DIR] [outfile] \
                  | gen-ground-truth [--voters N] [--positions P] [--candidates C] \
-                 [--distribution uniform|skewed] [--election-id S] --out-dir DIR \
+                 [--distribution uniform|skewed|realistic] [--election-id S] --out-dir DIR \
                  | audit <bundle.json> | audit-stream <dir> [--json]>"
             );
             ExitCode::FAILURE
@@ -70,7 +70,7 @@ fn default_majority(n: usize) -> usize {
 
 fn parse_gen_args(args: &[String]) -> Result<ParsedGen, String> {
     let (mut voters, mut positions, mut candidates) = (None, None, None);
-    let mut skewed = false;
+    let mut profile_arg: Option<SelectionProfile> = None;
     let (mut election_id, mut election_name) = (None, None);
     let (mut threshold, mut trustees): (Option<usize>, Option<usize>) = (None, None);
     let mut trustee_names: Option<Vec<String>> = None;
@@ -125,14 +125,20 @@ fn parse_gen_args(args: &[String]) -> Result<ParsedGen, String> {
             }
             "--distribution" => match args.get(i + 1).map(String::as_str) {
                 Some("uniform") => {
-                    skewed = false;
+                    profile_arg = Some(SelectionProfile::Uniform);
                     i += 2;
                 }
                 Some("skewed") => {
-                    skewed = true;
+                    profile_arg = Some(SelectionProfile::Skewed);
                     i += 2;
                 }
-                _ => return Err("--distribution must be 'uniform' or 'skewed'".into()),
+                Some("realistic") => {
+                    profile_arg = Some(SelectionProfile::Realistic);
+                    i += 2;
+                }
+                _ => {
+                    return Err("--distribution must be 'uniform', 'skewed', or 'realistic'".into())
+                }
             },
             "--stream" => {
                 stream = Some(take(args.get(i + 1), "--stream")?);
@@ -153,7 +159,7 @@ fn parse_gen_args(args: &[String]) -> Result<ParsedGen, String> {
         || election_id.is_some()
         || election_name.is_some()
         || trustee_names.is_some()
-        || skewed
+        || profile_arg.is_some()
         || stream.is_some();
 
     let n = trustees.unwrap_or(5);
@@ -162,11 +168,7 @@ fn parse_gen_args(args: &[String]) -> Result<ParsedGen, String> {
         trustee_names.unwrap_or_else(|| (1..=n).map(|idx| format!("Trustee {idx}")).collect());
     let eid = election_id.unwrap_or_else(|| "election-2026".to_string());
     let ename = election_name.unwrap_or_else(|| eid.clone());
-    let profile = if skewed {
-        SelectionProfile::Skewed
-    } else {
-        SelectionProfile::Uniform
-    };
+    let profile = profile_arg.unwrap_or(SelectionProfile::Uniform);
 
     let params = GenParams {
         election_id: eid,
@@ -258,6 +260,7 @@ fn cmd_gen_ground_truth(args: &[String]) -> ExitCode {
                 match params.profile {
                     SelectionProfile::Uniform => "uniform",
                     SelectionProfile::Skewed => "skewed",
+                    SelectionProfile::Realistic => "realistic",
                 }
             );
             ExitCode::SUCCESS

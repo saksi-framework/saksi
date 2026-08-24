@@ -331,12 +331,26 @@ pub(crate) fn happy_path_fixture() -> ElectionFixture {
 /// Candidate-selection distribution profile (paper §Appendix A: "uniform and
 /// skewed profiles, fixed for reproducibility"). Both are deterministic so a
 /// generated population is byte-reproducible.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SelectionProfile {
     /// Even spread of selections across the candidate set.
     Uniform,
     /// Biased toward the first candidate (~half the votes), the rest spread.
     Skewed,
+    /// Strictly decreasing vote counts, with a different shape per position.
+    ///
+    /// `Uniform` divides the electorate evenly and `Skewed` divides the losing
+    /// half evenly, so under both profiles candidates tie: uniform ties at rank
+    /// one, and skewed leaves every loser on an identical count at every
+    /// population size. Neither can decide a single-winner race outright or cut
+    /// cleanly at rank N for a multi-seat one.
+    ///
+    /// This profile apportions each position by an integer weight curve whose
+    /// steepness varies with the position, then adds a one-vote ladder that
+    /// makes the counts strictly decreasing by construction. A clear winner
+    /// therefore holds at every voter count, and no two positions carry the
+    /// same multiset of totals.
+    Realistic,
 }
 
 /// Full parameterization for the multi-position generator. Carries the
@@ -428,12 +442,176 @@ pub(crate) fn tally_selections(
     totals
 }
 
+/// Per-position vote quotas for [`SelectionProfile::Realistic`].
+///
+/// Returns `candidates` counts that sum to **exactly** `voters` and, when the
+/// electorate can afford it, strictly decrease.
+///
+/// Weight curve `w_k = (C - k)^s`, with the exponent `s` set by the position so
+/// the races differ in shape: position 0 steep (a decisive race), position 1
+/// moderate, position 2 linear (flat enough that a multi-seat contest is
+/// meaningful). Apportionment is largest-remainder.
+///
+/// All of it is integer arithmetic. Floating point would be a reproducibility
+/// hazard here: a last-bit difference between x86 and Apple Silicon could flip a
+/// largest-remainder comparison and produce a different population on a
+/// different machine, which is exactly the property this generator promises not
+/// to have.
+pub(crate) fn realistic_quotas(voters: usize, candidates: usize, p: usize) -> Vec<usize> {
+    let c = candidates;
+    // The smallest budget that can fund C distinct non-negative counts is
+    // 0+1+…+(C-1). Below it, strict ordering is arithmetically impossible.
+    let ladder = c * (c - 1) / 2;
+    if voters < ladder {
+        // Fund the top ranks first so the winner stays unambiguous even here.
+        let mut q = vec![0usize; c];
+        let mut left = voters;
+        let mut k = 0;
+        while left > 0 && k < c {
+            let take = left.min(c - k);
+            q[k] = take;
+            left -= take;
+            k += 1;
+        }
+        return q;
+    }
+
+    let bulk = (voters - ladder) as u128;
+    let s = 3 - (p % 3) as u32; // 3 = steep, 2 = moderate, 1 = linear
+    let w: Vec<u128> = (0..c).map(|k| ((c - k) as u128).pow(s)).collect();
+    let total: u128 = w.iter().sum();
+
+    let mut a: Vec<usize> = w.iter().map(|&x| (bulk * x / total) as usize).collect();
+    let mut rem = (voters - ladder) - a.iter().sum::<usize>();
+
+    // Largest remainder, ties broken by index so the result is total-ordered.
+    let mut order: Vec<usize> = (0..c).collect();
+    order.sort_by_key(|&k| (std::cmp::Reverse((bulk * w[k]) % total), k));
+    for &k in order.iter() {
+        if rem == 0 {
+            break;
+        }
+        a[k] += 1;
+        rem -= 1;
+    }
+
+    // Sorting descending before adding the ladder is what guarantees strictness:
+    // a[k] >= a[k+1], so q[k] - q[k+1] = (a[k] - a[k+1]) + 1 >= 1.
+    a.sort_unstable_by(|x, y| y.cmp(x));
+    (0..c).map(|k| a[k] + (c - 1 - k)).collect()
+}
+
+fn gcd(a: usize, b: usize) -> usize {
+    if b == 0 {
+        a
+    } else {
+        gcd(b, a % b)
+    }
+}
+
+/// A stride coprime to the voter count, so multiplying by it permutes the voters
+/// rather than colliding them. Without it the quota brackets would hand the
+/// first block of voters to candidate 0, the next block to candidate 1, and the
+/// exported ballot table would read as sorted runs instead of an electorate.
+fn interleave_stride(voters: usize) -> usize {
+    if voters <= 2 {
+        return 1;
+    }
+    // Golden-ratio stride: consecutive voters land far apart across the whole
+    // range (a low-discrepancy sequence), so the exported table reads as a
+    // mixed electorate. Step up until it is coprime with the voter count, which
+    // is what keeps the multiply a permutation rather than a collision — and
+    // therefore leaves the quota counts exactly intact.
+    let mut s = (voters * 61803 / 100000).max(1);
+    let mut tries = 0;
+    while gcd(s, voters) != 1 && tries <= voters {
+        s += 1;
+        if s >= voters {
+            s = 1;
+        }
+        tries += 1;
+    }
+    s.max(1)
+}
+
+/// Precomputed selection state, built once per generation run.
+///
+/// [`SelectionProfile::Realistic`] needs the quotas for a whole position before
+/// it can place a single voter, so recomputing them per voter would be
+/// `O(V·C log C)` — untenable at the 3.5M tier. The plan computes each
+/// position's cumulative brackets once and answers a voter with a binary search.
+///
+/// Both generator paths build this from the same parameters, which is what keeps
+/// the cryptographic stream and the ground-truth tables describing one and the
+/// same population.
+pub(crate) struct SelectionPlan {
+    profile: SelectionProfile,
+    candidates: usize,
+    voters: usize,
+    /// `cum[p][k]` = quotas `0..=k` summed. Empty for the non-quota profiles.
+    cum: Vec<Vec<usize>>,
+    stride: usize,
+}
+
+impl SelectionPlan {
+    pub(crate) fn new(
+        profile: SelectionProfile,
+        voters: usize,
+        positions: usize,
+        candidates: usize,
+    ) -> Self {
+        let mut cum = Vec::new();
+        if profile == SelectionProfile::Realistic && candidates > 1 {
+            for p in 0..positions {
+                let q = realistic_quotas(voters, candidates, p);
+                let mut running = 0usize;
+                cum.push(
+                    q.iter()
+                        .map(|n| {
+                            running += n;
+                            running
+                        })
+                        .collect(),
+                );
+            }
+        }
+        Self {
+            profile,
+            candidates,
+            voters,
+            cum,
+            stride: interleave_stride(voters),
+        }
+    }
+
+    /// Which candidate voter `voter_idx` picks for position `p`.
+    pub(crate) fn select(&self, voter_idx: usize, p: usize) -> usize {
+        if self.candidates <= 1 {
+            return 0;
+        }
+        match self.profile {
+            SelectionProfile::Uniform | SelectionProfile::Skewed => {
+                select_candidate(self.profile, voter_idx, p, self.candidates)
+            }
+            SelectionProfile::Realistic => {
+                let cum = &self.cum[p % self.cum.len()];
+                let r = (voter_idx.wrapping_mul(self.stride) + p) % self.voters;
+                // The first bracket strictly greater than r owns this voter.
+                cum.partition_point(|&c| c <= r).min(self.candidates - 1)
+            }
+        }
+    }
+}
+
 /// Deterministic 1-of-C selection under a fixed profile (reproducible).
 ///
 /// `pub(crate)` so the ground-truth CSV writer can replay the same selections
 /// without running the cryptographic generator (see `ground_truth.rs`). It is a
 /// pure function of its arguments, so replaying it is bit-identical to what
 /// `multi_position_fixture` records.
+///
+/// Handles the two position-independent profiles. [`SelectionProfile::Realistic`]
+/// depends on the voter count, so it is served by [`SelectionPlan`] instead.
 pub(crate) fn select_candidate(
     profile: SelectionProfile,
     voter_idx: usize,
@@ -453,6 +631,8 @@ pub(crate) fn select_candidate(
                 1 + ((voter_idx / 2 + p) % (candidates - 1))
             }
         }
+        // Quota-based and voter-count dependent; see SelectionPlan::select.
+        SelectionProfile::Realistic => unreachable!("Realistic is served by SelectionPlan"),
     }
 }
 
@@ -538,12 +718,15 @@ pub(crate) fn multi_position_fixture(params: &GenParams) -> ElectionFixture {
     // `tally_selections`) — never accumulated inline with the ciphertexts.
     let mut selections: Vec<(usize, usize)> = Vec::with_capacity(voters * positions);
     let choice_set = [Scalar::ZERO, Scalar::ONE];
+    // Built once from the generation parameters; `ground_truth.rs` builds the
+    // same plan the same way, which is what keeps the two paths byte-identical.
+    let plan = SelectionPlan::new(profile, voters, positions, candidates);
 
     for (voter_idx, credential) in credentials.iter().enumerate() {
         for p in 0..positions {
             let position_id = ph_position_id(p);
             // Deterministic 1-of-C selection under the chosen profile.
-            let selected = select_candidate(profile, voter_idx, p, candidates);
+            let selected = plan.select(voter_idx, p);
             selections.push((p, selected));
 
             let presentation = credential.present(
@@ -776,5 +959,157 @@ mod tally_selection_tests {
         // display metadata carried through to the fixture (for the stream header)
         assert_eq!(f.election_name, "Midterm 2026");
         assert_eq!(f.trustee_names, vec!["Alice", "Bob", "Carol"]);
+    }
+}
+
+#[cfg(test)]
+mod realistic_profile_tests {
+    use super::*;
+
+    /// The parameter space the generator is actually driven over: every wizard
+    /// preset boundary plus the small counts where the strict-ordering budget
+    /// runs out.
+    const VOTERS: &[usize] = &[1, 2, 3, 5, 6, 7, 20, 65, 66, 100, 1000, 10_000, 3_524_078];
+    const CANDIDATES: &[usize] = &[2, 3, 4, 6, 12, 37];
+
+    #[test]
+    fn quotas_sum_to_exactly_the_electorate() {
+        // Every voter votes, once, in every position. A quota set that does not
+        // sum to the voter count would invent or lose votes before any
+        // cryptography ran.
+        for &v in VOTERS {
+            for &c in CANDIDATES {
+                for p in 0..4 {
+                    let q = realistic_quotas(v, c, p);
+                    assert_eq!(q.len(), c, "V={v} C={c} p={p}: wrong candidate count");
+                    assert_eq!(
+                        q.iter().sum::<usize>(),
+                        v,
+                        "V={v} C={c} p={p}: quotas {q:?} do not sum to the electorate"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn there_is_always_a_clear_winner() {
+        // The property the profile exists for: a single-winner race must never
+        // come down to a tie at the top, at any population size.
+        for &v in VOTERS {
+            for &c in CANDIDATES {
+                for p in 0..4 {
+                    let q = realistic_quotas(v, c, p);
+                    assert!(
+                        q[0] > q[1],
+                        "V={v} C={c} p={p}: top two tied at {} — no clear winner ({q:?})",
+                        q[0]
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn counts_strictly_decrease_once_the_electorate_can_afford_it() {
+        // C distinct non-negative integers need a budget of 0+1+…+(C-1).
+        // At or above it every rank must be distinct, which is what lets a
+        // multi-seat race cut cleanly at rank N.
+        for &c in CANDIDATES {
+            let ladder = c * (c - 1) / 2;
+            for &v in VOTERS {
+                if v < ladder {
+                    continue;
+                }
+                for p in 0..4 {
+                    let q = realistic_quotas(v, c, p);
+                    for k in 0..c - 1 {
+                        assert!(
+                            q[k] > q[k + 1],
+                            "V={v} C={c} p={p}: rank {k} and {} both hold {} ({q:?})",
+                            k + 1,
+                            q[k]
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn positions_do_not_share_a_shape() {
+        // Under the round-robin profiles every position carried the same
+        // multiset of totals, so E = 0 could not tell one contest from another.
+        // Distinct weight curves per position close that gap.
+        for &c in CANDIDATES {
+            for &v in VOTERS {
+                // Distinct shapes need room to express: below roughly the
+                // ladder plus a couple of votes per candidate there is only one
+                // way to distribute, so all three curves land on it. Measured
+                // boundaries: C=4 diverges at V=12, C=12 at V=73, C=37 at
+                // V=685 — all comfortably under this guard.
+                if v < c * (c - 1) / 2 + 2 * c + 8 {
+                    continue;
+                }
+                let mut shapes: Vec<Vec<usize>> = (0..3)
+                    .map(|p| {
+                        let mut q = realistic_quotas(v, c, p);
+                        q.sort_unstable();
+                        q
+                    })
+                    .collect();
+                shapes.sort();
+                shapes.dedup();
+                assert_eq!(
+                    shapes.len(),
+                    3,
+                    "V={v} C={c}: positions share a multiset of totals"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_plan_realizes_its_quotas_exactly() {
+        // The stride permutes voters across the quota brackets; if it ever
+        // collided instead, the realized counts would drift from the quotas and
+        // the ground truth would stop matching what was planned.
+        for &v in &[1usize, 7, 20, 100, 1000, 5000] {
+            for &c in &[2usize, 4, 12] {
+                let positions = 3;
+                let plan = SelectionPlan::new(SelectionProfile::Realistic, v, positions, c);
+                for p in 0..positions {
+                    let mut got = vec![0usize; c];
+                    for voter in 0..v {
+                        got[plan.select(voter, p)] += 1;
+                    }
+                    let want = realistic_quotas(v, c, p);
+                    assert_eq!(got, want, "V={v} C={c} p={p}: realized counts != quotas");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn existing_profiles_are_untouched() {
+        // uniform and skewed back the manuscript's RQ comparisons; this change
+        // must not move them.
+        let c = 4;
+        let uniform: Vec<usize> = (0..8)
+            .map(|v| select_candidate(SelectionProfile::Uniform, v, 0, c))
+            .collect();
+        assert_eq!(uniform, vec![0, 1, 2, 3, 0, 1, 2, 3]);
+        let skewed: Vec<usize> = (0..8)
+            .map(|v| select_candidate(SelectionProfile::Skewed, v, 0, c))
+            .collect();
+        assert_eq!(skewed, vec![0, 1, 0, 2, 0, 3, 0, 1]);
+    }
+
+    #[test]
+    fn a_single_candidate_contest_is_still_trivially_valid() {
+        let plan = SelectionPlan::new(SelectionProfile::Realistic, 10, 2, 1);
+        for v in 0..10 {
+            assert_eq!(plan.select(v, 0), 0);
+        }
     }
 }

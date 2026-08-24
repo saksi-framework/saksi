@@ -174,6 +174,14 @@
   .crown { font-size:10px; text-transform:uppercase; letter-spacing:.06em; font-weight:700;
            color:var(--ok); background:var(--ok-weak); border-radius:999px; padding:2px 8px; margin-left:7px }
   .crown.tie { color:var(--warn); background:var(--warn-weak) }
+  .cand.cutline { border-bottom:2px dashed var(--ok); padding-bottom:9px; margin-bottom:11px;
+                  position:relative }
+  .cand.cutline::after { content:"elected above this line"; position:absolute; right:0; bottom:-9px;
+                  font-size:9px; letter-spacing:.05em; text-transform:uppercase; color:var(--ok);
+                  background:var(--panel-2); padding:0 5px }
+  .seats { font-size:10px; text-transform:uppercase; letter-spacing:.06em; font-weight:700;
+           color:var(--accent-ink); background:var(--accent-weak); border-radius:999px;
+           padding:2px 8px; margin-left:8px; vertical-align:middle }
 
   /* attack sub-rail — one dot per scenario, beneath the protocol rail */
   .arail { display:flex; gap:5px; flex-wrap:wrap; margin:-12px 0 20px; padding-left:2px }
@@ -240,7 +248,14 @@
 
     <div class="grid2">
       <div><label for="distribution">Vote distribution</label>
-        <select id="distribution"><option value="uniform">uniform</option><option value="skewed">skewed</option></select></div>
+        <select id="distribution">
+          <option value="realistic">realistic — clear winners, distinct counts</option>
+          <option value="uniform">uniform — even split (ties by design)</option>
+          <option value="skewed">skewed — front-runner takes half</option>
+        </select></div>
+      <div><label for="senateSeats">Senate seats</label>
+        <input id="senateSeats" type="number" min="0" value="3" class="tnum" />
+        <div class="small muted" style="margin-top:4px">Top N senators are elected. 0 = single-winner.</div></div>
       <div><label for="mode">Mode</label>
         <select id="mode">
           <option value="offline">offline — full crypto, no ledger</option>
@@ -375,6 +390,8 @@ const posLabel = (id) =>
   POS_LABEL[id] || id.replace(/^position-(\d+)$/, (_, n) => "Position " + n).replace(/-/g, " ");
 // cand0 is the first candidate on the ballot; label it 1-based to match the
 // CAND_PRES_01 convention the ground-truth tables use.
+// The multi-seat race, identified by the id ph_position_id(2) emits.
+const SENATE_POSITION_ID = "senator";
 const candLabel = (id) => { const m = /^cand(\d+)$/.exec(id); return m ? "Candidate " + (+m[1] + 1) : id; };
 const PRESETS = [1, 10, 100, 1000, 10000, 50000, 483000, 1000000, 1921917, 3524078];
 const OFFLINE_CEILING = 10000;
@@ -493,6 +510,7 @@ const config = () => ({
   candidates: +$("candidates").value,
   voters: +$("voters").value,
   distribution: $("distribution").value,
+  senate_seats: +$("senateSeats").value,
   mode: $("mode").value,
 });
 
@@ -761,27 +779,44 @@ function renderBoard(rows) {
 
   $("board").innerHTML = [...races].map(([pos, cands]) => {
     const total = cands.reduce((a, c) => a + c.votes, 0);
-    const top = Math.max(...cands.map((c) => c.votes));
-    // Collect EVERY candidate on the top count. The uniform profile splits the
-    // electorate evenly by construction, so an exact tie is a normal outcome —
-    // announcing the first row as the winner would invent a result.
-    const leaders = cands.filter((c) => c.votes === top);
-    const tied = leaders.length > 1;
-    const crown = tied
-      ? `<span class="crown tie">tied · ${leaders.length}-way</span>`
-      : `<span class="crown">winner</span>`;
+    // The Senate elects several; every other race elects one. Keyed off the
+    // position id rather than its ordinal in the file, so it stays correct
+    // however the contests happen to be ordered or filtered.
+    const seats = (pos === SENATE_POSITION_ID && (cfg?.senate_seats || 0) > 1)
+      ? Math.min(cfg.senate_seats, cands.length - 1) : 1;
 
-    const body = cands.map((c) => {
-      const lead = c.votes === top;
+    // Rank by votes; the cut falls after `seats` places.
+    const ranked = [...cands].sort((a, b) => b.votes - a.votes || a.cand.localeCompare(b.cand));
+    const cutoff = ranked[seats - 1].votes;
+    // Everyone level with the last elected place is also level for it. If more
+    // candidates hold that count than there are seats left, the cut is not
+    // decided and saying who won would be inventing it.
+    const atCut = ranked.filter((c) => c.votes === cutoff).length;
+    const contested = atCut > 1 && ranked.filter((c) => c.votes > cutoff).length < seats;
+
+    const label = seats > 1
+      ? `${seats} seats · top ${seats} elected`
+      : (contested ? `tied · ${atCut}-way` : "winner");
+
+    const body = ranked.map((c, i) => {
+      const elected = !contested && i < seats;
       const pct = total ? (c.votes / total) * 100 : 0;
-      return `<div class="cand${lead ? " lead" : ""}">
-        <span class="nm">${esc(candLabel(c.cand))}${lead ? crown : ""}</span>
+      const tag = elected
+        ? `<span class="crown">${seats > 1 ? "elected" : "winner"}</span>`
+        : (contested && c.votes === cutoff ? `<span class="crown tie">${label}</span>` : "");
+      const cut = (!contested && i === seats - 1 && i < ranked.length - 1)
+        ? ` cutline` : "";
+      return `<div class="cand${elected ? " lead" : ""}${cut}">
+        <span class="nm">${esc(candLabel(c.cand))}${tag}</span>
         <span class="ct"><b>${c.votes.toLocaleString()}</b> · ${pct.toFixed(1)}%</span>
         <span class="bar"><i style="width:${pct.toFixed(2)}%"></i></span></div>`;
     }).join("");
 
-    return `<div class="race"><h3>${esc(posLabel(pos))}</h3>
-      <div class="turnout">${total.toLocaleString()} votes counted${tied ? " · no outright winner" : ""}</div>
+    const seatNote = seats > 1 ? ` · ${seats} of ${ranked.length} elected` : "";
+    return `<div class="race"><h3>${esc(posLabel(pos))}${
+        seats > 1 ? `<span class="seats">${seats} seats</span>` : ""}</h3>
+      <div class="turnout">${total.toLocaleString()} votes counted${seatNote}${
+        contested ? " · cut not decided" : ""}</div>
       ${body}</div>`;
   }).join("");
   $("boardWrap").style.display = "block";

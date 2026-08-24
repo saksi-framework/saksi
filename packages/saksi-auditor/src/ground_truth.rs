@@ -30,7 +30,7 @@ use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::Path;
 
-use crate::fixtures::{ph_position_id, select_candidate, GenParams};
+use crate::fixtures::{ph_position_id, GenParams, SelectionPlan};
 
 /// Filename of the wide, one-row-per-voter plaintext ballot table.
 pub const GROUND_TRUTH_BALLOTS_CSV: &str = "ground-truth-ballots.csv";
@@ -98,6 +98,10 @@ pub fn write_ground_truth_csvs(dir: &Path, params: &GenParams) -> Result<(), Str
     }
     writeln!(out).map_err(io_err(&ballots_path))?;
 
+    // Same plan the cryptographic path builds, from the same parameters — that
+    // is what makes the two tables byte-identical.
+    let plan = SelectionPlan::new(params.profile, params.voters, positions, candidates);
+
     for voter_idx in 0..params.voters {
         write!(
             out,
@@ -108,7 +112,7 @@ pub fn write_ground_truth_csvs(dir: &Path, params: &GenParams) -> Result<(), Str
         )
         .map_err(io_err(&ballots_path))?;
         for p in 0..positions {
-            let selected = select_candidate(params.profile, voter_idx, p, candidates);
+            let selected = plan.select(voter_idx, p);
             counts[p * candidates + selected] += 1;
             write!(out, ",{}", labels[p][selected]).map_err(io_err(&ballots_path))?;
         }
@@ -147,7 +151,12 @@ mod tests {
     use super::*;
     use crate::fixtures::{tally_selections, SelectionProfile};
 
-    fn params(voters: usize, positions: usize, candidates: usize, profile: SelectionProfile) -> GenParams {
+    fn params(
+        voters: usize,
+        positions: usize,
+        candidates: usize,
+        profile: SelectionProfile,
+    ) -> GenParams {
         GenParams {
             election_id: "gt-test".to_string(),
             election_name: "gt-test".to_string(),
@@ -201,7 +210,9 @@ mod tests {
 
         let lines = read(&dir, GROUND_TRUTH_BALLOTS_CSV);
         assert_eq!(lines[0], "voter_id,scale_group,ballot_complexity,PRESIDENT");
-        assert!(lines[1].ends_with(",single,CAND_PRES_01") || lines[1].contains(",single,CAND_PRES_"));
+        assert!(
+            lines[1].ends_with(",single,CAND_PRES_01") || lines[1].contains(",single,CAND_PRES_")
+        );
     }
 
     /// The summary must equal the independent tally the cryptographic generator
@@ -226,8 +237,7 @@ mod tests {
             }
             // `tally_selections`' second argument is the total contest-slot
             // count (positions × candidates), not the position count.
-            let expected =
-                tally_selections(&selections, p.positions * p.candidates, p.candidates);
+            let expected = tally_selections(&selections, p.positions * p.candidates, p.candidates);
 
             let rows = read(&dir, GROUND_TRUTH_SUMMARY_CSV);
             assert_eq!(rows.len(), 1 + p.positions * p.candidates);
@@ -253,7 +263,11 @@ mod tests {
         let dir = tempdir();
         write_ground_truth_csvs(&dir, &params(2, 5, 2, SelectionProfile::Uniform)).expect("writes");
         let lines = read(&dir, GROUND_TRUTH_BALLOTS_CSV);
-        assert!(lines[0].ends_with(",POSITION_3,POSITION_4"), "got {}", lines[0]);
+        assert!(
+            lines[0].ends_with(",POSITION_3,POSITION_4"),
+            "got {}",
+            lines[0]
+        );
         assert!(lines[1].contains("CAND_POS3_"), "got {}", lines[1]);
     }
 

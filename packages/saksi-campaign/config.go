@@ -37,8 +37,31 @@ type ElectionConfig struct {
 	Positions    int       `json:"positions"`
 	Candidates   int       `json:"candidates"`
 	Voters       int       `json:"voters"`
-	Distribution string    `json:"distribution"` // uniform | skewed
+	Distribution string    `json:"distribution"` // uniform | skewed | realistic
 	Mode         string    `json:"mode"`         // offline | onchain | groundtruth
+	// SenateSeats is how many senators are elected — the Senate is a
+	// multi-seat race decided by plurality (the top SenateSeats candidates
+	// win), while President and Vice President stay single-winner.
+	//
+	// Each voter still selects exactly ONE candidate per position, so this
+	// changes nothing cryptographic: the CDS proof still shows each ciphertext
+	// encrypts 0 or 1, and the auditor's gate still requires each position's
+	// aggregate to equal the ballot count. Seats decide how the result is
+	// READ, not how it is produced, which is why this never reaches
+	// saksi-demo. Zero means "single-winner", the previous behaviour.
+	SenateSeats int `json:"senate_seats"`
+}
+
+// SenatePosition is the ballot index of the multi-seat race (President 0,
+// Vice President 1, Senator 2), matching ph_position_id in the generator.
+const SenatePosition = 2
+
+// Seats returns how many candidates win position p.
+func (c ElectionConfig) Seats(p int) int {
+	if p == SenatePosition && c.SenateSeats > 1 {
+		return c.SenateSeats
+	}
+	return 1
 }
 
 // ModeGroundTruth generates ONLY the Stage-4 plaintext ground-truth tables
@@ -71,9 +94,15 @@ func (c ElectionConfig) Validate() error {
 		return fmt.Errorf("positions, candidates, voters must each be >= 1")
 	}
 	switch c.Distribution {
-	case "uniform", "skewed":
+	case "uniform", "skewed", "realistic":
 	default:
-		return fmt.Errorf("distribution must be 'uniform' or 'skewed' (got %q)", c.Distribution)
+		return fmt.Errorf(
+			"distribution must be 'uniform', 'skewed', or 'realistic' (got %q)", c.Distribution)
+	}
+	// A cut needs at least one candidate below it, or every candidate is
+	// elected and the race decides nothing.
+	if c.SenateSeats < 0 || c.SenateSeats >= c.Candidates {
+		return fmt.Errorf("senate seats must be 0..%d (got %d)", c.Candidates-1, c.SenateSeats)
 	}
 	switch c.Mode {
 	case "offline", "onchain", ModeGroundTruth:
