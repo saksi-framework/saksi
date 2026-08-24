@@ -428,37 +428,12 @@ pub(crate) fn tally_selections(
     totals
 }
 
-/// Scrambles `(voter_idx, position)` into a well-spread pseudorandom number.
-///
-/// This is the SplitMix64 finalizer: four operations, no state, no seed. It is
-/// deterministic — the same voter and position always produce the same value —
-/// but the output has no visible pattern, so the resulting vote counts look
-/// like a real election rather than a round-robin.
-///
-/// That distinction matters for what the data can prove. Plain modular
-/// arithmetic (`(voter_idx + p) % candidates`) gave every position a near-
-/// identical set of totals, differing by a vote or two, so a component that
-/// confused one contest for another would still have satisfied `E = 0`. Mixed
-/// selections give each contest its own distinctive totals, which the check
-/// can then actually discriminate on.
-fn mix(voter_idx: usize, p: usize) -> u64 {
-    // Combine the two indices into one value first, so position genuinely
-    // changes the result rather than merely shifting it.
-    let mut x = (voter_idx as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ (p as u64).wrapping_add(1);
-    x ^= x >> 30;
-    x = x.wrapping_mul(0xbf58_476d_1ce4_e5b9);
-    x ^= x >> 27;
-    x = x.wrapping_mul(0x94d0_49bb_1331_11eb);
-    x ^ (x >> 31)
-}
-
 /// Deterministic 1-of-C selection under a fixed profile (reproducible).
 ///
 /// `pub(crate)` so the ground-truth CSV writer can replay the same selections
 /// without running the cryptographic generator (see `ground_truth.rs`). It is a
 /// pure function of its arguments, so replaying it is bit-identical to what
-/// `multi_position_fixture` records — which is why a population is reproduced
-/// by restating its parameters, with no seed to store or lose.
+/// `multi_position_fixture` records.
 pub(crate) fn select_candidate(
     profile: SelectionProfile,
     voter_idx: usize,
@@ -468,18 +443,14 @@ pub(crate) fn select_candidate(
     if candidates <= 1 {
         return 0;
     }
-    let h = mix(voter_idx, p);
     match profile {
-        // Every candidate equally likely.
-        SelectionProfile::Uniform => (h % candidates as u64) as usize,
-        // Candidate 0 takes roughly half; the rest share what remains. Two
-        // independent slices of the same hash decide the two questions, so the
-        // front-runner's share and the spread behind it don't correlate.
+        SelectionProfile::Uniform => (voter_idx + p) % candidates,
+        // Half the voters pick candidate 0; the rest spread over 1..C.
         SelectionProfile::Skewed => {
-            if h & 1 == 0 {
+            if voter_idx % 2 == 0 {
                 0
             } else {
-                1 + ((h >> 8) % (candidates as u64 - 1)) as usize
+                1 + ((voter_idx / 2 + p) % (candidates - 1))
             }
         }
     }
