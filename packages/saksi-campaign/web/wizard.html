@@ -200,6 +200,21 @@
   .adot.fail .n { background:var(--bad); color:#fff }
   .adot.na { opacity:.55 } .adot.na .n { background:var(--warn); color:#fff }
 
+  /* in-lifecycle attack panels */
+  .stagebox { margin-top:18px; border-top:1px solid var(--line); padding-top:14px }
+  .stagehead { display:flex; align-items:center; gap:10px; margin:14px 0 4px }
+  .stagehead h3 { margin:0; font-size:12px; text-transform:uppercase; letter-spacing:.07em;
+                  color:var(--warn) }
+  .stagehead .skip { margin-left:auto }
+  .atk { display:flex; align-items:flex-start; gap:11px; padding:10px 0;
+         border-bottom:1px solid var(--line-2) }
+  .atk:last-child { border-bottom:0 }
+  .atk .body { flex:1; min-width:0 }
+  .atk .nm { font-weight:600; font-size:13px }
+  .atk .why { font-size:12px; color:var(--muted); margin-top:2px }
+  .atk .out { font-size:12px; margin-top:5px; font-family:var(--mono); word-break:break-word }
+  .atk .act { flex:none; display:flex; align-items:center; gap:7px }
+
   /* attack briefing */
   .brief { display:grid; gap:11px; margin:2px 0 16px }
   .brief > div { border:1px solid var(--line); border-left:3px solid var(--line);
@@ -275,6 +290,16 @@
         <div class="small muted" id="modeHint" style="margin-top:4px"></div></div>
     </div>
 
+    <div style="margin-top:13px">
+      <label style="display:flex;align-items:center;gap:9px;cursor:pointer;margin:0">
+        <input type="checkbox" id="skipAttacks" style="width:auto;margin:0" />
+        <span>Skip attacks — run the election straight through</span>
+      </label>
+      <div class="small muted" style="margin-top:4px">
+        Attacks are offered inside the steps they belong to. Tick this for a clean end-to-end run.
+      </div>
+    </div>
+
     <div class="err" id="configErr"></div>
     <div class="actions"><div class="right"><button class="primary" id="btnStart">Generate ballots →</button></div></div>
   </section>
@@ -318,6 +343,7 @@
     </p>
     <div class="loader" id="load2"><span class="spin"></span><span id="loadTxt2" aria-hidden="true"></span></div>
     <div id="trailBox" style="display:none;margin-top:12px"></div>
+    <div class="stagebox" id="stage3" style="display:none"></div>
     <div class="err" id="err2"></div>
     <div class="actions"><button id="back2">← Back</button><div class="right"><button class="primary" id="next2" disabled>To the trustees →</button></div></div>
   </section>
@@ -333,6 +359,7 @@
     <div class="cards" id="cards"></div>
     <div class="note" id="gateNote"></div>
     <div id="tallyBox"></div>
+    <div class="stagebox" id="stage4" style="display:none"></div>
     <div class="err" id="err3"></div>
     <div class="actions"><button id="back3">← Back</button><div class="right">
       <button class="primary" id="btnPublish" disabled>Publish tally</button>
@@ -555,6 +582,7 @@ const config = () => ({
   voters: +$("voters").value,
   distribution: $("distribution").value,
   senate_seats: +$("senateSeats").value,
+  skip_attacks: $("skipAttacks").checked,
   mode: $("mode").value,
 });
 
@@ -700,6 +728,7 @@ async function startSaksi() {
       hideLoader(2);
       $("next2").disabled = false;
       renderTrail();
+      renderStages(["dkg", "ballots", "close"], "stage3");
     } else if (e.level === "error") {
       hideLoader(2);
       $("err2").textContent = e.msg;
@@ -978,7 +1007,7 @@ $("next1").onclick = runCheck;
 $("back2b").onclick = () => go(1);
 $("next2b").onclick = () => { if (cfg.mode === "groundtruth") go(2); else startSaksi(); };
 $("back2").onclick = () => go(2);
-$("next2").onclick = startCeremony;
+$("next2").onclick = () => { startCeremony(); renderStages(["ceremony"], "stage4"); };
 $("back3").onclick = () => { stopTimers(); go(3); };
 $("btnPublish").onclick = async () => {
   $("btnPublish").disabled = true;
@@ -1001,7 +1030,8 @@ $("next5").onclick = () => {
 };
 $("atkRerun").onclick = () => runAttack(step - ATTACK_STEP);
 $("btnRestart").onclick = () => {
-  closeStream(); stopTimers(); runID = null; cfg = null; attacks = []; showIDChip(); go(0);
+  closeStream(); stopTimers(); runID = null; cfg = null; attacks = [];
+  skippedStages.clear(); showIDChip(); go(0);
 };
 
 // Ask the server what it can actually do before offering on-chain. Without

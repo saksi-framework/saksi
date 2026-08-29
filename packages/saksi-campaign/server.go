@@ -112,6 +112,7 @@ func NewServer(store *RunStore, exec *Executor, hub *Hub, fabric FabricConfig, a
 	mux.HandleFunc("/api/scenarios/", s.handleScenarioList)
 	mux.HandleFunc("/api/capabilities", s.handleCapabilities)
 	mux.HandleFunc("/api/trail", s.handleTrailIndex)
+	mux.HandleFunc("/attack", s.handleStagedAttack)
 	s.handler = s.guard(mux)
 	return s
 }
@@ -649,6 +650,35 @@ func (s *Server) handleCeremonyStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSONResp(w, http.StatusOK, state)
+}
+
+// handleStagedAttack mounts one attack at its lifecycle stage — really against
+// the ledger when the run is on-chain and a network is configured, simulated
+// against a copy otherwise.
+func (s *Server) handleStagedAttack(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		RunID    string `json:"run_id"`
+		Scenario string `json:"scenario"`
+	}
+	if !decodeJSON(w, r, &body) {
+		return
+	}
+	runID, err := validRun(s, body.RunID)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if !s.ballotPhaseAllowed(w, runID, "attack") {
+		return
+	}
+	rec, err := s.record(runID)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusNotFound)
+		return
+	}
+	s.dispatch(w, runID, func(ctx context.Context) {
+		_ = s.exec.RunStagedAttack(ctx, runID, rec.Config, body.Scenario)
+	})
 }
 
 // handleCapabilities tells the UI what this console can actually do, so the

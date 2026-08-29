@@ -74,6 +74,14 @@ The ceremony gates *publication*; the auditor is what proves enough trustees
 actually contributed. The UI is written not to imply the displayed numbers were
 reconstructed live from the clicked cards, because they were not.
 
+## Attacks at this stage
+
+The ceremony carries its own **Attacks at this stage** panel with
+`tamper-partial-decryption` — a trustee submitting a share whose
+Chaum-Pedersen proof does not verify. On a live network this is a real
+`SubmitPartialDecryption` the chaincode refuses; offline it is simulated.
+See [7-attacks.md](7-attacks.md).
+
 ## Ground-truth mode
 
 Does not apply — no ciphertexts exist to decrypt.

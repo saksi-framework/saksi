@@ -69,6 +69,21 @@ The ceremony therefore generates the bundle **once**, here, and every later step
 reads the cached file. Any change to this code path must preserve that. It is
 called out in the source for the same reason.
 
+## Attacks at this stage
+
+This step now carries an **Attacks at this stage** panel covering the three
+moments an attacker would actually strike: before any ballot is cast (`dkg`),
+while ballots are being submitted (`ballots`), and once the box is sealed
+(`close`).
+
+On a live network the ballot-stage attacks are **real** — the tampered ballot is
+submitted to the peer and the chaincode refuses it at endorsement, with its own
+error text shown in the panel. Offline they are simulated against a copy and
+labelled as such. Details in [7-attacks.md](7-attacks.md).
+
+Nothing runs unless clicked, each stage has a **Skip**, and step 1 has a
+**Skip attacks** checkbox for a clean run.
+
 ## Ground-truth mode
 
 This step does not apply. That mode produces no ciphertexts, the server answers

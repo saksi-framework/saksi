@@ -98,3 +98,61 @@ func TestTrailIndexWithoutChain(t *testing.T) {
 		t.Errorf("row lost its config: %+v", rows[0])
 	}
 }
+
+// Every attack must declare where in the election it belongs, or it silently
+// disappears from the wizard instead of appearing at its stage.
+func TestEveryScenarioDeclaresAStage(t *testing.T) {
+	valid := map[string]bool{}
+	for _, st := range StageOrder {
+		valid[st] = true
+	}
+	for _, sc := range Registry() {
+		if !valid[sc.Stage] {
+			t.Errorf("%s has stage %q, not one of %v", sc.ID, sc.Stage, StageOrder)
+		}
+	}
+}
+
+// Every stage must have something to show, and the union must be the whole
+// catalogue — an attack in no stage would never be offered.
+func TestStagesPartitionTheCatalogue(t *testing.T) {
+	seen := 0
+	for _, st := range StageOrder {
+		got := ScenariosForStage(st)
+		if len(got) == 0 {
+			t.Errorf("stage %q has no attacks; the panel would render empty", st)
+		}
+		seen += len(got)
+	}
+	if seen != len(Registry()) {
+		t.Errorf("stages cover %d attacks, catalogue has %d", seen, len(Registry()))
+	}
+}
+
+// close-stage attacks describe something missing or reordered across the whole
+// ballot set, which no single submission can express. Claiming otherwise would
+// send them down the live path and produce a misleading result.
+func TestOnlySubmittableStagesAreLiveCapable(t *testing.T) {
+	for _, sc := range Registry() {
+		want := sc.Stage != StageClose
+		if sc.LiveCapable() != want {
+			t.Errorf("%s (stage %s): LiveCapable=%v, want %v", sc.ID, sc.Stage, sc.LiveCapable(), want)
+		}
+	}
+}
+
+// The listing carries the stage through, since the page groups by it.
+func TestListingsCarryStageAndLiveFlags(t *testing.T) {
+	list, err := ScenarioListings(t.TempDir())
+	if err != nil {
+		t.Fatalf("listings: %v", err)
+	}
+	for _, l := range list {
+		if l.Stage == "" {
+			t.Errorf("%s listing has no stage", l.ID)
+		}
+		if l.WasLive {
+			t.Errorf("%s claims a live verdict before being run", l.ID)
+		}
+	}
+}

@@ -7,6 +7,14 @@ verifiability claim actually rests on.
 Seven attacks, each its own wizard step, each briefed before it runs and run
 live.
 
+> **Attacks also happen during the election.** An attacker does not wait for the
+> count to finish, so each attack is additionally offered *at the point in the
+> lifecycle it belongs to* — inside steps 4 and 5 — where on a live network it
+> is a **real** submission the chaincode refuses. See
+> [Attacks during the election](#attacks-during-the-election) below. This step
+> remains the full catalogue and is what writes a complete
+> `negative-tests.csv`.
+
 ## What each step shows
 
 Before running:
@@ -93,3 +101,67 @@ Verdicts accumulate in `scenarios.json`, and `negative-tests.csv` is regenerated
 in full from it after every run. Running attacks one at a time therefore leaves a
 complete export — the CSV holds all seven, in registry order, regardless of the
 sequence that produced them.
+
+
+---
+
+## Attacks during the election
+
+Running every attack after the count reads as a test suite bolted onto the end.
+Each attack therefore also appears at its own lifecycle stage, in an
+**Attacks at this stage** panel inside the step that owns it.
+
+| Stage | Wizard step | Attacks |
+|---|---|---|
+| `dkg` — before any ballot is cast | 4 | `tamper-dkg-transcript` |
+| `ballots` — during submission | 4 | `tamper-ballot-proof`, `reused-nullifier`, `corrupted-ballot-bytes` |
+| `close` — on the sealed ballot box | 4 | `dropped-ballot`, `reordered-ballots` |
+| `ceremony` — during decryption | 5 | `tamper-partial-decryption` |
+
+The stage is a field on `Scenario` (`scenarios.go`), beside `Action` and
+`Expected`, so the page never hardcodes which attack happens when.
+
+### Simulated versus real
+
+This is the distinction to be precise about, because only one of them is
+evidence about the deployed system.
+
+**Offline — simulated.** The attack mutates a copy of the run and re-audits it.
+Labelled `simulated` in the UI and recorded as `on_chain=false` in
+`negative-tests.csv`.
+
+**On-chain — real.** The tampered artifact is submitted to the peer and the
+**chaincode refuses it at endorsement**, mid-election. `SubmitBallot` verifies
+the CDS proof on-chain and fails with *"contest %q CDS well-formedness proof
+failed"*; a replayed nullifier fails with *"nullifier already spent … (double
+vote)"*. That error text is what the panel displays, and the row is recorded as
+`on_chain=true`.
+
+The verdict inverts on the live path: **an error is PASS**, and a successful
+commit is `FAIL`, because a tampered artifact the ledger accepted is a genuine
+finding. The real election is never at risk — the chaincode declines the write,
+and that refusal is the demonstration.
+
+`close`-stage attacks stay simulated in both modes: they describe something
+missing or reordered across the whole ballot set, which no single submission can
+express. `Scenario.LiveCapable()` encodes that, and a test asserts it.
+
+### Skipping
+
+Attacks are opt-in — nothing runs until a **Run** button is pressed. Beyond
+that:
+
+- **Skip** on any stage panel hides that stage and moves on.
+- **Skip attacks** in step 1 hides every inline panel for a clean end-to-end
+  run.
+
+Skipping is not recorded as a pass. A stage that was never run simply has no
+verdict.
+
+### One catalogue, two places
+
+A verdict earned inline is upserted into `scenarios.json` by
+`mergeScenarioResults`, so step 7 shows it as already decided rather than
+re-running it, and `negative-tests.csv` stays complete however the verdicts were
+obtained. The CSV carries `stage` and `on_chain` columns so the manuscript can
+distinguish a simulated rejection from a real one.

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	pb "github.com/saksi-framework/saksi/packages/saksi-protocol/go/saksiprotocolv1"
@@ -50,7 +51,36 @@ type Scenario struct {
 	Layer    Layer
 	Action   string // human description of the mutation
 	Expected string // human description of the expected rejection
-	Mutate   func(dir string) error
+	// Stage is the point in the election lifecycle this attack belongs to, so
+	// the wizard can offer it while the election is running rather than only
+	// after the count. Kept beside the mutation, exactly as Action/Expected
+	// are, so the page never hardcodes which attack happens when.
+	Stage  string
+	Mutate func(dir string) error
+}
+
+// Lifecycle stages an attack can be mounted at. They map onto wizard steps:
+// dkg/ballots/close are all inside step 4 (Encrypt & record) in submission
+// order, ceremony is step 5.
+const (
+	StageDKG      = "dkg"      // before any ballot is submitted
+	StageBallots  = "ballots"  // while ballots are being submitted
+	StageClose    = "close"    // after CloseElection, before decryption
+	StageCeremony = "ceremony" // during the trustee ceremony
+)
+
+// StageOrder is the lifecycle order, for rendering.
+var StageOrder = []string{StageDKG, StageBallots, StageClose, StageCeremony}
+
+// ScenariosForStage returns the attacks that belong at one lifecycle stage.
+func ScenariosForStage(stage string) []Scenario {
+	var out []Scenario
+	for _, sc := range Registry() {
+		if sc.Stage == stage {
+			out = append(out, sc)
+		}
+	}
+	return out
 }
 
 // ScenarioResult is one row of negative-tests.csv.
@@ -62,6 +92,12 @@ type ScenarioResult struct {
 	Actual   string
 	Verdict  string // PASS | FAIL | SKIPPED
 	Property string
+	// OnChain records whether the attack was really submitted to the ledger
+	// and refused by the chaincode, or simulated against a copy of the run.
+	// The distinction matters in the export: only one of them is evidence
+	// about the deployed system.
+	OnChain bool
+	Stage   string
 }
 
 // Registry is the offline-detectable attack catalog. Each entry is grounded in
@@ -71,7 +107,7 @@ type ScenarioResult struct {
 func Registry() []Scenario {
 	return []Scenario{
 		{
-			ID: "tamper-ballot-proof", Property: "ballot well-formedness (CDS proof)",
+			ID: "tamper-ballot-proof", Stage: StageBallots, Property: "ballot well-formedness (CDS proof)",
 			Layer: LayerOffline, Action: "flip a byte in a ballot's CDS proof response",
 			Expected: "auditor rejects: proof verification fails",
 			Mutate: func(dir string) error {
@@ -85,7 +121,7 @@ func Registry() []Scenario {
 			},
 		},
 		{
-			ID: "reused-nullifier", Property: "no double voting (per-position nullifier)",
+			ID: "reused-nullifier", Stage: StageBallots, Property: "no double voting (per-position nullifier)",
 			Layer: LayerOffline, Action: "copy ballot 0's nullifier onto ballot 1",
 			Expected: "auditor rejects: duplicate nullifier",
 			Mutate: func(dir string) error {
@@ -107,7 +143,7 @@ func Registry() []Scenario {
 			},
 		},
 		{
-			ID: "dropped-ballot", Property: "ballot-box completeness",
+			ID: "dropped-ballot", Stage: StageClose, Property: "ballot-box completeness",
 			Layer: LayerOffline, Action: "remove one committed ballot line",
 			Expected: "auditor rejects: ballot count / ledger digest mismatch",
 			Mutate: func(dir string) error {
@@ -126,7 +162,7 @@ func Registry() []Scenario {
 			// same tally + proofs regardless of ballot order, so audit-stream does
 			// NOT reject a reorder (verified: it passed a reordered run). The chain's
 			// ledger digest binds order — hence LayerChaincode, network-gated.
-			ID: "reordered-ballots", Property: "ledger integrity (ordering)",
+			ID: "reordered-ballots", Stage: StageClose, Property: "ledger integrity (ordering)",
 			Layer: LayerChaincode, Action: "swap the first two ballot lines",
 			Expected: "chaincode rejects: ledger digest mismatch",
 			Mutate: func(dir string) error {
@@ -142,7 +178,7 @@ func Registry() []Scenario {
 			},
 		},
 		{
-			ID: "corrupted-ballot-bytes", Property: "wire integrity",
+			ID: "corrupted-ballot-bytes", Stage: StageBallots, Property: "wire integrity",
 			Layer: LayerOffline, Action: "flip a byte in a ballot's wire bytes",
 			Expected: "auditor rejects: ballot does not decode / proof fails",
 			Mutate: func(dir string) error {
@@ -163,7 +199,7 @@ func Registry() []Scenario {
 			},
 		},
 		{
-			ID: "tamper-partial-decryption", Property: "threshold-decryption integrity",
+			ID: "tamper-partial-decryption", Stage: StageCeremony, Property: "threshold-decryption integrity",
 			Layer: LayerOffline, Action: "flip a byte in a trustee's partial decryption",
 			Expected: "auditor rejects: Chaum-Pedersen proof fails",
 			Mutate: func(dir string) error {
@@ -180,7 +216,7 @@ func Registry() []Scenario {
 			},
 		},
 		{
-			ID: "tamper-dkg-transcript", Property: "DKG transcript integrity",
+			ID: "tamper-dkg-transcript", Stage: StageDKG, Property: "DKG transcript integrity",
 			Layer: LayerOffline, Action: "flip a byte in the DKG transcript",
 			Expected: "auditor rejects: DKG transcript invalid",
 			Mutate: func(dir string) error {
@@ -241,7 +277,7 @@ func (e *Executor) RunScenarios(ctx context.Context, runID string, list []string
 func (e *Executor) runOneScenario(ctx context.Context, runID, srcDir string, sc Scenario) ScenarioResult {
 	res := ScenarioResult{
 		Scenario: sc.ID, Layer: sc.Layer.String(), Action: sc.Action,
-		Expected: sc.Expected, Property: sc.Property,
+		Expected: sc.Expected, Property: sc.Property, Stage: sc.Stage,
 	}
 
 	// Chaincode-only attacks are not offline-detectable — never assert them
@@ -459,6 +495,9 @@ type ScenarioListing struct {
 	Expected string `json:"expected"`
 	Verdict  string `json:"verdict"` // "" until the scenario has been run
 	Actual   string `json:"actual"`
+	Stage    string `json:"stage"`
+	Live     bool   `json:"live"`     // can be mounted against a running ledger
+	WasLive  bool   `json:"was_live"` // this verdict came from a real submission
 }
 
 // ScenarioListings returns every registered attack for a run, in Registry
@@ -479,9 +518,10 @@ func ScenarioListings(dir string) ([]ScenarioListing, error) {
 		l := ScenarioListing{
 			ID: sc.ID, Property: sc.Property, Layer: sc.Layer.String(),
 			Action: sc.Action, Expected: sc.Expected,
+			Stage: sc.Stage, Live: sc.LiveCapable(),
 		}
 		if r, ok := byID[sc.ID]; ok {
-			l.Verdict, l.Actual = r.Verdict, r.Actual
+			l.Verdict, l.Actual, l.WasLive = r.Verdict, r.Actual, r.OnChain
 		}
 		out = append(out, l)
 	}
@@ -549,17 +589,261 @@ func writeNegativeTestsCSV(path string, results []ScenarioResult) error {
 	defer f.Close()
 	w := csv.NewWriter(f)
 	if err := w.Write([]string{
-		"scenario", "layer", "action", "expected", "actual", "verdict", "property",
+		"scenario", "stage", "layer", "action", "expected", "actual", "verdict", "property", "on_chain",
 	}); err != nil {
 		return err
 	}
 	for _, r := range results {
 		if err := w.Write([]string{
-			r.Scenario, r.Layer, r.Action, r.Expected, r.Actual, r.Verdict, r.Property,
+			r.Scenario, r.Stage, r.Layer, r.Action, r.Expected, r.Actual, r.Verdict, r.Property,
+			strconv.FormatBool(r.OnChain),
 		}); err != nil {
 			return err
 		}
 	}
 	w.Flush()
 	return w.Error()
+}
+
+// LiveCapable reports whether this attack can be mounted against a running
+// ledger. The stages that submit an artifact can; `close`-stage attacks are
+// about what is MISSING or REORDERED across the whole ballot set, which is not
+// something a single submission can express, so they stay simulated.
+func (s Scenario) LiveCapable() bool {
+	return s.Stage == StageDKG || s.Stage == StageBallots || s.Stage == StageCeremony
+}
+
+// runLiveScenario mounts a REAL attack against the running election: apply the
+// mutation, then submit the tampered artifact to the peer and let the chaincode
+// refuse it. Its rejection message is the result.
+//
+// The verdict is inverted relative to an honest submission — an error is PASS,
+// and a successful commit is FAIL, because a tampered artifact the ledger
+// accepted is a genuine finding. Nothing here can corrupt the real election:
+// the chaincode declines the write, and that refusal is the demonstration.
+func (e *Executor) runLiveScenario(ctx context.Context, runID, srcDir string, sc Scenario) ScenarioResult {
+	res := ScenarioResult{
+		Scenario: sc.ID, Layer: sc.Layer.String(), Action: sc.Action,
+		Expected: sc.Expected, Property: sc.Property, Stage: sc.Stage, OnChain: true,
+	}
+	if !sc.LiveCapable() {
+		res.Verdict = "SKIPPED"
+		res.Actual = "not mountable as a single submission — runs as a simulation instead"
+		return res
+	}
+
+	// Mutate a COPY. The live election's own artifacts are never touched.
+	scenDir := filepath.Join(srcDir, "scenarios", "live-"+sc.ID)
+	if err := copyStream(srcDir, scenDir); err != nil {
+		res.Verdict, res.Actual = "FAIL", "could not copy run: "+err.Error()
+		return res
+	}
+	if err := sc.Mutate(scenDir); err != nil {
+		res.Verdict, res.Actual = "FAIL", "mutation error: "+err.Error()
+		return res
+	}
+
+	conn, err := e.fabric.Connect()
+	if err != nil {
+		res.Verdict, res.Actual = "SKIPPED", "connect to Fabric: "+err.Error()
+		return res
+	}
+	defer conn.Close()
+
+	b, err := e.readBundle(runID)
+	if err != nil {
+		res.Verdict, res.Actual = "FAIL", "read bundle: "+err.Error()
+		return res
+	}
+
+	var submitErr error
+	switch sc.Stage {
+	case StageBallots:
+		// Submit whichever ballot the attacker actually changed, so one code
+		// path serves every ballot-stage mutation regardless of which index it
+		// touched.
+		idx, hexLine, err := firstChangedBallot(srcDir, scenDir)
+		if err != nil {
+			res.Verdict, res.Actual = "FAIL", err.Error()
+			return res
+		}
+		e.publish(runID, "attack", "info",
+			fmt.Sprintf("%s: submitting tampered ballot %d to the peer…", sc.ID, idx))
+		submitErr = conn.Bulletin.SubmitBallot(hexLine)
+	case StageCeremony:
+		hexVal, err := firstChangedHeaderList(srcDir, scenDir, "partial_decryptions")
+		if err != nil {
+			res.Verdict, res.Actual = "FAIL", err.Error()
+			return res
+		}
+		e.publish(runID, "attack", "info", sc.ID+": submitting tampered partial decryption…")
+		submitErr = conn.Bulletin.SubmitPartialDecryption(b.ElectionID, hexVal)
+	case StageDKG:
+		hexVal, err := changedHeaderField(srcDir, scenDir, "dkg")
+		if err != nil {
+			res.Verdict, res.Actual = "FAIL", err.Error()
+			return res
+		}
+		e.publish(runID, "attack", "info", sc.ID+": submitting tampered DKG transcript…")
+		submitErr = conn.Bulletin.PublishDKGTranscript(hexVal)
+	}
+
+	if submitErr != nil {
+		res.Verdict = "PASS"
+		res.Actual = "chaincode rejected: " + truncateErr(submitErr.Error())
+		e.publish(runID, "attack", "info", sc.ID+": PASS — the ledger refused it")
+	} else {
+		res.Verdict = "FAIL"
+		res.Actual = "NOT rejected — the ledger accepted a tampered artifact"
+		e.publish(runID, "attack", "error", sc.ID+": FAIL — the ledger accepted it")
+	}
+	return res
+}
+
+// truncateErr keeps a chaincode error readable in a UI chip. Fabric wraps
+// endorsement failures in a lot of envelope detail; the useful part is first.
+func truncateErr(s string) string {
+	s = strings.TrimSpace(strings.ReplaceAll(s, "\n", " "))
+	if len(s) > 400 {
+		return s[:400] + "…"
+	}
+	return s
+}
+
+// firstChangedBallot returns the index and hex of the first ballot line the
+// mutation altered.
+func firstChangedBallot(srcDir, scenDir string) (int, string, error) {
+	before, err := readBallotLines(srcDir)
+	if err != nil {
+		return 0, "", fmt.Errorf("read original ballots: %w", err)
+	}
+	after, err := readBallotLines(scenDir)
+	if err != nil {
+		return 0, "", fmt.Errorf("read mutated ballots: %w", err)
+	}
+	for i := range after {
+		if i >= len(before) || before[i] != after[i] {
+			return i, after[i], nil
+		}
+	}
+	return 0, "", fmt.Errorf("mutation changed no ballot line, so there is nothing to submit")
+}
+
+// firstChangedHeaderList returns the first altered element of a hex-string list
+// in header.json (e.g. partial_decryptions).
+func firstChangedHeaderList(srcDir, scenDir, field string) (string, error) {
+	before, err := headerList(srcDir, field)
+	if err != nil {
+		return "", err
+	}
+	after, err := headerList(scenDir, field)
+	if err != nil {
+		return "", err
+	}
+	for i := range after {
+		if i >= len(before) || before[i] != after[i] {
+			return after[i], nil
+		}
+	}
+	return "", fmt.Errorf("mutation changed no %s entry", field)
+}
+
+// changedHeaderField returns a mutated scalar hex field from header.json.
+func changedHeaderField(srcDir, scenDir, field string) (string, error) {
+	after, err := headerField(scenDir, field)
+	if err != nil {
+		return "", err
+	}
+	before, err := headerField(srcDir, field)
+	if err != nil {
+		return "", err
+	}
+	if before == after {
+		return "", fmt.Errorf("mutation changed no %s field", field)
+	}
+	return after, nil
+}
+
+func headerMap(dir string) (map[string]any, error) {
+	raw, err := os.ReadFile(filepath.Join(dir, "header.json"))
+	if err != nil {
+		return nil, fmt.Errorf("read header.json: %w", err)
+	}
+	var h map[string]any
+	if err := json.Unmarshal(raw, &h); err != nil {
+		return nil, fmt.Errorf("parse header.json: %w", err)
+	}
+	return h, nil
+}
+
+func headerList(dir, field string) ([]string, error) {
+	h, err := headerMap(dir)
+	if err != nil {
+		return nil, err
+	}
+	arr, ok := h[field].([]any)
+	if !ok {
+		return nil, fmt.Errorf("header.json has no %s list", field)
+	}
+	out := make([]string, 0, len(arr))
+	for _, v := range arr {
+		s, _ := v.(string)
+		out = append(out, s)
+	}
+	return out, nil
+}
+
+func headerField(dir, field string) (string, error) {
+	h, err := headerMap(dir)
+	if err != nil {
+		return "", err
+	}
+	s, ok := h[field].(string)
+	if !ok {
+		return "", fmt.Errorf("header.json has no %s field", field)
+	}
+	return s, nil
+}
+
+// RunStagedAttack runs one attack at its lifecycle stage: really, against the
+// ledger, when a network is configured; simulated against a copy otherwise.
+func (e *Executor) RunStagedAttack(ctx context.Context, runID string, c ElectionConfig, id string) error {
+	srcDir, err := e.store.Dir(runID)
+	if err != nil {
+		return err
+	}
+	var sc *Scenario
+	for _, cand := range Registry() {
+		if cand.ID == id {
+			s := cand
+			sc = &s
+			break
+		}
+	}
+	if sc == nil {
+		return fmt.Errorf("unknown scenario %q", id)
+	}
+
+	live := c.Mode == "onchain" && e.fabric.Enabled() && sc.LiveCapable()
+	var res ScenarioResult
+	if live {
+		res = e.runLiveScenario(ctx, runID, srcDir, *sc)
+	} else {
+		res = e.runOneScenario(ctx, runID, srcDir, *sc)
+		res.Stage = sc.Stage
+	}
+
+	merged, err := mergeScenarioResults(srcDir, []ScenarioResult{res})
+	if err != nil {
+		return err
+	}
+	if err := writeNegativeTestsCSV(filepath.Join(srcDir, NegativeTestsFile), merged); err != nil {
+		return err
+	}
+	if res.Verdict == "FAIL" {
+		e.publish(runID, "attack", "error", id+" FAILED — a gate that should have rejected did not")
+	} else {
+		e.publish(runID, "attack", "done", id+": "+res.Verdict)
+	}
+	return nil
 }

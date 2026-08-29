@@ -228,7 +228,18 @@ func TestScenarioRerunUpdatesRowInPlace(t *testing.T) {
 	if len(rows) != 2 { // header + 1
 		t.Fatalf("re-running a scenario appended a duplicate row: %v", rows)
 	}
-	if verdict := rows[1][5]; verdict != "PASS" {
+	// Look the column up by name: hardcoding an index means a schema change
+	// silently reads the wrong field instead of failing honestly.
+	col := -1
+	for i, h := range rows[0] {
+		if h == "verdict" {
+			col = i
+		}
+	}
+	if col < 0 {
+		t.Fatalf("negative-tests.csv has no verdict column: %v", rows[0])
+	}
+	if verdict := rows[1][col]; verdict != "PASS" {
 		t.Errorf("verdict = %q, want PASS (the re-run should replace the earlier FAIL)", verdict)
 	}
 }

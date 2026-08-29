@@ -50,6 +50,10 @@ type ElectionConfig struct {
 	// READ, not how it is produced, which is why this never reaches
 	// saksi-demo. Zero means "single-winner", the previous behaviour.
 	SenateSeats int `json:"senate_seats"`
+	// SkipAttacks hides the in-lifecycle attack panels for a clean end-to-end
+	// run. The attacks are opt-in either way; this removes the offer entirely
+	// so a straight demonstration is one click.
+	SkipAttacks bool `json:"skip_attacks"`
 }
 
 // SenatePosition is the ballot index of the multi-seat race (President 0,
