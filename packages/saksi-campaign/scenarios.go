@@ -613,36 +613,25 @@ func (s Scenario) LiveCapable() bool {
 	return s.Stage == StageDKG || s.Stage == StageBallots || s.Stage == StageCeremony
 }
 
-// runLiveScenario mounts a REAL attack against the running election: apply the
-// mutation, then submit the tampered artifact to the peer and let the chaincode
-// refuse it. Its rejection message is the result.
-//
-// The verdict is inverted relative to an honest submission — an error is PASS,
-// and a successful commit is FAIL, because a tampered artifact the ledger
-// accepted is a genuine finding. Nothing here can corrupt the real election:
-// the chaincode declines the write, and that refusal is the demonstration.
+// attackSubmitter is the slice of the bulletin client a live attack needs.
+// Narrowing it to three methods is what lets the verdict logic — which INVERTS,
+// treating a rejection as a pass — be tested without a Fabric network.
+// *clientsdk.BulletinClient satisfies it as it stands.
+type attackSubmitter interface {
+	SubmitBallot(ballotHex string) error
+	SubmitPartialDecryption(electionID, partialHex string) error
+	PublishDKGTranscript(transcriptHex string) error
+}
+
+// runLiveScenario mounts a REAL attack against the running election: dial the
+// peer, then hand off to mountLiveAttack.
 func (e *Executor) runLiveScenario(ctx context.Context, runID, srcDir string, sc Scenario) ScenarioResult {
-	res := ScenarioResult{
-		Scenario: sc.ID, Layer: sc.Layer.String(), Action: sc.Action,
-		Expected: sc.Expected, Property: sc.Property, Stage: sc.Stage, OnChain: true,
-	}
+	res := newLiveResult(sc)
 	if !sc.LiveCapable() {
 		res.Verdict = "SKIPPED"
 		res.Actual = "not mountable as a single submission — runs as a simulation instead"
 		return res
 	}
-
-	// Mutate a COPY. The live election's own artifacts are never touched.
-	scenDir := filepath.Join(srcDir, "scenarios", "live-"+sc.ID)
-	if err := copyStream(srcDir, scenDir); err != nil {
-		res.Verdict, res.Actual = "FAIL", "could not copy run: "+err.Error()
-		return res
-	}
-	if err := sc.Mutate(scenDir); err != nil {
-		res.Verdict, res.Actual = "FAIL", "mutation error: "+err.Error()
-		return res
-	}
-
 	conn, err := e.fabric.Connect()
 	if err != nil {
 		res.Verdict, res.Actual = "SKIPPED", "connect to Fabric: "+err.Error()
@@ -653,6 +642,40 @@ func (e *Executor) runLiveScenario(ctx context.Context, runID, srcDir string, sc
 	b, err := e.readBundle(runID)
 	if err != nil {
 		res.Verdict, res.Actual = "FAIL", "read bundle: "+err.Error()
+		return res
+	}
+	return e.mountLiveAttack(runID, srcDir, sc, conn.Bulletin, b.ElectionID)
+}
+
+func newLiveResult(sc Scenario) ScenarioResult {
+	return ScenarioResult{
+		Scenario: sc.ID, Layer: sc.Layer.String(), Action: sc.Action,
+		Expected: sc.Expected, Property: sc.Property, Stage: sc.Stage, OnChain: true,
+	}
+}
+
+// mountLiveAttack applies the mutation and submits the tampered artifact,
+// expecting the chaincode to refuse it. Its rejection message is the result.
+//
+// THE VERDICT IS INVERTED HERE, and that is the whole point: an error is PASS,
+// because the ledger did its job; a successful commit is FAIL, because a
+// tampered artifact the ledger accepted is a genuine finding. Getting this
+// backwards would report a broken gate as green, so it is tested directly.
+//
+// Nothing here can corrupt the real election: the mutation is applied to a
+// COPY, and the chaincode declines the write.
+func (e *Executor) mountLiveAttack(
+	runID, srcDir string, sc Scenario, sub attackSubmitter, electionID string,
+) ScenarioResult {
+	res := newLiveResult(sc)
+
+	scenDir := filepath.Join(srcDir, "scenarios", "live-"+sc.ID)
+	if err := copyStream(srcDir, scenDir); err != nil {
+		res.Verdict, res.Actual = "FAIL", "could not copy run: "+err.Error()
+		return res
+	}
+	if err := sc.Mutate(scenDir); err != nil {
+		res.Verdict, res.Actual = "FAIL", "mutation error: "+err.Error()
 		return res
 	}
 
@@ -669,7 +692,7 @@ func (e *Executor) runLiveScenario(ctx context.Context, runID, srcDir string, sc
 		}
 		e.publish(runID, "attack", "info",
 			fmt.Sprintf("%s: submitting tampered ballot %d to the peer…", sc.ID, idx))
-		submitErr = conn.Bulletin.SubmitBallot(hexLine)
+		submitErr = sub.SubmitBallot(hexLine)
 	case StageCeremony:
 		hexVal, err := firstChangedHeaderList(srcDir, scenDir, "partial_decryptions")
 		if err != nil {
@@ -677,7 +700,7 @@ func (e *Executor) runLiveScenario(ctx context.Context, runID, srcDir string, sc
 			return res
 		}
 		e.publish(runID, "attack", "info", sc.ID+": submitting tampered partial decryption…")
-		submitErr = conn.Bulletin.SubmitPartialDecryption(b.ElectionID, hexVal)
+		submitErr = sub.SubmitPartialDecryption(electionID, hexVal)
 	case StageDKG:
 		hexVal, err := changedHeaderField(srcDir, scenDir, "dkg")
 		if err != nil {
@@ -685,7 +708,11 @@ func (e *Executor) runLiveScenario(ctx context.Context, runID, srcDir string, sc
 			return res
 		}
 		e.publish(runID, "attack", "info", sc.ID+": submitting tampered DKG transcript…")
-		submitErr = conn.Bulletin.PublishDKGTranscript(hexVal)
+		submitErr = sub.PublishDKGTranscript(hexVal)
+	default:
+		res.Verdict = "SKIPPED"
+		res.Actual = "stage " + sc.Stage + " is not mountable as a single submission"
+		return res
 	}
 
 	if submitErr != nil {

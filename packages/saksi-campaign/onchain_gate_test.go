@@ -156,3 +156,28 @@ func TestListingsCarryStageAndLiveFlags(t *testing.T) {
 		}
 	}
 }
+
+// A run that asked to skip attacks must not be offered any. The panels are
+// opt-in either way, but the flag is what makes a clean end-to-end run one
+// click, so it needs to survive into the stored config.
+func TestSkipAttacksIsRecordedOnTheRun(t *testing.T) {
+	store := NewRunStore(t.TempDir())
+	c := good()
+	c.SkipAttacks = true
+	runID, _, err := store.Create(c, time.Now())
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	recs, err := store.List()
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	for _, r := range recs {
+		if r.RunID == runID && !r.Config.SkipAttacks {
+			t.Error("skip_attacks did not survive into the stored run config")
+		}
+	}
+	if err := c.Validate(); err != nil {
+		t.Errorf("a skip-attacks run should still validate: %v", err)
+	}
+}
