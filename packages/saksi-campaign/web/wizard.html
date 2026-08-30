@@ -900,6 +900,86 @@ function renderBoard(rows) {
   $("boardWrap").style.display = "block";
 }
 
+/* ---- attacks mounted during the election -------------------------------- */
+// Each protocol step offers the attacks that belong at its point in the
+// lifecycle, so the election is seen defending itself rather than being tested
+// afterwards. On-chain these are REAL submissions the chaincode refuses;
+// offline they are simulated against a copy, and labelled as such.
+const STAGE_TITLES = {
+  dkg:      "Attacks before any ballot is cast",
+  ballots:  "Attacks while ballots are being submitted",
+  close:    "Attacks on the sealed ballot box",
+  ceremony: "Attacks during the trustee ceremony",
+};
+const skippedStages = new Set();
+
+async function renderStages(stages, boxID) {
+  const box = $(boxID);
+  if (!box) return;
+  if (!runID || (cfg && cfg.skip_attacks) || (cfg && cfg.mode === "groundtruth")) {
+    box.style.display = "none";
+    return;
+  }
+  if (!attacks.length) { try { await loadAttacks(); } catch (_) { return; } }
+
+  const live = cfg && cfg.mode === "onchain" && caps.fabric;
+  const parts = stages.filter((st) => !skippedStages.has(st)).map((stage) => {
+    const rows = attacks.filter((a) => a.stage === stage);
+    if (!rows.length) return "";
+    const head = '<div class="stagehead"><h3>' + esc(STAGE_TITLES[stage] || stage) +
+      '</h3><button class="small skip" data-skipstage="' + esc(stage) + '">Skip</button></div>';
+    return head + rows.map((a) => {
+      const canLive = live && a.live;
+      const how = a.verdict
+        ? (a.was_live ? '<span class="pill ok">refused by the ledger</span>'
+                      : '<span class="pill">simulated</span>')
+        : (canLive ? '<span class="pill warn">real submission</span>'
+                   : '<span class="pill">simulated</span>');
+      const verdict = a.verdict === "PASS"
+        ? '<span class="verdict pass"><span class="dot2"></span>rejected</span>'
+        : a.verdict === "FAIL"
+          ? '<span class="verdict fail"><span class="dot2"></span>NOT REJECTED</span>'
+          : a.verdict === "SKIPPED" ? '<span class="pill warn">not run</span>' : "";
+      return '<div class="atk"><div class="body">' +
+        '<div class="nm">' + esc(a.id) + " " + how + "</div>" +
+        '<div class="why">' + esc(a.action) + " \u2014 expected: " + esc(a.expected) + "</div>" +
+        (a.actual ? '<div class="out muted">' + esc(a.actual) + "</div>" : "") +
+        '</div><div class="act">' + verdict +
+        '<button class="small" data-atk="' + esc(a.id) + '">' +
+        (a.verdict ? "Run again" : "Run") + "</button></div></div>";
+    }).join("");
+  }).join("");
+
+  box.innerHTML = parts;
+  box.style.display = parts ? "block" : "none";
+  box.querySelectorAll("[data-skipstage]").forEach((b) => {
+    b.onclick = () => { skippedStages.add(b.dataset.skipstage); renderStages(stages, boxID); };
+  });
+  box.querySelectorAll("[data-atk]").forEach((b) => {
+    b.onclick = () => runStagedAttack(b.dataset.atk, stages, boxID, b);
+  });
+}
+
+async function runStagedAttack(id, stages, boxID, btn) {
+  btn.disabled = true;
+  btn.textContent = "running\u2026";
+  const errEl = boxID === "stage4" ? "err3" : "err2";
+  try {
+    await post("/attack", { run_id: runID, scenario: id }, errEl);
+  } catch (_) {
+    btn.disabled = false;
+    btn.textContent = "Run";
+    return;
+  }
+  openStream(runID, async (e) => {
+    if (e.phase !== "attack") return;
+    if (e.level === "done" || e.level === "error") {
+      await loadAttacks();
+      await renderStages(stages, boxID);
+    }
+  });
+}
+
 /* ---- step 7..N: attacks, one per step ---------------------------------- */
 async function loadAttacks() {
   const res = await fetch(`/api/scenarios/${encodeURIComponent(runID)}`);
