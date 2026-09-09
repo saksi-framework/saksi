@@ -25,6 +25,10 @@ type RunRecord struct {
 	RunID     string         `json:"run_id"`
 	Config    ElectionConfig `json:"config"`
 	CreatedAt time.Time      `json:"created_at"`
+	// Commit pins the exact code the run executed against ("saksi", "console"
+	// git HEADs), filled from the environment snapshot (see CollectEnv in
+	// journal.go) by the caller.
+	Commit map[string]string `json:"commit,omitempty"`
 }
 
 // RunStore owns the run-folder tree under root. It hands out traversal-safe run

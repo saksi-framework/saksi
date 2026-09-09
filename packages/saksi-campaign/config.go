@@ -18,9 +18,9 @@ import (
 const MaxTrustees = 15
 
 // OfflineVoterCeiling caps offline-mode voters. Offline generation is not
-// parallelized, so the 50k/483k/1M tiers are on-chain/perf mode only; a
-// researcher clicking a huge offline tier gets a clear error, not a run that
-// never finishes.
+// parallelized, so the 50k/483k/1M tiers need ground-truth mode until the
+// streaming generator lands; a researcher clicking a huge offline tier gets a
+// clear error, not a run that never finishes.
 const OfflineVoterCeiling = 10000
 
 // Trustee is one DKG trustee's display identity.
@@ -115,7 +115,7 @@ func (c ElectionConfig) Validate() error {
 	}
 	if c.Mode == "offline" && c.Voters > OfflineVoterCeiling {
 		return fmt.Errorf(
-			"offline mode is capped at %d voters (got %d); select on-chain/perf mode for larger tiers",
+			"offline mode is capped at %d voters (got %d); use ground-truth mode for larger tiers until the streaming generator lands",
 			OfflineVoterCeiling, c.Voters)
 	}
 	return nil
