@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -27,9 +28,9 @@ type TrailEvent struct {
 
 const receiptsCSVHeader = "event,ref,tx_id,block_number,block_hash,data_hash,previous_hash,timestamp"
 
-// receiptsCSVFields is len(strings.Split(receiptsCSVHeader, ",")) — the
-// column count every well-formed data row must have.
-const receiptsCSVFields = 8
+// receiptsCSVFields is the column count every well-formed data row must
+// have, derived from receiptsCSVHeader so the two can never drift apart.
+var receiptsCSVFields = strings.Count(receiptsCSVHeader, ",") + 1
 
 // ErrTruncatedReceipts is returned by readReceipts alongside the rows parsed
 // so far when receipts.csv's last line is a partial write (a crash mid
@@ -45,6 +46,14 @@ type receiptsWriter struct {
 	f      *os.File // receipts.csv
 	trail  *os.File // trail.ndjson
 	runDir string
+
+	// refs counts live holders of this writer (one per lifecycle() call that
+	// hasn't yet been matched by a closeReceipts). Guarded by the owning
+	// Executor's receiptsMu, not mu — only Executor.openReceiptsFor/
+	// closeReceipts touch it, and always while holding receiptsMu, so a
+	// second caller sharing the cached writer can never have it closed out
+	// from under a still-in-flight write.
+	refs int
 }
 
 // openReceipts opens <runDir>/receipts.csv (O_APPEND|O_CREATE|O_WRONLY) and
@@ -114,15 +123,11 @@ func (w *receiptsWriter) writeCSVRow(ev TrailEvent) error {
 	return err
 }
 
-// Close closes both underlying files.
+// Close closes both underlying files, joining both errors if both fail.
 func (w *receiptsWriter) Close() error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	err := w.f.Close()
-	if terr := w.trail.Close(); err == nil {
-		err = terr
-	}
-	return err
+	return errors.Join(w.f.Close(), w.trail.Close())
 }
 
 // readReceipts parses receipts.csv with encoding/csv. A crash mid-Append

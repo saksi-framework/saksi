@@ -354,19 +354,24 @@ func (e *Executor) lifecycle(runID string, led clientsdk.Ledger, bundlePath, pha
 }
 
 // openReceiptsFor returns the run's receiptsWriter, opening it lazily (and
-// caching it on the Executor) if this is the first lifecycle call for runID.
-// Later steps on the same run — and a later benchmark task reusing the writer
-// after a window — reuse the same open file handles rather than reopening.
+// caching it on the Executor) if this is the first live caller for runID, and
+// incrementing its refcount either way. Later steps on the same run — and a
+// later benchmark task reusing the writer after a window — reuse the same
+// open file handles rather than reopening. Every successful call here must be
+// matched by exactly one closeReceipts call, or the writer (and its open
+// files) leaks.
 func (e *Executor) openReceiptsFor(runID, runDir string) (*receiptsWriter, error) {
 	e.receiptsMu.Lock()
 	defer e.receiptsMu.Unlock()
 	if w, ok := e.receipts[runID]; ok {
+		w.refs++
 		return w, nil
 	}
 	w, err := openReceipts(runDir)
 	if err != nil {
 		return nil, err
 	}
+	w.refs = 1
 	if e.receipts == nil {
 		e.receipts = make(map[string]*receiptsWriter)
 	}
@@ -374,18 +379,27 @@ func (e *Executor) openReceiptsFor(runID, runDir string) (*receiptsWriter, error
 	return w, nil
 }
 
-// closeReceipts closes and forgets runID's receiptsWriter, if one is open.
-// Called at the end of submitOnChain and at the end of each ceremony action.
+// closeReceipts releases this caller's reference to runID's receiptsWriter,
+// closing the underlying files and forgetting the writer only once every
+// caller that opened it (openReceiptsFor) has released it — a concurrent
+// second caller sharing the same cached writer (e.g. two overlapping ceremony
+// actions on the same run) can otherwise have it closed out from under a
+// still-in-flight Append/Lifecycle write. Called at the end of submitOnChain
+// and at the end of each ceremony action.
 func (e *Executor) closeReceipts(runID string) error {
 	e.receiptsMu.Lock()
 	w, ok := e.receipts[runID]
-	if ok {
-		delete(e.receipts, runID)
-	}
-	e.receiptsMu.Unlock()
 	if !ok {
+		e.receiptsMu.Unlock()
 		return nil
 	}
+	w.refs--
+	if w.refs > 0 {
+		e.receiptsMu.Unlock()
+		return nil
+	}
+	delete(e.receipts, runID)
+	e.receiptsMu.Unlock()
 	return w.Close()
 }
 
