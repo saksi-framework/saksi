@@ -149,7 +149,7 @@ fn io_err(path: &Path) -> impl Fn(std::io::Error) -> String + '_ {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fixtures::{tally_selections, SelectionProfile};
+    use crate::fixtures::{select_candidate, tally_selections, SelectionProfile};
 
     fn params(
         voters: usize,
