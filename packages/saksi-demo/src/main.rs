@@ -7,8 +7,11 @@
 //!   (population), `--election-id S --election-name S --threshold T --trustees N
 //!   --trustee-names a,b,c` (identity + t-of-n DKG), and `--stream <dir>` to emit
 //!   a streamed `header.json` + `ballots.ndjson` run folder instead of a one-blob
-//!   bundle. With no flags, emits the legacy happy-path bundle; any flag switches
-//!   to the parameterized generator (after the fail-closed validation gate).
+//!   bundle. A stream is generated in chunks of `--chunk N` voters (default
+//!   5000; `--chunk 0` selects the old single-pass writer), and also writes
+//!   `gen-timings.json`. With no flags, emits the legacy happy-path bundle; any
+//!   flag switches to the parameterized generator (after the fail-closed
+//!   validation gate).
 //! - `audit <bundle.json>` — audit a one-blob bundle; exits non-zero on FAIL.
 //! - `audit-stream <dir> [--json]` — audit a stream run folder; with `--json`,
 //!   prints structured per-contest correctness `{overall, contests:[{contest,
@@ -19,9 +22,11 @@ use std::process::ExitCode;
 
 use saksi_auditor::demo::{
     audit_bundle_json, audit_stream_dir, election_bundle_json, election_bundle_json_params,
-    write_election_stream_params, GenParams, SelectionProfile,
+    write_election_stream_params, write_election_stream_params_chunked, GenParams,
+    SelectionProfile,
 };
 use saksi_auditor::ground_truth::write_ground_truth_csvs;
+use saksi_auditor::stream::DEFAULT_CHUNK_VOTERS;
 use saksi_auditor::{AuditReport, AuditStatus};
 
 fn main() -> ExitCode {
@@ -35,7 +40,7 @@ fn main() -> ExitCode {
             eprintln!(
                 "usage: saksi-demo <gen [--voters N] [--positions P] [--candidates C] \
                  [--distribution uniform|skewed|realistic] [--election-id S] [--election-name S] \
-                 [--threshold T] [--trustees N] [--trustee-names a,b,c] [--stream DIR] [outfile] \
+                 [--threshold T] [--trustees N] [--trustee-names a,b,c] [--stream DIR] [--chunk N] [outfile] \
                  | gen-ground-truth [--voters N] [--positions P] [--candidates C] \
                  [--distribution uniform|skewed|realistic] [--election-id S] --out-dir DIR \
                  | audit <bundle.json> | audit-stream <dir> [--json]>"
@@ -61,6 +66,9 @@ struct ParsedGen {
     params: GenParams,
     target: GenTarget,
     parameterized: bool,
+    /// Voters per generation chunk for `--stream`. `0` selects the single-pass
+    /// writer that builds the whole population before writing it.
+    chunk: usize,
 }
 
 /// Simple majority threshold for `n` trustees (`⌊n/2⌋ + 1`).
@@ -75,6 +83,7 @@ fn parse_gen_args(args: &[String]) -> Result<ParsedGen, String> {
     let (mut threshold, mut trustees): (Option<usize>, Option<usize>) = (None, None);
     let mut trustee_names: Option<Vec<String>> = None;
     let mut stream: Option<String> = None;
+    let mut chunk: Option<usize> = None;
     let mut out: Option<String> = None;
 
     let parse_usize = |v: Option<&String>, name: &str| -> Result<usize, String> {
@@ -144,6 +153,14 @@ fn parse_gen_args(args: &[String]) -> Result<ParsedGen, String> {
                 stream = Some(take(args.get(i + 1), "--stream")?);
                 i += 2;
             }
+            "--chunk" => {
+                chunk = Some(
+                    args.get(i + 1)
+                        .and_then(|s| s.parse::<usize>().ok())
+                        .ok_or_else(|| "--chunk needs a non-negative integer".to_string())?,
+                );
+                i += 2;
+            }
             other => {
                 out = Some(other.to_string());
                 i += 1;
@@ -196,6 +213,7 @@ fn parse_gen_args(args: &[String]) -> Result<ParsedGen, String> {
         params,
         target,
         parameterized,
+        chunk: chunk.unwrap_or(DEFAULT_CHUNK_VOTERS),
     })
 }
 
@@ -277,6 +295,7 @@ fn cmd_gen(args: &[String]) -> ExitCode {
         params,
         target,
         parameterized,
+        chunk,
     } = match parse_gen_args(args) {
         Ok(p) => p,
         Err(e) => {
@@ -291,16 +310,30 @@ fn cmd_gen(args: &[String]) -> ExitCode {
     );
 
     match target {
-        GenTarget::Stream(dir) => match write_election_stream_params(Path::new(&dir), &params) {
-            Ok(()) => {
-                eprintln!("wrote stream ({summary}; gate passed) -> {dir}");
-                ExitCode::SUCCESS
+        GenTarget::Stream(dir) => {
+            // Chunked by default (bounded memory, rayon inside a chunk);
+            // `--chunk 0` asks for the original single-pass writer.
+            let written = if chunk == 0 {
+                write_election_stream_params(Path::new(&dir), &params)
+            } else {
+                write_election_stream_params_chunked(Path::new(&dir), &params, chunk)
+            };
+            match written {
+                Ok(()) => {
+                    let how = if chunk == 0 {
+                        "single pass".to_string()
+                    } else {
+                        format!("chunks of {chunk} voters")
+                    };
+                    eprintln!("wrote stream ({summary}; {how}; gate passed) -> {dir}");
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("validation gate rejected the population: {e}");
+                    ExitCode::FAILURE
+                }
             }
-            Err(e) => {
-                eprintln!("validation gate rejected the population: {e}");
-                ExitCode::FAILURE
-            }
-        },
+        }
         GenTarget::Bundle(out) => {
             let json = if parameterized {
                 match election_bundle_json_params(&params) {
@@ -480,6 +513,29 @@ mod tests {
         let p = parse_gen_args(&sv(&["--trustees", "4"])).expect("parses");
         assert_eq!(p.params.trustee_names.len(), 4);
         assert_eq!(p.params.threshold, 3); // default_majority(4) = 3
+    }
+
+    #[test]
+    fn parse_gen_args_defaults_the_chunk_size_and_reads_an_override() {
+        assert_eq!(
+            parse_gen_args(&sv(&[])).expect("parses").chunk,
+            DEFAULT_CHUNK_VOTERS,
+            "streams are chunked by default"
+        );
+        assert_eq!(
+            parse_gen_args(&sv(&["--chunk", "250"]))
+                .expect("parses")
+                .chunk,
+            250
+        );
+        // 0 is the escape hatch to the original single-pass writer.
+        assert_eq!(
+            parse_gen_args(&sv(&["--chunk", "0"]))
+                .expect("parses")
+                .chunk,
+            0
+        );
+        assert!(parse_gen_args(&sv(&["--chunk", "x"])).is_err());
     }
 
     #[test]
