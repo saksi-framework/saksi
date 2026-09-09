@@ -11,6 +11,7 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/hyperledger/fabric-protos-go-apiv2/common"
 	clientsdk "github.com/saksi-framework/saksi/packages/saksi-bulletin/client-sdk"
 )
 
@@ -18,6 +19,12 @@ type fakeLedger struct {
 	calls   []string // fn name, in call order
 	failOn  string   // fn name to fail on ("" = never)
 	nextBlk uint64
+	// blocks is the minimal in-memory chain fakeLedger hands out: block n
+	// holds the txIDs Submit/SubmitWithReceipt reported as landing there.
+	// A trivially "linked" chain (previous_hash = the block number as bytes)
+	// is enough here — nothing in campaign asserts on VerifyChain's output,
+	// this just has to compile and stay deterministic.
+	blocks map[uint64][]string
 }
 
 func (f *fakeLedger) SubmitWithReceipt(fn string, args ...string) ([]byte, clientsdk.Receipt, error) {
@@ -26,10 +33,47 @@ func (f *fakeLedger) SubmitWithReceipt(fn string, args ...string) ([]byte, clien
 		return nil, clientsdk.Receipt{}, errors.New("boom")
 	}
 	f.nextBlk++
-	return nil, clientsdk.Receipt{TxID: fmt.Sprintf("tx-%d", f.nextBlk), BlockNumber: f.nextBlk}, nil
+	txID := fmt.Sprintf("tx-%d", f.nextBlk)
+	f.recordBlock(f.nextBlk, txID)
+	return nil, clientsdk.Receipt{TxID: txID, BlockNumber: f.nextBlk}, nil
+}
+func (f *fakeLedger) Submit(fn string, args ...string) (string, uint64, error) {
+	f.calls = append(f.calls, fn)
+	if fn == f.failOn {
+		return "", 0, errors.New("boom")
+	}
+	f.nextBlk++
+	txID := fmt.Sprintf("tx-%d", f.nextBlk)
+	f.recordBlock(f.nextBlk, txID)
+	return txID, f.nextBlk, nil
+}
+func (f *fakeLedger) recordBlock(n uint64, txID string) {
+	if f.blocks == nil {
+		f.blocks = map[uint64][]string{}
+	}
+	f.blocks[n] = append(f.blocks[n], txID)
 }
 func (f *fakeLedger) LedgerReceipt(string) (clientsdk.Receipt, error) {
 	return clientsdk.Receipt{}, nil
+}
+func (f *fakeLedger) GetBlockByNumber(n uint64) (*common.Block, error) {
+	return &common.Block{Header: &common.BlockHeader{Number: n}}, nil
+}
+func (f *fakeLedger) ReceiptsForBlock(n uint64, txIDs []string) ([]clientsdk.Receipt, error) {
+	present := make(map[string]bool, len(f.blocks[n]))
+	for _, id := range f.blocks[n] {
+		present[id] = true
+	}
+	receipts := make([]clientsdk.Receipt, 0, len(txIDs))
+	for _, id := range txIDs {
+		if present[id] {
+			receipts = append(receipts, clientsdk.Receipt{TxID: id, BlockNumber: n})
+		}
+	}
+	return receipts, nil
+}
+func (f *fakeLedger) VerifyChain(from, to uint64, sample []clientsdk.Receipt) (clientsdk.ChainReport, error) {
+	return clientsdk.ChainReport{Blocks: int(to - from + 1), Linked: true, Status: "PASS"}, nil
 }
 func (f *fakeLedger) ChainInfo() (uint64, []byte, error) { return f.nextBlk + 1, nil, nil }
 
