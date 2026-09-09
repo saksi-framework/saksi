@@ -200,6 +200,7 @@ func (e *Executor) CeremonyStart(ctx context.Context, runID string, c ElectionCo
 	if err != nil {
 		return err
 	}
+	defer e.closeReceipts(runID)
 	if err := e.setupOnChain(ctx, b, step); err != nil {
 		return err
 	}
@@ -249,6 +250,7 @@ func (e *Executor) CeremonySubmit(ctx context.Context, runID string, c ElectionC
 	if err != nil {
 		return err
 	}
+	defer e.closeReceipts(runID)
 	for i, pd := range mine {
 		ref := fmt.Sprintf("%s/%d", name, i)
 		if err := step(ctx, "SubmitPartialDecryption", ref, "SubmitPartialDecryption", b.ElectionID, pd); err != nil {
@@ -298,6 +300,7 @@ func (e *Executor) CeremonyPublish(ctx context.Context, runID string, c Election
 	if err != nil {
 		return err
 	}
+	defer e.closeReceipts(runID)
 	if err := step(ctx, "PublishTally", "", "PublishTally", b.Tally); err != nil {
 		return err
 	}

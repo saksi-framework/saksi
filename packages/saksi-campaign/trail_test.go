@@ -67,8 +67,9 @@ func hexElectionParams(t *testing.T, contestIDs []string) string {
 	return hex.EncodeToString(raw)
 }
 
-// writeFixtureTrail writes a 2-event trail.json into dir, mirroring what
-// appendReceipt would have produced during an on-chain Submit.
+// writeFixtureTrail writes a 2-event trail.json into dir, mirroring what a
+// pre-Task-2 run recorded (the legacy whole-array format readTrailEvents
+// falls back to when trail.ndjson is absent).
 func writeFixtureTrail(t *testing.T, dir string) {
 	t.Helper()
 	events := []TrailEvent{
@@ -238,6 +239,48 @@ func TestBuildTrailMissingTrailJSONIsEmptyEvents(t *testing.T) {
 	}
 	if len(got.Events) != 0 {
 		t.Fatalf("want 0 events, got %v", got.Events)
+	}
+}
+
+func TestReadTrailEventsPrefersNDJSONOverJSONFallback(t *testing.T) {
+	dir := t.TempDir()
+	writeFixtureTrail(t, dir) // trail.json: 2 events (CreateElection, SubmitBallot)
+
+	ndjsonEvents := []TrailEvent{
+		{Event: "CreateElection", Ref: "election", Receipt: clientsdk.Receipt{TxID: "tx-a", BlockNumber: 1}},
+	}
+	var buf strings.Builder
+	for _, ev := range ndjsonEvents {
+		b, err := json.Marshal(ev)
+		if err != nil {
+			t.Fatal(err)
+		}
+		buf.Write(b)
+		buf.WriteByte('\n')
+	}
+	if err := os.WriteFile(filepath.Join(dir, "trail.ndjson"), []byte(buf.String()), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := readTrailEvents(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].Event != "CreateElection" || got[0].Receipt.TxID != "tx-a" {
+		t.Fatalf("want the single trail.ndjson event (ignoring trail.json), got %+v", got)
+	}
+}
+
+func TestReadTrailEventsFallsBackToJSONWhenNDJSONAbsent(t *testing.T) {
+	dir := t.TempDir()
+	writeFixtureTrail(t, dir) // trail.json only, no trail.ndjson
+
+	got, err := readTrailEvents(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 || got[1].Event != "SubmitBallot" {
+		t.Fatalf("want the 2 fixture trail.json events, got %+v", got)
 	}
 }
 

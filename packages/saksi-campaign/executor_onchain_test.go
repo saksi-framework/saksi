@@ -46,7 +46,7 @@ func writeTestBundle(t *testing.T, dir string) string {
 
 // newTestExecutor builds an Executor rooted at dir (same NewExecutor
 // constructor executor_test.go's newRun uses) and pre-creates the "run-1" run
-// folder so submitOnChain's appendReceipt has somewhere to write.
+// folder so submitOnChain's receiptsWriter has somewhere to write.
 func newTestExecutor(t *testing.T, dir string) *Executor {
 	t.Helper()
 	store := NewRunStore(dir)

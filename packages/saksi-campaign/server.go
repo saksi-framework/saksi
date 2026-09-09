@@ -38,7 +38,8 @@ var exportOrder = []string{
 	RunFile,
 	"receipts.csv",
 	CheckFile,
-	trailJSONFile,
+	trailNDJSONFile, // new runs (Task 2+)
+	trailJSONFile,   // legacy runs recorded before trail.ndjson
 }
 
 var exportAllowlist = func() map[string]bool {

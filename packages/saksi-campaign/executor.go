@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 
 	clientsdk "github.com/saksi-framework/saksi/packages/saksi-bulletin/client-sdk"
 )
@@ -65,6 +66,9 @@ type Executor struct {
 	consBin string // path to the on-chain console driver (Submit); "" = none
 	fabric  FabricConfig
 	run     Runner
+
+	receiptsMu sync.Mutex
+	receipts   map[string]*receiptsWriter // runID -> its open receiptsWriter (see openReceiptsFor/closeReceipts)
 }
 
 // NewExecutor wires the production runner. demoBin is the saksi-demo path;
@@ -267,7 +271,7 @@ type onChainBundle struct {
 // submitOnChain drives the full election lifecycle over led in order —
 // CreateElection, PublishDKGTranscript, SubmitBallot×each, CloseElection,
 // SubmitPartialDecryption×each, PublishTally — recording a receipt after every
-// committed step (appendReceipt) so a mid-lifecycle failure leaves the
+// committed step (via the run's receiptsWriter) so a mid-lifecycle failure leaves the
 // already-committed steps' evidence on disk. Chaincode arg forms mirror
 // cmd/saksi-console/main.go's calls.
 func (e *Executor) submitOnChain(ctx context.Context, runID string, c ElectionConfig, led clientsdk.Ledger, bundlePath string) error {
@@ -275,6 +279,7 @@ func (e *Executor) submitOnChain(ctx context.Context, runID string, c ElectionCo
 	if err != nil {
 		return err
 	}
+	defer e.closeReceipts(runID)
 	if err := e.setupOnChain(ctx, b, step); err != nil {
 		return err
 	}
@@ -316,6 +321,10 @@ func (e *Executor) lifecycle(runID string, led clientsdk.Ledger, bundlePath, pha
 	if err != nil {
 		return nil, nil, err
 	}
+	w, err := e.openReceiptsFor(runID, runDir)
+	if err != nil {
+		return nil, nil, err
+	}
 
 	step := func(ctx context.Context, event, ref, fn string, args ...string) error {
 		if err := ctx.Err(); err != nil {
@@ -326,7 +335,15 @@ func (e *Executor) lifecycle(runID string, led clientsdk.Ledger, bundlePath, pha
 			e.publish(runID, phase, "error", fmt.Sprintf("%s %s: %v", event, ref, err))
 			return fmt.Errorf("%s: %w", event, err)
 		}
-		if err := appendReceipt(runDir, TrailEvent{Event: event, Ref: ref, Receipt: receipt}); err != nil {
+		ev := TrailEvent{Event: event, Ref: ref, Receipt: receipt}
+		// SubmitBallot goes only to receipts.csv; every other lifecycle event
+		// goes to both receipts.csv and trail.ndjson.
+		if event == "SubmitBallot" {
+			err = w.Append(ev)
+		} else {
+			err = w.Lifecycle(ev)
+		}
+		if err != nil {
 			return err
 		}
 		e.publish(runID, phase, "info", fmt.Sprintf("%s %s committed: block %d tx %s",
@@ -334,6 +351,42 @@ func (e *Executor) lifecycle(runID string, led clientsdk.Ledger, bundlePath, pha
 		return nil
 	}
 	return &b, step, nil
+}
+
+// openReceiptsFor returns the run's receiptsWriter, opening it lazily (and
+// caching it on the Executor) if this is the first lifecycle call for runID.
+// Later steps on the same run — and a later benchmark task reusing the writer
+// after a window — reuse the same open file handles rather than reopening.
+func (e *Executor) openReceiptsFor(runID, runDir string) (*receiptsWriter, error) {
+	e.receiptsMu.Lock()
+	defer e.receiptsMu.Unlock()
+	if w, ok := e.receipts[runID]; ok {
+		return w, nil
+	}
+	w, err := openReceipts(runDir)
+	if err != nil {
+		return nil, err
+	}
+	if e.receipts == nil {
+		e.receipts = make(map[string]*receiptsWriter)
+	}
+	e.receipts[runID] = w
+	return w, nil
+}
+
+// closeReceipts closes and forgets runID's receiptsWriter, if one is open.
+// Called at the end of submitOnChain and at the end of each ceremony action.
+func (e *Executor) closeReceipts(runID string) error {
+	e.receiptsMu.Lock()
+	w, ok := e.receipts[runID]
+	if ok {
+		delete(e.receipts, runID)
+	}
+	e.receiptsMu.Unlock()
+	if !ok {
+		return nil
+	}
+	return w.Close()
 }
 
 // setupOnChain runs the lifecycle prefix that must precede any trustee action:

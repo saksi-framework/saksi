@@ -1,6 +1,8 @@
 package campaign
 
 import (
+	"bufio"
+	"bytes"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -32,7 +34,7 @@ type trailResponse struct {
 	Sealed   bool         `json:"sealed"`
 	Status   string       `json:"status,omitempty"`
 	Election string       `json:"election_id"`
-	Events   []TrailEvent `json:"events,omitempty"` // from trail.json (recorded receipts)
+	Events   []TrailEvent `json:"events,omitempty"` // from trail.ndjson (or trail.json for legacy runs)
 	Live     *liveProof   `json:"live,omitempty"`   // fresh chain reads proving the records exist NOW
 	// Results is the decoded tally: contest id -> candidate label -> vote
 	// count. Only ever populated alongside a non-empty Live.TallyHex (never
@@ -57,6 +59,11 @@ type liveProof struct {
 }
 
 const trailJSONFile = "trail.json"
+
+// trailNDJSONFile replaces trailJSONFile going forward (Task 2): one JSON
+// TrailEvent per line, append-only, never rewritten. trailJSONFile is kept
+// only as the read-side fallback for runs recorded before this change.
+const trailNDJSONFile = "trail.ndjson"
 
 // buildTrail assembles the trail view for an election. The gate is fail-closed
 // on the tally, not the lifecycle status: the chaincode never sets a "tallied"
@@ -202,9 +209,44 @@ func splitContestID(contestID string) (position, candidate string) {
 	return contestID, "cand0"
 }
 
-// readTrailEvents reads trail.json from the run folder. A missing file is not
-// an error — it just means no on-chain events have been recorded yet.
+// readTrailEvents reads the run's lifecycle trail: trail.ndjson (one JSON
+// TrailEvent per line) when present, falling back to the legacy trail.json
+// (whole-array) for runs recorded before Task 2 retired it. Neither file
+// existing is not an error — it just means no lifecycle events have been
+// recorded yet.
 func readTrailEvents(runDir string) ([]TrailEvent, error) {
+	f, err := os.Open(filepath.Join(runDir, trailNDJSONFile))
+	if os.IsNotExist(err) {
+		return readTrailJSONFallback(runDir)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("read trail.ndjson: %w", err)
+	}
+	defer f.Close()
+
+	var events []TrailEvent
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		line := bytes.TrimSpace(scanner.Bytes())
+		if len(line) == 0 {
+			continue
+		}
+		var ev TrailEvent
+		if err := json.Unmarshal(line, &ev); err != nil {
+			return nil, fmt.Errorf("decode trail.ndjson: %w", err)
+		}
+		events = append(events, ev)
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, fmt.Errorf("read trail.ndjson: %w", err)
+	}
+	return events, nil
+}
+
+// readTrailJSONFallback reads the legacy whole-array trail.json. A missing
+// file is not an error — it just means no on-chain events have been recorded
+// yet (or the run predates trail.ndjson but never got any events either).
+func readTrailJSONFallback(runDir string) ([]TrailEvent, error) {
 	data, err := os.ReadFile(filepath.Join(runDir, trailJSONFile))
 	if os.IsNotExist(err) {
 		return nil, nil
