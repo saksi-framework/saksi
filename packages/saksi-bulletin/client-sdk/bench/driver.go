@@ -101,9 +101,16 @@ func Run(ctx context.Context, n int, submit SubmitFunc, opts RunOpts) RunResult 
 		}()
 	}
 
-	var deadline time.Time
+	// runCtx folds MaxDuration into the same Done() channel as ctx, so both
+	// selects below react to a deadline the instant it lands — even while
+	// blocked waiting for a busy worker or a rate-limit tick — instead of
+	// only being checked once at the top of the loop (which could let one
+	// more index through after the deadline while blocked mid-select).
+	runCtx := ctx
 	if opts.MaxDuration > 0 {
-		deadline = start.Add(opts.MaxDuration)
+		var cancel context.CancelFunc
+		runCtx, cancel = context.WithTimeout(ctx, opts.MaxDuration)
+		defer cancel()
 	}
 
 	var tick *time.Ticker
@@ -113,26 +120,22 @@ func Run(ctx context.Context, n int, submit SubmitFunc, opts RunOpts) RunResult 
 	}
 
 	dispatched := 0
-	lastReported := 0
+	lastReported := -1 // -1 (not 0) so n==0 still fires the final OnProgress(0) below.
 	lastIndex := -1
 	stopped := false
 
 dispatchLoop:
 	for i := 0; i < n; i++ {
-		if !deadline.IsZero() && !time.Now().Before(deadline) {
-			stopped = true
-			break dispatchLoop
-		}
 		if tick != nil {
 			select {
-			case <-ctx.Done():
+			case <-runCtx.Done():
 				stopped = true
 				break dispatchLoop
 			case <-tick.C:
 			}
 		}
 		select {
-		case <-ctx.Done():
+		case <-runCtx.Done():
 			stopped = true
 			break dispatchLoop
 		case jobs <- i:

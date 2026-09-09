@@ -3,6 +3,7 @@ package bench
 import (
 	"context"
 	"fmt"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -193,6 +194,100 @@ func TestRunOnProgressFiresAtThousandBoundaries(t *testing.T) {
 	last := calls[len(calls)-1]
 	if last != n {
 		t.Fatalf("final OnProgress call = %d, want %d (n)", last, n)
+	}
+}
+
+// TestRunMaxDurationNeverDispatchesAfterDeadline covers review finding #1:
+// MaxDuration must be checked even while the dispatcher is blocked inside a
+// select (waiting for a busy worker or a rate-limit tick), not only at the
+// top of the loop — otherwise a deadline that lands mid-block still lets one
+// more index through once the block clears. 2 workers, each submit sleeping
+// 50ms, MaxDuration 60ms: every recorded dispatch time must be before the
+// deadline.
+func TestRunMaxDurationNeverDispatchesAfterDeadline(t *testing.T) {
+	const n = 100000
+	const concurrency = 2
+	maxDur := 60 * time.Millisecond
+
+	start := time.Now()
+	deadline := start.Add(maxDur)
+
+	var mu sync.Mutex
+	var dispatchTimes []time.Time
+
+	res := Run(context.Background(), n, func(i int) error {
+		mu.Lock()
+		dispatchTimes = append(dispatchTimes, time.Now())
+		mu.Unlock()
+		time.Sleep(50 * time.Millisecond)
+		return nil
+	}, RunOpts{Concurrency: concurrency, MaxDuration: maxDur})
+
+	if !res.Stopped {
+		t.Fatalf("Stopped = false, want true after MaxDuration elapsed")
+	}
+	// Grant a small tolerance for the gap between this test's `start` and
+	// Run's own internal `start` (both are captured moments apart) — the
+	// bug this guards against is a whole extra worker-busy-period (~50ms)
+	// late, not a few hundred microseconds.
+	tolerance := 5 * time.Millisecond
+	for i, dt := range dispatchTimes {
+		if dt.After(deadline.Add(tolerance)) {
+			t.Fatalf("dispatch %d happened at %v, %v after deadline %v (want none after it)",
+				i, dt, dt.Sub(deadline), deadline)
+		}
+	}
+}
+
+// TestRunSendRateCancelledStopsPromptly covers review finding #2: with
+// SendRate > 0 (an open-loop, slow send rate), a ctx cancellation mid-run
+// must stop the dispatcher promptly rather than waiting out the full
+// remaining schedule.
+func TestRunSendRateCancelledStopsPromptly(t *testing.T) {
+	const n = 1000000
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var mu sync.Mutex
+	var cancelAt time.Time
+	go func() {
+		time.Sleep(20 * time.Millisecond)
+		mu.Lock()
+		cancelAt = time.Now()
+		mu.Unlock()
+		cancel()
+	}()
+
+	// SendRate 10/s = 100ms between dispatches; uncancelled this would run
+	// for ~100 seconds. It must instead stop within ~200ms of the cancel.
+	res := Run(ctx, n, func(i int) error { return nil }, RunOpts{Concurrency: 4, SendRate: 10})
+	returned := time.Now()
+
+	if !res.Stopped {
+		t.Fatalf("Stopped = false, want true after ctx cancellation")
+	}
+	mu.Lock()
+	elapsed := returned.Sub(cancelAt)
+	mu.Unlock()
+	if elapsed > 200*time.Millisecond {
+		t.Fatalf("Run returned %v after cancel, want < 200ms", elapsed)
+	}
+}
+
+// TestRunZeroNCallsOnProgressOnce covers review finding #3: n == 0 must
+// still call OnProgress once (with 0), so a caller polling for completion
+// via the progress callback is not left waiting forever.
+func TestRunZeroNCallsOnProgressOnce(t *testing.T) {
+	var calls []int
+	res := Run(context.Background(), 0, func(i int) error { return nil }, RunOpts{
+		Concurrency: 4,
+		OnProgress:  func(done int) { calls = append(calls, done) },
+	})
+	if res.Submitted != 0 {
+		t.Fatalf("Submitted = %d, want 0", res.Submitted)
+	}
+	if len(calls) != 1 || calls[0] != 0 {
+		t.Fatalf("OnProgress calls = %v, want exactly [0]", calls)
 	}
 }
 
