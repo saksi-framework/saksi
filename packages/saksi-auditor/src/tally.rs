@@ -7,6 +7,7 @@
 //! `tally.totals[contest]`.
 
 use std::collections::HashMap;
+use std::time::Instant;
 
 use curve25519_dalek::{ristretto::RistrettoPoint, scalar::Scalar, traits::Identity};
 
@@ -44,6 +45,7 @@ pub(crate) fn verify_tally(
     decryption: &DecryptionVerification,
     eligible_ballot_count: usize,
     ground_truth: Option<&[u64]>,
+    timings: &mut crate::Timings,
     builder: &mut ReportBuilder,
 ) -> Vec<ContestEvidence> {
     let mut evidence: Vec<ContestEvidence> = Vec::new();
@@ -138,6 +140,7 @@ pub(crate) fn verify_tally(
         let subset = &verified[..threshold];
         let subset_indices: Vec<usize> = subset.iter().map(|s| s.trustee_index).collect();
 
+        let combine_started = Instant::now();
         let mut shared_secret = RistrettoPoint::identity();
         let mut bad_lagrange = false;
         for share in subset {
@@ -154,6 +157,7 @@ pub(crate) fn verify_tally(
             };
             shared_secret += lambda * share.share_point;
         }
+        timings.combine += combine_started.elapsed();
         if bad_lagrange {
             evidence.push(ContestEvidence {
                 contest_id: contest_id.clone(),
@@ -168,7 +172,9 @@ pub(crate) fn verify_tally(
 
         // Recover the integer tally in [0, eligible_ballot_count]: linear scan at
         // small tiers, baby-step giant-step at >= 50k (see decode_tally).
+        let decode_started = Instant::now();
         let decoded = decode_tally(plaintext_point, eligible_ballot_count as u64);
+        timings.decode += decode_started.elapsed();
 
         evidence.push(ContestEvidence {
             contest_id: contest_id.clone(),

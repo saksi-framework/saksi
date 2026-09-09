@@ -67,6 +67,9 @@ pub mod ground_truth;
 pub mod stream;
 
 use std::collections::HashMap;
+use std::time::{Duration, Instant};
+
+use curve25519_dalek::{ristretto::RistrettoPoint, traits::Identity};
 
 use saksi_credentials::IssuerPublicKey;
 use saksi_crypto::elgamal;
@@ -111,6 +114,55 @@ pub struct ElectionArtifacts<'a> {
     pub ground_truth: Option<&'a [u64]>,
 }
 
+/// How long the auditor spent in each of its four measured stages.
+///
+/// Measured with [`Instant`] at the stage boundaries of a single audit run:
+/// `verify_ballots` (per-ballot CDS + credential verification), `aggregate`
+/// (folding eligible ciphertexts into the per-contest homomorphic sum),
+/// `combine` (Lagrange-at-zero over the threshold partial decryptions), and
+/// `decode` (recovering the integer tally from the plaintext point). The four
+/// are disjoint spans of one thread, so their sum is at most the audit's wall
+/// time — the rest is DKG, partial-decryption proofs, and reporting.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Timings {
+    /// Per-ballot CDS OR-proof + credential-presentation verification.
+    pub verify_ballots: Duration,
+    /// Folding eligible ballots into the per-contest aggregate ciphertext.
+    pub aggregate: Duration,
+    /// Lagrange recombination of the threshold partial decryptions.
+    pub combine: Duration,
+    /// Discrete-log recovery of the integer tally from the plaintext point.
+    pub decode: Duration,
+}
+
+/// Everything the auditor needs **except** the ballots: the small, resident part
+/// of [`ElectionArtifacts`] that stays in memory while ballots stream past one
+/// at a time.
+pub(crate) struct AuditInputs<'a> {
+    pub(crate) parameters: &'a ElectionParameters,
+    pub(crate) dkg_transcript: &'a DKGTranscript,
+    pub(crate) partial_decryptions: &'a [PartialDecryption],
+    pub(crate) tally: &'a TallyResult,
+    pub(crate) binding_context: &'a [u8],
+    pub(crate) issuer_public_key: &'a IssuerPublicKey,
+    pub(crate) ground_truth: Option<&'a [u64]>,
+}
+
+impl<'a> ElectionArtifacts<'a> {
+    /// Borrow everything but the ballots (see [`AuditInputs`]).
+    fn inputs(&self) -> AuditInputs<'a> {
+        AuditInputs {
+            parameters: self.parameters,
+            dkg_transcript: self.dkg_transcript,
+            partial_decryptions: self.partial_decryptions,
+            tally: self.tally,
+            binding_context: self.binding_context,
+            issuer_public_key: self.issuer_public_key,
+            ground_truth: self.ground_truth,
+        }
+    }
+}
+
 /// Runs every audit check against `artifacts` and returns a structured
 /// [`AuditReport`].
 ///
@@ -121,82 +173,133 @@ pub fn audit(artifacts: ElectionArtifacts) -> AuditReport {
     audit_with_evidence(artifacts).0
 }
 
-/// Audit an election and also return the per-contest tally evidence (the
-/// aggregate ciphertext + recovered plaintext point the decrypt produced), so a
-/// consumer can surface the cryptographic proof of correctness, not just the
-/// verdict. `audit` is the thin wrapper that discards the evidence.
+/// Audit an in-memory `&[Ballot]` election: the thin wrapper over
+/// [`audit_streaming`] for callers that already hold every ballot (the one-blob
+/// bundle path and the auditor's own tests). Ballots are cloned one at a time
+/// into the streaming core and dropped after each is verified.
 pub(crate) fn audit_with_evidence(
     artifacts: ElectionArtifacts,
-) -> (AuditReport, Vec<crate::tally::ContestEvidence>) {
+) -> (AuditReport, Vec<crate::tally::ContestEvidence>, Timings) {
+    let ballots = artifacts.ballots.iter().cloned().map(Ok);
+    audit_streaming(artifacts.inputs(), ballots)
+}
+
+/// Audit an election whose ballots arrive as a stream.
+///
+/// Nothing per-ballot is retained: each item is verified, folded into the
+/// running per-contest aggregate ciphertext and the nullifier set, and dropped.
+/// Peak memory is therefore the nullifier set plus a constant, not the
+/// population — which is what makes the capstone tiers auditable at all.
+///
+/// A ballot the stream could not produce (`Err`) is recorded as a Fatal
+/// `ballot.decode` finding and iteration continues; the report never
+/// short-circuits.
+pub(crate) fn audit_streaming(
+    inputs: AuditInputs<'_>,
+    ballots: impl Iterator<Item = Result<Ballot, String>>,
+) -> (AuditReport, Vec<crate::tally::ContestEvidence>, Timings) {
     let mut builder = ReportBuilder::new();
+    let mut timings = Timings::default();
 
     // -- 1. Election parameters shape --------------------------------------
 
-    let params_ok = check_parameters(artifacts.parameters, &mut builder);
+    let params_ok = check_parameters(inputs.parameters, &mut builder);
     if !params_ok {
-        return (builder.finish(), Vec::new());
+        return (builder.finish(), Vec::new(), timings);
     }
 
     // -- 2-4. DKG transcript ----------------------------------------------
 
-    let dkg_verification = crate::dkg::verify_dkg_transcript(
-        artifacts.parameters,
-        artifacts.dkg_transcript,
-        &mut builder,
-    );
+    let dkg_verification =
+        crate::dkg::verify_dkg_transcript(inputs.parameters, inputs.dkg_transcript, &mut builder);
 
     // If the DKG transcript could not be rebuilt we cannot meaningfully
     // verify ballots / partial decryptions. Still run nullifier-uniqueness
     // because it doesn't depend on the DKG, then finish.
     let Some(dkg_v) = dkg_verification else {
-        check_nullifier_uniqueness(artifacts.ballots, &mut builder);
-        return (builder.finish(), Vec::new());
+        let mut nullifiers = NullifierTracker::default();
+        for (idx, item) in ballots.enumerate() {
+            match item {
+                Ok(ballot) => nullifiers.observe(idx, &ballot),
+                Err(err) => builder.fail("ballot.decode", err),
+            }
+        }
+        nullifiers.report(&mut builder);
+        return (builder.finish(), Vec::new(), timings);
     };
 
     let election_public_key = elgamal::PublicKey::from_point(dkg_v.joint_public_key);
 
-    // -- 5. Per-ballot checks ---------------------------------------------
+    // -- 5/6. Per-ballot checks + running aggregate + nullifier uniqueness --
 
-    let eligible = crate::ballot::verify_ballots(
-        artifacts.parameters,
-        artifacts.ballots,
-        &election_public_key,
-        artifacts.issuer_public_key,
-        artifacts.binding_context,
-        &mut builder,
-    );
+    let contest_count = inputs.parameters.contest_ids.len();
+    let mut aggregate_pads = vec![RistrettoPoint::identity(); contest_count];
+    let mut aggregate_data = vec![RistrettoPoint::identity(); contest_count];
+    let mut nullifiers = NullifierTracker::default();
+    let mut eligible_count = 0usize;
 
-    // -- 6. Nullifier uniqueness ------------------------------------------
+    for (idx, item) in ballots.enumerate() {
+        let ballot = match item {
+            Ok(b) => b,
+            Err(err) => {
+                builder.fail("ballot.decode", err);
+                continue;
+            }
+        };
 
-    check_nullifier_uniqueness(artifacts.ballots, &mut builder);
+        let started = Instant::now();
+        let decoded = crate::ballot::verify_ballot(
+            idx,
+            &ballot,
+            inputs.parameters,
+            &election_public_key,
+            inputs.issuer_public_key,
+            inputs.binding_context,
+            &mut builder,
+        );
+        timings.verify_ballots += started.elapsed();
+
+        nullifiers.observe(idx, &ballot);
+
+        if let Some(decoded) = decoded {
+            let started = Instant::now();
+            for ct in &decoded {
+                aggregate_pads[ct.contest] += ct.pad;
+                aggregate_data[ct.contest] += ct.data;
+            }
+            timings.aggregate += started.elapsed();
+            eligible_count += 1;
+        }
+        // `ballot` drops here.
+    }
+
+    nullifiers.report(&mut builder);
 
     // -- 7. Per-trustee partial decryptions -------------------------------
 
     let decryption = crate::decryption::verify_partial_decryptions(
-        artifacts.parameters,
-        &eligible,
-        artifacts.partial_decryptions,
+        inputs.parameters,
+        &aggregate_pads,
+        aggregate_data,
+        inputs.partial_decryptions,
         &dkg_v.trustee_share_publics,
-        artifacts.binding_context,
+        inputs.binding_context,
         &mut builder,
     );
 
     // -- 8. Homomorphic-sum tally -----------------------------------------
 
-    let evidence = if let Some(decryption) = decryption {
-        crate::tally::verify_tally(
-            artifacts.parameters,
-            artifacts.tally,
-            &decryption,
-            eligible.len(),
-            artifacts.ground_truth,
-            &mut builder,
-        )
-    } else {
-        Vec::new()
-    };
+    let evidence = crate::tally::verify_tally(
+        inputs.parameters,
+        inputs.tally,
+        &decryption,
+        eligible_count,
+        inputs.ground_truth,
+        &mut timings,
+        &mut builder,
+    );
 
-    (builder.finish(), evidence)
+    (builder.finish(), evidence, timings)
 }
 
 /// Global indices (into `contest_ids`) of the contests a ballot in `position_id`
@@ -274,47 +377,64 @@ fn check_parameters(parameters: &ElectionParameters, builder: &mut ReportBuilder
     ok
 }
 
-/// Cross-ballot nullifier uniqueness. Collects every
-/// `ballot.credential_presentation.nullifier.value` and reports the first
-/// collision (if any) as a single Fatal finding listing the colliding indices.
-fn check_nullifier_uniqueness(ballots: &[Ballot], builder: &mut ReportBuilder) {
-    // Map raw nullifier bytes -> first ballot index that used them.
-    let mut seen: HashMap<Vec<u8>, usize> = HashMap::new();
-    let mut collisions: Vec<(usize, usize, Vec<u8>)> = Vec::new();
+/// Incremental cross-ballot nullifier uniqueness (the double-vote check).
+///
+/// Retains one 32-byte key per ballot and the index that first used it —
+/// nothing else about the ballot survives — so the check runs over a streamed
+/// population without holding it.
+#[derive(Default)]
+struct NullifierTracker {
+    /// Raw nullifier bytes -> first ballot index that used them.
+    seen: HashMap<[u8; 32], usize>,
+    /// `(first, repeat)` ballot index pairs.
+    collisions: Vec<(usize, usize)>,
+    /// Ballots observed, whether or not they carried a nullifier.
+    total: usize,
+}
 
-    for (idx, ballot) in ballots.iter().enumerate() {
-        let Some(presentation) = ballot.credential_presentation.as_ref() else {
-            continue;
+impl NullifierTracker {
+    fn observe(&mut self, idx: usize, ballot: &Ballot) {
+        self.total += 1;
+        let Some(nullifier) = ballot
+            .credential_presentation
+            .as_ref()
+            .and_then(|p| p.nullifier.as_ref())
+        else {
+            return;
         };
-        let Some(nullifier) = presentation.nullifier.as_ref() else {
-            continue;
+        // A nullifier is a compressed ristretto point. A value of any other
+        // length cannot verify as a credential presentation, so such a ballot is
+        // never eligible for the tally and is not a double-vote vector; skip it
+        // rather than widen the key.
+        let Ok(key) = <[u8; 32]>::try_from(nullifier.value.as_slice()) else {
+            return;
         };
-        let value = nullifier.value.clone();
-        match seen.get(&value) {
+        match self.seen.get(&key) {
             None => {
-                seen.insert(value, idx);
+                self.seen.insert(key, idx);
             }
-            Some(&first) => {
-                collisions.push((first, idx, value));
-            }
+            Some(&first) => self.collisions.push((first, idx)),
         }
     }
 
-    if collisions.is_empty() {
-        builder.pass(
-            "nullifier.unique",
-            format!("all {} nullifiers are pairwise distinct", ballots.len()),
-        );
-    } else {
-        let detail = collisions
-            .iter()
-            .map(|(a, b, _)| format!("ballots {a} and {b}"))
-            .collect::<Vec<_>>()
-            .join("; ");
-        builder.fail(
-            "nullifier.unique",
-            format!("duplicate nullifier(s) detected: {detail}"),
-        );
+    fn report(&self, builder: &mut ReportBuilder) {
+        if self.collisions.is_empty() {
+            builder.pass(
+                "nullifier.unique",
+                format!("all {} nullifiers are pairwise distinct", self.total),
+            );
+        } else {
+            let detail = self
+                .collisions
+                .iter()
+                .map(|(a, b)| format!("ballots {a} and {b}"))
+                .collect::<Vec<_>>()
+                .join("; ");
+            builder.fail(
+                "nullifier.unique",
+                format!("duplicate nullifier(s) detected: {detail}"),
+            );
+        }
     }
 }
 

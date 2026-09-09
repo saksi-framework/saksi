@@ -533,3 +533,39 @@ fn duplicate_partial_decryption_for_contest_is_caught() {
         report
     );
 }
+
+// ---------------------------------------------------------------------------
+// Stage timings
+// ---------------------------------------------------------------------------
+
+/// The four stage timers must actually measure something, and they must be
+/// disjoint spans of the one audit — so their sum cannot exceed the wall time
+/// the whole audit took.
+#[test]
+fn audit_stage_timings_are_measured_and_within_the_wall() {
+    let fixture = multi_position_fixture(&GenParams::simple(100, 1, 2, SelectionProfile::Uniform));
+    let started = std::time::Instant::now();
+    let (report, _evidence, timings) = crate::audit_with_evidence(fixture.artifacts());
+    let wall = started.elapsed();
+
+    assert!(
+        report.passed(),
+        "100-voter fixture audits clean: {report:#?}"
+    );
+    for (name, spent) in [
+        ("verify_ballots", timings.verify_ballots),
+        ("aggregate", timings.aggregate),
+        ("combine", timings.combine),
+        ("decode", timings.decode),
+    ] {
+        assert!(
+            spent > std::time::Duration::ZERO,
+            "stage {name} recorded no time at all"
+        );
+    }
+    let sum = timings.verify_ballots + timings.aggregate + timings.combine + timings.decode;
+    assert!(
+        sum <= wall,
+        "stage timings {sum:?} exceed the audit's wall time {wall:?}"
+    );
+}
