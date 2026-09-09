@@ -96,23 +96,31 @@ func sampleOnce(ctx context.Context, j *Journal, containers []string, agg *sampl
 	sampleClient(j, agg)
 }
 
+// cpuSecondsFn returns the process's accumulated CPU time in seconds, via a
+// platform syscall (procstat_unix.go / procstat_windows.go). Package variable
+// so tests can inject a fake sequence of readings.
+var cpuSecondsFn = processCPUSeconds
+
 // sampleClient samples the console's own process: heap+runtime memory via
-// runtime.ReadMemStats(Sys), and CPU% via a platform syscall where available.
-//
-// ponytail: process CPU% needs a delta of accumulated CPU time across two
-// syscalls (Getrusage on unix, GetProcessTimes on windows) plus the wall-clock
-// gap between them, which means carrying state across ticks — genuinely
-// platform-specific and untested by this task's brief. Reports cpu_pct: null
-// for now; upgrade by tracking (time, cpuSeconds) in sampleAgg and adding
-// build-tagged syscall readers per OS when the accuracy is actually needed.
+// runtime.ReadMemStats(Sys), and CPU% as 100 * (delta CPU seconds / delta
+// wall seconds) between this call and the previous one. The first sample has
+// no prior reading to delta against, so it reports cpu_pct: null; so does any
+// sample where the syscall itself fails.
 func sampleClient(j *Journal, agg *sampleAgg) {
 	var m runtime.MemStats
 	runtime.ReadMemStats(&m)
 	sys := int64(m.Sys)
-	agg.add("client", 0, false, sys)
+
+	pct, hasCPU := agg.clientCPUPct(time.Now(), cpuSecondsFn)
+
+	agg.add("client", pct, hasCPU, sys)
+	var cpu any
+	if hasCPU {
+		cpu = pct
+	}
 	_ = j.Stamp("sample", map[string]any{
 		"container": "client",
-		"cpu_pct":   nil,
+		"cpu_pct":   cpu,
 		"mem_bytes": sys,
 	})
 }
@@ -129,9 +137,35 @@ type containerAcc struct {
 type sampleAgg struct {
 	malformed int
 	acc       map[string]*containerAcc
+
+	// client CPU-time delta tracking, for clientCPUPct.
+	haveLastClientCPU bool
+	lastClientCPU     float64
+	lastClientCPUTime time.Time
 }
 
 func newSampleAgg() *sampleAgg { return &sampleAgg{acc: map[string]*containerAcc{}} }
+
+// clientCPUPct returns 100 * (delta CPU seconds / delta wall seconds) since
+// the previous call, using cpuSeconds to read the current accumulated CPU
+// time. The first call (or a failed read) has nothing to delta against and
+// returns (0, false).
+func (a *sampleAgg) clientCPUPct(now time.Time, cpuSeconds func() (float64, bool)) (float64, bool) {
+	cur, ok := cpuSeconds()
+	if !ok {
+		return 0, false
+	}
+	defer func() { a.lastClientCPU, a.lastClientCPUTime, a.haveLastClientCPU = cur, now, true }()
+
+	if !a.haveLastClientCPU {
+		return 0, false
+	}
+	dWall := now.Sub(a.lastClientCPUTime).Seconds()
+	if dWall <= 0 {
+		return 0, false
+	}
+	return 100 * (cur - a.lastClientCPU) / dWall, true
+}
 
 func (a *sampleAgg) add(name string, cpuPct float64, hasCPU bool, memBytes int64) {
 	c, ok := a.acc[name]

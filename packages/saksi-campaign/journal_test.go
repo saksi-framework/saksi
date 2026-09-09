@@ -393,6 +393,65 @@ func TestLedgerBytesWindowsWalk(t *testing.T) {
 	}
 }
 
+// clientCPUPct: first sample has nothing to delta against (null); the second
+// sample reports 100 * (delta CPU seconds / delta wall seconds).
+func TestSampleAggClientCPUPercent(t *testing.T) {
+	agg := newSampleAgg()
+	t0 := time.Date(2026, 9, 10, 0, 0, 0, 0, time.UTC)
+	seq := []float64{10, 12} // fake accumulated CPU seconds
+	i := 0
+	fake := func() (float64, bool) {
+		v := seq[i]
+		i++
+		return v, true
+	}
+
+	if _, ok := agg.clientCPUPct(t0, fake); ok {
+		t.Fatal("first sample should have no CPU%: nothing to delta against")
+	}
+
+	// 2 CPU-seconds consumed over a 4-second wall gap -> 50%.
+	pct, ok := agg.clientCPUPct(t0.Add(4*time.Second), fake)
+	if !ok {
+		t.Fatal("second sample should report a CPU%")
+	}
+	if pct != 50 {
+		t.Fatalf("cpu_pct = %v, want 50", pct)
+	}
+}
+
+// clientCPUPct: a failed CPU-time read reports null and doesn't wedge the
+// delta state (a later successful pair still works).
+func TestSampleAggClientCPUPercentUnavailable(t *testing.T) {
+	agg := newSampleAgg()
+	t0 := time.Date(2026, 9, 10, 0, 0, 0, 0, time.UTC)
+	fail := func() (float64, bool) { return 0, false }
+	if _, ok := agg.clientCPUPct(t0, fail); ok {
+		t.Fatal("unavailable CPU-time read should report null")
+	}
+}
+
+// sampleClient reads CPU time through the cpuSecondsFn package var, so
+// clearing it (unavailable) must surface as a null cpu_pct in the stamped
+// event.
+func TestSampleClientCPUUnavailableIsNull(t *testing.T) {
+	orig := cpuSecondsFn
+	cpuSecondsFn = func() (float64, bool) { return 0, false }
+	defer func() { cpuSecondsFn = orig }()
+
+	f := &fakeJournalFile{}
+	j := newJournal(f, time.Now())
+	sampleClient(j, newSampleAgg())
+
+	var got map[string]any
+	if err := json.Unmarshal(bytes.TrimRight(f.buf.Bytes(), "\n"), &got); err != nil {
+		t.Fatalf("stamped line not valid JSON: %v", err)
+	}
+	if got["cpu_pct"] != nil {
+		t.Fatalf("cpu_pct = %v, want null", got["cpu_pct"])
+	}
+}
+
 // (8) CollectEnv with a fake demoBin path and every probe made to fail
 // (simulating a cleared PATH) returns a map with null_probes listing the
 // docker/git keys and no error (CollectEnv has no error return at all).
