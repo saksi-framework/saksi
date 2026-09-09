@@ -132,6 +132,60 @@ The server has **no login** — anyone who can reach the address can drive it. P
    and export links.
 4. **History**: past runs accumulate; each is exportable.
 
+## 6b. Serving the browser apps (`--web-dir`)
+
+The console can host two standalone browser apps alongside the wizard: the
+**public bulletin board** at `/board/` and the **trustee console** at
+`/trustee/`. They live in the sibling **balotachain** repo
+(`apps/auditor`, `apps/trustee`) and are served as built static bundles — the
+console does not build them.
+
+```bash
+# in balotachain, once:
+pnpm install
+./tools/build-web.sh          # or tools\build-web.ps1 on Windows
+#   -> <balotachain>/dist-web/board  and  <balotachain>/dist-web/trustee
+
+# then start the console pointed at that directory:
+saksi-campaign serve --demo ../../target/release/saksi-demo \
+                     --web-dir <balotachain>/dist-web
+```
+
+`--web-dir` also reads the environment variable `SAKSI_WEB_DIR` (the flag wins).
+Unset, the two routes are simply not registered and the console behaves exactly
+as it did before.
+
+Both apps select their election with a query parameter:
+
+| URL | Shows |
+|---|---|
+| `/board/?run=<run-id>` | the public bulletin board for that election |
+| `/trustee/?run=<run-id>&trustee=<n>` | the ceremony as trustee `n` (`1`..`n`) |
+
+Omitting `?run=` picks the newest run. Omitting `?trustee=` shows a picker.
+
+They are served **same-origin with the API**, which is what keeps the
+cross-origin POST guard in `server.go` protecting `/ceremony/submit` and
+`/ceremony/publish`. Serving them from a different origin would defeat it.
+
+**The trustee console has no authentication.** `POST /ceremony/submit` takes a
+`trustee_id` and no credential, so anyone who can reach the page can submit any
+trustee's share. That is true of the wizard too; it is a research console on a
+loopback bind. Do not expose it to an untrusted network.
+
+### The JSON these apps read
+
+| Endpoint | Body |
+|---|---|
+| `GET /api/board/<run>` | `BoardResponse` — ranked contests with seats/elected/ties, ballot accounting, cryptographic digests, the check list, and the artifact list. **Offline-first**: it reads the run folder and only *enriches* from the ledger, so unlike `/api/trail/<id>` it never 502s without a network |
+| `GET /api/verify-code/<run>/<code>` | `VerifyCodeResponse` — the ballot record whose nullifier starts with the code's eight hex characters. `409` if the prefix is ambiguous, `400` if the code is not hex |
+| `GET /api/ceremony/<run>` | `CeremonyView` — `CeremonyState` (unchanged, same JSON paths the wizard reads) plus the run's decryption context and an audit-log timeline |
+
+A tracking code `BC-XXXX-XXXX` is the first eight hex characters of a ballot's
+nullifier. Nullifiers are derived **per voter per position**, so a code
+identifies one ballot *record*, not a voter's whole ballot — and it reveals
+nothing about the selection.
+
 ## 7. What works offline vs. network-gated
 
 - **Offline (fully working, no network):** Generate → Verify → correctness.csv,

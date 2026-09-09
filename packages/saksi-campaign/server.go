@@ -143,8 +143,39 @@ func NewServer(store *RunStore, exec *Executor, hub *Hub, fabric FabricConfig, a
 	mux.HandleFunc("/api/capabilities", s.handleCapabilities)
 	mux.HandleFunc("/api/trail", s.handleTrailIndex)
 	mux.HandleFunc("/attack", s.handleStagedAttack)
+	mux.HandleFunc("/api/board/", s.handleBoard)
+	mux.HandleFunc("/api/verify-code/", s.handleVerifyCode)
+	mountWebDir(mux, os.Getenv("SAKSI_WEB_DIR"))
 	s.handler = s.guard(mux)
 	return s
+}
+
+// mountWebDir serves the two browser apps the console can host: the public
+// bulletin board at /board/ and the trustee console at /trustee/, read from
+// <dir>/board and <dir>/trustee. Same origin as the API, so guard()'s
+// cross-origin POST defense keeps protecting the ceremony endpoints.
+//
+// Both apps select their election with a query parameter rather than a route,
+// so http.FileServer's own index.html handling is the whole router and no SPA
+// fallback is needed. An empty dir registers nothing and the console behaves
+// exactly as it did before.
+func mountWebDir(mux *http.ServeMux, dir string) {
+	if strings.TrimSpace(dir) == "" {
+		return
+	}
+	for _, app := range []string{"board", "trustee"} {
+		prefix := "/" + app + "/"
+		mux.Handle(prefix, http.StripPrefix(prefix,
+			http.FileServer(http.Dir(filepath.Join(dir, app)))))
+		// Without this the bare path falls through to handleIndex's 404.
+		mux.HandleFunc("/"+app, func(w http.ResponseWriter, r *http.Request) {
+			target := r.URL.Path + "/"
+			if r.URL.RawQuery != "" {
+				target += "?" + r.URL.RawQuery
+			}
+			http.Redirect(w, r, target, http.StatusMovedPermanently)
+		})
+	}
 }
 
 // ServeHTTP makes *Server itself the http.Handler main.go passes to
@@ -695,7 +726,15 @@ func (s *Server) handleCeremonyStatus(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	writeJSONResp(w, http.StatusOK, state)
+	dir, err := s.store.Dir(runID)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	// CeremonyView embeds CeremonyState, so every field the wizard already
+	// reads stays at the same JSON path; the trustee console gets its context
+	// on the same poll instead of a second request.
+	writeJSONResp(w, http.StatusOK, s.buildCeremonyView(rec, dir, state))
 }
 
 // handleStagedAttack mounts one attack at its lifecycle stage — really against

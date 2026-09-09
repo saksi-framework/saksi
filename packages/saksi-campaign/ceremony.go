@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	saksiprotocolv1 "github.com/saksi-framework/saksi/packages/saksi-protocol/go/saksiprotocolv1"
 	"google.golang.org/protobuf/proto"
@@ -57,6 +58,11 @@ type CeremonyTrustee struct {
 	Submitted bool `json:"submitted"`
 	// Contests counts the partial decryptions this trustee owns (one per contest).
 	Contests int `json:"contests"`
+	// SubmittedAt is when this console recorded the contribution. Offline it is
+	// the only timestamp that exists; on-chain the ledger receipt in trail.json
+	// is the authority and this is a convenience record. Nil when the trustee
+	// has not contributed, or when the chain (not this console) observed it.
+	SubmittedAt *time.Time `json:"submitted_at,omitempty"`
 }
 
 // CeremonyState is the /api/ceremony/<runID> body and the ceremony.json shape.
@@ -73,6 +79,15 @@ type CeremonyState struct {
 	OnChain bool `json:"on_chain"`
 	// Ready reports whether setup has run and trustees may act.
 	Ready bool `json:"ready"`
+	// StartedAt and ClosedAt are both stamped at CeremonyStart: that call is
+	// what runs the lifecycle prefix up to and including CloseElection, so it
+	// is the moment the election stopped accepting ballots. Offline there is
+	// no ledger receipt to read a close time from, and this is the only
+	// honest source for it.
+	StartedAt *time.Time `json:"started_at,omitempty"`
+	ClosedAt  *time.Time `json:"closed_at,omitempty"`
+	// PublishedAt is when the tally was published.
+	PublishedAt *time.Time `json:"published_at,omitempty"`
 }
 
 // partialsByTrustee groups a bundle's partial decryptions by the trustee_id
@@ -528,14 +543,20 @@ func (e *Executor) readCeremony(runID string, c ElectionConfig) CeremonyState {
 	// Trust the config for the roster shape and the file only for progress, so
 	// an edited config can never desync the card list from the trustee ids.
 	submitted := make(map[string]bool, len(stored.Trustees))
+	submittedAt := make(map[string]*time.Time, len(stored.Trustees))
 	for _, t := range stored.Trustees {
 		submitted[t.ID] = t.Submitted
+		submittedAt[t.ID] = t.SubmittedAt
 	}
 	for i := range fresh.Trustees {
 		fresh.Trustees[i].Submitted = submitted[fresh.Trustees[i].ID]
+		fresh.Trustees[i].SubmittedAt = submittedAt[fresh.Trustees[i].ID]
 	}
 	fresh.Published = stored.Published
 	fresh.Ready = stored.Ready
+	fresh.StartedAt = stored.StartedAt
+	fresh.ClosedAt = stored.ClosedAt
+	fresh.PublishedAt = stored.PublishedAt
 	return fresh
 }
 
@@ -549,6 +570,14 @@ func (e *Executor) writeCeremony(runID string, c ElectionConfig, state *Ceremony
 		s = *state
 	}
 	s.Ready = true
+	// The first write is CeremonyStart's, which has just closed the election.
+	now := time.Now().UTC()
+	if s.StartedAt == nil {
+		s.StartedAt = &now
+	}
+	if s.ClosedAt == nil {
+		s.ClosedAt = &now
+	}
 	data, err := json.MarshalIndent(s, "", "  ")
 	if err != nil {
 		return err
@@ -558,9 +587,13 @@ func (e *Executor) writeCeremony(runID string, c ElectionConfig, state *Ceremony
 
 func (e *Executor) markSubmitted(runID string, c ElectionConfig, trusteeID string) error {
 	s := e.readCeremony(runID, c)
+	now := time.Now().UTC()
 	for i := range s.Trustees {
 		if s.Trustees[i].ID == trusteeID {
 			s.Trustees[i].Submitted = true
+			if s.Trustees[i].SubmittedAt == nil {
+				s.Trustees[i].SubmittedAt = &now
+			}
 		}
 	}
 	return e.writeCeremony(runID, c, &s)
@@ -569,5 +602,9 @@ func (e *Executor) markSubmitted(runID string, c ElectionConfig, trusteeID strin
 func (e *Executor) markPublished(runID string, c ElectionConfig) error {
 	s := e.readCeremony(runID, c)
 	s.Published = true
+	if s.PublishedAt == nil {
+		now := time.Now().UTC()
+		s.PublishedAt = &now
+	}
 	return e.writeCeremony(runID, c, &s)
 }
