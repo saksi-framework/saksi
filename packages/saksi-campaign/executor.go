@@ -258,7 +258,7 @@ func groundTruthOnly(c ElectionConfig) bool { return c.Mode == ModeGroundTruth }
 // ledger_dump.go). A chain that cannot be reached costs the cross-check, never
 // the audit: the local audit is what this phase owes the caller.
 func (e *Executor) Verify(ctx context.Context, runID string, c ElectionConfig) (StreamAudit, error) {
-	if c.Mode != "onchain" || !e.fabric.Enabled() {
+	if !e.onChainRun(c) {
 		return e.verify(ctx, runID, c, nil)
 	}
 	conn, err := e.fabric.Connect()

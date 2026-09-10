@@ -892,7 +892,7 @@ func (e *Executor) RunStagedAttack(ctx context.Context, runID string, c Election
 		return fmt.Errorf("unknown scenario %q", id)
 	}
 
-	live := c.Mode == "onchain" && e.fabric.Enabled() && sc.LiveCapable()
+	live := e.onChainRun(c) && sc.LiveCapable()
 	var res ScenarioResult
 	if live {
 		res = e.runLiveScenario(ctx, runID, srcDir, *sc)

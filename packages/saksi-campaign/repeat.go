@@ -224,8 +224,17 @@ func (d *repeatDriver) once(ctx context.Context, c ElectionConfig, rep RepTag) (
 	if err := d.phase(ctx, runID, "/submit", map[string]string{"run_id": runID}); err != nil {
 		d.printf("  submit: %v", err)
 	}
-	if err := d.ceremony(ctx, runID); err != nil {
-		d.printf("  ceremony: %v", err)
+	// An on-chain run's Submit already drove the WHOLE lifecycle — submitOnChain
+	// commits CreateElection, the DKG transcript, every ballot, CloseElection,
+	// every partial decryption and the tally. Running the ceremony after it
+	// re-issues CreateElection for an election that exists, which the chaincode
+	// refuses ("election %q already exists", saksi-bulletin/chaincode/contract.go),
+	// so the ceremony phase belongs to the runs Submit did not complete: the
+	// local ones, where it is the bookkeeping the board reads back.
+	if c.Mode != "onchain" {
+		if err := d.ceremony(ctx, runID); err != nil {
+			d.printf("  ceremony: %v", err)
+		}
 	}
 	if err := d.phase(ctx, runID, "/verify", map[string]string{"run_id": runID}); err != nil {
 		d.printf("  verify: %v", err)

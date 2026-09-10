@@ -210,11 +210,36 @@ func errNoFabric() error {
 			"if the peer is not at the default endpoint)")
 }
 
-// localCeremonyOK reports whether running the ceremony without a ledger is what
-// the operator actually asked for. offline and ground-truth runs never involve
-// a chain; an on-chain run without one is a misconfiguration, not a fallback.
-func localCeremonyOK(c ElectionConfig) bool {
-	return c.Mode != "onchain"
+// onChainRun reports whether this run's phases may touch the ledger: the
+// operator asked for on-chain mode AND a network is configured.
+//
+// Every other mode is local in EVERY phase, the ceremony included. Gating the
+// ceremony on e.fabric.Enabled() alone is what let an offline run on a
+// Fabric-wired console commit its whole lifecycle on-chain — Submit honoured
+// the mode and no-opped, then CeremonyStart put the same election, all its
+// ballots, the partials and the tally on the chain anyway.
+func (e *Executor) onChainRun(c ElectionConfig) bool {
+	return c.Mode == "onchain" && e.fabric.Enabled()
+}
+
+// useLedger decides, once, whether a ceremony action goes to the chain, and
+// says why when it does not. An on-chain run with no network is a
+// misconfiguration and fails (errNoFabric); any other mode runs locally, and on
+// a Fabric-wired console it says so in Submit's words, so a simulated ceremony
+// is never read as a committed one.
+func (e *Executor) useLedger(runID string, c ElectionConfig) (bool, error) {
+	if c.Mode == "onchain" {
+		if !e.fabric.Enabled() {
+			e.publish(runID, "ceremony", "error", errNoFabric().Error())
+			return false, errNoFabric()
+		}
+		return true, nil
+	}
+	if e.fabric.Enabled() {
+		e.publish(runID, "ceremony", "info", c.Mode+
+			" mode: ceremony is simulated locally, nothing submitted on-chain")
+	}
+	return false, nil
 }
 
 func (e *Executor) CeremonyStart(ctx context.Context, runID string, c ElectionConfig) error {
@@ -226,11 +251,11 @@ func (e *Executor) CeremonyStart(ctx context.Context, runID string, c ElectionCo
 	}
 	_ = j.Stamp("stage.ceremony.start", nil)
 	defer func() { _ = j.Stamp("stage.ceremony.end", nil) }()
-	if !e.fabric.Enabled() {
-		if !localCeremonyOK(c) {
-			e.publish(runID, "ceremony", "error", errNoFabric().Error())
-			return errNoFabric()
-		}
+	onChain, err := e.useLedger(runID, c)
+	if err != nil {
+		return err
+	}
+	if !onChain {
 		e.publish(runID, "ceremony", "done",
 			"local ceremony ready — no ledger; the threshold gate is enforced by this console")
 		return e.writeCeremony(runID, c, nil)
@@ -276,10 +301,11 @@ func (e *Executor) CeremonySubmit(ctx context.Context, runID string, c ElectionC
 	defer j.Close()
 	_ = j.Stamp("stage.ceremony.trustee.start", map[string]any{"trustee": trusteeID, "partials": len(mine)})
 	defer func() { _ = j.Stamp("stage.ceremony.trustee.end", map[string]any{"trustee": trusteeID}) }()
-	if !e.fabric.Enabled() {
-		if !localCeremonyOK(c) {
-			return errNoFabric()
-		}
+	onChain, err := e.useLedger(runID, c)
+	if err != nil {
+		return err
+	}
+	if !onChain {
 		e.publish(runID, "ceremony", "info",
 			fmt.Sprintf("%s contributed %d partial decryptions (local ceremony)", name, len(mine)))
 		return e.markSubmitted(runID, c, trusteeID)
@@ -331,10 +357,11 @@ func (e *Executor) CeremonyPublish(ctx context.Context, runID string, c Election
 	defer j.Close()
 	_ = j.Stamp("stage.ceremony.publish.start", map[string]any{"submitted": state.Submitted, "threshold": state.Threshold})
 	defer func() { _ = j.Stamp("stage.ceremony.publish.end", nil) }()
-	if !e.fabric.Enabled() {
-		if !localCeremonyOK(c) {
-			return errNoFabric()
-		}
+	onChain, err := e.useLedger(runID, c)
+	if err != nil {
+		return err
+	}
+	if !onChain {
 		e.publish(runID, "ceremony", "done",
 			fmt.Sprintf("threshold met (%d of %d) — tally unlocked", state.Submitted, state.Threshold))
 		return e.markPublished(runID, c)
@@ -418,7 +445,7 @@ func tallyToPublish(tallyHex string, state CeremonyState) (string, error) {
 // authority; the local file is the fallback and the offline authority.
 func (e *Executor) CeremonyStatus(runID string, c ElectionConfig) (CeremonyState, error) {
 	state := e.readCeremony(runID, c)
-	state.OnChain = e.fabric.Enabled()
+	state.OnChain = e.onChainRun(c)
 
 	if b, err := e.readBundle(runID); err == nil {
 		state.Ready = true
