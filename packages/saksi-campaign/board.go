@@ -690,9 +690,11 @@ func formatTrackingCode(nullifier string) string {
 	return "BC-" + up[:4] + "-" + up[4:]
 }
 
-// ballotReader is the one chaincode getter the lookup needs. Declared here
-// rather than added to chainReader so this file stays additive.
-type ballotReader interface {
+// ballotGetter is the one chaincode getter the lookup needs. Declared here
+// rather than added to chainReader so this file stays additive. Named for the
+// getter, not the file reader: ballots.go already owns ballotReader, the
+// index-wise reader over the local ballots file.
+type ballotGetter interface {
 	GetBallot(electionID, nullifier string) (string, error)
 }
 
@@ -751,7 +753,7 @@ func (s *Server) handleVerifyCode(w http.ResponseWriter, r *http.Request) {
 	resp.RecordedAt = submitBallotTime(dir, m.Index)
 	if s.fabric.Enabled() {
 		if reader, _, err := s.dial(); err == nil {
-			if br, ok := reader.(ballotReader); ok {
+			if br, ok := reader.(ballotGetter); ok {
 				if _, err := br.GetBallot(runID, m.Nullifier); err == nil {
 					resp.CommittedOnChain = true
 				}
