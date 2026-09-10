@@ -1,6 +1,9 @@
 package campaign
 
-import "testing"
+import (
+	"fmt"
+	"testing"
+)
 
 // mk builds n trustees with default names.
 func mk(n int) []Trustee {
@@ -115,5 +118,40 @@ func TestTrusteeNames(t *testing.T) {
 	names := c.TrusteeNames()
 	if len(names) != 3 || names[0] != "TA" {
 		t.Fatalf("unexpected trustee names: %v", names)
+	}
+}
+
+// Concurrency 1 measures the console's own round-trip, not the network's
+// throughput; 0 or less is not a load at all. The wizard sends whatever the
+// advanced field holds, so the floor is enforced here.
+func TestValidateRejectsConcurrencyBelowOne(t *testing.T) {
+	for _, n := range []int{0, -1} {
+		c := good()
+		c.Concurrency = n
+		err := c.Validate()
+		if err == nil {
+			t.Fatalf("concurrency %d must be rejected", n)
+		}
+		if want := fmt.Sprintf("concurrency must be >= 1 (got %d)", n); err.Error() != want {
+			t.Fatalf("error = %q, want %q", err, want)
+		}
+	}
+}
+
+// A negative send rate is a nonsense arrival rate; 0 is the documented "as
+// fast as the workers drain" and must stay legal.
+func TestValidateRejectsNegativeSendRate(t *testing.T) {
+	c := good()
+	c.SendRate = -0.5
+	err := c.Validate()
+	if err == nil {
+		t.Fatal("a negative send rate must be rejected")
+	}
+	if want := "send rate must be >= 0 (got -0.5)"; err.Error() != want {
+		t.Fatalf("error = %q, want %q", err, want)
+	}
+	c.SendRate = 0
+	if err := c.Validate(); err != nil {
+		t.Fatalf("send rate 0 is the default and must be accepted: %v", err)
 	}
 }

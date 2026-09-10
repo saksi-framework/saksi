@@ -315,7 +315,10 @@ func finaliseInput(dir string, c ElectionConfig, sa StreamAudit, stageErr error)
 		return in
 	}
 	in.Dropped = sm.Dropped
-	in.ReconcileOK = sm.Committed == sm.Submitted && sm.Committed == sm.Expected
+	// bench.Reconcile is the single definition of "every ballot landed", and
+	// its message names which half of that failed.
+	in.ReconcileErr = bench.Reconcile(sm.Submitted, sm.Committed, sm.Expected)
+	in.ReconcileOK = in.ReconcileErr == nil
 	in.Interrupted = sm.Stopped
 	in.Segments = []Segment{{
 		Index: 0, Committed: sm.Committed, WindowMs: sm.WindowMs,

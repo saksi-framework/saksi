@@ -2,6 +2,7 @@ package campaign
 
 import (
 	"bufio"
+	"encoding/csv"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -13,7 +14,7 @@ import (
 
 // The run's performance record.
 //
-// perf.csv is one row per run, appended by Verify. Every column names its own
+// perf.csv is one row per run, written by Verify. Every column names its own
 // provenance (`_inproc_ms` = measured inside the auditor process, `gen_` = the
 // generator's own sidecar, peaks = docker stats), and a column with no
 // producer for this run is EMPTY — never a fabricated 0. An offline run has no
@@ -177,28 +178,78 @@ func perfRow(dir, runID string, c ElectionConfig, fin FinaliseResult) []string {
 	}
 }
 
-// writePerfRow appends the run's row to perf.csv (header written iff the file
-// is empty, no comment lines) and drops perf-schema.md beside it.
+// writePerfRow writes the run's row to perf.csv (header once, no comment
+// lines) and drops perf-schema.md beside it.
+//
+// One row per run_id, latest Verify wins: re-auditing a run REPLACES its row
+// rather than appending a second one, so a re-verified run is never counted
+// twice by anything that concatenates these files. The rewrite goes to a temp
+// file and renames, so an interrupted write cannot leave a half-written CSV
+// where a complete one used to be.
 func writePerfRow(dir, runID string, c ElectionConfig, fin FinaliseResult) error {
 	if err := writePerfSchema(dir); err != nil {
 		return err
 	}
-	f, err := os.OpenFile(filepath.Join(dir, PerfCSV), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
-	if err != nil {
-		return fmt.Errorf("open %s: %w", PerfCSV, err)
-	}
-	defer f.Close()
-	info, err := f.Stat()
+	path := filepath.Join(dir, PerfCSV)
+	kept, err := perfRowsExcept(path, runID)
 	if err != nil {
 		return err
 	}
-	if info.Size() == 0 {
-		if _, err := fmt.Fprintln(f, strings.Join(perfColumns, ",")); err != nil {
-			return err
-		}
+	kept = append(kept, perfRow(dir, runID, c, fin))
+
+	tmp := path + ".tmp"
+	f, err := os.Create(tmp)
+	if err != nil {
+		return fmt.Errorf("open %s: %w", PerfCSV, err)
 	}
-	_, err = fmt.Fprintln(f, strings.Join(csvEscape(perfRow(dir, runID, c, fin)), ","))
-	return err
+	w := bufio.NewWriter(f)
+	_, err = fmt.Fprintln(w, strings.Join(perfColumns, ","))
+	for _, row := range kept {
+		if err != nil {
+			break
+		}
+		_, err = fmt.Fprintln(w, strings.Join(csvEscape(row), ","))
+	}
+	if err == nil {
+		err = w.Flush()
+	}
+	if cerr := f.Close(); err == nil {
+		err = cerr
+	}
+	if err != nil {
+		_ = os.Remove(tmp)
+		return fmt.Errorf("write %s: %w", PerfCSV, err)
+	}
+	return os.Rename(tmp, path)
+}
+
+// perfRowsExcept reads perf.csv's data rows, dropping the header and any row
+// belonging to runID. A missing file is simply no rows; an unreadable one is an
+// error rather than a silent overwrite of results somebody may still want.
+func perfRowsExcept(path, runID string) ([][]string, error) {
+	f, err := os.Open(path)
+	if os.IsNotExist(err) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	rows, err := csv.NewReader(f).ReadAll()
+	if err != nil {
+		return nil, fmt.Errorf("read %s: %w", PerfCSV, err)
+	}
+	var kept [][]string
+	for i, row := range rows {
+		if i == 0 && len(row) > 0 && row[0] == perfColumns[0] {
+			continue // header
+		}
+		if len(row) > 0 && row[0] == runID {
+			continue // superseded by this run's new row
+		}
+		kept = append(kept, row)
+	}
+	return kept, nil
 }
 
 // csvEscape quotes any cell containing a comma or quote — fail_reason is free

@@ -279,3 +279,81 @@ func TestSubmitBallotsLatenciesRecordEverySubmission(t *testing.T) {
 		}
 	}
 }
+
+// TestVerifyReplacesThePerfRowOnReAudit: perf.csv is one row per run_id and
+// the latest Verify wins. Re-auditing must REPLACE the run's row, never append
+// a second one — a duplicated row would double-count the run in anything that
+// concatenates these files.
+func TestVerifyReplacesThePerfRowOnReAudit(t *testing.T) {
+	e, runID, dir := newRun(t, "offline")
+	e.run = func(_ context.Context, _ string, _ ...string) ([]byte, error) {
+		return []byte(auditJSON), nil
+	}
+	if _, err := e.Verify(context.Background(), runID, good()); err != nil {
+		t.Fatalf("first Verify: %v", err)
+	}
+	if cells := perfCells(t, dir); cells["decrypt_inproc_ms"] != "12" {
+		t.Fatalf("first row decrypt_inproc_ms = %q", cells["decrypt_inproc_ms"])
+	}
+
+	// Re-audit: same run, a different verdict and different timings.
+	e.run = func(_ context.Context, _ string, _ ...string) ([]byte, error) {
+		return []byte(`{"overall":"fail","timings_ms":{"verify_ballots":99,"aggregate":1,` +
+			`"combine":2,"decode":77},"contests":[{"contest":"president/cand0",` +
+			`"ground_truth":3,"decoded":4,"E":1,"pass":false}]}`), nil
+	}
+	if _, err := e.Verify(context.Background(), runID, good()); err != nil {
+		t.Fatalf("second Verify: %v", err)
+	}
+
+	// perfCells fails unless the file is exactly a header + ONE data row.
+	cells := perfCells(t, dir)
+	if cells["run_id"] != runID {
+		t.Fatalf("run_id = %q, want %q", cells["run_id"], runID)
+	}
+	if cells["decrypt_inproc_ms"] != "77" || cells["proof_verify_inproc_ms"] != "99" {
+		t.Fatalf("the surviving row is not the second audit's: %v", cells)
+	}
+	if cells["failed"] != "true" || !strings.Contains(cells["fail_reason"], "e_nonzero") {
+		t.Fatalf("failed/fail_reason = %q/%q", cells["failed"], cells["fail_reason"])
+	}
+}
+
+// TestWritePerfRowKeepsOtherRuns: replacing this run's row must not disturb
+// rows belonging to other run ids sharing the file.
+func TestWritePerfRowKeepsOtherRuns(t *testing.T) {
+	dir := t.TempDir()
+	other := make([]string, len(perfColumns))
+	other[0] = "run-other"
+	other[len(other)-1] = `boom, "quoted"`
+	if err := os.WriteFile(filepath.Join(dir, PerfCSV),
+		[]byte(strings.Join(perfColumns, ",")+"\n"+
+			strings.Join(csvEscape(other), ",")+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	for i := 0; i < 2; i++ { // twice: the second write replaces the first
+		if err := writePerfRow(dir, "run-1", ElectionConfig{Mode: "offline"}, FinaliseResult{}); err != nil {
+			t.Fatalf("writePerfRow: %v", err)
+		}
+	}
+
+	f, err := os.Open(filepath.Join(dir, PerfCSV))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	rows, err := csv.NewReader(f).ReadAll()
+	if err != nil {
+		t.Fatalf("perf.csv unparseable: %v", err)
+	}
+	if len(rows) != 3 {
+		t.Fatalf("want header + run-other + run-1, got %d rows", len(rows))
+	}
+	if rows[1][0] != "run-other" || rows[1][len(perfColumns)-1] != `boom, "quoted"` {
+		t.Fatalf("the other run's row was disturbed: %q", rows[1])
+	}
+	if rows[2][0] != "run-1" {
+		t.Fatalf("this run's row = %q", rows[2][0])
+	}
+}

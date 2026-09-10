@@ -252,9 +252,12 @@ type FinaliseInput struct {
 	Segments          []Segment
 	Dropped           int
 	ReconcileOK       bool
-	EByContest        map[string]int64
-	StageErr          error
-	Interrupted       bool
+	// ReconcileErr is bench.Reconcile's own diagnosis when ReconcileOK is
+	// false. Optional: it only sharpens the reason, it does not decide it.
+	ReconcileErr error
+	EByContest   map[string]int64
+	StageErr     error
+	Interrupted  bool
 }
 
 // FinaliseResult is the run.end verdict.
@@ -278,6 +281,9 @@ func runFailed(f FinaliseInput) (bool, string) {
 		return true, fmt.Sprintf("dropped: %d", f.Dropped)
 	}
 	if !f.ReconcileOK {
+		if f.ReconcileErr != nil {
+			return true, "reconcile_mismatch: " + f.ReconcileErr.Error()
+		}
 		return true, "reconcile_mismatch"
 	}
 	contests := make([]string, 0, len(f.EByContest))
