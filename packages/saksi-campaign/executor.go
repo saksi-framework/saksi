@@ -1574,9 +1574,20 @@ func (e *Executor) verifyOnly(runID string, rr reconcileReader, led clientsdk.Le
 	}
 
 	e.verifyOnlyChain(j, dir, led)
-	e.publish(runID, "verify", "done", fmt.Sprintf(
-		"verify-only: the chain holds %d of this run's %d ballots (chain reports %d committed)",
-		local, b.BallotCount, chainCount))
+
+	// The message never invents a number it does not have: a chain that could
+	// not answer is reported as not having answered.
+	msg := fmt.Sprintf("verify-only: the chain holds %d of this run's %d ballots", local, b.BallotCount)
+	switch {
+	case countErr != nil:
+		msg = fmt.Sprintf("verify-only: the chain could not report its committed count: %v", countErr)
+	case setErr != nil:
+		msg = fmt.Sprintf("verify-only: the chain reports %d committed; this run's committed set could not be built: %v",
+			chainCount, setErr)
+	default:
+		msg += fmt.Sprintf(" (the chaincode reports %d committed for this election)", chainCount)
+	}
+	e.publish(runID, "verify", "done", msg)
 	if countErr != nil {
 		return countErr
 	}
