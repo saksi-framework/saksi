@@ -569,3 +569,35 @@ fn audit_stage_timings_are_measured_and_within_the_wall() {
         "stage timings {sum:?} exceed the audit's wall time {wall:?}"
     );
 }
+
+/// A clean audit of a thousand ballots must not keep a thousand findings: the
+/// per-ballot passes are counted and rolled up (failures are still listed one
+/// by one). This is the report-side half of the streaming memory bound — the
+/// findings Vec was the largest thing left in the process.
+#[test]
+fn per_ballot_passes_are_rolled_up_not_stored() {
+    // 500 voters x 2 positions = 1,000 ballot records.
+    let fixture = multi_position_fixture(&GenParams::simple(500, 2, 2, SelectionProfile::Uniform));
+    assert_eq!(fixture.ballots.len(), 1_000);
+
+    let report = audit(fixture.artifacts());
+    assert!(report.passed(), "{report:#?}");
+    assert!(
+        report.findings.len() < 100,
+        "a clean 1,000-ballot audit kept {} findings — per-ballot passes are being stored",
+        report.findings.len()
+    );
+    // The rollup still names every per-ballot check, exactly once.
+    for check in [
+        "ballot.shape",
+        "ballot.cds_proof",
+        "ballot.issuer_binding",
+        "ballot.credential",
+    ] {
+        assert_eq!(
+            report.findings.iter().filter(|f| f.check == check).count(),
+            1,
+            "{check} should appear once as a rollup: {report:#?}"
+        );
+    }
+}

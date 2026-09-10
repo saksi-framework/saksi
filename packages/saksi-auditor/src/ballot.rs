@@ -27,6 +27,60 @@ use saksi_protocol::{Ballot, ElectionParameters, WIRE_VERSION};
 
 use crate::report::ReportBuilder;
 
+/// Per-check tally of the ballot findings that **passed**.
+///
+/// The auditor records one finding per check per ballot, and at population
+/// scale that report is the largest thing in the process: seven-ish findings
+/// per ballot is ~46 MB at 20k ballots and gigabytes at the capstone tiers —
+/// which would put back exactly the per-ballot retention the streaming audit
+/// exists to remove. A passing check carries no information beyond "this one
+/// was fine", so passes are counted here and emitted as one rollup finding per
+/// check. **Failures are still recorded individually**: those are the ones a
+/// reader has to act on, and their number is bounded by how broken the
+/// population is, not by how large it is.
+#[derive(Default)]
+pub(crate) struct BallotPassCounts {
+    shape: usize,
+    cds_proof: usize,
+    issuer_binding: usize,
+    credential: usize,
+}
+
+impl BallotPassCounts {
+    /// Emits one rollup Pass finding per check that passed at least once.
+    ///
+    /// A check with no passes emits nothing, which is what an empty ballot list
+    /// did before the rollup existed.
+    pub(crate) fn report(&self, builder: &mut ReportBuilder) {
+        for (check, count, what) in [
+            (
+                "ballot.shape",
+                self.shape,
+                "ballots have a wire shape matching parameters",
+            ),
+            (
+                "ballot.cds_proof",
+                self.cds_proof,
+                "ballot ciphertexts carry a verifying CDS OR-proof",
+            ),
+            (
+                "ballot.issuer_binding",
+                self.issuer_binding,
+                "ballots embed the trust-anchor issuer key",
+            ),
+            (
+                "ballot.credential",
+                self.credential,
+                "ballot credential presentations verify",
+            ),
+        ] {
+            if count > 0 {
+                builder.pass(check, format!("{count} {what}"));
+            }
+        }
+    }
+}
+
 /// One eligible ballot's decoded ciphertext, already mapped to its global
 /// contest index. Returned by [`verify_ballot`] so the running homomorphic
 /// aggregate can fold points the verifier just decompressed, rather than
@@ -41,9 +95,14 @@ pub(crate) struct DecodedCiphertext {
 /// `parameters`, the rebuilt joint public key, the issuer key, and the auditor's
 /// `binding_context`. Pushes one finding per check onto `builder`.
 ///
+/// Failing checks are pushed onto `builder`; passing ones are counted into
+/// `passes` and reported once for the whole population (see
+/// [`BallotPassCounts`]).
+///
 /// Returns the ballot's decoded ciphertexts iff its CDS proofs **and** its
 /// credential presentation both passed — i.e. iff it is eligible to be folded
 /// into the homomorphic tally. `None` for every ineligible ballot.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn verify_ballot(
     idx: usize,
     ballot: &Ballot,
@@ -51,6 +110,7 @@ pub(crate) fn verify_ballot(
     election_public_key: &elgamal::PublicKey,
     issuer_public_key: &IssuerPublicKey,
     binding_context: &[u8],
+    passes: &mut BallotPassCounts,
     builder: &mut ReportBuilder,
 ) -> Option<Vec<DecodedCiphertext>> {
     let binary_choice_set = [Scalar::ZERO, Scalar::ONE];
@@ -108,10 +168,7 @@ pub(crate) fn verify_ballot(
         );
         return None;
     }
-    builder.pass(
-        "ballot.shape",
-        format!("ballot[{idx}] wire shape matches parameters"),
-    );
+    passes.shape += 1;
 
     // -- per-contest CDS check ----------------------------------------
 
@@ -202,10 +259,7 @@ pub(crate) fn verify_ballot(
             all_cds_ok = false;
             continue;
         }
-        builder.pass(
-            "ballot.cds_proof",
-            format!("ballot[{idx}] contest {contest_id}: CDS OR-proof verifies"),
-        );
+        passes.cds_proof += 1;
         decoded.push(DecodedCiphertext {
             contest: global_idx,
             pad,
@@ -242,10 +296,7 @@ pub(crate) fn verify_ballot(
         // key, which would double up the failure noise; we still call
         // it for the explicit ballot.credential finding.)
     } else {
-        builder.pass(
-            "ballot.issuer_binding",
-            format!("ballot[{idx}] embedded issuer_public_key matches trust anchor"),
-        );
+        passes.issuer_binding += 1;
     }
 
     let cred_ok = match verify_presentation(
@@ -258,10 +309,7 @@ pub(crate) fn verify_ballot(
         binding_context,
     ) {
         Ok(()) => {
-            builder.pass(
-                "ballot.credential",
-                format!("ballot[{idx}] credential presentation verifies"),
-            );
+            passes.credential += 1;
             true
         }
         Err(err) => {

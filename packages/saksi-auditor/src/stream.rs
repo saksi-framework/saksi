@@ -209,6 +209,84 @@ pub struct GenTimings {
 /// Memory is therefore `O(chunk_voters × positions × candidates)` for the
 /// ballots — plus `header.json`'s `voter_ids`, which the v1 header shape
 /// requires to be one string per ballot (see the struct field).
+/// Fail-closed structural check over one built chunk, run before a byte of it
+/// is written.
+///
+/// `first_line` is the number of ballot lines already written, so every message
+/// names the 1-based line the offending record would have occupied. Nullifier
+/// distinctness is checked **within the chunk**: nullifiers derive from
+/// distinct credentials, so a cross-chunk collision is a cryptographic
+/// impossibility rather than a generator bug, and the auditor's own
+/// `nullifier.unique` check covers the whole stream regardless.
+fn validate_chunk(
+    work: &[VoterWork],
+    positions: usize,
+    candidates: usize,
+    first_line: usize,
+) -> Result<(), String> {
+    let mut seen: HashSet<&[u8]> = HashSet::with_capacity(work.len() * positions);
+    let mut line = first_line;
+    for voter in work {
+        if voter.ballots.len() != positions {
+            return Err(format!(
+                "the voter at ballot line {} produced {} records, expected {positions} (one per position)",
+                line + 1,
+                voter.ballots.len()
+            ));
+        }
+        for ballot in &voter.ballots {
+            line += 1;
+            if ballot.ciphertexts.len() != candidates
+                || ballot.well_formedness_proofs.len() != candidates
+            {
+                return Err(format!(
+                    "ballot line {line} has {} ciphertexts / {} proofs, expected {candidates}",
+                    ballot.ciphertexts.len(),
+                    ballot.well_formedness_proofs.len()
+                ));
+            }
+            let nullifier = ballot
+                .credential_presentation
+                .as_ref()
+                .and_then(|p| p.nullifier.as_ref())
+                .ok_or_else(|| format!("ballot line {line} has no nullifier"))?;
+            if !seen.insert(nullifier.value.as_slice()) {
+                return Err(format!(
+                    "ballot line {line} replays a nullifier from its own chunk (double vote)"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Fail-closed whole-run gate: the checks that only make sense once every chunk
+/// has been written, expressed over the two running totals rather than over the
+/// population (which is long gone by then).
+fn validate_totals(
+    lines: usize,
+    counts: &[u64],
+    voters: usize,
+    positions: usize,
+    candidates: usize,
+) -> Result<(), String> {
+    if lines != voters * positions {
+        return Err(format!(
+            "wrote {lines} ballot lines, expected voters*positions {}",
+            voters * positions
+        ));
+    }
+    for p in 0..positions {
+        let selected: u64 = counts[p * candidates..(p + 1) * candidates].iter().sum();
+        if selected != voters as u64 {
+            return Err(format!(
+                "position {p} ground-truth aggregate {selected} != voter count {voters} (each voter must select exactly one candidate)"
+            ));
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn write_election_stream_chunked(
     dir: &Path,
     params: &GenParams,
@@ -247,44 +325,11 @@ pub(crate) fn write_election_stream_chunked(
                 .map(|voter_idx| build_voter(&pro, params, voter_idx))
                 .collect();
 
-            // Fail-closed shape + within-chunk nullifier check. Nullifiers are
-            // derived from distinct credentials, so a cross-chunk collision is a
-            // cryptographic impossibility rather than a generator bug; the
-            // auditor's own `nullifier.unique` check covers the whole stream.
-            let mut seen: HashSet<Vec<u8>> = HashSet::with_capacity(work.len() * positions);
-            let mut selections: Vec<(usize, usize)> = Vec::with_capacity(work.len() * positions);
+            validate_chunk(&work, positions, candidates, lines)?;
 
+            let mut selections: Vec<(usize, usize)> = Vec::with_capacity(work.len() * positions);
             for voter in &work {
-                if voter.ballots.len() != positions {
-                    return Err(format!(
-                        "voter produced {} records, expected {positions} (one per position)",
-                        voter.ballots.len()
-                    ));
-                }
                 for ballot in &voter.ballots {
-                    if ballot.ciphertexts.len() != candidates
-                        || ballot.well_formedness_proofs.len() != candidates
-                    {
-                        return Err(format!(
-                            "ballot line {} has {} ciphertexts / {} proofs, expected {candidates}",
-                            lines + 1,
-                            ballot.ciphertexts.len(),
-                            ballot.well_formedness_proofs.len()
-                        ));
-                    }
-                    let nullifier = ballot
-                        .credential_presentation
-                        .as_ref()
-                        .and_then(|p| p.nullifier.as_ref())
-                        .ok_or_else(|| format!("ballot line {} has no nullifier", lines + 1))?
-                        .value
-                        .clone();
-                    if !seen.insert(nullifier) {
-                        return Err(format!(
-                            "ballot line {} replays a nullifier from its own chunk (double vote)",
-                            lines + 1
-                        ));
-                    }
                     writeln!(out, "{}", hex::encode(ballot.encode_to_vec()))
                         .map_err(|e| format!("write ballot line: {e}"))?;
                     lines += 1;
@@ -315,21 +360,7 @@ pub(crate) fn write_election_stream_chunked(
 
     // -- fail-closed population gate (what can be checked without the ballots) --
 
-    if lines != params.voters * positions {
-        return Err(format!(
-            "wrote {lines} ballot lines, expected voters*positions {}",
-            params.voters * positions
-        ));
-    }
-    for p in 0..positions {
-        let selected: u64 = counts[p * candidates..(p + 1) * candidates].iter().sum();
-        if selected != params.voters as u64 {
-            return Err(format!(
-                "position {p} ground-truth aggregate {selected} != voter count {} (each voter must select exactly one candidate)",
-                params.voters
-            ));
-        }
-    }
+    validate_totals(lines, &counts, params.voters, positions, candidates)?;
 
     // -- trustee ceremony over the running aggregate ------------------------
 
@@ -363,9 +394,17 @@ pub(crate) fn write_election_stream_chunked(
     };
     let header_path = dir.join(HEADER_FILE);
     let header_tmp = tmp_path(&header_path);
-    let encoded =
-        serde_json::to_string_pretty(&header).map_err(|e| format!("encode header: {e}"))?;
-    fs::write(&header_tmp, encoded).map_err(|e| format!("write {}: {e}", header_tmp.display()))?;
+    {
+        // Serialized straight into the file: `to_string_pretty` would hold a
+        // second copy of the header (whose `voter_ids` is one string per ballot)
+        // in memory alongside the struct it is copying.
+        let file = fs::File::create(&header_tmp)
+            .map_err(|e| format!("create {}: {e}", header_tmp.display()))?;
+        let mut out = BufWriter::new(file);
+        serde_json::to_writer_pretty(&mut out, &header)
+            .map_err(|e| format!("encode header: {e}"))?;
+        out.flush().map_err(|e| format!("flush header: {e}"))?;
+    }
 
     fs::rename(&ballots_tmp, &ballots_path)
         .map_err(|e| format!("rename {}: {e}", ballots_path.display()))?;
@@ -545,6 +584,232 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("saksi-stream-test-{name}"));
         let _ = fs::remove_dir_all(&dir);
         dir
+    }
+
+    /// One chunk's worth of freshly built voters, for the gate tests below to
+    /// corrupt. Built through the real generator so the "valid" baseline is the
+    /// same thing the writer produces.
+    fn built_chunk(voters: usize, positions: usize, candidates: usize) -> Vec<VoterWork> {
+        let params = GenParams::simple(voters, positions, candidates, SelectionProfile::Uniform);
+        let pro = gen_prologue(&params);
+        (0..voters)
+            .map(|voter_idx| build_voter(&pro, &params, voter_idx))
+            .collect()
+    }
+
+    #[test]
+    fn the_chunk_gate_rejects_a_voter_with_the_wrong_record_count() {
+        let mut work = built_chunk(2, 2, 2);
+        work[1].ballots.pop();
+        let err = validate_chunk(&work, 2, 2, 0).expect_err("must reject a short voter");
+        assert!(err.contains("records"), "got {err}");
+        // Voter 1's records would have been lines 3 and 4.
+        assert!(
+            err.contains("line 3"),
+            "the error must name the line: {err}"
+        );
+    }
+
+    #[test]
+    fn the_chunk_gate_rejects_a_ballot_with_the_wrong_ciphertext_count() {
+        let mut work = built_chunk(1, 1, 2);
+        work[0].ballots[0].ciphertexts.pop();
+        let err = validate_chunk(&work, 1, 2, 0).expect_err("must reject a short ballot");
+        assert!(err.contains("ciphertexts"), "got {err}");
+    }
+
+    #[test]
+    fn the_chunk_gate_rejects_a_ballot_with_no_nullifier() {
+        let mut work = built_chunk(1, 1, 2);
+        work[0].ballots[0]
+            .credential_presentation
+            .as_mut()
+            .expect("presentation")
+            .nullifier = None;
+        let err = validate_chunk(&work, 1, 2, 0).expect_err("must reject a nullifier-less ballot");
+        assert!(err.contains("nullifier"), "got {err}");
+    }
+
+    #[test]
+    fn the_chunk_gate_rejects_a_replayed_nullifier() {
+        let mut work = built_chunk(2, 1, 2);
+        let replay = work[0].ballots[0].credential_presentation.clone();
+        work[1].ballots[0].credential_presentation = replay;
+        let err = validate_chunk(&work, 1, 2, 0).expect_err("must reject a double vote");
+        assert!(err.contains("replays"), "got {err}");
+    }
+
+    #[test]
+    fn the_whole_run_gate_rejects_a_short_stream() {
+        // 2 voters x 2 positions = 4 lines; the seeded counts are consistent.
+        let counts = [2u64, 0, 1, 1];
+        validate_totals(4, &counts, 2, 2, 2).expect("an intact run passes");
+        let err = validate_totals(3, &counts, 2, 2, 2).expect_err("must reject a short stream");
+        assert!(err.contains("ballot lines"), "got {err}");
+    }
+
+    #[test]
+    fn the_whole_run_gate_rejects_a_position_that_lost_a_vote() {
+        // Position 1 seeds only one selection across two voters.
+        let err = validate_totals(4, &[2, 0, 1, 0], 2, 2, 2)
+            .expect_err("must reject a per-position aggregate that is not the voter count");
+        assert!(err.contains("aggregate"), "got {err}");
+    }
+
+    /// A line the auditor cannot decode is reported as its own finding and the
+    /// rest of the stream is still audited — the audit never short-circuits.
+    #[test]
+    fn a_corrupt_ballot_line_fails_the_stream_audit() {
+        let dir = scratch("audit-corrupt-line");
+        crate::demo::write_election_stream_params_chunked(
+            &dir,
+            &GenParams::simple(3, 1, 2, SelectionProfile::Uniform),
+            2,
+        )
+        .expect("chunked write");
+
+        let path = dir.join(BALLOTS_FILE);
+        let mut lines: Vec<String> = fs::read_to_string(&path)
+            .expect("read ndjson")
+            .lines()
+            .map(String::from)
+            .collect();
+        lines[1] = "zz-not-hex".to_owned();
+        fs::write(&path, format!("{}\n", lines.join("\n"))).expect("rewrite corrupt");
+
+        let (sa, report) = crate::demo::audit_stream_dir_full(&dir).expect("audits");
+        assert_eq!(sa.overall, "fail");
+        assert!(
+            report
+                .findings
+                .iter()
+                .any(|f| f.check == "ballot.decode" && f.status == crate::AuditStatus::Fail),
+            "the undecodable line must be reported: {report:#?}"
+        );
+        assert!(
+            report.finding("nullifier.unique").is_some(),
+            "the surviving ballots must still be audited"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The same reporting holds on the DKG-failed path, where the audit stops
+    /// after nullifier uniqueness: an undecodable line is still named.
+    #[test]
+    fn a_corrupt_line_is_reported_even_when_the_dkg_cannot_be_rebuilt() {
+        let f = multi_position_fixture(&GenParams::simple(2, 1, 2, SelectionProfile::Uniform));
+        // A default transcript fails the very first shape check, so
+        // `verify_dkg_transcript` returns None and the audit takes the short path.
+        let broken = saksi_protocol::DKGTranscript::default();
+
+        let (report, evidence, _timings) = crate::audit_streaming(
+            crate::AuditInputs {
+                parameters: &f.parameters,
+                dkg_transcript: &broken,
+                partial_decryptions: &f.partial_decryptions,
+                tally: &f.tally,
+                binding_context: crate::fixtures::BINDING_CONTEXT,
+                issuer_public_key: &f.issuer_public_key,
+                ground_truth: None,
+                expected_ballots: None,
+            },
+            vec![
+                Ok(f.ballots[0].clone()),
+                Err("ballot line 2 is not valid hex".to_string()),
+            ]
+            .into_iter(),
+        );
+
+        assert!(
+            evidence.is_empty(),
+            "no tally evidence without a usable DKG transcript"
+        );
+        assert!(
+            report
+                .findings
+                .iter()
+                .any(|x| x.check == "ballot.decode" && x.status == crate::AuditStatus::Fail),
+            "{report:#?}"
+        );
+        assert!(
+            report.finding("nullifier.unique").is_some(),
+            "nullifier uniqueness still runs when the DKG cannot be rebuilt"
+        );
+    }
+
+    /// A stream that ends early must not read as a smaller, clean election: the
+    /// audit says how many declared lines it never saw.
+    #[test]
+    fn a_line_over_the_cap_reports_the_lines_it_never_audited() {
+        let dir = scratch("cap-completeness");
+        crate::demo::write_election_stream_params_chunked(
+            &dir,
+            &GenParams::simple(3, 1, 2, SelectionProfile::Uniform),
+            3,
+        )
+        .expect("chunked write");
+
+        let path = dir.join(BALLOTS_FILE);
+        let lines: Vec<String> = fs::read_to_string(&path)
+            .expect("read ndjson")
+            .lines()
+            .map(String::from)
+            .collect();
+        // Line 1 audits, line 2 blows the cap and ends the stream, line 3 is
+        // never reached.
+        let rewritten = format!(
+            "{}\n{}\n{}\n",
+            lines[0],
+            "a".repeat(MAX_BALLOT_LINE_BYTES + 1),
+            lines[2]
+        );
+        fs::write(&path, rewritten).expect("rewrite oversize");
+
+        let (sa, report) = crate::demo::audit_stream_dir_full(&dir).expect("audits");
+        assert_eq!(sa.overall, "fail");
+        let completeness = report
+            .finding("stream.completeness")
+            .expect("a truncated stream must be reported");
+        assert_eq!(completeness.status, crate::AuditStatus::Fail);
+        assert!(
+            completeness.detail.contains("audited 2 of the 3")
+                && completeness.detail.contains("1 not audited"),
+            "got {}",
+            completeness.detail
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The header the chunked writer streams into its file parses back exactly.
+    #[test]
+    fn the_chunked_header_round_trips_through_read_header() {
+        let dir = scratch("header-roundtrip");
+        let params = GenParams::simple(4, 2, 3, SelectionProfile::Realistic);
+        crate::demo::write_election_stream_params_chunked(&dir, &params, 2).expect("chunked write");
+
+        let header = read_header(&dir).expect("header parses");
+        assert_eq!(header.n, 4 * 2, "one record per (voter, position)");
+        assert_eq!(header.positions, 2);
+        assert_eq!(header.candidates, 3);
+        assert_eq!(header.election_id, params.election_id);
+        assert_eq!(header.election_name, params.election_name);
+        assert_eq!(header.trustee_names, params.trustee_names);
+        assert_eq!(header.voter_ids.len(), header.n);
+        assert_eq!(header.ground_truth.len(), 2 * 3);
+        assert_eq!(
+            header.ground_truth.iter().sum::<u64>(),
+            4 * 2,
+            "one selection per voter per position"
+        );
+        assert!(
+            !header.params.is_empty() && !header.dkg.is_empty() && !header.tally.is_empty(),
+            "the embedded protobuf payloads survive the streamed write"
+        );
+        assert_eq!(verify_stream(&dir).expect("gate passes"), 8);
+
+        let _ = fs::remove_dir_all(&dir);
     }
 
     /// Every chunk size must describe the same election: the boundary is a

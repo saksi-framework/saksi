@@ -514,6 +514,7 @@ pub(crate) fn audit_stream_dir_full(
             binding_context: &binding_context,
             issuer_public_key: &issuer_public_key,
             ground_truth: Some(&ground_truth),
+            expected_ballots: Some(header.n),
         },
         ballots,
     );

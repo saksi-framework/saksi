@@ -146,6 +146,13 @@ pub(crate) struct AuditInputs<'a> {
     pub(crate) binding_context: &'a [u8],
     pub(crate) issuer_public_key: &'a IssuerPublicKey,
     pub(crate) ground_truth: Option<&'a [u64]>,
+    /// How many ballots the producer says the stream holds (`header.n`), when
+    /// the caller knows. A stream that ends early — a line over the read cap, a
+    /// truncated file — otherwise looks exactly like a smaller election, so the
+    /// mismatch is reported as a Fatal `stream.completeness` finding. `None` for
+    /// an in-memory `&[Ballot]`, where the count is the slice length by
+    /// definition.
+    pub(crate) expected_ballots: Option<usize>,
 }
 
 impl<'a> ElectionArtifacts<'a> {
@@ -159,6 +166,7 @@ impl<'a> ElectionArtifacts<'a> {
             binding_context: self.binding_context,
             issuer_public_key: self.issuer_public_key,
             ground_truth: self.ground_truth,
+            expected_ballots: None,
         }
     }
 }
@@ -236,9 +244,12 @@ pub(crate) fn audit_streaming(
     let mut aggregate_pads = vec![RistrettoPoint::identity(); contest_count];
     let mut aggregate_data = vec![RistrettoPoint::identity(); contest_count];
     let mut nullifiers = NullifierTracker::default();
+    let mut passes = crate::ballot::BallotPassCounts::default();
     let mut eligible_count = 0usize;
+    let mut observed = 0usize;
 
     for (idx, item) in ballots.enumerate() {
+        observed += 1;
         let ballot = match item {
             Ok(b) => b,
             Err(err) => {
@@ -255,6 +266,7 @@ pub(crate) fn audit_streaming(
             &election_public_key,
             inputs.issuer_public_key,
             inputs.binding_context,
+            &mut passes,
             &mut builder,
         );
         timings.verify_ballots += started.elapsed();
@@ -273,6 +285,21 @@ pub(crate) fn audit_streaming(
         // `ballot` drops here.
     }
 
+    // A stream that stopped early (a line over the read cap, a truncated file)
+    // must not read as a smaller, clean election.
+    if let Some(expected) = inputs.expected_ballots {
+        if observed != expected {
+            builder.fail(
+                "stream.completeness",
+                format!(
+                    "audited {observed} of the {expected} ballot lines the header declares ({} not audited)",
+                    expected.saturating_sub(observed)
+                ),
+            );
+        }
+    }
+
+    passes.report(&mut builder);
     nullifiers.report(&mut builder);
 
     // -- 7. Per-trustee partial decryptions -------------------------------
