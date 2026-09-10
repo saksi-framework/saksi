@@ -196,13 +196,14 @@ func TestNegativeTestsCSVRowsMatchTheirHeader(t *testing.T) {
 		Property: "prop", OnChain: false,
 	})
 	rows := readCSVRows(t, dir)
-	if len(rows) != 2 {
-		t.Fatalf("csv rows = %d, want header + 1: %v", len(rows), rows)
+	if len(rows) != 3 {
+		t.Fatalf("csv rows = %d, want header + 1 + summary: %v", len(rows), rows)
 	}
 	for col, want := range map[string]string{
 		"scenario": "dropped-ballot", "stage": StageClose, "layer": "offline",
 		"action": "act", "expected": "exp", "actual": "actual",
 		"verdict": "PASS", "property": "prop", "on_chain": "false",
+		"attempted": "1", "rejected": "1", "rate": "1.00",
 	} {
 		if got := rows[1][csvCol(t, rows[0], col)]; got != want {
 			t.Errorf("column %q = %q, want %q — header and row writer are out of step", col, got, want)
@@ -234,8 +235,8 @@ func TestScenarioResultsAccumulateAcrossSeparateRuns(t *testing.T) {
 	exportOnce(t, dir, ScenarioResult{Scenario: "dropped-ballot", Verdict: "PASS", Actual: "rejected"})
 
 	rows := readCSVRows(t, dir)
-	if len(rows) != 3 { // header + 2
-		t.Fatalf("csv rows = %d, want 3 (header + both scenarios): %v", len(rows), rows)
+	if len(rows) != 4 { // header + 2 + summary
+		t.Fatalf("csv rows = %d, want 4 (header + both scenarios + summary): %v", len(rows), rows)
 	}
 	got := map[string]bool{rows[1][0]: true, rows[2][0]: true}
 	for _, want := range []string{"reused-nullifier", "dropped-ballot"} {
@@ -257,7 +258,7 @@ func TestScenarioRerunUpdatesRowInPlace(t *testing.T) {
 	exportOnce(t, dir, ScenarioResult{Scenario: "dropped-ballot", Verdict: "PASS", Actual: "rejected"})
 
 	rows := readCSVRows(t, dir)
-	if len(rows) != 2 { // header + 1
+	if len(rows) != 3 { // header + 1 + summary
 		t.Fatalf("re-running a scenario appended a duplicate row: %v", rows)
 	}
 	// Look the column up by name: hardcoding an index means a schema change
@@ -307,5 +308,47 @@ func TestScenarioListingsJoinVerdicts(t *testing.T) {
 	}
 	if !seen {
 		t.Error("reused-nullifier missing from the listings")
+	}
+}
+
+// The rejection-rate columns are what the paper reports: how many attacks were
+// mounted and how many the system refused. A SKIPPED scenario was never
+// mounted, so it must not dilute the rate with a phantom attempt.
+func TestNegativeTestsCSVRejectionRates(t *testing.T) {
+	dir := t.TempDir()
+
+	exportOnce(t, dir, ScenarioResult{Scenario: "tamper-ballot-proof", Verdict: "PASS", OnChain: true})
+	exportOnce(t, dir, ScenarioResult{Scenario: "reused-nullifier", Verdict: "FAIL"})
+	exportOnce(t, dir, ScenarioResult{Scenario: "dropped-ballot", Verdict: "SKIPPED"})
+
+	rows := readCSVRows(t, dir)
+	if len(rows) != 5 { // header + 3 + summary
+		t.Fatalf("csv rows = %d, want header + 3 + summary: %v", len(rows), rows)
+	}
+	scenarioCol := csvCol(t, rows[0], "scenario")
+	attempted, rejected, rate := csvCol(t, rows[0], "attempted"), csvCol(t, rows[0], "rejected"), csvCol(t, rows[0], "rate")
+
+	want := map[string][3]string{
+		"tamper-ballot-proof": {"1", "1", "1.00"},
+		"reused-nullifier":    {"1", "0", "0.00"},
+		"dropped-ballot":      {"0", "0", ""}, // never mounted — no rate to report
+		"summary":             {"2", "1", "0.50"},
+	}
+	for _, cols := range rows[1:] {
+		w, ok := want[cols[scenarioCol]]
+		if !ok {
+			t.Fatalf("unexpected row %q", cols[scenarioCol])
+		}
+		got := [3]string{cols[attempted], cols[rejected], cols[rate]}
+		if got != w {
+			t.Errorf("%s: attempted/rejected/rate = %v, want %v", cols[scenarioCol], got, w)
+		}
+		delete(want, cols[scenarioCol])
+	}
+	if len(want) != 0 {
+		t.Errorf("rows missing from the export: %v", want)
+	}
+	if rows[len(rows)-1][scenarioCol] != "summary" {
+		t.Errorf("summary must be the last row, got %q", rows[len(rows)-1][scenarioCol])
 	}
 }
