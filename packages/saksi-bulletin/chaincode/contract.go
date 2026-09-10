@@ -839,7 +839,7 @@ func verifyTallySignatures(stub interface {
 		return fmt.Errorf("decode stored DKG transcript: %w", err)
 	}
 
-	context := sigverify.TallySigContext(electionID, tally.GetTotals())
+	sigContext := sigverify.TallySigContext(electionID, tally.GetTotals())
 	trusteeIDs := params.GetTrusteeIds()
 	seen := make(map[string]bool, len(signatures))
 	valid := 0
@@ -857,7 +857,7 @@ func verifyTallySignatures(stub interface {
 		if err != nil {
 			return fmt.Errorf("derive verification key for trustee %q: %w", id, err)
 		}
-		if err := sigverify.VerifySchnorr(key, context, sig.GetSignature()); err == nil {
+		if err := sigverify.VerifySchnorr(key, sigContext, sig.GetSignature()); err == nil {
 			valid++
 		}
 	}
