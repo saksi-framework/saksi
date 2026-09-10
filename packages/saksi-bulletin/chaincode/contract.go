@@ -729,7 +729,8 @@ func (s *SmartContract) GetPartialDecryption(ctx contractapi.TransactionContextI
 //
 // On-chain checks: supported wire version, the election exists and is closed, one
 // total per contest, no tally has been published yet, and — the threshold gate —
-// at least `threshold` distinct trustees have signed these exact totals. The
+// every signature it carries verifies and at least `threshold` distinct trustees
+// have signed these exact totals. The
 // tally's correctness (that the totals match the homomorphic sum decrypted by
 // the partial decryptions) is still verified off-chain by auditor clients.
 func (s *SmartContract) PublishTally(ctx contractapi.TransactionContextInterface, tallyHex string) error {
@@ -808,11 +809,20 @@ func (s *SmartContract) PublishTally(ctx contractapi.TransactionContextInterface
 // trustees must have produced one.
 //
 // A tally carrying no signatures is refused outright — nobody endorsed it. An
-// unknown or repeated trustee_id is a hard rejection (the submission is
-// malformed, not merely short of quorum); a signature that simply fails to
-// verify is not counted, so it surfaces as the threshold error alongside any
-// other shortfall. The signed bytes use the election id from the STORED
-// parameters, never the one the tally chose.
+// unknown trustee_id, a repeated one, and a signature that does not verify are
+// each a hard rejection. The threshold error is then reached only by a tally
+// whose signatures all verify but are too few.
+//
+// **Chaincode and auditor agree on strictness.** The off-chain auditor's
+// `tally.signatures` finding (saksi-auditor/src/tally.rs) fails on ANY bad
+// signature, not merely on a shortfall. If this gate merely declined to count a
+// corrupt entry, a tally carrying threshold-many good signatures plus one
+// corrupt one would be published once and then fail every audit of that
+// election forever. Rejecting here keeps the two verifiers from disagreeing
+// about the same bytes.
+//
+// The signed bytes use the election id from the STORED parameters, never the
+// one the tally chose.
 func verifyTallySignatures(stub interface {
 	CreateCompositeKey(string, []string) (string, error)
 	GetState(string) ([]byte, error)
@@ -857,9 +867,10 @@ func verifyTallySignatures(stub interface {
 		if err != nil {
 			return fmt.Errorf("derive verification key for trustee %q: %w", id, err)
 		}
-		if err := sigverify.VerifySchnorr(key, sigContext, sig.GetSignature()); err == nil {
-			valid++
+		if err := sigverify.VerifySchnorr(key, sigContext, sig.GetSignature()); err != nil {
+			return fmt.Errorf("tally signature from trustee %q does not verify: %w", id, err)
 		}
+		valid++
 	}
 	if valid < int(params.GetThreshold()) {
 		return fmt.Errorf("tally has %d valid trustee signatures, threshold is %d", valid, params.GetThreshold())

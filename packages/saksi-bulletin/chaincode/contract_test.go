@@ -1032,6 +1032,8 @@ func TestPublishTallyRejectsUnsignedTally(t *testing.T) {
 	}
 }
 
+// The threshold error is now reachable only one way: every signature verifies,
+// there are just too few of them. A bad signature never reaches this count.
 func TestPublishTallyRejectsBelowThreshold(t *testing.T) {
 	sc := &SmartContract{}
 	ctx := newContext()
@@ -1072,24 +1074,50 @@ func TestPublishTallyRejectsUnknownTrusteeSignature(t *testing.T) {
 }
 
 // A signature over other totals is real, correctly formed, and by a real
-// trustee — it just does not endorse THIS tally. It must not count.
+// trustee — it just does not endorse THIS tally. It is a hard rejection, not a
+// silently uncounted entry: the off-chain auditor fails `tally.signatures` on
+// any bad signature, so a tally with threshold-many good ones plus this bad one
+// would otherwise be published once and fail every audit of that election
+// forever. Note there ARE threshold-many valid signatures here — only the
+// strictness rule rejects it.
 func TestPublishTallyRejectsSignatureOverOtherTotals(t *testing.T) {
 	sc := &SmartContract{}
 	ctx := newContext()
 	v := loadTallySigVector(t)
 	withSignedTallyElection(t, sc, ctx, v)
-	// Swap trustee 1's real signature for its signature over other totals, so
-	// exactly one of the threshold-many signatures stops verifying.
-	sigs := append([]*saksiprotocolv1.TrusteeSignature{v.negative}, v.signatures[1:v.threshold]...)
+	// The negative line is trustee_ids[0]'s, so take the threshold-many good
+	// signatures from the OTHER trustees — every id stays distinct and the
+	// tally really does carry threshold-many valid endorsements.
+	sigs := append(append([]*saksiprotocolv1.TrusteeSignature{}, v.signatures[1:v.threshold+1]...), v.negative)
 	err := sc.PublishTally(ctx, mustMarshalTally(t, signedTally(v, sigs...)))
-	want := fmt.Sprintf("tally has %d valid trustee signatures, threshold is %d", int(v.threshold)-1, v.threshold)
-	if err == nil || err.Error() != want {
-		t.Fatalf("expected %q, got: %v", want, err)
+	want := fmt.Sprintf("tally signature from trustee %q does not verify", v.negative.GetTrusteeId())
+	if err == nil || !strings.Contains(err.Error(), want) {
+		t.Fatalf("expected an error containing %q, got: %v", want, err)
+	}
+}
+
+// A malformed signature is rejected the same way, naming the trustee — never
+// merely skipped on the way to a threshold count.
+func TestPublishTallyRejectsMalformedSignature(t *testing.T) {
+	sc := &SmartContract{}
+	ctx := newContext()
+	v := loadTallySigVector(t)
+	withSignedTallyElection(t, sc, ctx, v)
+	stub := &saksiprotocolv1.TrusteeSignature{
+		TrusteeId: v.signatures[v.threshold].GetTrusteeId(),
+		Signature: v.signatures[v.threshold].GetSignature()[:63], // one byte short
+	}
+	sigs := append(append([]*saksiprotocolv1.TrusteeSignature{}, v.signatures[:v.threshold]...), stub)
+	err := sc.PublishTally(ctx, mustMarshalTally(t, signedTally(v, sigs...)))
+	want := fmt.Sprintf("tally signature from trustee %q does not verify", stub.GetTrusteeId())
+	if err == nil || !strings.Contains(err.Error(), want) {
+		t.Fatalf("expected an error containing %q, got: %v", want, err)
 	}
 }
 
 // A tampered total changes the signed context, so every signature stops
-// verifying at once — the totals are bound, not merely accompanied.
+// verifying at once — the totals are bound, not merely accompanied. The first
+// one to fail names its trustee.
 func TestPublishTallyRejectsTamperedTotals(t *testing.T) {
 	sc := &SmartContract{}
 	ctx := newContext()
@@ -1099,9 +1127,9 @@ func TestPublishTallyRejectsTamperedTotals(t *testing.T) {
 	tally.Totals = append([]uint64(nil), v.totals...)
 	tally.Totals[0]++
 	err := sc.PublishTally(ctx, mustMarshalTally(t, tally))
-	want := fmt.Sprintf("tally has 0 valid trustee signatures, threshold is %d", v.threshold)
-	if err == nil || err.Error() != want {
-		t.Fatalf("expected %q, got: %v", want, err)
+	want := fmt.Sprintf("tally signature from trustee %q does not verify", v.signatures[0].GetTrusteeId())
+	if err == nil || !strings.Contains(err.Error(), want) {
+		t.Fatalf("expected an error containing %q, got: %v", want, err)
 	}
 }
 
