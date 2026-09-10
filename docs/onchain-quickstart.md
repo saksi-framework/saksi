@@ -158,6 +158,10 @@ also the fastest way to get a clean ledger for a fresh demonstration.
 ## Related
 
 - `research-election-console-runbook.md` — running the console without Fabric
-  (offline mode, no Docker needed).
+  (offline mode, no Docker needed), the run-folder artifacts (`journal.ndjson`,
+  `perf.csv`, `latencies.csv`), and §9 *Measurement runs*: `--repeat`,
+  `tools/ladder.sh`, `tools/tier.sh` (per-tier network reset before a
+  measurement tier), `tools/t3-restart.sh` (node restart under load), and
+  `POST /api/runs/{id}/resume`.
 - `wizard/4-encrypt.md` — what the on-chain lifecycle actually submits.
 - `wizard/deep-dive.md` — every step, and where each guarantee is enforced.
