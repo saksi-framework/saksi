@@ -25,7 +25,7 @@ pub use v1::{
     Ballot, CdsProof as CDSProof, CdsProofBranch as CDSProofBranch, ChaumPedersenProof, Ciphertext,
     CredentialPresentation, DkgComplaint as DKGComplaint, DkgTranscript as DKGTranscript,
     ElectionParameters, Nullifier, PartialDecryption, PedersenCommitment, TallyResult,
-    TrusteeCommitment,
+    TrusteeCommitment, TrusteeSignature,
 };
 
 /// The current wire-format version. Every protobuf message that crosses the
