@@ -136,7 +136,29 @@
       <details class="evidence">
         <summary>On-chain evidence (tally hex)</summary>
         <div class="kv"><span class="k">tally hex</span><span id="tallyHex" class="mono hash" title="click to copy full tally hex"></span></div>
+        <div class="kv"><span class="k">endorsement</span><span id="tallySigs"></span></div>
       </details>
+    </section>
+
+    <section class="panel">
+      <h2>What the independent verifier checks</h2>
+      <ol id="verifierChecks" class="sub" style="margin:0; padding-left:20px; line-height:1.9">
+        <li><code>parameters.shape</code> — the election's own parameters are internally consistent</li>
+        <li><code>dkg.shape</code> — one commitment set per trustee, each of degree threshold−1</li>
+        <li><code>dkg.decode</code> — every coefficient commitment is a valid group element</li>
+        <li><code>ballot.credential</code> — each ballot carries a real issuer signature</li>
+        <li><code>ballot.cds_proof</code> — each ciphertext is proven to encrypt 0 or 1</li>
+        <li><code>nullifier.unique</code> — no voter voted twice</li>
+        <li><code>decryption.cp_proof</code> — each decryption share is proven to use the trustee's own key</li>
+        <li><code>decryption.threshold</code> — enough distinct trustees decrypted each contest</li>
+        <li><code>tally.homomorphic_sum</code> — the published totals equal the decrypted sum of the ballots</li>
+        <li><code>tally.signatures</code> — threshold-many trustees signed these exact totals</li>
+      </ol>
+      <p class="sub" style="margin:10px 0 0">
+        Run by <code>saksi-auditor</code> against the chain, independently of this console.
+        The chaincode enforces the last one at endorsement too, so a tally too few trustees
+        signed is never recorded in the first place.
+      </p>
     </section>
   </div>
 
@@ -316,6 +338,18 @@ function render(data) {
 
   $("tallyHex").textContent = truncMid(live.tally_hex || "");
   $("tallyHex").onclick = () => copyText(live.tally_hex || "");
+  $("tallySigs").innerHTML = tallySignatureLabel(!!live.tally_hex, live.tally_signatures);
+}
+
+// A tally is only endorsed if trustees signed it. A tally published before
+// signatures existed carries none, and must be labelled as such rather than
+// shown the same way as a signed one.
+function tallySignatureLabel(hasTally, count) {
+  if (!hasTally) return "<span class='pill'>no tally</span>";
+  const n = count || 0;
+  return n === 0
+    ? "<span class='pill'>unsigned (legacy)</span>"
+    : `<span class='pill ok'>${n} trustee signature${n === 1 ? "" : "s"}</span>`;
 }
 
 // With no id in the path this page is an index of every election the console
@@ -336,7 +370,9 @@ function renderIndex(doc) {
         : r.on_chain
           ? "<span class='pill ok'>on chain" + (r.status ? " · " + esc(r.status) : "") + "</span>"
           : "<span class='pill'>not committed</span>";
-      const tally = r.tallied ? "<span class='pill ok'>tally published</span>" : "";
+      const tally = r.tallied
+        ? "<span class='pill ok'>tally published</span>" + tallySignatureLabel(true, r.tally_signatures)
+        : "";
       const ballots = r.ballots ? r.ballots.toLocaleString() + " ballots" : "";
       return `<div class="idxrow">
         <a href="/trail/${encodeURIComponent(r.election_id)}"><code>${esc(r.election_id)}</code></a>

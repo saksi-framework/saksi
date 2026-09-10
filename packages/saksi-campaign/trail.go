@@ -57,10 +57,15 @@ type liveProof struct {
 	StatusNow     string `json:"status_now"`
 	NullifierRows int    `json:"nullifier_count"`
 	TallyHex      string `json:"tally_hex,omitempty"`
-	ChainHeight   uint64 `json:"chain_height"`
-	TipHash       string `json:"tip_hash"`
-	Partial       bool   `json:"partial,omitempty"`
-	PartialReason string `json:"partial_reason,omitempty"`
+	// TallySignatures counts the trustee signatures the published tally
+	// carries. Zero alongside a non-empty TallyHex means the tally was
+	// published before tally signatures existed — the page labels that
+	// "unsigned (legacy)" rather than letting it pass for an endorsed one.
+	TallySignatures int    `json:"tally_signatures"`
+	ChainHeight     uint64 `json:"chain_height"`
+	TipHash         string `json:"tip_hash"`
+	Partial         bool   `json:"partial,omitempty"`
+	PartialReason   string `json:"partial_reason,omitempty"`
 }
 
 const trailJSONFile = "trail.json"
@@ -145,13 +150,14 @@ func buildTrail(reader chainReader, led clientsdk.Ledger, runDir, electionID str
 		Election: electionID,
 		Events:   events,
 		Live: &liveProof{
-			StatusNow:     displayStatus,
-			NullifierRows: nullifierCount,
-			TallyHex:      tallyHex,
-			ChainHeight:   height,
-			TipHash:       hex.EncodeToString(tip),
-			Partial:       partial,
-			PartialReason: partialReason,
+			StatusNow:       displayStatus,
+			NullifierRows:   nullifierCount,
+			TallyHex:        tallyHex,
+			TallySignatures: tallySignatureCount(tallyHex),
+			ChainHeight:     height,
+			TipHash:         hex.EncodeToString(tip),
+			Partial:         partial,
+			PartialReason:   partialReason,
 		},
 		Results:            results,
 		LedgerMatchesLocal: ledgerVerdict(runDir),
@@ -177,6 +183,22 @@ func ledgerVerdict(runDir string) *bool {
 		}
 	}
 	return v
+}
+
+// tallySignatureCount reports how many trustee signatures a hex-encoded
+// TallyResult carries. Anything that does not decode counts as zero: the page
+// uses this only to label a tally, and a tally that cannot be decoded is
+// already reported through the Partial/PartialReason path.
+func tallySignatureCount(tallyHex string) int {
+	raw, err := hex.DecodeString(tallyHex)
+	if err != nil {
+		return 0
+	}
+	var tally pb.TallyResult
+	if err := proto.Unmarshal(raw, &tally); err != nil {
+		return 0
+	}
+	return len(tally.GetSignatures())
 }
 
 // decodeTally decodes a hex-encoded saksi.protocol.v1.TallyResult against its
@@ -298,6 +320,9 @@ type trailIndexRow struct {
 	Status     string    `json:"status,omitempty"`
 	Ballots    int       `json:"ballots,omitempty"`
 	Tallied    bool      `json:"tallied"`
+	// TallySignatures counts the trustee signatures on the published tally;
+	// zero alongside Tallied is the "unsigned (legacy)" case.
+	TallySignatures int `json:"tally_signatures,omitempty"`
 }
 
 // trailIndex lists every election this console recorded, each checked against
@@ -341,6 +366,7 @@ func (s *Server) trailIndex() ([]trailIndexRow, bool) {
 				}
 				if t, err := reader.GetTally(rec.RunID); err == nil && t != "" {
 					row.Tallied = true
+					row.TallySignatures = tallySignatureCount(t)
 				}
 			}
 		}
