@@ -170,26 +170,32 @@ pub(crate) fn decode_trustee_commitments(
         .collect()
 }
 
-/// Public verification key of the trustee holding DKG share index `index`:
+/// Public verification key of the trustee at DKG share index `index`:
 ///
 /// ```text
 /// vk_i = Σ_j Σ_k C_{j,k} · i^k
 /// ```
 ///
-/// summed over **every** dealer `j` in the transcript and each of that dealer's
-/// coefficient commitments `C_{j,k} = a_{j,k}·G`. Because the DKG hands trustee
-/// `i` the share `s_i = Σ_j f_j(i)`, this is exactly `s_i·G` — the key that
-/// verifies that trustee's Chaum-Pedersen partial-decryption proofs and its
-/// Schnorr signature over the published tally.
+/// `commitments` is the **dealer list**: entry `j` is dealer `j`'s
+/// `coefficient_commitments` from `DKGTranscript.trustee_commitments`, in
+/// transcript order, decoded to points (`C_{j,k} = a_{j,k}·G`). The sum runs
+/// over *every* dealer. Because the DKG hands trustee `i` the share
+/// `s_i = Σ_j f_j(i)`, the result is exactly `s_i·G` — the key that verifies
+/// that trustee's Chaum-Pedersen partial-decryption proofs and its Schnorr
+/// signature over the published tally.
 ///
-/// **Index convention: 1-based, in transcript/parameters order.**
-/// `saksi_crypto::dkg::run_in_memory` gives the k-th trustee (0-based `k`) the
-/// share `Σ_j f_j(k + 1)` — it evaluates every dealer polynomial at
-/// `recipient_id = k + 1` — so the k-th entry of `parameters.trustee_ids`
-/// evaluates at `x = k + 1`, never at `x = 0` (which would yield the joint
-/// public key rather than a share's public). The Go chaincode copies this
-/// convention verbatim; the golden vector
-/// `saksi-protocol/test-vectors/tally-sig-v1.hex` pins the resulting keys.
+/// **Index convention: `index` is the trustee's 1-based position in
+/// `parameters.trustee_ids` — NOT anything parsed out of its `trustee_id`
+/// string.** Trustee ids are opaque labels (the golden vector deliberately uses
+/// non-numeric, non-sorted ones); the k-th entry of `parameters.trustee_ids`
+/// uses `index = k + 1`. That is the DKG's own indexing:
+/// `saksi_crypto::dkg::run_in_memory` gives the k-th trustee the share
+/// `Σ_j f_j(k + 1)`, evaluating every dealer polynomial at
+/// `recipient_id = k + 1`, never at `x = 0` (which would yield the joint public
+/// key rather than a share's public). The Go chaincode copies this convention
+/// verbatim; the golden vector
+/// `saksi-protocol/test-vectors/tally-sig-v1.hex` pins the resulting keys and
+/// carries the `trustee_ids` line the port must map by position.
 pub(crate) fn trustee_verification_key(
     commitments: &[Vec<RistrettoPoint>],
     index: u64,

@@ -1308,15 +1308,21 @@ mod realistic_profile_tests {
 /// ```text
 /// 1           dkg_transcript, hex of the canonical protobuf encoding
 /// 2           election_id, hex of its UTF-8 bytes
-/// 3           totals, comma-separated decimal, in contest order
-/// 4           threshold, decimal
-/// 5..5+n      trustee_id,verification_key_hex,signature_hex  (trustee order)
+/// 3           trustee_ids, comma-separated, in ElectionParameters order
+/// 4           totals, comma-separated decimal, in contest order
+/// 5           threshold, decimal
+/// 6..6+n      trustee_id,verification_key_hex,signature_hex  (trustee order)
 /// last        negative,trustee_id,verification_key_hex,signature_hex
 /// ```
 ///
-/// The `negative` line is a well-formed signature by trustee 1 over *different*
-/// totals: a verifier that forgets to bind the totals into the context accepts
-/// it, and is wrong.
+/// The trustee ids are deliberately **non-numeric and not in sorted order**: a
+/// port that derives the share index by parsing the id (or by sorting) instead
+/// of taking its 1-based position in the `trustee_ids` line must fail this
+/// vector rather than pass it by coincidence.
+///
+/// The `negative` line is a well-formed signature by the first trustee over
+/// *different* totals: a verifier that forgets to bind the totals into the
+/// context accepts it, and is wrong.
 ///
 /// Regenerate with `SAKSI_WRITE_VECTORS=1 cargo test -p saksi-auditor
 /// tally_signature_golden_vector`.
@@ -1361,6 +1367,16 @@ mod tally_signature_vector {
     impl CryptoRng for SplitMix64 {}
 
     const ELECTION_ID: &str = "election-2026";
+    /// Opaque trustee labels: non-numeric and NOT in sorted order, so the only
+    /// way to reach the right DKG share index is the 1-based position in this
+    /// list (see [`crate::dkg::trustee_verification_key`]).
+    const TRUSTEE_IDS: [&str; 5] = [
+        "trustee-e",
+        "trustee-a",
+        "trustee-d",
+        "trustee-b",
+        "trustee-c",
+    ];
     const TOTALS: [u64; 2] = [4, 2];
     /// The totals the `negative` line signs instead of [`TOTALS`].
     const OTHER_TOTALS: [u64; 2] = [5, 1];
@@ -1382,9 +1398,7 @@ mod tally_signature_vector {
             .collect();
         let output = run_in_memory(config, &dealers).expect("DKG completes");
         let transcript = output.to_protocol_transcript(ELECTION_ID);
-        let trustee_ids = (1..=config.trustees as u32)
-            .map(|i| i.to_string())
-            .collect();
+        let trustee_ids = TRUSTEE_IDS.iter().map(|id| id.to_string()).collect();
         (
             transcript,
             output.trustee_shares,
@@ -1464,6 +1478,7 @@ mod tally_signature_vector {
         let mut lines = vec![
             hex::encode(encode(&transcript)),
             hex::encode(ELECTION_ID.as_bytes()),
+            trustee_ids.join(","),
             TOTALS
                 .iter()
                 .map(u64::to_string)
@@ -1510,25 +1525,37 @@ mod tally_signature_vector {
                 .expect("transcript decodes");
         let election_id =
             String::from_utf8(hex::decode(read[1]).expect("election id hex")).expect("utf-8");
-        let totals: Vec<u64> = read[2]
+        let ids: Vec<&str> = read[2].split(',').collect();
+        let totals: Vec<u64> = read[3]
             .split(',')
             .map(|t| t.parse().expect("total"))
             .collect();
-        let threshold: usize = read[3].parse().expect("threshold");
+        let threshold: usize = read[4].parse().expect("threshold");
+
+        // The ids must be useless as indices: a port that does `atoi(id)` or
+        // sorts them cannot reproduce the keys below.
+        assert!(
+            ids.iter().all(|id| id.parse::<u64>().is_err()),
+            "the vector's trustee ids must be non-numeric so position is the only index: {ids:?}"
+        );
+        let mut sorted = ids.clone();
+        sorted.sort_unstable();
+        assert_ne!(ids, sorted, "the vector's trustee ids must not be sorted");
         let commitments = decode_trustee_commitments(&transcript).expect("transcript decodes");
         let context = tally_sig_context(&election_id, &totals);
         let g = basepoint();
 
         let mut verified = 0usize;
-        for (t, line) in read[4..read.len() - 1].iter().enumerate() {
+        for (t, line) in read[5..read.len() - 1].iter().enumerate() {
             let fields: Vec<&str> = line.split(',').collect();
-            assert_eq!(fields[0], (t + 1).to_string(), "trustee order");
+            assert_eq!(fields[0], ids[t], "trustee order");
+            // Index by POSITION in the trustee_ids line, not by the id itself.
             let key = trustee_verification_key(&commitments, (t + 1) as u64);
             assert_eq!(
                 hex::encode(compress_point(&key)),
                 fields[1],
                 "line {} pins a key the transcript does not derive",
-                t + 5
+                t + 6
             );
             proof_from_hex(fields[2])
                 .verify(&g, &key, &context)

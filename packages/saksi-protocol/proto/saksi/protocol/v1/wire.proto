@@ -102,10 +102,17 @@ message PartialDecryption {
 // scalar) of knowledge of s_i such that `trustee_public_share = s_i·G`, taken
 // over the context
 //   b"saksi.tally.sig.v1" || election_id || totals[0..n] as little-endian u64s
+// The context carries NO length prefixes, so distinct (election_id, totals)
+// pairs could collide if the election id were attacker-chosen: its safety rests
+// on the id being fixed by the deployment at election creation. A v2 domain
+// should length-prefix the id instead of relying on that.
+//
 // The verification key is derived from the DKG transcript alone:
 //   vk_i = Σ_j Σ_k C_{j,k} · i^k
-// over every trustee's `coefficient_commitments`, with `i` the trustee's
-// 1-based DKG share index (the DKG evaluates dealer polynomials at 1..n).
+// over every dealer's `coefficient_commitments`, where `i` is the trustee's
+// **1-based position in ElectionParameters.trustee_ids**, never a number parsed
+// out of `trustee_id` (ids are opaque labels). The DKG evaluates dealer
+// polynomials at exactly those positions, 1..n.
 message TrusteeSignature {
   string trustee_id = 1;
   bytes signature = 2;

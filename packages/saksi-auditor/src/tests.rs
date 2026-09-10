@@ -137,6 +137,7 @@ fn happy_path_audit_passes() {
         "decryption.threshold",
         "tally.shape",
         "tally.homomorphic_sum",
+        "tally.signatures",
     ] {
         assert!(
             report.finding(check).is_some(),
@@ -608,9 +609,9 @@ fn per_ballot_passes_are_rolled_up_not_stored() {
 
 /// Finding lookup that names the failing report when the check is absent.
 fn signature_finding(report: &crate::AuditReport) -> &crate::AuditFinding {
-    report
-        .finding("tally.signatures")
-        .unwrap_or_else(|| panic!("audit must always report tally.signatures: {report:#?}"))
+    report.finding("tally.signatures").unwrap_or_else(|| {
+        panic!("tally.signatures must be reported whenever the DKG verified: {report:#?}")
+    })
 }
 
 #[test]

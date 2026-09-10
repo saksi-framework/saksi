@@ -46,12 +46,16 @@ const TALLY_SIG_DOMAIN: &[u8] = b"saksi.tally.sig.v1";
 /// `b"saksi.tally.sig.v1" || election_id || totals[0..n]`, each total as 8
 /// little-endian bytes in contest order.
 ///
-/// No length prefixes: the domain separator is a fixed 18 bytes, the totals are
-/// a fixed 8 bytes each, and the election id is the only variable-length part —
-/// it sits between two fixed-width runs, so the encoding is unambiguous. The Go
-/// chaincode mirrors this byte-for-byte (golden vector
-/// `test-vectors/tally-sig-v1.hex`), so it must not grow a framing scheme
-/// without a wire-version bump.
+/// **There are no length prefixes.** The only variable-length part is the
+/// election id, so distinct `(election_id, totals)` pairs can collide: an id
+/// ending in eight attacker-chosen bytes absorbs a total, or vice versa. The
+/// encoding is therefore only unambiguous because the election id is fixed by
+/// the deployment (it is set at election creation and checked against
+/// `ElectionParameters` before this context is ever built), never chosen by a
+/// party who benefits from the collision. A v2 of this domain should
+/// length-prefix the id rather than rely on that assumption. The Go chaincode
+/// mirrors these bytes exactly (golden vector `test-vectors/tally-sig-v1.hex`),
+/// so the layout cannot change without a new domain separator.
 pub(crate) fn tally_sig_context(election_id: &str, totals: &[u64]) -> Vec<u8> {
     let mut context =
         Vec::with_capacity(TALLY_SIG_DOMAIN.len() + election_id.len() + totals.len() * 8);
@@ -84,7 +88,9 @@ pub(crate) fn verify_tally_signatures(
         return;
     }
 
-    let context = tally_sig_context(&tally.election_id, &tally.totals);
+    // The election id comes from the parameters, not from the tally: the id is
+    // the deployment's, and a tally that disagrees is caught by `tally.shape`.
+    let context = tally_sig_context(&parameters.election_id, &tally.totals);
     let g = basepoint();
     let mut seen: HashSet<&str> = HashSet::new();
     let mut problems: Vec<String> = Vec::new();
