@@ -9,6 +9,7 @@ import (
 	"github.com/hyperledger/fabric-contract-api-go/contractapi"
 	"github.com/saksi-framework/saksi/packages/saksi-bulletin/chaincode/cdsverify"
 	"github.com/saksi-framework/saksi/packages/saksi-bulletin/chaincode/credverify"
+	"github.com/saksi-framework/saksi/packages/saksi-bulletin/chaincode/sigverify"
 	saksiprotocolv1 "github.com/saksi-framework/saksi/packages/saksi-protocol/go/saksiprotocolv1"
 	"google.golang.org/protobuf/proto"
 )
@@ -727,9 +728,10 @@ func (s *SmartContract) GetPartialDecryption(ctx contractapi.TransactionContextI
 // hex-encoded canonical protobuf encoding of a saksi.protocol.v1.TallyResult.
 //
 // On-chain checks: supported wire version, the election exists and is closed, one
-// total per contest, and no tally has been published yet. The tally's correctness
-// (that the totals match the homomorphic sum decrypted by the partial decryptions)
-// is verified off-chain by auditor clients.
+// total per contest, no tally has been published yet, and — the threshold gate —
+// at least `threshold` distinct trustees have signed these exact totals. The
+// tally's correctness (that the totals match the homomorphic sum decrypted by
+// the partial decryptions) is still verified off-chain by auditor clients.
 func (s *SmartContract) PublishTally(ctx contractapi.TransactionContextInterface, tallyHex string) error {
 	raw, err := hex.DecodeString(tallyHex)
 	if err != nil {
@@ -785,8 +787,82 @@ func (s *SmartContract) PublishTally(ctx contractapi.TransactionContextInterface
 	if existing != nil {
 		return fmt.Errorf("a tally is already published for election %q", electionID)
 	}
+
+	// The threshold gate, last because it is the expensive check. Until this
+	// existed the chaincode accepted any tally an operator handed it and the
+	// t-of-n rule was only enforced by the console; now the ledger refuses a
+	// tally fewer than `threshold` trustees endorsed.
+	if err := verifyTallySignatures(stub, params, &tally); err != nil {
+		return err
+	}
+
 	if err := stub.PutState(tallyKey, raw); err != nil {
 		return fmt.Errorf("store tally: %w", err)
+	}
+	return nil
+}
+
+// verifyTallySignatures is PublishTally's threshold gate: every signature the
+// tally carries must be a Schnorr proof of knowledge of that trustee's DKG
+// share, taken over these exact totals, and at least `threshold` distinct
+// trustees must have produced one.
+//
+// A tally carrying no signatures is refused outright — nobody endorsed it. An
+// unknown or repeated trustee_id is a hard rejection (the submission is
+// malformed, not merely short of quorum); a signature that simply fails to
+// verify is not counted, so it surfaces as the threshold error alongside any
+// other shortfall. The signed bytes use the election id from the STORED
+// parameters, never the one the tally chose.
+func verifyTallySignatures(stub interface {
+	CreateCompositeKey(string, []string) (string, error)
+	GetState(string) ([]byte, error)
+}, params *saksiprotocolv1.ElectionParameters, tally *saksiprotocolv1.TallyResult) error {
+	electionID := params.GetElectionId()
+	signatures := tally.GetSignatures()
+	if len(signatures) == 0 {
+		return fmt.Errorf("tally for election %q carries no trustee signatures", electionID)
+	}
+
+	dkgKey, err := stub.CreateCompositeKey(dkgIndex, []string{electionID})
+	if err != nil {
+		return fmt.Errorf("build DKG key: %w", err)
+	}
+	dkgRaw, err := stub.GetState(dkgKey)
+	if err != nil {
+		return fmt.Errorf("read DKG transcript state: %w", err)
+	}
+	if dkgRaw == nil {
+		return fmt.Errorf("election %q has no published DKG transcript; tally signatures cannot be verified", electionID)
+	}
+	var transcript saksiprotocolv1.DKGTranscript
+	if err := proto.Unmarshal(dkgRaw, &transcript); err != nil {
+		return fmt.Errorf("decode stored DKG transcript: %w", err)
+	}
+
+	context := sigverify.TallySigContext(electionID, tally.GetTotals())
+	trusteeIDs := params.GetTrusteeIds()
+	seen := make(map[string]bool, len(signatures))
+	valid := 0
+	for _, sig := range signatures {
+		id := sig.GetTrusteeId()
+		if !contains(trusteeIDs, id) {
+			return fmt.Errorf("tally is signed by %q, which is not a trustee of election %q", id, electionID)
+		}
+		if seen[id] {
+			return fmt.Errorf("tally carries more than one signature from trustee %q", id)
+		}
+		seen[id] = true
+
+		key, err := sigverify.DeriveVerificationKey(&transcript, trusteeIDs, id)
+		if err != nil {
+			return fmt.Errorf("derive verification key for trustee %q: %w", id, err)
+		}
+		if err := sigverify.VerifySchnorr(key, context, sig.GetSignature()); err == nil {
+			valid++
+		}
+	}
+	if valid < int(params.GetThreshold()) {
+		return fmt.Errorf("tally has %d valid trustee signatures, threshold is %d", valid, params.GetThreshold())
 	}
 	return nil
 }

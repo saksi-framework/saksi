@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"encoding/binary"
 	"encoding/hex"
+	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -863,11 +865,112 @@ func mustMarshalTally(t *testing.T, tr *saksiprotocolv1.TallyResult) string {
 	return hex.EncodeToString(raw)
 }
 
+// tallySigVector is the parsed tally-signature golden vector: the DKG
+// transcript, the election it belongs to, and one real Schnorr signature per
+// trustee over the published totals (plus a `negative` signature by trustee 1
+// over DIFFERENT totals). Written by the Rust saksi-auditor test
+// `tally_signature_golden_vector`; the layout is documented on
+// sigverify_test.go's loader, which reads the same file.
+type tallySigVector struct {
+	transcriptHex string
+	electionID    string
+	trusteeIDs    []string
+	totals        []uint64
+	threshold     uint32
+	signatures    []*saksiprotocolv1.TrusteeSignature // trustee order
+	negative      *saksiprotocolv1.TrusteeSignature
+}
+
+func loadTallySigVector(t *testing.T) tallySigVector {
+	t.Helper()
+	raw, err := os.ReadFile(filepath.Join("..", "..", "saksi-protocol", "test-vectors", "tally-sig-v1.hex"))
+	if err != nil {
+		t.Fatalf("read tally-sig vector: %v", err)
+	}
+	lines := strings.Split(strings.ReplaceAll(strings.TrimSpace(string(raw)), "\r\n", "\n"), "\n")
+	if len(lines) != 11 {
+		t.Fatalf("tally-sig vector has %d lines, want 11", len(lines))
+	}
+	unhex := func(s string) []byte {
+		t.Helper()
+		b, err := hex.DecodeString(strings.TrimSpace(s))
+		if err != nil {
+			t.Fatalf("decode vector hex: %v", err)
+		}
+		return b
+	}
+	v := tallySigVector{
+		transcriptHex: strings.TrimSpace(lines[0]),
+		electionID:    string(unhex(lines[1])),
+		trusteeIDs:    strings.Split(strings.TrimSpace(lines[2]), ","),
+	}
+	for _, field := range strings.Split(strings.TrimSpace(lines[3]), ",") {
+		n, err := strconv.ParseUint(field, 10, 64)
+		if err != nil {
+			t.Fatalf("parse total %q: %v", field, err)
+		}
+		v.totals = append(v.totals, n)
+	}
+	th, err := strconv.ParseUint(strings.TrimSpace(lines[4]), 10, 32)
+	if err != nil {
+		t.Fatalf("parse threshold: %v", err)
+	}
+	v.threshold = uint32(th)
+	for _, line := range lines[5:10] {
+		f := strings.Split(strings.TrimSpace(line), ",")
+		v.signatures = append(v.signatures, &saksiprotocolv1.TrusteeSignature{TrusteeId: f[0], Signature: unhex(f[2])})
+	}
+	neg := strings.Split(strings.TrimSpace(lines[10]), ",")
+	v.negative = &saksiprotocolv1.TrusteeSignature{TrusteeId: neg[1], Signature: unhex(neg[3])}
+	return v
+}
+
+// withSignedTallyElection sets up the closed election the golden vector's
+// signatures actually belong to: the vector's trustee ids and threshold, and
+// its DKG transcript on-chain so PublishTally can derive verification keys.
+func withSignedTallyElection(t *testing.T, sc *SmartContract, ctx *fakeContext, v tallySigVector) {
+	t.Helper()
+	params := &saksiprotocolv1.ElectionParameters{
+		Version:    saksiprotocolv1.WireVersion,
+		ElectionId: v.electionID,
+		ContestIds: []string{"contest-1", "contest-2"}, // one per total
+		TrusteeIds: v.trusteeIDs,
+		Threshold:  v.threshold,
+	}
+	if err := sc.CreateElection(ctx, mustMarshalParams(t, params)); err != nil {
+		t.Fatalf("CreateElection: %v", err)
+	}
+	if err := sc.PublishDKGTranscript(ctx, v.transcriptHex); err != nil {
+		t.Fatalf("PublishDKGTranscript: %v", err)
+	}
+	if err := sc.CloseElection(ctx, v.electionID); err != nil {
+		t.Fatalf("CloseElection: %v", err)
+	}
+}
+
+// signedTally builds the vector's tally carrying the given trustee signatures.
+func signedTally(v tallySigVector, sigs ...*saksiprotocolv1.TrusteeSignature) *saksiprotocolv1.TallyResult {
+	return &saksiprotocolv1.TallyResult{
+		Version:    saksiprotocolv1.WireVersion,
+		ElectionId: v.electionID,
+		Totals:     v.totals,
+		Signatures: sigs,
+	}
+}
+
+// signedTallyElection is the happy-path setup: a closed, vector-backed election
+// and a tally signed by exactly `threshold` trustees.
+func signedTallyElection(t *testing.T, sc *SmartContract, ctx *fakeContext) (tallySigVector, string) {
+	t.Helper()
+	v := loadTallySigVector(t)
+	withSignedTallyElection(t, sc, ctx, v)
+	return v, mustMarshalTally(t, signedTally(v, v.signatures[:v.threshold]...))
+}
+
 func TestPublishTallyThenGetRoundTrips(t *testing.T) {
 	sc := &SmartContract{}
 	ctx := newContext()
-	withClosedElection(t, sc, ctx)
-	tallyHex := mustMarshalTally(t, validTally())
+	_, tallyHex := signedTallyElection(t, sc, ctx)
 
 	if err := sc.PublishTally(ctx, tallyHex); err != nil {
 		t.Fatalf("PublishTally: %v", err)
@@ -906,14 +1009,122 @@ func TestPublishTallyRejectsWrongTotalsCount(t *testing.T) {
 func TestPublishTallyRejectsDuplicate(t *testing.T) {
 	sc := &SmartContract{}
 	ctx := newContext()
-	withClosedElection(t, sc, ctx)
-	tallyHex := mustMarshalTally(t, validTally())
+	_, tallyHex := signedTallyElection(t, sc, ctx)
 	if err := sc.PublishTally(ctx, tallyHex); err != nil {
 		t.Fatalf("first publish: %v", err)
 	}
 	err := sc.PublishTally(ctx, tallyHex)
 	if err == nil || !strings.Contains(err.Error(), "already published") {
 		t.Fatalf("expected a duplicate-tally error, got: %v", err)
+	}
+}
+
+// The gate itself: a tally nobody endorsed is not publishable, whatever the
+// operator says.
+func TestPublishTallyRejectsUnsignedTally(t *testing.T) {
+	sc := &SmartContract{}
+	ctx := newContext()
+	v := loadTallySigVector(t)
+	withSignedTallyElection(t, sc, ctx, v)
+	err := sc.PublishTally(ctx, mustMarshalTally(t, signedTally(v)))
+	if err == nil || !strings.Contains(err.Error(), "no trustee signatures") {
+		t.Fatalf("expected a no-signatures error, got: %v", err)
+	}
+}
+
+func TestPublishTallyRejectsBelowThreshold(t *testing.T) {
+	sc := &SmartContract{}
+	ctx := newContext()
+	v := loadTallySigVector(t)
+	withSignedTallyElection(t, sc, ctx, v)
+	short := v.signatures[:v.threshold-1]
+	err := sc.PublishTally(ctx, mustMarshalTally(t, signedTally(v, short...)))
+	want := fmt.Sprintf("tally has %d valid trustee signatures, threshold is %d", len(short), v.threshold)
+	if err == nil || err.Error() != want {
+		t.Fatalf("expected %q, got: %v", want, err)
+	}
+}
+
+func TestPublishTallyRejectsDuplicateTrusteeSignature(t *testing.T) {
+	sc := &SmartContract{}
+	ctx := newContext()
+	v := loadTallySigVector(t)
+	withSignedTallyElection(t, sc, ctx, v)
+	// Threshold-many entries, but one trustee counted twice.
+	sigs := []*saksiprotocolv1.TrusteeSignature{v.signatures[0], v.signatures[1], v.signatures[0]}
+	err := sc.PublishTally(ctx, mustMarshalTally(t, signedTally(v, sigs...)))
+	if err == nil || !strings.Contains(err.Error(), "more than one signature from trustee") {
+		t.Fatalf("expected a duplicate-signature error, got: %v", err)
+	}
+}
+
+func TestPublishTallyRejectsUnknownTrusteeSignature(t *testing.T) {
+	sc := &SmartContract{}
+	ctx := newContext()
+	v := loadTallySigVector(t)
+	withSignedTallyElection(t, sc, ctx, v)
+	stranger := &saksiprotocolv1.TrusteeSignature{TrusteeId: "trustee-zzz", Signature: v.signatures[0].GetSignature()}
+	sigs := append([]*saksiprotocolv1.TrusteeSignature{stranger}, v.signatures[:v.threshold]...)
+	err := sc.PublishTally(ctx, mustMarshalTally(t, signedTally(v, sigs...)))
+	if err == nil || !strings.Contains(err.Error(), "not a trustee of election") {
+		t.Fatalf("expected an unknown-trustee error, got: %v", err)
+	}
+}
+
+// A signature over other totals is real, correctly formed, and by a real
+// trustee — it just does not endorse THIS tally. It must not count.
+func TestPublishTallyRejectsSignatureOverOtherTotals(t *testing.T) {
+	sc := &SmartContract{}
+	ctx := newContext()
+	v := loadTallySigVector(t)
+	withSignedTallyElection(t, sc, ctx, v)
+	// Swap trustee 1's real signature for its signature over other totals, so
+	// exactly one of the threshold-many signatures stops verifying.
+	sigs := append([]*saksiprotocolv1.TrusteeSignature{v.negative}, v.signatures[1:v.threshold]...)
+	err := sc.PublishTally(ctx, mustMarshalTally(t, signedTally(v, sigs...)))
+	want := fmt.Sprintf("tally has %d valid trustee signatures, threshold is %d", int(v.threshold)-1, v.threshold)
+	if err == nil || err.Error() != want {
+		t.Fatalf("expected %q, got: %v", want, err)
+	}
+}
+
+// A tampered total changes the signed context, so every signature stops
+// verifying at once — the totals are bound, not merely accompanied.
+func TestPublishTallyRejectsTamperedTotals(t *testing.T) {
+	sc := &SmartContract{}
+	ctx := newContext()
+	v := loadTallySigVector(t)
+	withSignedTallyElection(t, sc, ctx, v)
+	tally := signedTally(v, v.signatures[:v.threshold]...)
+	tally.Totals = append([]uint64(nil), v.totals...)
+	tally.Totals[0]++
+	err := sc.PublishTally(ctx, mustMarshalTally(t, tally))
+	want := fmt.Sprintf("tally has 0 valid trustee signatures, threshold is %d", v.threshold)
+	if err == nil || err.Error() != want {
+		t.Fatalf("expected %q, got: %v", want, err)
+	}
+}
+
+func TestPublishTallyRejectsMissingDKGTranscript(t *testing.T) {
+	sc := &SmartContract{}
+	ctx := newContext()
+	v := loadTallySigVector(t)
+	params := &saksiprotocolv1.ElectionParameters{
+		Version:    saksiprotocolv1.WireVersion,
+		ElectionId: v.electionID,
+		ContestIds: []string{"contest-1", "contest-2"},
+		TrusteeIds: v.trusteeIDs,
+		Threshold:  v.threshold,
+	}
+	if err := sc.CreateElection(ctx, mustMarshalParams(t, params)); err != nil {
+		t.Fatalf("CreateElection: %v", err)
+	}
+	if err := sc.CloseElection(ctx, v.electionID); err != nil {
+		t.Fatalf("CloseElection: %v", err)
+	}
+	err := sc.PublishTally(ctx, mustMarshalTally(t, signedTally(v, v.signatures[:v.threshold]...)))
+	if err == nil || !strings.Contains(err.Error(), "no published DKG transcript") {
+		t.Fatalf("expected a missing-transcript error, got: %v", err)
 	}
 }
 
