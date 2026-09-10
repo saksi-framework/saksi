@@ -247,6 +247,25 @@ func TestRunFailed(t *testing.T) {
 			f.Interrupted = true
 			return f
 		}, true, "interrupted"},
+		{"bounded stop is not an interruption", func(f FinaliseInput) FinaliseInput {
+			f.Interrupted, f.Bounded = true, true
+			return f
+		}, false, ""},
+		{"bounded does not forgive a drop", func(f FinaliseInput) FinaliseInput {
+			f.Interrupted, f.Bounded = true, true
+			f.Dropped = 2
+			return f
+		}, true, "dropped: 2"},
+		{"bounded does not forgive a reconcile mismatch", func(f FinaliseInput) FinaliseInput {
+			f.Interrupted, f.Bounded = true, true
+			f.ReconcileOK = false
+			return f
+		}, true, "reconcile_mismatch"},
+		{"bounded does not forgive a nonzero E", func(f FinaliseInput) FinaliseInput {
+			f.Interrupted, f.Bounded = true, true
+			f.EByContest = map[string]int64{"mayor": 1}
+			return f
+		}, true, "e_nonzero: mayor=1"},
 		{"stage error wins over everything else", func(f FinaliseInput) FinaliseInput {
 			f.StageErr = errors.New("boom")
 			f.Dropped = 1

@@ -258,6 +258,17 @@ type FinaliseInput struct {
 	EByContest   map[string]int64
 	StageErr     error
 	Interrupted  bool
+	// Bounded reports that the ballot window closed because it reached its own
+	// time bound (bench.RunOpts.MaxDuration), not because anything went wrong:
+	// a sweep step is a fixed slice of wall clock at a fixed offered rate, and
+	// it ends when the clock says so.
+	//
+	// A bounded window is still not SUSTAINED (Interrupted stays set, so the
+	// scaling verdict stays per-segment and inconclusive), but it did not
+	// FAIL: it ended as instructed, and every ballot it dispatched committed.
+	// Without this, every sweep step would be recorded as a failed run and the
+	// campaign's failure rate would measure the sweep rather than the network.
+	Bounded bool
 	// LedgerAudit is the on-chain cross-audit's fate: "" when there was no
 	// chain to audit, "ok" when the chain's own record was dumped and audited,
 	// "not run" when that could not be completed.
@@ -281,6 +292,11 @@ type FinaliseResult struct {
 // runFailed implements the failed-run predicate: stage error, or any ballot
 // dropped, or a reconcile mismatch, or a nonzero E for any contest, or the
 // run was interrupted. Reason is the first clause that fired, in that order.
+//
+// A BOUNDED window is the one stop that is not an interruption — see
+// FinaliseInput.Bounded. Its reconcile clause is decided by the caller
+// (finaliseInput compares committed against submitted rather than against the
+// planned population), so only the interruption clause is relaxed here.
 func runFailed(f FinaliseInput) (bool, string) {
 	if f.StageErr != nil {
 		return true, "stage_error: " + f.StageErr.Error()
@@ -304,7 +320,7 @@ func runFailed(f FinaliseInput) (bool, string) {
 			return true, fmt.Sprintf("e_nonzero: %s=%d", c, e)
 		}
 	}
-	if f.Interrupted {
+	if f.Interrupted && !f.Bounded {
 		return true, "interrupted"
 	}
 	return false, ""
@@ -349,6 +365,11 @@ func Finalise(j *Journal, f FinaliseInput) FinaliseResult {
 			"arrival_tps":   res.ArrivalTPS,
 			"scaling_limit": res.ScalingLimit,
 			"sustained":     res.Sustained,
+		}
+		// Absent, not false: a run whose window was never time-bounded should
+		// not carry a field claiming it was considered and ruled out.
+		if f.Bounded {
+			end["bounded"] = true
 		}
 		// Absent, not false: an offline run has no chain to disagree with, and
 		// a reader must be able to tell that from a chain that disagreed.

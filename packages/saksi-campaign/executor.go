@@ -412,9 +412,19 @@ func finaliseInput(dir string, c ElectionConfig, sa StreamAudit, stageErr error,
 	in.Dropped = sm.Dropped
 	// bench.Reconcile is the single definition of "every ballot landed", and
 	// its message names which half of that failed.
-	in.ReconcileErr = bench.Reconcile(sm.Submitted, sm.Committed, sm.Expected)
+	//
+	// A time-bounded window never intended to dispatch the whole population,
+	// so holding it against the planned total would fail it for doing exactly
+	// what it was told. What it still owes is that every ballot it DID
+	// dispatch committed, which is the "committed != submitted" half.
+	expected := sm.Expected
+	if sm.Bounded {
+		expected = sm.Submitted
+	}
+	in.ReconcileErr = bench.Reconcile(sm.Submitted, sm.Committed, expected)
 	in.ReconcileOK = in.ReconcileErr == nil
 	in.Interrupted = sm.Stopped
+	in.Bounded = sm.Bounded
 	in.Segments = []Segment{{
 		Index: 0, Committed: sm.Committed, WindowMs: sm.WindowMs,
 		TPS: sm.CommittedTPS, P50Ms: sm.LatencyP50Ms,
@@ -741,16 +751,23 @@ func (e *Executor) submitBallots(ctx context.Context, runID string, c ElectionCo
 		},
 	})
 	samples := stopSampler()
+	bounded := windowWasBounded(ctx, c, res)
 
 	endBytes, haveEndBytes := e.ledgerBytes()
 	end := map[string]any{
 		"submitted": res.Submitted, "committed": res.Committed, "dropped": res.Dropped,
 		"window_ms": res.Window.Milliseconds(), "stopped": res.Stopped,
 	}
+	if bounded {
+		end["bounded"] = true
+	}
 	if haveEndBytes {
 		end["ledger_bytes"] = endBytes
 	}
-	stampWindowEnd(j, end, res.Stopped)
+	// A bounded window is CLOSED, not left open: stage.ballots.end, so a later
+	// resume does not offer to "finish" a sweep step that already ended as
+	// instructed.
+	stampWindowEnd(j, end, res.Stopped && !bounded)
 	stampSegmentEnd(j, segmentOf(0, res, res.Committed))
 
 	if readErr != nil {
@@ -760,7 +777,7 @@ func (e *Executor) submitBallots(ctx context.Context, runID string, c ElectionCo
 	if err := writeLatenciesCSV(dir, res, 0); err != nil {
 		return err
 	}
-	if err := e.writeSubmitMetrics(dir, c, res, samples, count, startBytes, endBytes, haveBytes && haveEndBytes); err != nil {
+	if err := e.writeSubmitMetrics(dir, c, res, samples, count, bounded, startBytes, endBytes, haveBytes && haveEndBytes); err != nil {
 		return err
 	}
 	if res.Dropped > 0 {
@@ -818,9 +835,19 @@ func (e *Executor) collectReceipts(runID string, j *Journal, w *receiptsWriter, 
 	}
 }
 
+// windowWasBounded reports that the window stopped because it reached its own
+// time bound, rather than because it was cut short.
+//
+// All three conditions matter: a window with no bound cannot have hit one; a
+// cancelled context is an interruption even if the bound would also have
+// fired; and a window that dropped a ballot failed regardless of why it ended.
+func windowWasBounded(ctx context.Context, c ElectionConfig, res bench.RunResult) bool {
+	return c.Window() > 0 && res.Stopped && res.Dropped == 0 && ctx.Err() == nil
+}
+
 // writeSubmitMetrics hands the ballot window's measurements to Verify, which
 // runs as a separate phase and cannot see them any other way.
-func (e *Executor) writeSubmitMetrics(dir string, c ElectionConfig, res bench.RunResult, samples Samples, expected int, startBytes, endBytes int64, haveBytes bool) error {
+func (e *Executor) writeSubmitMetrics(dir string, c ElectionConfig, res bench.RunResult, samples Samples, expected int, bounded bool, startBytes, endBytes int64, haveBytes bool) error {
 	stats := bench.Summary(res.Latencies)
 	toMs := func(d time.Duration) float64 { return float64(d.Microseconds()) / 1000.0 }
 	sm := submitMetrics{
@@ -834,6 +861,7 @@ func (e *Executor) writeSubmitMetrics(dir string, c ElectionConfig, res bench.Ru
 		Concurrency:      res.Concurrency,
 		SendRate:         c.SendRate,
 		Stopped:          res.Stopped,
+		Bounded:          bounded,
 		LatencyMinMs:     toMs(stats.Min),
 		LatencyP50Ms:     toMs(stats.Median),
 		LatencyMeanMs:    toMs(stats.Mean),

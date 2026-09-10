@@ -12,10 +12,12 @@
 # The bring-up itself is tools/up.sh's, sourced rather than copied: a second
 # copy of the preflight and deploy steps would drift from the one CI proves.
 #
-# The tier's arguments are used to report the ledger this tier projects
-# (voters x positions x 12,000 bytes), which is the same number the console's
-# own disk guard refuses on — so a tier that will not fit says so here, before
-# the teardown, rather than after the network is already down.
+# The tier's arguments are only used to PRINT the ledger this tier projects
+# (voters x positions x 12,000 bytes) before the teardown, so the operator sees
+# the number while there is still time to pick a smaller tier. This script does
+# not refuse anything: the refusal is the console's, at POST /generate, where
+# the projection is compared against the actual free space on the peer volume.
+# The constant here is the same one the guard uses, so the two agree.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -26,7 +28,7 @@ while [ $# -gt 0 ]; do
 	case "$1" in
 	--dry-run) DRY_RUN=1; shift ;;
 	-h | --help)
-		sed -n '2,18p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+		sed -n '2,20p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
 		exit 0
 		;;
 	*)

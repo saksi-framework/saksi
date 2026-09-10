@@ -75,9 +75,14 @@ type submitMetrics struct {
 	DriverCeilingTPS float64 `json:"driver_ceiling_tps"`
 	Concurrency      int     `json:"concurrency"`
 	SendRate         float64 `json:"send_rate"`
-	// Stopped reports that ctx was cancelled before every ballot was
-	// dispatched — the run was interrupted, not completed.
+	// Stopped reports that the window closed before every ballot was
+	// dispatched — either ctx was cancelled (interrupted) or the window's own
+	// time bound elapsed (see Bounded).
 	Stopped bool `json:"stopped"`
+	// Bounded distinguishes the second of those: the window stopped because
+	// MaxDuration elapsed, with the context still live and nothing dropped.
+	// That is a window that ended as instructed, not a failed run.
+	Bounded bool `json:"bounded"`
 
 	LatencyMinMs    float64 `json:"latency_min_ms"`
 	LatencyP50Ms    float64 `json:"latency_p50_ms"`
@@ -361,6 +366,14 @@ window) — it is never a measured zero.
 | ` + "`sustained`" + ` | bool | the run was one uninterrupted window |
 | ` + "`scaling_limit`" + ` | true\|false\|inconclusive | sustained TPS vs. the arrival rate the tier demands; ` + "`inconclusive`" + ` when the driver was the ceiling |
 | ` + "`failed`, `fail_reason`" + ` | bool, text | the run-failed predicate: stage error, any drop, reconcile mismatch, nonzero E, or interruption |
+
+A window that closed because it reached its own configured time bound
+(` + "`window_s`" + `, as a rate sweep's steps do) is **not** an interruption and not a
+failure: it ended as instructed, and it still owes that every ballot it
+dispatched committed. Such a run is stamped ` + "`bounded`" + ` in ` + "`journal.ndjson`" + `'s
+` + "`run.end`" + `. It is not a sustained measurement either — ` + "`sustained`" + ` is false and
+` + "`scaling_limit`" + ` inconclusive — because it covers a slice of the population,
+not all of it.
 
 Per-ballot latencies are in ` + "`latencies.csv`" + ` (` + "`index,segment,ms,ok`" + `);
 the full event log with the environment snapshot is ` + "`journal.ndjson`" + `.

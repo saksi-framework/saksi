@@ -16,6 +16,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/saksi-framework/saksi/packages/saksi-bulletin/client-sdk/bench"
 )
 
 // fakeConsole is the minimum of the console's HTTP API that the --repeat
@@ -592,5 +594,149 @@ func TestRepTagReachesTheJournal(t *testing.T) {
 	starts := journalEventsOfType(t, runDir, "segment.start")
 	if len(starts) != 1 || jstring(starts[0], "tag") != "burst" {
 		t.Fatalf("segment.start = %v, want one tagged burst", starts)
+	}
+}
+
+// --- the bounded window ------------------------------------------------------
+
+// slowLedger makes every submit take long enough that a short window closes
+// before the whole population is dispatched — which is what a sweep step does
+// on purpose.
+type slowLedger struct {
+	*fakeLedger
+	delay time.Duration
+}
+
+func (s slowLedger) Submit(fn string, args ...string) (string, uint64, error) {
+	time.Sleep(s.delay)
+	return s.fakeLedger.Submit(fn, args...)
+}
+
+// A window that closed because it reached its own time bound ended as
+// instructed. It is not a failed run, and it is not left open for a resume to
+// "finish" — otherwise every sweep step would be recorded as a failure and the
+// campaign's failure rate would measure the sweep instead of the network.
+func TestBoundedWindowIsNotAFailedRun(t *testing.T) {
+	dir := t.TempDir()
+	runDir := filepath.Join(dir, "run-1")
+	e := newTestExecutor(t, dir)
+	path := writeRealBallotStream(t, runDir, 400)
+
+	c := ElectionConfig{
+		Mode: "onchain", Voters: 400, Positions: 1, Candidates: 2,
+		Concurrency: 2, WindowS: 0.15,
+		Rep: &RepTag{Index: 1, Kind: "sweep"},
+	}
+	led := slowLedger{fakeLedger: &fakeLedger{}, delay: 10 * time.Millisecond}
+	if err := e.submitOnChain(context.Background(), "run-1", c, led, path); err != nil {
+		t.Fatalf("submitOnChain: %v", err)
+	}
+
+	var sm submitMetrics
+	if err := readJSON(filepath.Join(runDir, submitMetricsFile), &sm); err != nil {
+		t.Fatalf("read submit metrics: %v", err)
+	}
+	if !sm.Stopped || !sm.Bounded {
+		t.Fatalf("want a bounded stop, got stopped=%v bounded=%v", sm.Stopped, sm.Bounded)
+	}
+	if sm.Dropped != 0 {
+		t.Fatalf("a bounded window should drop nothing, got %d", sm.Dropped)
+	}
+	if sm.Submitted >= c.Voters {
+		t.Fatalf("the window dispatched all %d ballots, so it was never bounded", sm.Submitted)
+	}
+
+	// The window is CLOSED: a resume must not offer to finish it.
+	if got := journalEventsOfType(t, runDir, "stage.ballots.interrupted"); len(got) != 0 {
+		t.Errorf("a bounded window must not be stamped interrupted: %v", got)
+	}
+	if got := journalEventsOfType(t, runDir, "stage.ballots.end"); len(got) != 1 {
+		t.Errorf("want one stage.ballots.end, got %d", len(got))
+	}
+	if _, err := planResume(runDir, c); err == nil {
+		t.Error("a bounded window is not resumable: planResume should refuse it")
+	}
+
+	// And the verdict: not a failure.
+	in := finaliseInput(runDir, c, StreamAudit{}, nil, nil)
+	if !in.Bounded || !in.ReconcileOK {
+		t.Fatalf("finaliseInput = bounded %v / reconcileOK %v (%v), want true/true",
+			in.Bounded, in.ReconcileOK, in.ReconcileErr)
+	}
+	j := e.journalFor("run-1")
+	fin := Finalise(j, in)
+	_ = j.Close()
+	if fin.Failed || fin.Reason != "" {
+		t.Fatalf("bounded run recorded as failed: %v %q", fin.Failed, fin.Reason)
+	}
+	// A bounded window is still not a sustained measurement.
+	if fin.Sustained {
+		t.Error("a bounded window must not be reported as sustained")
+	}
+
+	end := journalEventsOfType(t, runDir, "run.end")
+	if len(end) != 1 {
+		t.Fatalf("want one run.end, got %d", len(end))
+	}
+	if failed, _ := end[0]["failed"].(bool); failed {
+		t.Errorf("run.end.failed = true for a bounded window: %v", end[0])
+	}
+	if jstring(end[0], "reason") != "" {
+		t.Errorf("run.end.reason = %q, want empty", jstring(end[0], "reason"))
+	}
+	if b, _ := end[0]["bounded"].(bool); !b {
+		t.Errorf("run.end should stamp bounded=true: %v", end[0])
+	}
+}
+
+// An interrupted window (context cancelled) is still a failure — the bounded
+// carve-out must not swallow the case it was carved out of.
+func TestCancelledWindowIsStillInterrupted(t *testing.T) {
+	dir := t.TempDir()
+	runDir := filepath.Join(dir, "run-1")
+	e := newTestExecutor(t, dir)
+	path := writeRealBallotStream(t, runDir, 400)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	c := ElectionConfig{Mode: "onchain", Voters: 400, Positions: 1, Candidates: 2,
+		Concurrency: 2, WindowS: 30}
+	led := slowLedger{fakeLedger: &fakeLedger{cancel: cancel, FailAt: 5}, delay: time.Millisecond}
+	_ = e.submitOnChain(ctx, "run-1", c, led, path)
+
+	var sm submitMetrics
+	if err := readJSON(filepath.Join(runDir, submitMetricsFile), &sm); err != nil {
+		t.Skipf("no submit metrics written (the window failed before writing): %v", err)
+	}
+	if sm.Bounded {
+		t.Fatal("a cancelled window must not be recorded as a bounded stop")
+	}
+}
+
+// windowWasBounded is the whole carve-out, so each of its three conditions
+// gets a row: no bound, a live bound reached, a cancelled context, a drop.
+func TestWindowWasBounded(t *testing.T) {
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+	stoppedClean := bench.RunResult{Stopped: true}
+	cases := []struct {
+		name    string
+		ctx     context.Context
+		windowS float64
+		res     bench.RunResult
+		want    bool
+	}{
+		{"bound reached", context.Background(), 120, stoppedClean, true},
+		{"no bound configured", context.Background(), 0, stoppedClean, false},
+		{"not stopped at all", context.Background(), 120, bench.RunResult{}, false},
+		{"context cancelled", cancelled, 120, stoppedClean, false},
+		{"a ballot dropped", context.Background(), 120, bench.RunResult{Stopped: true, Dropped: 1}, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			cfg := ElectionConfig{WindowS: c.windowS}
+			if got := windowWasBounded(c.ctx, cfg, c.res); got != c.want {
+				t.Fatalf("windowWasBounded = %v, want %v", got, c.want)
+			}
+		})
 	}
 }
