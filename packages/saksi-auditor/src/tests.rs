@@ -601,3 +601,112 @@ fn per_ballot_passes_are_rolled_up_not_stored() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Trustee tally signatures (`tally.signatures`)
+// ---------------------------------------------------------------------------
+
+/// Finding lookup that names the failing report when the check is absent.
+fn signature_finding(report: &crate::AuditReport) -> &crate::AuditFinding {
+    report
+        .finding("tally.signatures")
+        .unwrap_or_else(|| panic!("audit must always report tally.signatures: {report:#?}"))
+}
+
+#[test]
+fn trustee_tally_signatures_verify() {
+    let fixture = happy_path_fixture();
+    assert_eq!(
+        fixture.tally.signatures.len(),
+        fixture.parameters.trustee_ids.len(),
+        "every trustee signs the published tally"
+    );
+    let report = audit(fixture.artifacts());
+    assert!(report.passed(), "{report:#?}");
+    assert_eq!(signature_finding(&report).status, AuditStatus::Pass);
+}
+
+#[test]
+fn missing_tally_signatures_are_caught() {
+    let mut fixture = happy_path_fixture();
+    fixture.tally.signatures.clear();
+
+    let report = audit(fixture.artifacts());
+    assert_eq!(report.overall, AuditStatus::Fail);
+    let finding = signature_finding(&report);
+    assert_eq!(finding.status, AuditStatus::Fail);
+    assert_eq!(finding.detail, "missing");
+}
+
+#[test]
+fn tampered_tally_signature_is_caught() {
+    let mut fixture = happy_path_fixture();
+    // Flip a bit in the response scalar: still a canonical 64-byte proof, but
+    // it no longer satisfies s·G == R + c·vk.
+    fixture.tally.signatures[0].signature[32] ^= 0x01;
+
+    let report = audit(fixture.artifacts());
+    assert_eq!(report.overall, AuditStatus::Fail);
+    assert_eq!(signature_finding(&report).status, AuditStatus::Fail);
+}
+
+#[test]
+fn tally_signature_over_different_totals_is_caught() {
+    let mut fixture = happy_path_fixture();
+    // Re-sign nothing, just move the totals the signatures commit to. The
+    // homomorphic sum catches this too; the point here is that the signature
+    // check catches it independently.
+    fixture.tally.totals[0] += 1;
+
+    let report = audit(fixture.artifacts());
+    assert_eq!(report.overall, AuditStatus::Fail);
+    assert_eq!(signature_finding(&report).status, AuditStatus::Fail);
+}
+
+#[test]
+fn duplicate_trustee_signature_is_caught() {
+    let mut fixture = happy_path_fixture();
+    fixture.tally.signatures[1] = fixture.tally.signatures[0].clone();
+
+    let report = audit(fixture.artifacts());
+    assert_eq!(report.overall, AuditStatus::Fail);
+    let finding = signature_finding(&report);
+    assert_eq!(finding.status, AuditStatus::Fail);
+    assert!(finding.detail.contains("duplicate"), "{finding:#?}");
+}
+
+#[test]
+fn unknown_trustee_signature_is_caught() {
+    let mut fixture = happy_path_fixture();
+    fixture.tally.signatures[0].trustee_id = "not-a-trustee".into();
+
+    let report = audit(fixture.artifacts());
+    assert_eq!(report.overall, AuditStatus::Fail);
+    let finding = signature_finding(&report);
+    assert_eq!(finding.status, AuditStatus::Fail);
+    assert!(finding.detail.contains("unknown"), "{finding:#?}");
+}
+
+#[test]
+fn below_threshold_tally_signatures_are_caught() {
+    let mut fixture = happy_path_fixture();
+    let threshold = fixture.parameters.threshold as usize;
+    // Keep one fewer valid signature than the threshold demands.
+    fixture.tally.signatures.truncate(threshold - 1);
+
+    let report = audit(fixture.artifacts());
+    assert_eq!(report.overall, AuditStatus::Fail);
+    let finding = signature_finding(&report);
+    assert_eq!(finding.status, AuditStatus::Fail);
+    assert!(finding.detail.contains("threshold"), "{finding:#?}");
+}
+
+#[test]
+fn malformed_tally_signature_is_caught() {
+    let mut fixture = happy_path_fixture();
+    fixture.tally.signatures[0].signature.truncate(63);
+
+    let report = audit(fixture.artifacts());
+    assert_eq!(report.overall, AuditStatus::Fail);
+    assert_eq!(signature_finding(&report).status, AuditStatus::Fail);
+}

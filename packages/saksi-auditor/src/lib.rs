@@ -21,6 +21,9 @@
 //!   trustee's public share.
 //! - Confirms that, per contest, at least `parameters.threshold` distinct
 //!   trustees submitted a valid partial decryption.
+//! - Verifies every trustee's Schnorr signature over the published tally
+//!   (`tally.signatures`) under a verification key derived from the DKG
+//!   transcript alone, and requires at least `threshold` valid ones.
 //! - Recombines the threshold-many partials via Lagrange-at-zero, decodes
 //!   the plaintext point with a brute-force discrete log in
 //!   `[0, eligible_ballot_count]`, and asserts equality with the published
@@ -323,6 +326,15 @@ pub(crate) fn audit_streaming(
         eligible_count,
         inputs.ground_truth,
         &mut timings,
+        &mut builder,
+    );
+
+    // -- 9. Trustee signatures over the published tally --------------------
+
+    crate::tally::verify_tally_signatures(
+        inputs.parameters,
+        inputs.tally,
+        &dkg_v.trustee_share_publics,
         &mut builder,
     );
 
