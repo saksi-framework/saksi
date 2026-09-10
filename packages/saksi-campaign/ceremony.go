@@ -22,14 +22,21 @@ import (
 // partial decryption it receives (trustee must be in the election's trustee
 // set, contest must exist, Chaum-Pedersen proof must be present, election must
 // be closed) and rejects a repeat submission from the same trustee for the same
-// contest. It does NOT count partials before accepting PublishTally. So the
-// t-of-n gate here is enforced by this console, not by the ledger.
+// contest. It still does NOT count partials.
 //
-// That does not make the property unproven: the independent auditor verifies it
-// at audit time, counting distinct verified trustees per contest and failing
-// below threshold (saksi-auditor/src/decryption.rs). Threshold integrity is a
-// verification-time guarantee. Adding an endorsement-time check to PublishTally
-// would be a genuine improvement, and needs a chaincode redeploy.
+// It does now count SIGNATURES: PublishTally verifies each trustee's Schnorr
+// signature over the published totals and refuses a tally fewer than
+// `threshold` distinct trustees endorsed (chaincode/sigverify). That is why
+// CeremonyPublish sends only the submitted trustees' signatures — the ledger
+// gate has to be counting what actually happened in this ceremony, not the
+// full set the generator signed with. A chaincode built before that gate
+// existed accepts any tally, so on such a network the t-of-n rule is still
+// this console's alone.
+//
+// Either way the property is independently checked: the auditor counts
+// distinct verified trustees per contest and fails below threshold
+// (saksi-auditor/src/decryption.rs), and verifies the same signatures
+// (saksi-auditor/src/tally.rs, finding `tally.signatures`).
 //
 // Note also that the published tally is the generator's seeded result, not a
 // recomputation from the shares that happened to be submitted. The ceremony
@@ -121,10 +128,27 @@ func (e *Executor) readBundle(runID string) (*onChainBundle, error) {
 	return &b, nil
 }
 
-// generateBundle shells the demo binary to write the run's bundle exactly once.
-// Regenerating would draw fresh randomness, changing every share and making
-// CreateElection a duplicate, so an existing bundle is reused as-is.
-func (e *Executor) generateBundle(ctx context.Context, runID string, c ElectionConfig) (string, error) {
+// generateBundle writes the run's bundle.json from the stream Generate already
+// produced, exactly once.
+//
+// The small artifacts (parameters, DKG transcript, partial decryptions, tally)
+// are copied out of header.json and the population is REFERENCED by file. It
+// deliberately does NOT re-run the generator: `saksi-demo gen` draws from
+// OsRng, so a second generation would produce a bundle whose ballots are not
+// the ones in ballots.ndjson — the election would be created from one
+// population and filled from another.
+// The stage boundary is stamped here rather than at the call sites so both
+// entry points (Submit and CeremonyStart) record it identically.
+func (e *Executor) generateBundle(runID string) (string, error) {
+	j := e.journalFor(runID)
+	defer j.Close()
+	_ = j.Stamp("stage.bundle.start", nil)
+	path, err := e.bundleFrom(runID)
+	_ = j.Stamp("stage.bundle.end", stageEnd(err))
+	return path, err
+}
+
+func (e *Executor) bundleFrom(runID string) (string, error) {
 	path, err := e.bundlePath(runID)
 	if err != nil {
 		return "", err
@@ -133,22 +157,25 @@ func (e *Executor) generateBundle(ctx context.Context, runID string, c ElectionC
 		e.publish(runID, "ceremony", "info", "reusing this run's generated bundle")
 		return path, nil
 	}
-	args := []string{
-		"gen",
-		"--voters", strconv.Itoa(c.Voters),
-		"--positions", strconv.Itoa(c.Positions),
-		"--candidates", strconv.Itoa(c.Candidates),
-		"--trustees", strconv.Itoa(len(c.Trustees)),
-		"--threshold", strconv.Itoa(c.Threshold),
-		"--election-id", runID,
-		"--election-name", c.Name,
-		"--trustee-names", strings.Join(c.TrusteeNames(), ","),
-		"--distribution", c.Distribution,
-		path,
+	dir, err := e.store.Dir(runID)
+	if err != nil {
+		return "", err
 	}
-	e.publish(runID, "ceremony", "info", "generating the election bundle…")
-	if _, err := e.run(ctx, e.demoBin, args...); err != nil {
-		e.publish(runID, "ceremony", "error", "bundle generation failed: "+err.Error())
+	var h electionHeader
+	if err := readJSON(filepath.Join(dir, "header.json"), &h); err != nil {
+		return "", fmt.Errorf("this run has no generated election to submit — run Generate first: %w", err)
+	}
+	e.publish(runID, "ceremony", "info", "preparing the election bundle…")
+	b := onChainBundle{
+		ElectionID:         h.ElectionID,
+		Params:             h.Params,
+		DKG:                h.Dkg,
+		BallotsFile:        BallotsFile,
+		BallotCount:        h.N,
+		PartialDecryptions: h.PartialDecryptions,
+		Tally:              h.Tally,
+	}
+	if err := writeJSON(path, b); err != nil {
 		return "", err
 	}
 	return path, nil
@@ -176,10 +203,14 @@ func localCeremonyOK(c ElectionConfig) bool {
 }
 
 func (e *Executor) CeremonyStart(ctx context.Context, runID string, c ElectionConfig) error {
-	path, err := e.generateBundle(ctx, runID, c)
+	j := e.journalFor(runID)
+	defer j.Close()
+	path, err := e.generateBundle(runID)
 	if err != nil {
 		return err
 	}
+	_ = j.Stamp("stage.ceremony.start", nil)
+	defer func() { _ = j.Stamp("stage.ceremony.end", nil) }()
 	if !e.fabric.Enabled() {
 		if !localCeremonyOK(c) {
 			e.publish(runID, "ceremony", "error", errNoFabric().Error())
@@ -200,7 +231,8 @@ func (e *Executor) CeremonyStart(ctx context.Context, runID string, c ElectionCo
 	if err != nil {
 		return err
 	}
-	if err := e.setupOnChain(ctx, b, step); err != nil {
+	defer e.closeReceipts(runID)
+	if err := e.setupOnChain(ctx, runID, c, b, conn.Ledger(), step); err != nil {
 		return err
 	}
 	e.publish(runID, "ceremony", "done", "election closed — trustees may now contribute")
@@ -225,6 +257,10 @@ func (e *Executor) CeremonySubmit(ctx context.Context, runID string, c ElectionC
 	}
 
 	name := trusteeDisplayName(c, trusteeID)
+	j := e.journalFor(runID)
+	defer j.Close()
+	_ = j.Stamp("stage.ceremony.trustee.start", map[string]any{"trustee": trusteeID, "partials": len(mine)})
+	defer func() { _ = j.Stamp("stage.ceremony.trustee.end", map[string]any{"trustee": trusteeID}) }()
 	if !e.fabric.Enabled() {
 		if !localCeremonyOK(c) {
 			return errNoFabric()
@@ -249,6 +285,7 @@ func (e *Executor) CeremonySubmit(ctx context.Context, runID string, c ElectionC
 	if err != nil {
 		return err
 	}
+	defer e.closeReceipts(runID)
 	for i, pd := range mine {
 		ref := fmt.Sprintf("%s/%d", name, i)
 		if err := step(ctx, "SubmitPartialDecryption", ref, "SubmitPartialDecryption", b.ElectionID, pd); err != nil {
@@ -275,6 +312,10 @@ func (e *Executor) CeremonyPublish(ctx context.Context, runID string, c Election
 	if err != nil {
 		return err
 	}
+	j := e.journalFor(runID)
+	defer j.Close()
+	_ = j.Stamp("stage.ceremony.publish.start", map[string]any{"submitted": state.Submitted, "threshold": state.Threshold})
+	defer func() { _ = j.Stamp("stage.ceremony.publish.end", nil) }()
 	if !e.fabric.Enabled() {
 		if !localCeremonyOK(c) {
 			return errNoFabric()
@@ -298,12 +339,64 @@ func (e *Executor) CeremonyPublish(ctx context.Context, runID string, c Election
 	if err != nil {
 		return err
 	}
-	if err := step(ctx, "PublishTally", "", "PublishTally", b.Tally); err != nil {
+	defer e.closeReceipts(runID)
+	tallyHex, err := tallyToPublish(b.Tally, state)
+	if err != nil {
+		e.publish(runID, "ceremony", "error", err.Error())
+		return err
+	}
+	if err := step(ctx, "PublishTally", "", "PublishTally", tallyHex); err != nil {
 		return err
 	}
 	e.publish(runID, "ceremony", "done",
 		fmt.Sprintf("threshold met (%d of %d) — tally published on-chain", state.Submitted, state.Threshold))
 	return e.markPublished(runID, c)
+}
+
+// tallyToPublish re-encodes the bundle's tally carrying only the signatures of
+// the trustees that actually submitted, and returns it hex-encoded.
+//
+// The generator signs the tally with EVERY trustee's share, because it holds
+// them all. Publishing that list unfiltered would put a 5-of-5 endorsement
+// on-chain for a ceremony only two trustees took part in — the ledger's own
+// threshold gate (the chaincode counts these signatures) would then be
+// counting a claim this console made up rather than what happened here.
+//
+// A bundle generated before tally signatures existed carries none; it is
+// returned verbatim, and the chaincode refuses it. Rewriting an old artifact to
+// look endorsed is exactly what must not happen.
+func tallyToPublish(tallyHex string, state CeremonyState) (string, error) {
+	raw, err := hex.DecodeString(tallyHex)
+	if err != nil {
+		return "", fmt.Errorf("this run's tally is not valid hex: %w", err)
+	}
+	var tally saksiprotocolv1.TallyResult
+	if err := proto.Unmarshal(raw, &tally); err != nil {
+		return "", fmt.Errorf("decode this run's tally: %w", err)
+	}
+	if len(tally.GetSignatures()) == 0 {
+		return tallyHex, nil
+	}
+
+	submitted := make(map[string]bool, len(state.Trustees))
+	for _, tr := range state.Trustees {
+		if tr.Submitted {
+			submitted[tr.ID] = true
+		}
+	}
+	kept := make([]*saksiprotocolv1.TrusteeSignature, 0, len(tally.GetSignatures()))
+	for _, sig := range tally.GetSignatures() {
+		if submitted[sig.GetTrusteeId()] {
+			kept = append(kept, sig)
+		}
+	}
+	tally.Signatures = kept
+
+	out, err := proto.Marshal(&tally)
+	if err != nil {
+		return "", fmt.Errorf("re-encode tally: %w", err)
+	}
+	return hex.EncodeToString(out), nil
 }
 
 // CeremonyStatus reports the roster. On-chain the ledger is consulted as the

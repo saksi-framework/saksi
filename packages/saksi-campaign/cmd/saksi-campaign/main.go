@@ -7,9 +7,19 @@
 //	                     [--fabric-tls-cert path] [--fabric-msp-id id]
 //	                     [--fabric-cert path] [--fabric-key path]
 //	                     [--fabric-channel name] [--fabric-chaincode name]
+//
+// The same binary is also the campaign driver for an ALREADY-RUNNING console,
+// over that console's own HTTP API — it never reaches into a run folder:
+//
+//	saksi-campaign --repeat --config run.json --warmups 2 --reps 10
+//	                        [--sweep 1.5] [--window 120s] [--burst N]
+//	                        [--base-url http://127.0.0.1:8090] [--out summary.csv]
+//	saksi-campaign --ladder [--base-url URL] [--runs dir]
 package main
 
 import (
+	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"net"
@@ -27,12 +37,83 @@ type multiFlag []string
 func (m *multiFlag) String() string     { return strings.Join(*m, ",") }
 func (m *multiFlag) Set(v string) error { *m = append(*m, v); return nil }
 
+const defaultBaseURL = "http://127.0.0.1:8090"
+
 func main() {
-	if len(os.Args) < 2 || os.Args[1] != "serve" {
+	mode := ""
+	if len(os.Args) > 1 {
+		mode = os.Args[1]
+	}
+	switch mode {
+	case "serve":
+		serve(os.Args[2:])
+	case "--repeat":
+		repeat(os.Args[2:])
+	case "--ladder":
+		ladder(os.Args[2:])
+	default:
 		fmt.Fprintln(os.Stderr, "usage: saksi-campaign serve [flags]")
+		fmt.Fprintln(os.Stderr, "       saksi-campaign --repeat --config run.json [flags]")
+		fmt.Fprintln(os.Stderr, "       saksi-campaign --ladder [flags]")
 		os.Exit(2)
 	}
+}
 
+// repeat drives a repeated-measures campaign against a running console.
+func repeat(args []string) {
+	fs := flag.NewFlagSet("--repeat", flag.ExitOnError)
+	configPath := fs.String("config", "", "path to the election config JSON (required)")
+	baseURL := fs.String("base-url", defaultBaseURL, "the running console to drive")
+	warmups := fs.Int("warmups", 0, "discarded warm-up repetitions")
+	reps := fs.Int("reps", 1, "measured repetitions")
+	sweep := fs.Float64("sweep", 0, "raise the offered rate by this factor per step (0 = no sweep)")
+	window := fs.Duration("window", campaign.DefaultWindow, "wall-clock window per sweep step")
+	burst := fs.Int("burst", 0, "after the measured reps, submit this many ballots with no rate cap")
+	out := fs.String("out", campaign.SummaryCSV, "where to write the campaign summary")
+	_ = fs.Parse(args)
+
+	if *configPath == "" {
+		fatal("--config is required: it names the election every repetition runs")
+	}
+	data, err := os.ReadFile(*configPath)
+	if err != nil {
+		fatal("read %s: %v", *configPath, err)
+	}
+	var c campaign.ElectionConfig
+	if err := json.Unmarshal(data, &c); err != nil {
+		fatal("parse %s: %v", *configPath, err)
+	}
+	if err := campaign.Repeat(context.Background(), campaign.RepeatOpts{
+		BaseURL: *baseURL, Config: c,
+		Warmups: *warmups, Reps: *reps,
+		Sweep: *sweep, Window: *window, Burst: *burst,
+		Out: *out,
+	}); err != nil {
+		fatal("%v", err)
+	}
+	fmt.Println("summary written to " + *out)
+}
+
+// ladder runs the validation ladder against a running console.
+func ladder(args []string) {
+	fs := flag.NewFlagSet("--ladder", flag.ExitOnError)
+	baseURL := fs.String("base-url", defaultBaseURL, "the running console to drive")
+	runsDir := fs.String("runs", defaultRunsDir(), "the console's run-store root (where ladder.json is written)")
+	_ = fs.Parse(args)
+
+	if err := campaign.RunLadder(context.Background(), campaign.LadderOpts{
+		BaseURL: *baseURL, DataDir: *runsDir,
+	}); err != nil {
+		fatal("%v", err)
+	}
+}
+
+func fatal(format string, args ...any) {
+	fmt.Fprintf(os.Stderr, format+"\n", args...)
+	os.Exit(1)
+}
+
+func serve(args []string) {
 	fs := flag.NewFlagSet("serve", flag.ExitOnError)
 	addr := fs.String("addr", "127.0.0.1:8090", "bind address (host:port); use 0.0.0.0 for LAN")
 	runsDir := fs.String("runs", defaultRunsDir(), "run-folder store root")
@@ -47,9 +128,10 @@ func main() {
 	fabricKey := fs.String("fabric-key", "", "path to the client identity private key")
 	fabricChannel := fs.String("fabric-channel", "saksi", "Fabric channel the bulletin board runs on")
 	fabricChaincode := fs.String("fabric-chaincode", "saksi-bulletin", "deployed chaincode name")
+	fabricPeerVolume := fs.String("fabric-peer-volume", "", "host path of the peer's ledger volume (enables perf.csv's ledger_bytes_delta)")
 	var allow multiFlag
 	fs.Var(&allow, "allow-host", "additional accepted Host header (repeatable; for LAN)")
-	_ = fs.Parse(os.Args[2:])
+	_ = fs.Parse(args)
 
 	fabric := campaign.FabricConfig{
 		PeerEndpoint: *fabricPeer,
@@ -60,6 +142,7 @@ func main() {
 		Key:          *fabricKey,
 		Channel:      *fabricChannel,
 		Chaincode:    *fabricChaincode,
+		PeerVolume:   *fabricPeerVolume,
 	}
 
 	if err := os.MkdirAll(*runsDir, 0o755); err != nil {

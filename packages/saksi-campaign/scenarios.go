@@ -356,23 +356,29 @@ func selectScenarios(list []string) []Scenario {
 
 // --- ballot / header mutation helpers --------------------------------------
 
+// readBallotLines scans the stream rather than slurping it, so one oversized
+// line fails by number instead of the whole file arriving as one string. The
+// slice IS the whole population: a mutation that drops, reorders or rewrites a
+// line has to rewrite the file, which needs every other line. That bounds the
+// negative-test scenarios to demo-scale runs — the measured tiers stream
+// through scanBallotLines and never come here.
 func readBallotLines(dir string) ([]string, error) {
-	raw, err := os.ReadFile(filepath.Join(dir, "ballots.ndjson"))
+	var lines []string
+	err := scanBallotLines(dir, func(_ int, line string) error {
+		if line != "" {
+			lines = append(lines, line)
+		}
+		return nil
+	})
 	if err != nil {
 		return nil, err
-	}
-	var lines []string
-	for _, l := range strings.Split(string(raw), "\n") {
-		if strings.TrimSpace(l) != "" {
-			lines = append(lines, strings.TrimSpace(l))
-		}
 	}
 	return lines, nil
 }
 
 func writeBallotLines(dir string, lines []string) error {
 	body := strings.Join(lines, "\n") + "\n"
-	return os.WriteFile(filepath.Join(dir, "ballots.ndjson"), []byte(body), 0o644)
+	return os.WriteFile(filepath.Join(dir, BallotsFile), []byte(body), 0o644)
 }
 
 func readBallot(dir string, idx int) (*pb.Ballot, error) {
@@ -469,7 +475,7 @@ func copyStream(srcDir, dstDir string) error {
 	if err := os.MkdirAll(dstDir, 0o755); err != nil {
 		return err
 	}
-	for _, name := range []string{"header.json", "ballots.ndjson"} {
+	for _, name := range []string{"header.json", BallotsFile} {
 		data, err := os.ReadFile(filepath.Join(srcDir, name))
 		if err != nil {
 			return fmt.Errorf("copy %s: %w", name, err)
@@ -590,19 +596,54 @@ func writeNegativeTestsCSV(path string, results []ScenarioResult) error {
 	w := csv.NewWriter(f)
 	if err := w.Write([]string{
 		"scenario", "stage", "layer", "action", "expected", "actual", "verdict", "property", "on_chain",
+		"attempted", "rejected", "rate",
 	}); err != nil {
 		return err
 	}
+	var totalAttempted, totalRejected int
 	for _, r := range results {
+		attempted, rejected := r.rejection()
+		totalAttempted, totalRejected = totalAttempted+attempted, totalRejected+rejected
 		if err := w.Write([]string{
 			r.Scenario, r.Stage, r.Layer, r.Action, r.Expected, r.Actual, r.Verdict, r.Property,
 			strconv.FormatBool(r.OnChain),
+			strconv.Itoa(attempted), strconv.Itoa(rejected), rejectionRate(attempted, rejected),
 		}); err != nil {
 			return err
 		}
 	}
+	// Totals last: the paper quotes one rejection rate for the whole catalog.
+	if err := w.Write([]string{
+		"summary", "", "", "", "", "", "", "", "",
+		strconv.Itoa(totalAttempted), strconv.Itoa(totalRejected),
+		rejectionRate(totalAttempted, totalRejected),
+	}); err != nil {
+		return err
+	}
 	w.Flush()
 	return w.Error()
+}
+
+// rejection counts one scenario's attack attempts and refusals. One mounting
+// per scenario, live or simulated; a PASS verdict IS the refusal (the verdict
+// is inverted — see mountLiveAttack). SKIPPED was never mounted, so it counts
+// as no attempt rather than as an attack that got through.
+func (r ScenarioResult) rejection() (attempted, rejected int) {
+	if r.Verdict == "SKIPPED" {
+		return 0, 0
+	}
+	if r.Verdict == "PASS" {
+		return 1, 1
+	}
+	return 1, 0
+}
+
+// rejectionRate is blank when nothing was attempted: 0/0 is not 0%.
+func rejectionRate(attempted, rejected int) string {
+	if attempted == 0 {
+		return ""
+	}
+	return strconv.FormatFloat(float64(rejected)/float64(attempted), 'f', 2, 64)
 }
 
 // LiveCapable reports whether this attack can be mounted against a running

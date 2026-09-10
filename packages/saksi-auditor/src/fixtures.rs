@@ -18,8 +18,10 @@
 //! values can be borrowed into an [`crate::ElectionArtifacts`]. Tests mutate
 //! one field of this struct, call [`crate::audit`], and assert.
 
+use std::time::{Duration, Instant};
+
 use curve25519_dalek::{ristretto::RistrettoPoint, scalar::Scalar, traits::Identity};
-use rand_core::OsRng;
+use rand_core::{CryptoRng, OsRng, RngCore};
 
 use saksi_credentials::{
     issuer_pre_sign, issuer_sign, voter_begin_issuance, voter_blind_challenge,
@@ -29,11 +31,11 @@ use saksi_crypto::{
     dkg::{run_in_memory, Dealer, DkgConfig, TrusteeShare},
     elgamal::{self, encrypt, Plaintext, PublicKey},
     group::{basepoint, compress_point},
-    nizk::{cds::CDSProof, chaum_pedersen::ChaumPedersenProof},
+    nizk::{cds::CDSProof, chaum_pedersen::ChaumPedersenProof, schnorr::SchnorrProof},
 };
 use saksi_protocol::{
     Ballot, Ciphertext as WireCiphertext, DKGTranscript, ElectionParameters, PartialDecryption,
-    TallyResult, WIRE_VERSION,
+    TallyResult, TrusteeSignature, WIRE_VERSION,
 };
 
 use crate::{ballot::cds_context_for_test, decryption::cp_context_for_test, ElectionArtifacts};
@@ -296,6 +298,13 @@ pub(crate) fn happy_path_fixture() -> ElectionFixture {
         election_id: parameters.election_id.clone(),
         totals: plaintext_tallies.clone(),
         partial_decryptions: partial_decryptions.clone(),
+        signatures: sign_tally(
+            &parameters.election_id,
+            &plaintext_tallies,
+            &trustee_ids,
+            &dkg_output.trustee_shares,
+            &mut rng,
+        ),
     };
 
     // Legacy fixture: one ballot per voter, so voter-i labels the i-th ballot.
@@ -643,18 +652,69 @@ pub(crate) fn select_candidate(
     }
 }
 
-pub(crate) fn multi_position_fixture(params: &GenParams) -> ElectionFixture {
-    let voters = params.voters;
-    let positions = params.positions;
-    let candidates = params.candidates;
-    let profile = params.profile;
+/// Per-voter CPU time, summed by the chunked generator into `gen-timings.json`.
+/// Thread-local while a voter is built, then folded into the run totals — so
+/// these are CPU sums across worker threads, never wall time.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct CpuTimes {
+    /// Blind-signature issuance + this voter's credential presentations.
+    pub(crate) credential: Duration,
+    /// ElGamal encryption of every (position, candidate) bit.
+    pub(crate) encrypt: Duration,
+    /// CDS OR-proof generation for the same ciphertexts.
+    pub(crate) cds_prove: Duration,
+}
+
+impl CpuTimes {
+    /// Folds another thread's totals into this one.
+    pub(crate) fn add(&mut self, other: &CpuTimes) {
+        self.credential += other.credential;
+        self.encrypt += other.encrypt;
+        self.cds_prove += other.cds_prove;
+    }
+}
+
+/// Everything a generation run computes **once**, before any voter is built:
+/// election parameters, the DKG transcript + trustee shares, the issuer
+/// keypair, and the selection plan.
+///
+/// The chunked stream writer keeps one of these alive across every chunk and
+/// shares it (read-only) with the rayon workers; [`multi_position_fixture`]
+/// builds one, walks the voters serially, and throws it away. Both paths run the
+/// same [`build_voter`], which is what makes them one generator rather than two.
+pub(crate) struct GenPrologue {
+    pub(crate) parameters: ElectionParameters,
+    pub(crate) dkg_transcript: DKGTranscript,
+    pub(crate) issuer_public_key: IssuerPublicKey,
+    election_public_key: PublicKey,
+    issuer_secret_key: IssuerSecretKey,
+    trustee_shares: Vec<TrusteeShare>,
+    plan: SelectionPlan,
+}
+
+/// One voter's contribution: their per-position ballot records (in position
+/// order), the selections behind them, this voter's per-contest ciphertext pads
+/// for the running homomorphic aggregate, and the CPU spent producing them.
+pub(crate) struct VoterWork {
+    pub(crate) ballots: Vec<Ballot>,
+    pub(crate) selections: Vec<(usize, usize)>,
+    /// `pads[p * candidates + k]` — this voter's pad for that contest slot. Kept
+    /// as a decompressed point so the aggregate never re-decompresses the wire
+    /// bytes it just wrote.
+    pub(crate) pads: Vec<RistrettoPoint>,
+    pub(crate) cpu: CpuTimes,
+}
+
+/// Builds the run-wide prologue (see [`GenPrologue`]). Panics on dimensions the
+/// fail-closed parameter gate would already have rejected.
+pub(crate) fn gen_prologue(params: &GenParams) -> GenPrologue {
     assert!(
-        voters >= 1 && positions >= 1 && candidates >= 1,
-        "multi_position_fixture needs non-empty dimensions"
+        params.voters >= 1 && params.positions >= 1 && params.candidates >= 1,
+        "the generator needs non-empty dimensions"
     );
     assert!(
         params.threshold >= 1 && params.threshold <= params.trustees,
-        "multi_position_fixture needs 1 <= threshold <= trustees"
+        "the generator needs 1 <= threshold <= trustees"
     );
     assert_eq!(
         params.trustee_names.len(),
@@ -668,19 +728,18 @@ pub(crate) fn multi_position_fixture(params: &GenParams) -> ElectionFixture {
     let trustee_ids: Vec<String> = (1..=params.trustees as u32)
         .map(|i| i.to_string())
         .collect();
-    let threshold: u32 = params.threshold as u32;
-    let mut contest_ids: Vec<String> = Vec::with_capacity(positions * candidates);
-    for p in 0..positions {
-        for k in 0..candidates {
+    let mut contest_ids: Vec<String> = Vec::with_capacity(params.positions * params.candidates);
+    for p in 0..params.positions {
+        for k in 0..params.candidates {
             contest_ids.push(format!("{}/cand{k}", ph_position_id(p)));
         }
     }
     let parameters = ElectionParameters {
         version: WIRE_VERSION,
         election_id: params.election_id.clone(),
-        contest_ids: contest_ids.clone(),
-        trustee_ids: trustee_ids.clone(),
-        threshold,
+        contest_ids,
+        trustee_ids,
+        threshold: params.threshold as u32,
     };
 
     // -- DKG (t-of-n; deterministic dealers as happy_path) -----------------
@@ -698,131 +757,154 @@ pub(crate) fn multi_position_fixture(params: &GenParams) -> ElectionFixture {
         .collect();
     let dkg_output = run_in_memory(config, &dealers).expect("DKG completes");
     let dkg_transcript = dkg_output.to_protocol_transcript(parameters.election_id.clone());
-    let election_public_key = dkg_output.public_key;
 
-    // -- issuer + one credential per voter ---------------------------------
+    // -- issuer keypair ----------------------------------------------------
 
-    let issuer_sk = IssuerSecretKey::generate(&mut rng);
-    let issuer_pk = issuer_sk.public_key();
-    let mut credentials: Vec<Credential> = Vec::with_capacity(voters);
-    for _ in 0..voters {
-        let (request, blind_state) = voter_begin_issuance(&mut rng);
-        let (pre_sig, session) = issuer_pre_sign(&issuer_sk, &request, &mut rng);
-        let (blinded, finalize_state) =
-            voter_blind_challenge(blind_state, &pre_sig, &issuer_pk, &mut rng);
-        let response = issuer_sign(&issuer_sk, session, &blinded);
-        credentials.push(
-            voter_finalize_issuance(finalize_state, &response, &issuer_pk)
-                .expect("issuance happy path"),
-        );
+    let issuer_secret_key = IssuerSecretKey::generate(&mut rng);
+    let issuer_public_key = issuer_secret_key.public_key();
+
+    GenPrologue {
+        parameters,
+        dkg_transcript,
+        issuer_public_key,
+        election_public_key: dkg_output.public_key,
+        issuer_secret_key,
+        trustee_shares: dkg_output.trustee_shares,
+        plan: SelectionPlan::new(
+            params.profile,
+            params.voters,
+            params.positions,
+            params.candidates,
+        ),
     }
+}
 
-    // -- one ballot per (voter, position); ground truth per contest --------
-
-    let mut ballots: Vec<Ballot> = Vec::with_capacity(voters * positions);
-    let mut voter_ids: Vec<String> = Vec::with_capacity(voters * positions);
-    // Recorded selections drive the INDEPENDENT ground-truth tally (see
-    // `tally_selections`) — never accumulated inline with the ciphertexts.
-    let mut selections: Vec<(usize, usize)> = Vec::with_capacity(voters * positions);
+/// Builds one voter end-to-end: issue a credential, then for each position
+/// present it (per-position nullifier) and encrypt + CDS-prove one bit per
+/// candidate (ADR-0007 one-record-per-position).
+///
+/// Depends only on `pro`, `params`, `voter_idx` and its own `OsRng`, so many
+/// threads can run it at once — which is what the chunked writer does inside a
+/// chunk.
+pub(crate) fn build_voter(pro: &GenPrologue, params: &GenParams, voter_idx: usize) -> VoterWork {
+    let mut rng = OsRng;
+    let candidates = params.candidates;
+    let contest_count = params.positions * candidates;
     let choice_set = [Scalar::ZERO, Scalar::ONE];
-    // Built once from the generation parameters; `ground_truth.rs` builds the
-    // same plan the same way, which is what keeps the two paths byte-identical.
-    let plan = SelectionPlan::new(profile, voters, positions, candidates);
+    let mut cpu = CpuTimes::default();
 
-    for (voter_idx, credential) in credentials.iter().enumerate() {
-        for p in 0..positions {
-            let position_id = ph_position_id(p);
-            // Deterministic 1-of-C selection under the chosen profile.
-            let selected = plan.select(voter_idx, p);
-            selections.push((p, selected));
+    let started = Instant::now();
+    let (request, blind_state) = voter_begin_issuance(&mut rng);
+    let (pre_sig, session) = issuer_pre_sign(&pro.issuer_secret_key, &request, &mut rng);
+    let (blinded, finalize_state) =
+        voter_blind_challenge(blind_state, &pre_sig, &pro.issuer_public_key, &mut rng);
+    let response = issuer_sign(&pro.issuer_secret_key, session, &blinded);
+    let credential = voter_finalize_issuance(finalize_state, &response, &pro.issuer_public_key)
+        .expect("issuance happy path");
+    cpu.credential += started.elapsed();
 
-            let presentation = credential.present(
-                &issuer_pk,
-                parameters.election_id.as_bytes(),
-                position_id.as_bytes(),
-                BINDING_CONTEXT,
-                &mut rng,
-            );
-            let nullifier_bytes = presentation
-                .nullifier
-                .as_ref()
-                .expect("presentation has a nullifier")
-                .value
-                .clone();
+    let mut ballots = Vec::with_capacity(params.positions);
+    let mut selections = Vec::with_capacity(params.positions);
+    let mut pads = vec![RistrettoPoint::identity(); contest_count];
 
-            let mut ciphertexts: Vec<WireCiphertext> = Vec::with_capacity(candidates);
-            let mut proofs = Vec::with_capacity(candidates);
-            for k in 0..candidates {
-                let global_c = p * candidates + k;
-                let choice: u8 = u8::from(k == selected);
+    for p in 0..params.positions {
+        let position_id = ph_position_id(p);
+        // Deterministic 1-of-C selection under the chosen profile.
+        let selected = pro.plan.select(voter_idx, p);
+        selections.push((p, selected));
 
-                let r = Scalar::random(&mut rng);
-                let plaintext = Plaintext::from_small_integer(choice as u64);
-                let ct = encrypt(&election_public_key, plaintext, r);
-                let (pad_bytes, data_bytes) = ct.to_compressed_bytes();
-                ciphertexts.push(WireCiphertext {
-                    version: WIRE_VERSION,
-                    pad: pad_bytes.to_vec(),
-                    data: data_bytes.to_vec(),
-                });
+        let started = Instant::now();
+        let presentation = credential.present(
+            &pro.issuer_public_key,
+            pro.parameters.election_id.as_bytes(),
+            position_id.as_bytes(),
+            BINDING_CONTEXT,
+            &mut rng,
+        );
+        cpu.credential += started.elapsed();
+        let nullifier_bytes = presentation
+            .nullifier
+            .as_ref()
+            .expect("presentation has a nullifier")
+            .value
+            .clone();
 
-                let context = cds_context_for_test(
-                    parameters.election_id.as_bytes(),
-                    contest_ids[global_c].as_bytes(),
-                    &nullifier_bytes,
-                );
-                let cds = CDSProof::prove(
-                    &election_public_key,
-                    &ct,
-                    &choice_set,
-                    choice as usize,
-                    &r,
-                    &context,
-                    &mut rng,
-                )
-                .expect("CDS prove ok");
-                proofs.push(cds.to_wire());
-            }
+        let mut ciphertexts: Vec<WireCiphertext> = Vec::with_capacity(candidates);
+        let mut proofs = Vec::with_capacity(candidates);
+        for k in 0..candidates {
+            let global_c = p * candidates + k;
+            let choice: u8 = u8::from(k == selected);
 
-            ballots.push(Ballot {
+            let started = Instant::now();
+            let r = Scalar::random(&mut rng);
+            let plaintext = Plaintext::from_small_integer(choice as u64);
+            let ct = encrypt(&pro.election_public_key, plaintext, r);
+            cpu.encrypt += started.elapsed();
+            let (pad_bytes, data_bytes) = ct.to_compressed_bytes();
+            ciphertexts.push(WireCiphertext {
                 version: WIRE_VERSION,
-                election_id: parameters.election_id.clone(),
-                voter_credential_commitment: presentation.credential_commitment.clone(),
-                ciphertexts,
-                well_formedness_proofs: proofs,
-                credential_presentation: Some(presentation),
-                position_id,
+                pad: pad_bytes.to_vec(),
+                data: data_bytes.to_vec(),
             });
-            // Synthetic voter id: shared across this voter's positions, unique
-            // per voter (paper Table 3.1). Off-wire generation metadata.
-            voter_ids.push(format!("voter-{voter_idx}"));
+            pads[global_c] = ct.pad;
+
+            let context = cds_context_for_test(
+                pro.parameters.election_id.as_bytes(),
+                pro.parameters.contest_ids[global_c].as_bytes(),
+                &nullifier_bytes,
+            );
+            let started = Instant::now();
+            let cds = CDSProof::prove(
+                &pro.election_public_key,
+                &ct,
+                &choice_set,
+                choice as usize,
+                &r,
+                &context,
+                &mut rng,
+            )
+            .expect("CDS prove ok");
+            cpu.cds_prove += started.elapsed();
+            proofs.push(cds.to_wire());
         }
+
+        ballots.push(Ballot {
+            version: WIRE_VERSION,
+            election_id: pro.parameters.election_id.clone(),
+            voter_credential_commitment: presentation.credential_commitment.clone(),
+            ciphertexts,
+            well_formedness_proofs: proofs,
+            credential_presentation: Some(presentation),
+            position_id,
+        });
     }
 
-    // -- independent ground truth (NOT accumulated in the crypto loop) ------
-    let ground_truth = tally_selections(&selections, contest_ids.len(), candidates);
-
-    // -- aggregate per contest (reuse the shared position→contest mapping) --
-
-    let contest_count = contest_ids.len();
-    let trustee_count = trustee_ids.len();
-    let mut aggregate_pads = vec![RistrettoPoint::identity(); contest_count];
-    for ballot in &ballots {
-        let idxs = crate::contest_indices_for_position(&contest_ids, &ballot.position_id);
-        for (local, ct) in ballot.ciphertexts.iter().enumerate() {
-            let pad: [u8; 32] = ct.pad.as_slice().try_into().unwrap();
-            aggregate_pads[idxs[local]] += saksi_crypto::group::point_from_compressed(pad).unwrap();
-        }
+    VoterWork {
+        ballots,
+        selections,
+        pads,
+        cpu,
     }
+}
 
-    // -- one partial decryption per (contest, trustee) ---------------------
+/// Runs the trustee ceremony over a finished per-contest aggregate: one
+/// Chaum-Pedersen-proved [`PartialDecryption`] per (contest, trustee).
+///
+/// Takes only the aggregate pads, never the ballots — so the chunked writer can
+/// call it after streaming every ballot to disk and dropping it.
+pub(crate) fn build_partial_decryptions(
+    pro: &GenPrologue,
+    aggregate_pads: &[RistrettoPoint],
+) -> Vec<PartialDecryption> {
+    let mut rng = OsRng;
+    let g = basepoint();
+    let trustee_ids = &pro.parameters.trustee_ids;
+    let mut out = Vec::with_capacity(pro.parameters.contest_ids.len() * trustee_ids.len());
 
-    let mut partial_decryptions: Vec<PartialDecryption> =
-        Vec::with_capacity(contest_count * trustee_count);
-    for (c, contest_id) in contest_ids.iter().enumerate() {
+    for (c, contest_id) in pro.parameters.contest_ids.iter().enumerate() {
         let aggregate_pad = aggregate_pads[c];
         for (t, trustee_id_str) in trustee_ids.iter().enumerate() {
-            let trustee_share: &TrusteeShare = dkg_output
+            let trustee_share: &TrusteeShare = pro
                 .trustee_shares
                 .iter()
                 .find(|s| s.trustee_id == t + 1)
@@ -831,7 +913,6 @@ pub(crate) fn multi_position_fixture(params: &GenParams) -> ElectionFixture {
             let share_point = s * aggregate_pad;
             let pub_share = s * basepoint();
 
-            let g = basepoint();
             let context = cp_context_for_test(BINDING_CONTEXT, trustee_id_str, contest_id);
             let cp = ChaumPedersenProof::prove(
                 &g,
@@ -843,7 +924,7 @@ pub(crate) fn multi_position_fixture(params: &GenParams) -> ElectionFixture {
                 &mut rng,
             );
 
-            partial_decryptions.push(PartialDecryption {
+            out.push(PartialDecryption {
                 version: WIRE_VERSION,
                 trustee_id: trustee_id_str.clone(),
                 share: compress_point(&share_point).to_vec(),
@@ -852,21 +933,109 @@ pub(crate) fn multi_position_fixture(params: &GenParams) -> ElectionFixture {
             });
         }
     }
+    out
+}
 
-    let tally = TallyResult {
+/// Every trustee's Schnorr signature over the published totals, in trustee
+/// order (see [`crate::tally::tally_sig_context`] for the signed bytes and
+/// [`crate::dkg::trustee_verification_key`] for the key that verifies them).
+///
+/// Production signing uses `OsRng`; only the golden-vector test passes a
+/// deterministic `rng`.
+pub(crate) fn sign_tally(
+    election_id: &str,
+    totals: &[u64],
+    trustee_ids: &[String],
+    trustee_shares: &[TrusteeShare],
+    rng: &mut (impl RngCore + CryptoRng),
+) -> Vec<TrusteeSignature> {
+    let g = basepoint();
+    let context = crate::tally::tally_sig_context(election_id, totals);
+    trustee_ids
+        .iter()
+        .enumerate()
+        .map(|(t, trustee_id)| {
+            let share = trustee_shares
+                .iter()
+                .find(|s| s.trustee_id == t + 1)
+                .expect("DKG produced share for every trustee");
+            let public_share = share.value * g;
+            let proof = SchnorrProof::prove(&g, &public_share, &share.value, &context, rng);
+            TrusteeSignature {
+                trustee_id: trustee_id.clone(),
+                signature: proof.to_bytes().to_vec(),
+            }
+        })
+        .collect()
+}
+
+/// Assembles the published [`TallyResult`] from the seeded totals + the
+/// ceremony, signed by every trustee.
+pub(crate) fn build_tally(
+    pro: &GenPrologue,
+    totals: Vec<u64>,
+    partial_decryptions: Vec<PartialDecryption>,
+) -> TallyResult {
+    let signatures = sign_tally(
+        &pro.parameters.election_id,
+        &totals,
+        &pro.parameters.trustee_ids,
+        &pro.trustee_shares,
+        &mut OsRng,
+    );
+    TallyResult {
         version: WIRE_VERSION,
-        election_id: parameters.election_id.clone(),
-        totals: ground_truth.clone(),
-        partial_decryptions: partial_decryptions.clone(),
-    };
+        election_id: pro.parameters.election_id.clone(),
+        totals,
+        partial_decryptions,
+        signatures,
+    }
+}
+
+/// Synthetic voter id for ballot record `ballot_idx` when each voter casts
+/// `positions` records. Ballots are voter-major, so the id is a pure function of
+/// the index and no per-ballot table has to be carried through generation.
+pub(crate) fn voter_id_for_ballot(ballot_idx: usize, positions: usize) -> String {
+    format!("voter-{}", ballot_idx / positions.max(1))
+}
+
+pub(crate) fn multi_position_fixture(params: &GenParams) -> ElectionFixture {
+    let pro = gen_prologue(params);
+    let contest_count = params.positions * params.candidates;
+
+    let mut ballots: Vec<Ballot> = Vec::with_capacity(params.voters * params.positions);
+    // Recorded selections drive the INDEPENDENT ground-truth tally (see
+    // `tally_selections`) — never accumulated inline with the ciphertexts.
+    let mut selections: Vec<(usize, usize)> = Vec::with_capacity(params.voters * params.positions);
+    let mut aggregate_pads = vec![RistrettoPoint::identity(); contest_count];
+
+    for voter_idx in 0..params.voters {
+        let work = build_voter(&pro, params, voter_idx);
+        for (c, pad) in work.pads.iter().enumerate() {
+            aggregate_pads[c] += pad;
+        }
+        selections.extend(work.selections);
+        ballots.extend(work.ballots);
+    }
+
+    // Synthetic voter id: shared across this voter's positions, unique per voter
+    // (paper Table 3.1). Off-wire generation metadata.
+    let voter_ids = (0..ballots.len())
+        .map(|i| voter_id_for_ballot(i, params.positions))
+        .collect();
+
+    // -- independent ground truth (NOT accumulated in the crypto loop) ------
+    let ground_truth = tally_selections(&selections, contest_count, params.candidates);
+    let partial_decryptions = build_partial_decryptions(&pro, &aggregate_pads);
+    let tally = build_tally(&pro, ground_truth.clone(), partial_decryptions.clone());
 
     ElectionFixture {
-        parameters,
-        dkg_transcript,
+        parameters: pro.parameters,
+        dkg_transcript: pro.dkg_transcript,
         ballots,
         partial_decryptions,
         tally,
-        issuer_public_key: issuer_pk,
+        issuer_public_key: pro.issuer_public_key,
         ground_truth,
         voter_ids,
         election_name: params.election_name.clone(),
@@ -1127,5 +1296,295 @@ mod realistic_profile_tests {
         for v in 0..10 {
             assert_eq!(plan.select(v, 0), 0);
         }
+    }
+}
+
+/// Cross-language golden vector for the trustee tally signature.
+///
+/// The Go chaincode (Task 11) reads `test-vectors/tally-sig-v1.hex` and must
+/// derive the same verification keys and accept the same signatures, so this
+/// module pins the bytes. Layout, one item per line:
+///
+/// ```text
+/// 1           dkg_transcript, hex of the canonical protobuf encoding
+/// 2           election_id, hex of its UTF-8 bytes
+/// 3           trustee_ids, comma-separated, in ElectionParameters order
+/// 4           totals, comma-separated decimal, in contest order
+/// 5           threshold, decimal
+/// 6..6+n      trustee_id,verification_key_hex,signature_hex  (trustee order)
+/// last        negative,trustee_id,verification_key_hex,signature_hex
+/// ```
+///
+/// The trustee ids are deliberately **non-numeric and not in sorted order**: a
+/// port that derives the share index by parsing the id (or by sorting) instead
+/// of taking its 1-based position in the `trustee_ids` line must fail this
+/// vector rather than pass it by coincidence.
+///
+/// The `negative` line is a well-formed signature by the first trustee over
+/// *different* totals: a verifier that forgets to bind the totals into the
+/// context accepts it, and is wrong.
+///
+/// Regenerate with `SAKSI_WRITE_VECTORS=1 cargo test -p saksi-auditor
+/// tally_signature_golden_vector`.
+#[cfg(test)]
+mod tally_signature_vector {
+    use std::path::PathBuf;
+
+    use super::*;
+    use crate::dkg::{decode_trustee_commitments, trustee_verification_key};
+    use crate::tally::tally_sig_context;
+    use saksi_crypto::group::point_from_compressed;
+    use saksi_protocol::encode;
+
+    /// SplitMix64 as an `RngCore`: deterministic, so the vector's signatures are
+    /// byte-stable. **Vector-only** — every production signing path (see
+    /// [`build_tally`]) uses `OsRng`.
+    struct SplitMix64(u64);
+
+    impl RngCore for SplitMix64 {
+        fn next_u32(&mut self) -> u32 {
+            self.next_u64() as u32
+        }
+        fn next_u64(&mut self) -> u64 {
+            self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        }
+        fn fill_bytes(&mut self, dest: &mut [u8]) {
+            for chunk in dest.chunks_mut(8) {
+                let bytes = self.next_u64().to_le_bytes();
+                chunk.copy_from_slice(&bytes[..chunk.len()]);
+            }
+        }
+        fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), rand_core::Error> {
+            self.fill_bytes(dest);
+            Ok(())
+        }
+    }
+
+    impl CryptoRng for SplitMix64 {}
+
+    const ELECTION_ID: &str = "election-2026";
+    /// Opaque trustee labels: non-numeric and NOT in sorted order, so the only
+    /// way to reach the right DKG share index is the 1-based position in this
+    /// list (see [`crate::dkg::trustee_verification_key`]).
+    const TRUSTEE_IDS: [&str; 5] = [
+        "trustee-e",
+        "trustee-a",
+        "trustee-d",
+        "trustee-b",
+        "trustee-c",
+    ];
+    const TOTALS: [u64; 2] = [4, 2];
+    /// The totals the `negative` line signs instead of [`TOTALS`].
+    const OTHER_TOTALS: [u64; 2] = [5, 1];
+
+    /// The fixed 3-of-5 DKG the vector is built on: the same deterministic
+    /// dealer polynomials [`happy_path_fixture`] uses, so the vector's keys are
+    /// the fixture's keys.
+    fn vector_dkg() -> (DKGTranscript, Vec<TrusteeShare>, Vec<String>, u32) {
+        let config = DkgConfig::default_3_of_5();
+        let dealers: Vec<Dealer> = (1..=config.trustees)
+            .map(|dealer_id| {
+                Dealer::new(
+                    dealer_id,
+                    (0..config.threshold)
+                        .map(|coefficient| Scalar::from((dealer_id * 10 + coefficient + 1) as u64))
+                        .collect(),
+                )
+            })
+            .collect();
+        let output = run_in_memory(config, &dealers).expect("DKG completes");
+        let transcript = output.to_protocol_transcript(ELECTION_ID);
+        let trustee_ids = TRUSTEE_IDS.iter().map(|id| id.to_string()).collect();
+        (
+            transcript,
+            output.trustee_shares,
+            trustee_ids,
+            config.threshold as u32,
+        )
+    }
+
+    fn vector_path() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../saksi-protocol/test-vectors/tally-sig-v1.hex")
+    }
+
+    fn proof_from_hex(hex_str: &str) -> SchnorrProof {
+        let bytes: [u8; 64] = hex::decode(hex_str)
+            .expect("signature hex")
+            .try_into()
+            .expect("64-byte signature");
+        SchnorrProof::from_bytes(&bytes).expect("canonical Schnorr proof")
+    }
+
+    /// The signed bytes are exactly the domain, the election id, and the totals
+    /// as little-endian u64s — no length prefixes. Hand-computed, so a change to
+    /// the encoding cannot slip through by regenerating the vector.
+    #[test]
+    fn tally_sig_context_is_domain_election_id_and_le_totals() {
+        assert_eq!(
+            hex::encode(tally_sig_context("e1", &[1, 258])),
+            concat!(
+                "73616b73692e74616c6c792e7369672e7631", // b"saksi.tally.sig.v1"
+                "6531",                                 // b"e1"
+                "0100000000000000",                     // 1u64, little-endian
+                "0201000000000000",                     // 258u64, little-endian
+            )
+        );
+    }
+
+    /// The key derived from the public transcript alone is the trustee's real
+    /// public share `s_i·G` — which is what lets anyone holding only the
+    /// bulletin board check the signature.
+    #[test]
+    fn derived_verification_keys_equal_share_publics() {
+        let (transcript, shares, trustee_ids, _) = vector_dkg();
+        let commitments = decode_trustee_commitments(&transcript).expect("transcript decodes");
+        for t in 0..trustee_ids.len() {
+            let share = shares
+                .iter()
+                .find(|s| s.trustee_id == t + 1)
+                .expect("share per trustee");
+            assert_eq!(
+                trustee_verification_key(&commitments, (t + 1) as u64),
+                share.value * basepoint(),
+                "trustee {} verification key must equal s_i·G",
+                t + 1
+            );
+        }
+    }
+
+    /// Renders the vector text (deterministic) and pins it against the committed
+    /// file, then reads that file back and verifies every line the way the Go
+    /// chaincode will.
+    #[test]
+    fn tally_signature_golden_vector() {
+        let (transcript, shares, trustee_ids, threshold) = vector_dkg();
+        let mut rng = SplitMix64(0x5AC5_1000_0000_0001);
+
+        let signatures = sign_tally(ELECTION_ID, &TOTALS, &trustee_ids, &shares, &mut rng);
+        let negative = sign_tally(
+            ELECTION_ID,
+            &OTHER_TOTALS,
+            &trustee_ids[..1],
+            &shares,
+            &mut rng,
+        );
+        let commitments = decode_trustee_commitments(&transcript).expect("transcript decodes");
+
+        let mut lines = vec![
+            hex::encode(encode(&transcript)),
+            hex::encode(ELECTION_ID.as_bytes()),
+            trustee_ids.join(","),
+            TOTALS
+                .iter()
+                .map(u64::to_string)
+                .collect::<Vec<_>>()
+                .join(","),
+            threshold.to_string(),
+        ];
+        for (t, signature) in signatures.iter().enumerate() {
+            lines.push(format!(
+                "{},{},{}",
+                signature.trustee_id,
+                hex::encode(compress_point(&trustee_verification_key(
+                    &commitments,
+                    (t + 1) as u64
+                ))),
+                hex::encode(&signature.signature),
+            ));
+        }
+        lines.push(format!(
+            "negative,{},{},{}",
+            negative[0].trustee_id,
+            hex::encode(compress_point(&trustee_verification_key(&commitments, 1))),
+            hex::encode(&negative[0].signature),
+        ));
+        let rendered = format!("{}\n", lines.join("\n"));
+
+        let path = vector_path();
+        if std::env::var_os("SAKSI_WRITE_VECTORS").is_some() {
+            std::fs::write(&path, &rendered).expect("write golden vector");
+        }
+        let committed = std::fs::read_to_string(&path)
+            .expect("golden vector is committed")
+            .replace("\r\n", "\n");
+        assert_eq!(
+            committed, rendered,
+            "tally-signature golden vector drifted; the Go cross-check must be regenerated too"
+        );
+
+        // -- round-trip: verify the committed file the way Go will ------------
+
+        let read: Vec<&str> = committed.lines().collect();
+        let transcript: DKGTranscript =
+            saksi_protocol::decode(&hex::decode(read[0]).expect("transcript hex"))
+                .expect("transcript decodes");
+        let election_id =
+            String::from_utf8(hex::decode(read[1]).expect("election id hex")).expect("utf-8");
+        let ids: Vec<&str> = read[2].split(',').collect();
+        let totals: Vec<u64> = read[3]
+            .split(',')
+            .map(|t| t.parse().expect("total"))
+            .collect();
+        let threshold: usize = read[4].parse().expect("threshold");
+
+        // The ids must be useless as indices: a port that does `atoi(id)` or
+        // sorts them cannot reproduce the keys below.
+        assert!(
+            ids.iter().all(|id| id.parse::<u64>().is_err()),
+            "the vector's trustee ids must be non-numeric so position is the only index: {ids:?}"
+        );
+        let mut sorted = ids.clone();
+        sorted.sort_unstable();
+        assert_ne!(ids, sorted, "the vector's trustee ids must not be sorted");
+        let commitments = decode_trustee_commitments(&transcript).expect("transcript decodes");
+        let context = tally_sig_context(&election_id, &totals);
+        let g = basepoint();
+
+        let mut verified = 0usize;
+        for (t, line) in read[5..read.len() - 1].iter().enumerate() {
+            let fields: Vec<&str> = line.split(',').collect();
+            assert_eq!(fields[0], ids[t], "trustee order");
+            // Index by POSITION in the trustee_ids line, not by the id itself.
+            let key = trustee_verification_key(&commitments, (t + 1) as u64);
+            assert_eq!(
+                hex::encode(compress_point(&key)),
+                fields[1],
+                "line {} pins a key the transcript does not derive",
+                t + 6
+            );
+            proof_from_hex(fields[2])
+                .verify(&g, &key, &context)
+                .unwrap_or_else(|_| panic!("trustee {} signature must verify", t + 1));
+            verified += 1;
+        }
+        assert_eq!(verified, trustee_ids.len());
+        assert!(verified >= threshold);
+
+        // The negative line is a real signature over different totals: it must
+        // NOT verify against the published totals' context.
+        let fields: Vec<&str> = read[read.len() - 1].split(',').collect();
+        assert_eq!(fields[0], "negative");
+        let key_bytes: [u8; 32] = hex::decode(fields[2])
+            .expect("key hex")
+            .try_into()
+            .expect("32-byte key");
+        let key = point_from_compressed(key_bytes).expect("key point");
+        assert!(
+            proof_from_hex(fields[3])
+                .verify(&g, &key, &context)
+                .is_err(),
+            "the negative vector must be rejected over the published totals"
+        );
+        assert!(
+            proof_from_hex(fields[3])
+                .verify(&g, &key, &tally_sig_context(&election_id, &OTHER_TOTALS))
+                .is_ok(),
+            "the negative vector is a real signature over the other totals"
+        );
     }
 }

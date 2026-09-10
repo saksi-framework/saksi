@@ -1,6 +1,7 @@
 package campaign
 
 import (
+	"bytes"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -9,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -67,8 +69,9 @@ func hexElectionParams(t *testing.T, contestIDs []string) string {
 	return hex.EncodeToString(raw)
 }
 
-// writeFixtureTrail writes a 2-event trail.json into dir, mirroring what
-// appendReceipt would have produced during an on-chain Submit.
+// writeFixtureTrail writes a 2-event trail.json into dir, mirroring what a
+// pre-Task-2 run recorded (the legacy whole-array format readTrailEvents
+// falls back to when trail.ndjson is absent).
 func writeFixtureTrail(t *testing.T, dir string) {
 	t.Helper()
 	events := []TrailEvent{
@@ -241,6 +244,48 @@ func TestBuildTrailMissingTrailJSONIsEmptyEvents(t *testing.T) {
 	}
 }
 
+func TestReadTrailEventsPrefersNDJSONOverJSONFallback(t *testing.T) {
+	dir := t.TempDir()
+	writeFixtureTrail(t, dir) // trail.json: 2 events (CreateElection, SubmitBallot)
+
+	ndjsonEvents := []TrailEvent{
+		{Event: "CreateElection", Ref: "election", Receipt: clientsdk.Receipt{TxID: "tx-a", BlockNumber: 1}},
+	}
+	var buf strings.Builder
+	for _, ev := range ndjsonEvents {
+		b, err := json.Marshal(ev)
+		if err != nil {
+			t.Fatal(err)
+		}
+		buf.Write(b)
+		buf.WriteByte('\n')
+	}
+	if err := os.WriteFile(filepath.Join(dir, "trail.ndjson"), []byte(buf.String()), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := readTrailEvents(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].Event != "CreateElection" || got[0].Receipt.TxID != "tx-a" {
+		t.Fatalf("want the single trail.ndjson event (ignoring trail.json), got %+v", got)
+	}
+}
+
+func TestReadTrailEventsFallsBackToJSONWhenNDJSONAbsent(t *testing.T) {
+	dir := t.TempDir()
+	writeFixtureTrail(t, dir) // trail.json only, no trail.ndjson
+
+	got, err := readTrailEvents(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 || got[1].Event != "SubmitBallot" {
+		t.Fatalf("want the 2 fixture trail.json events, got %+v", got)
+	}
+}
+
 // --- HTTP-level tests --------------------------------------------------
 
 func TestHandleTrailAPISealedWithoutOperator(t *testing.T) {
@@ -356,4 +401,101 @@ func TestHandleTrailPageServesHTML(t *testing.T) {
 	if ct := rec.Header().Get("Content-Type"); !strings.Contains(ct, "text/html") {
 		t.Fatalf("want text/html, got %q", ct)
 	}
+}
+
+// hexSignedTallyResult is hexTallyResult's signed twin: the same totals, plus
+// n trustee signatures. A tally decoding with none of these is a run recorded
+// before the signatures existed — the "unsigned (legacy)" case.
+func hexSignedTallyResult(t *testing.T, n int) string {
+	t.Helper()
+	tally := &pb.TallyResult{ElectionId: "run-1", Totals: []uint64{7, 3, 5}}
+	for i := 1; i <= n; i++ {
+		tally.Signatures = append(tally.Signatures, &pb.TrusteeSignature{
+			TrusteeId: strconv.Itoa(i),
+			Signature: bytes.Repeat([]byte{byte(i)}, 64),
+		})
+	}
+	raw, err := proto.Marshal(tally)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return hex.EncodeToString(raw)
+}
+
+// The trail must say whether the tally on the chain was endorsed, and by how
+// many trustees — a legacy tally nobody signed must not look like a signed one.
+func TestBuildTrailReportsTallySignatureCount(t *testing.T) {
+	contests := []string{"president/cand0", "president/cand1", "vp/cand0"}
+	cases := []struct {
+		name  string
+		tally string
+		want  int
+	}{
+		{"legacy unsigned tally", hexTallyResult(t), 0},
+		{"signed tally", hexSignedTallyResult(t, 3), 3},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			writeFixtureTrail(t, dir)
+			reader := &fakeChainReader{status: "closed", tally: tc.tally, election: hexElectionParams(t, contests)}
+			got, err := buildTrail(reader, &fakeLedger{}, dir, "run-1", false)
+			if err != nil {
+				t.Fatalf("buildTrail: %v", err)
+			}
+			if got.Live.TallySignatures != tc.want {
+				t.Fatalf("TallySignatures = %d, want %d", got.Live.TallySignatures, tc.want)
+			}
+		})
+	}
+}
+
+func TestTallySignatureCountIgnoresUndecodableTally(t *testing.T) {
+	if n := tallySignatureCount("nothex"); n != 0 {
+		t.Fatalf("undecodable tally = %d signatures, want 0", n)
+	}
+	if n := tallySignatureCount(""); n != 0 {
+		t.Fatalf("absent tally = %d signatures, want 0", n)
+	}
+}
+
+// The page has to render the label and the count itself: assert the trail HTML
+// carries the branch, and that tally.signatures is listed as the tenth thing
+// the independent verifier checks.
+func TestTrailPageShowsSignatureLabelAndVerifierCheck(t *testing.T) {
+	_, h, _ := testServer(t, nil)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/trail/some-run", nil))
+	body := rec.Body.String()
+	for _, want := range []string{"unsigned (legacy)", "tally_signatures", `id="verifierChecks"`} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("trail page is missing %q", want)
+		}
+	}
+	checks := verifierCheckList(t, body)
+	if len(checks) != 10 {
+		t.Fatalf("verifier check list has %d entries, want 10: %v", len(checks), checks)
+	}
+	if checks[9] != "tally.signatures" {
+		t.Fatalf("tenth verifier check = %q, want tally.signatures (all: %v)", checks[9], checks)
+	}
+}
+
+// verifierCheckList pulls the <code> ids out of the page's verifierChecks list,
+// in document order.
+func verifierCheckList(t *testing.T, body string) []string {
+	t.Helper()
+	start := strings.Index(body, `id="verifierChecks"`)
+	if start < 0 {
+		t.Fatal("no verifierChecks list on the page")
+	}
+	end := strings.Index(body[start:], "</ol>")
+	if end < 0 {
+		t.Fatal("verifierChecks list is not an <ol>")
+	}
+	var out []string
+	for _, chunk := range strings.Split(body[start:start+end], "<code>")[1:] {
+		out = append(out, chunk[:strings.Index(chunk, "</code>")])
+	}
+	return out
 }

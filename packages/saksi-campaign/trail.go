@@ -1,6 +1,8 @@
 package campaign
 
 import (
+	"bufio"
+	"bytes"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -32,13 +34,18 @@ type trailResponse struct {
 	Sealed   bool         `json:"sealed"`
 	Status   string       `json:"status,omitempty"`
 	Election string       `json:"election_id"`
-	Events   []TrailEvent `json:"events,omitempty"` // from trail.json (recorded receipts)
+	Events   []TrailEvent `json:"events,omitempty"` // from trail.ndjson (or trail.json for legacy runs)
 	Live     *liveProof   `json:"live,omitempty"`   // fresh chain reads proving the records exist NOW
 	// Results is the decoded tally: contest id -> candidate label -> vote
 	// count. Only ever populated alongside a non-empty Live.TallyHex (never
 	// on a sealed response); nil (never an empty map) if decoding failed —
 	// the failure is instead surfaced as Live.Partial/PartialReason.
 	Results map[string]map[string]uint64 `json:"results,omitempty"`
+	// LedgerMatchesLocal is the Verify phase's ledger cross-check: false means
+	// the record read back from the chain is not the one this console
+	// published, which the page shows as a red finding. Absent when the run
+	// never ran a ledger audit.
+	LedgerMatchesLocal *bool `json:"ledger_matches_local,omitempty"`
 }
 
 // liveProof is a fresh, on-chain-only re-read taken at render time (never
@@ -50,13 +57,23 @@ type liveProof struct {
 	StatusNow     string `json:"status_now"`
 	NullifierRows int    `json:"nullifier_count"`
 	TallyHex      string `json:"tally_hex,omitempty"`
-	ChainHeight   uint64 `json:"chain_height"`
-	TipHash       string `json:"tip_hash"`
-	Partial       bool   `json:"partial,omitempty"`
-	PartialReason string `json:"partial_reason,omitempty"`
+	// TallySignatures counts the trustee signatures the published tally
+	// carries. Zero alongside a non-empty TallyHex means the tally was
+	// published before tally signatures existed — the page labels that
+	// "unsigned (legacy)" rather than letting it pass for an endorsed one.
+	TallySignatures int    `json:"tally_signatures"`
+	ChainHeight     uint64 `json:"chain_height"`
+	TipHash         string `json:"tip_hash"`
+	Partial         bool   `json:"partial,omitempty"`
+	PartialReason   string `json:"partial_reason,omitempty"`
 }
 
 const trailJSONFile = "trail.json"
+
+// trailNDJSONFile replaces trailJSONFile going forward (Task 2): one JSON
+// TrailEvent per line, append-only, never rewritten. trailJSONFile is kept
+// only as the read-side fallback for runs recorded before this change.
+const trailNDJSONFile = "trail.ndjson"
 
 // buildTrail assembles the trail view for an election. The gate is fail-closed
 // on the tally, not the lifecycle status: the chaincode never sets a "tallied"
@@ -133,16 +150,55 @@ func buildTrail(reader chainReader, led clientsdk.Ledger, runDir, electionID str
 		Election: electionID,
 		Events:   events,
 		Live: &liveProof{
-			StatusNow:     displayStatus,
-			NullifierRows: nullifierCount,
-			TallyHex:      tallyHex,
-			ChainHeight:   height,
-			TipHash:       hex.EncodeToString(tip),
-			Partial:       partial,
-			PartialReason: partialReason,
+			StatusNow:       displayStatus,
+			NullifierRows:   nullifierCount,
+			TallyHex:        tallyHex,
+			TallySignatures: tallySignatureCount(tallyHex),
+			ChainHeight:     height,
+			TipHash:         hex.EncodeToString(tip),
+			Partial:         partial,
+			PartialReason:   partialReason,
 		},
-		Results: results,
+		Results:            results,
+		LedgerMatchesLocal: ledgerVerdict(runDir),
 	}, nil
+}
+
+// ledgerVerdict reads back the ledger cross-check the Verify phase stamped into
+// run.end, or nil if this run never ran one. The journal is the record of what
+// the run concluded; nothing here re-derives it.
+func ledgerVerdict(runDir string) *bool {
+	events, err := readJournalEvents(runDir)
+	if err != nil {
+		return nil
+	}
+	var v *bool
+	for _, ev := range events {
+		if jstring(ev, "event") != "run.end" {
+			continue
+		}
+		if b, ok := ev["ledger_matches_local"].(bool); ok {
+			match := b
+			v = &match
+		}
+	}
+	return v
+}
+
+// tallySignatureCount reports how many trustee signatures a hex-encoded
+// TallyResult carries. Anything that does not decode counts as zero: the page
+// uses this only to label a tally, and a tally that cannot be decoded is
+// already reported through the Partial/PartialReason path.
+func tallySignatureCount(tallyHex string) int {
+	raw, err := hex.DecodeString(tallyHex)
+	if err != nil {
+		return 0
+	}
+	var tally pb.TallyResult
+	if err := proto.Unmarshal(raw, &tally); err != nil {
+		return 0
+	}
+	return len(tally.GetSignatures())
 }
 
 // decodeTally decodes a hex-encoded saksi.protocol.v1.TallyResult against its
@@ -202,9 +258,44 @@ func splitContestID(contestID string) (position, candidate string) {
 	return contestID, "cand0"
 }
 
-// readTrailEvents reads trail.json from the run folder. A missing file is not
-// an error — it just means no on-chain events have been recorded yet.
+// readTrailEvents reads the run's lifecycle trail: trail.ndjson (one JSON
+// TrailEvent per line) when present, falling back to the legacy trail.json
+// (whole-array) for runs recorded before Task 2 retired it. Neither file
+// existing is not an error — it just means no lifecycle events have been
+// recorded yet.
 func readTrailEvents(runDir string) ([]TrailEvent, error) {
+	f, err := os.Open(filepath.Join(runDir, trailNDJSONFile))
+	if os.IsNotExist(err) {
+		return readTrailJSONFallback(runDir)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("read trail.ndjson: %w", err)
+	}
+	defer f.Close()
+
+	var events []TrailEvent
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		line := bytes.TrimSpace(scanner.Bytes())
+		if len(line) == 0 {
+			continue
+		}
+		var ev TrailEvent
+		if err := json.Unmarshal(line, &ev); err != nil {
+			return nil, fmt.Errorf("decode trail.ndjson: %w", err)
+		}
+		events = append(events, ev)
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, fmt.Errorf("read trail.ndjson: %w", err)
+	}
+	return events, nil
+}
+
+// readTrailJSONFallback reads the legacy whole-array trail.json. A missing
+// file is not an error — it just means no on-chain events have been recorded
+// yet (or the run predates trail.ndjson but never got any events either).
+func readTrailJSONFallback(runDir string) ([]TrailEvent, error) {
 	data, err := os.ReadFile(filepath.Join(runDir, trailJSONFile))
 	if os.IsNotExist(err) {
 		return nil, nil
@@ -229,6 +320,9 @@ type trailIndexRow struct {
 	Status     string    `json:"status,omitempty"`
 	Ballots    int       `json:"ballots,omitempty"`
 	Tallied    bool      `json:"tallied"`
+	// TallySignatures counts the trustee signatures on the published tally;
+	// zero alongside Tallied is the "unsigned (legacy)" case.
+	TallySignatures int `json:"tally_signatures,omitempty"`
 }
 
 // trailIndex lists every election this console recorded, each checked against
@@ -272,6 +366,7 @@ func (s *Server) trailIndex() ([]trailIndexRow, bool) {
 				}
 				if t, err := reader.GetTally(rec.RunID); err == nil && t != "" {
 					row.Tallied = true
+					row.TallySignatures = tallySignatureCount(t)
 				}
 			}
 		}

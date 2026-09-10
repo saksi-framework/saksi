@@ -12,15 +12,16 @@ package campaign
 import (
 	"fmt"
 	"strings"
+	"time"
 )
 
 // MaxTrustees is the UI/validation cap on trustee count.
 const MaxTrustees = 15
 
 // OfflineVoterCeiling caps offline-mode voters. Offline generation is not
-// parallelized, so the 50k/483k/1M tiers are on-chain/perf mode only; a
-// researcher clicking a huge offline tier gets a clear error, not a run that
-// never finishes.
+// parallelized, so the 50k/483k/1M tiers need ground-truth mode until the
+// streaming generator lands; a researcher clicking a huge offline tier gets a
+// clear error, not a run that never finishes.
 const OfflineVoterCeiling = 10000
 
 // Trustee is one DKG trustee's display identity.
@@ -50,10 +51,65 @@ type ElectionConfig struct {
 	// READ, not how it is produced, which is why this never reaches
 	// saksi-demo. Zero means "single-winner", the previous behaviour.
 	SenateSeats int `json:"senate_seats"`
+	// Concurrency is how many ballot submissions are in flight at once during
+	// the on-chain ballot window. Serial submission measures the driver's own
+	// round-trip ceiling rather than Fabric throughput, so this is never 1 by
+	// default. Zero means DefaultConcurrency (configs recorded before this
+	// field existed read as zero).
+	Concurrency int `json:"concurrency"`
+	// SendRate caps dispatch to that many submissions per second (open-loop
+	// load). Zero dispatches as fast as the workers drain (closed-loop).
+	SendRate float64 `json:"send_rate"`
+	// WindowS time-bounds the ballot window to that many seconds
+	// (bench.RunOpts.MaxDuration). Zero means unbounded: the window closes
+	// when every ballot has been dispatched. A sweep step sets it so each
+	// step measures the same slice of wall clock at a different offered rate.
+	WindowS float64 `json:"window_s"`
+	// Rep tags this run as one repetition of a --repeat campaign. Optional and
+	// purely descriptive: it is stamped into the journal at run.start (and onto
+	// the ballot window's segment) so a run folder says which repetition it is.
+	Rep *RepTag `json:"rep,omitempty"`
 	// SkipAttacks hides the in-lifecycle attack panels for a clean end-to-end
 	// run. The attacks are opt-in either way; this removes the offer entirely
 	// so a straight demonstration is one click.
 	SkipAttacks bool `json:"skip_attacks"`
+}
+
+// DefaultConcurrency is the in-flight ballot submission count when the config
+// does not say otherwise.
+const DefaultConcurrency = 8
+
+// RepTag identifies one repetition of a --repeat campaign: which repetition it
+// is and what it counts as. Kind is "warmup" (discarded), "measured" (counted
+// in summary.csv), "sweep" (one rate step) or "burst".
+type RepTag struct {
+	Index int    `json:"index"`
+	Kind  string `json:"kind"`
+}
+
+// Window is the ballot window's time bound, or 0 for unbounded.
+func (c ElectionConfig) Window() time.Duration {
+	if c.WindowS <= 0 {
+		return 0
+	}
+	return time.Duration(c.WindowS * float64(time.Second))
+}
+
+// applyDefaults fills the fields the UI may omit. Called on every decoded
+// config before Validate, so validation never has to special-case "unset".
+func (c *ElectionConfig) applyDefaults() {
+	if c.Concurrency == 0 {
+		c.Concurrency = DefaultConcurrency
+	}
+}
+
+// submitConcurrency is the worker count the on-chain ballot window runs with,
+// defaulting for run records written before Concurrency existed.
+func (c ElectionConfig) submitConcurrency() int {
+	if c.Concurrency < 1 {
+		return DefaultConcurrency
+	}
+	return c.Concurrency
 }
 
 // SenatePosition is the ballot index of the multi-seat race (President 0,
@@ -108,6 +164,15 @@ func (c ElectionConfig) Validate() error {
 	if c.SenateSeats < 0 || c.SenateSeats >= c.Candidates {
 		return fmt.Errorf("senate seats must be 0..%d (got %d)", c.Candidates-1, c.SenateSeats)
 	}
+	if c.Concurrency < 1 {
+		return fmt.Errorf("concurrency must be >= 1 (got %d)", c.Concurrency)
+	}
+	if c.SendRate < 0 {
+		return fmt.Errorf("send rate must be >= 0 (got %v)", c.SendRate)
+	}
+	if c.WindowS < 0 {
+		return fmt.Errorf("window must be >= 0 seconds (got %v)", c.WindowS)
+	}
 	switch c.Mode {
 	case "offline", "onchain", ModeGroundTruth:
 	default:
@@ -115,7 +180,7 @@ func (c ElectionConfig) Validate() error {
 	}
 	if c.Mode == "offline" && c.Voters > OfflineVoterCeiling {
 		return fmt.Errorf(
-			"offline mode is capped at %d voters (got %d); select on-chain/perf mode for larger tiers",
+			"offline mode is capped at %d voters (got %d); use ground-truth mode for larger tiers until the streaming generator lands",
 			OfflineVoterCeiling, c.Voters)
 	}
 	return nil

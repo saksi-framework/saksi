@@ -25,6 +25,10 @@ type RunRecord struct {
 	RunID     string         `json:"run_id"`
 	Config    ElectionConfig `json:"config"`
 	CreatedAt time.Time      `json:"created_at"`
+	// Commit pins the exact code the run executed against ("saksi", "console"
+	// git HEADs), filled from the environment snapshot (see CollectEnv in
+	// env.go) by the caller.
+	Commit map[string]string `json:"commit"`
 }
 
 // RunStore owns the run-folder tree under root. It hands out traversal-safe run
@@ -48,6 +52,9 @@ func (s *RunStore) Root() string { return s.root }
 // name + timestamp + a monotonic counter, creates the run folder, and writes
 // run.json. Returns the run id and its directory.
 func (s *RunStore) Create(c ElectionConfig, ts time.Time) (string, string, error) {
+	// Defaults first, so run.json records the values the run actually used
+	// rather than the zeros the caller left unset.
+	c.applyDefaults()
 	if err := c.Validate(); err != nil {
 		return "", "", err
 	}

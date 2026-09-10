@@ -41,3 +41,10 @@ rand_core = { version = "0.6", default-features = false, features = ["getrandom"
 
 # Testing
 proptest = "1"
+
+# Optimize third-party crates (curve25519-dalek's field arithmetic above all) even
+# in dev/test builds. Our own crates stay unoptimized and debug-assertion-checked;
+# only the dependency wall is compiled with -O3. Without this a population-scale
+# generator test spends minutes in unoptimized ristretto arithmetic.
+[profile.dev.package."*"]
+opt-level = 3

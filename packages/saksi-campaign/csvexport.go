@@ -54,10 +54,6 @@ func writeDerivedCSVs(dir string, c ElectionConfig) error {
 // bytes stay in ballots.ndjson — they are opaque without keys, so a CSV of them
 // would not be analyzable.
 func writeBallotsCSV(dir string) error {
-	lines, err := readBallotLines(dir)
-	if err != nil {
-		return fmt.Errorf("read ballots: %w", err)
-	}
 	f, err := os.Create(filepath.Join(dir, BallotsCSV))
 	if err != nil {
 		return err
@@ -72,7 +68,10 @@ func writeBallotsCSV(dir string) error {
 	}); err != nil {
 		return err
 	}
-	for i, line := range lines {
+	// One ballot in memory at a time: decoded, written, discarded. The whole
+	// population is never resident (csv.Writer's own buffer flushes as it
+	// fills), so this scales to the 1M tier.
+	err = scanBallotLines(dir, func(i int, line string) error {
 		raw, err := hex.DecodeString(line)
 		if err != nil {
 			return fmt.Errorf("ballot %d not hex: %w", i, err)
@@ -92,7 +91,7 @@ func writeBallotsCSV(dir string) error {
 		if err != nil {
 			return fmt.Errorf("json ballot %d: %w", i, err)
 		}
-		if err := w.Write([]string{
+		return w.Write([]string{
 			strconv.Itoa(i),
 			b.ElectionId,
 			b.PositionId,
@@ -102,9 +101,10 @@ func writeBallotsCSV(dir string) error {
 			strconv.Itoa(len(b.WellFormednessProofs)),
 			sha256Hex(raw),
 			string(bjson),
-		}); err != nil {
-			return err
-		}
+		})
+	})
+	if err != nil {
+		return fmt.Errorf("read ballots: %w", err)
 	}
 	w.Flush()
 	return w.Error()
@@ -113,17 +113,17 @@ func writeBallotsCSV(dir string) error {
 // ballotsDigest returns a single SHA-256 over every ballot's wire bytes in
 // order — a fingerprint of the whole ballot set for provenance.
 func ballotsDigest(dir string) (string, error) {
-	lines, err := readBallotLines(dir)
-	if err != nil {
-		return "", err
-	}
 	h := sha256.New()
-	for i, line := range lines {
+	err := scanBallotLines(dir, func(i int, line string) error {
 		raw, err := hex.DecodeString(line)
 		if err != nil {
-			return "", fmt.Errorf("ballot %d not hex: %w", i, err)
+			return fmt.Errorf("ballot %d not hex: %w", i, err)
 		}
 		h.Write(raw)
+		return nil
+	})
+	if err != nil {
+		return "", err
 	}
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
@@ -132,6 +132,7 @@ func ballotsDigest(dir string) (string, error) {
 type electionHeader struct {
 	ElectionID         string   `json:"election_id"`
 	ElectionName       string   `json:"election_name"`
+	Params             string   `json:"params"` // hex ElectionParameters
 	TrusteeNames       []string `json:"trustee_names"`
 	PartialDecryptions []string `json:"partial_decryptions"`
 	GroundTruth        []uint64 `json:"ground_truth"`

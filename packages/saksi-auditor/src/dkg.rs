@@ -92,42 +92,13 @@ pub(crate) fn verify_dkg_transcript(
 
     // -- decode every commitment -------------------------------------------
 
-    let mut decoded: Vec<Vec<RistrettoPoint>> =
-        Vec::with_capacity(transcript.trustee_commitments.len());
-    for commit in &transcript.trustee_commitments {
-        let mut points = Vec::with_capacity(commit.coefficient_commitments.len());
-        for (j, bytes) in commit.coefficient_commitments.iter().enumerate() {
-            let array: [u8; 32] = match bytes.as_slice().try_into() {
-                Ok(a) => a,
-                Err(_) => {
-                    builder.fail(
-                        "dkg.decode",
-                        format!(
-                            "trustee {} coefficient_commitments[{}] has wrong length: {}",
-                            commit.trustee_id,
-                            j,
-                            bytes.len()
-                        ),
-                    );
-                    return None;
-                }
-            };
-            match point_from_compressed(array) {
-                Ok(p) => points.push(p),
-                Err(_) => {
-                    builder.fail(
-                        "dkg.decode",
-                        format!(
-                            "trustee {} coefficient_commitments[{}] is not a valid ristretto point",
-                            commit.trustee_id, j
-                        ),
-                    );
-                    return None;
-                }
-            }
+    let decoded = match decode_trustee_commitments(transcript) {
+        Ok(decoded) => decoded,
+        Err(detail) => {
+            builder.fail("dkg.decode", detail);
+            return None;
         }
-        decoded.push(points);
-    }
+    };
     builder.pass(
         "dkg.decode",
         "every DKG coefficient commitment decoded to a valid ristretto point",
@@ -150,20 +121,9 @@ pub(crate) fn verify_dkg_transcript(
     // -- per-trustee public share pub_k = Σ_d Σ_j (k+1)^j · A_{d,j} --------
 
     let trustee_count = parameters.trustee_ids.len();
-    let mut trustee_share_publics = Vec::with_capacity(trustee_count);
-    for k in 0..trustee_count {
-        let x = Scalar::from((k as u64) + 1);
-        let mut sum = RistrettoPoint::identity();
-        for points in &decoded {
-            // Horner: A_0 + x·(A_1 + x·(A_2 + ...))
-            let mut acc = RistrettoPoint::identity();
-            for coeff in points.iter().rev() {
-                acc = acc * x + coeff;
-            }
-            sum += acc;
-        }
-        trustee_share_publics.push(sum);
-    }
+    let trustee_share_publics = (1..=trustee_count as u64)
+        .map(|index| trustee_verification_key(&decoded, index))
+        .collect();
     builder.pass(
         "dkg.trustee_share_publics",
         "per-trustee aggregated public shares evaluated from coefficient commitments",
@@ -173,4 +133,82 @@ pub(crate) fn verify_dkg_transcript(
         joint_public_key,
         trustee_share_publics,
     })
+}
+
+/// Decodes every trustee's `coefficient_commitments` into ristretto points, in
+/// transcript order. `Err` carries the human-readable reason (reported as a
+/// `dkg.decode` finding).
+pub(crate) fn decode_trustee_commitments(
+    transcript: &DKGTranscript,
+) -> Result<Vec<Vec<RistrettoPoint>>, String> {
+    transcript
+        .trustee_commitments
+        .iter()
+        .map(|commit| {
+            commit
+                .coefficient_commitments
+                .iter()
+                .enumerate()
+                .map(|(j, bytes)| {
+                    let array: [u8; 32] = bytes.as_slice().try_into().map_err(|_| {
+                        format!(
+                            "trustee {} coefficient_commitments[{}] has wrong length: {}",
+                            commit.trustee_id,
+                            j,
+                            bytes.len()
+                        )
+                    })?;
+                    point_from_compressed(array).map_err(|_| {
+                        format!(
+                            "trustee {} coefficient_commitments[{}] is not a valid ristretto point",
+                            commit.trustee_id, j
+                        )
+                    })
+                })
+                .collect()
+        })
+        .collect()
+}
+
+/// Public verification key of the trustee at DKG share index `index`:
+///
+/// ```text
+/// vk_i = Σ_j Σ_k C_{j,k} · i^k
+/// ```
+///
+/// `commitments` is the **dealer list**: entry `j` is dealer `j`'s
+/// `coefficient_commitments` from `DKGTranscript.trustee_commitments`, in
+/// transcript order, decoded to points (`C_{j,k} = a_{j,k}·G`). The sum runs
+/// over *every* dealer. Because the DKG hands trustee `i` the share
+/// `s_i = Σ_j f_j(i)`, the result is exactly `s_i·G` — the key that verifies
+/// that trustee's Chaum-Pedersen partial-decryption proofs and its Schnorr
+/// signature over the published tally.
+///
+/// **Index convention: `index` is the trustee's 1-based position in
+/// `parameters.trustee_ids` — NOT anything parsed out of its `trustee_id`
+/// string.** Trustee ids are opaque labels (the golden vector deliberately uses
+/// non-numeric, non-sorted ones); the k-th entry of `parameters.trustee_ids`
+/// uses `index = k + 1`. That is the DKG's own indexing:
+/// `saksi_crypto::dkg::run_in_memory` gives the k-th trustee the share
+/// `Σ_j f_j(k + 1)`, evaluating every dealer polynomial at
+/// `recipient_id = k + 1`, never at `x = 0` (which would yield the joint public
+/// key rather than a share's public). The Go chaincode copies this convention
+/// verbatim; the golden vector
+/// `saksi-protocol/test-vectors/tally-sig-v1.hex` pins the resulting keys and
+/// carries the `trustee_ids` line the port must map by position.
+pub(crate) fn trustee_verification_key(
+    commitments: &[Vec<RistrettoPoint>],
+    index: u64,
+) -> RistrettoPoint {
+    let x = Scalar::from(index);
+    let mut sum = RistrettoPoint::identity();
+    for points in commitments {
+        // Horner: A_0 + x·(A_1 + x·(A_2 + ...))
+        let mut acc = RistrettoPoint::identity();
+        for coeff in points.iter().rev() {
+            acc = acc * x + coeff;
+        }
+        sum += acc;
+    }
+    sum
 }

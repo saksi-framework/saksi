@@ -185,12 +185,17 @@ cmd_status() {
 	fi
 }
 
-case "${1:-up}" in
-up) cmd_up ;;
-down) cmd_down ;;
-status) cmd_status ;;
-*)
-	echo "usage: $0 {up|down|status}" >&2
-	exit 1
-	;;
-esac
+# Sourcing this file defines the functions above and runs nothing, so scripts
+# that need the same preflight / install / bring-up steps (tools/tier.sh) reuse
+# them instead of forking a second copy that can drift.
+if [ "${BASH_SOURCE[0]}" = "${0}" ]; then
+	case "${1:-up}" in
+	up) cmd_up ;;
+	down) cmd_down ;;
+	status) cmd_status ;;
+	*)
+		echo "usage: $0 {up|down|status}" >&2
+		exit 1
+		;;
+	esac
+fi

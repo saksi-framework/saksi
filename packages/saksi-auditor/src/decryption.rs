@@ -29,13 +29,13 @@
 
 use std::collections::HashSet;
 
-use curve25519_dalek::{ristretto::RistrettoPoint, scalar::Scalar, traits::Identity};
+use curve25519_dalek::{ristretto::RistrettoPoint, scalar::Scalar};
 
 use saksi_crypto::{
     group::{basepoint, point_from_compressed, scalar_from_canonical_bytes},
     nizk::chaum_pedersen::ChaumPedersenProof,
 };
-use saksi_protocol::{Ballot, ElectionParameters, PartialDecryption, WIRE_VERSION};
+use saksi_protocol::{ElectionParameters, PartialDecryption, WIRE_VERSION};
 
 use crate::report::ReportBuilder;
 
@@ -50,12 +50,8 @@ pub(crate) struct VerifiedShare {
 /// Verification result for partial decryptions across every contest.
 #[derive(Clone, Debug)]
 pub(crate) struct DecryptionVerification {
-    /// `aggregate_pads[c]` = Σ_b eligible_ballots[b].ciphertexts[c].pad.
-    /// Reserved for downstream consumers that may want to spot-check the
-    /// aggregate without recomputing it.
-    #[allow(dead_code)]
-    pub(crate) aggregate_pads: Vec<RistrettoPoint>,
-    /// `aggregate_data[c]` = Σ_b eligible_ballots[b].ciphertexts[c].data.
+    /// `aggregate_data[c]` = Σ_b eligible_ballots[b].ciphertexts[c].data,
+    /// accumulated while the ballots streamed past.
     pub(crate) aggregate_data: Vec<RistrettoPoint>,
     /// `verified_shares[c]` = the partial decryptions for contest c whose
     /// Chaum-Pedersen proof verified, in input order.
@@ -64,81 +60,25 @@ pub(crate) struct DecryptionVerification {
     pub(crate) threshold_satisfied: bool,
 }
 
+/// Verifies every partial decryption against the per-contest aggregate the
+/// ballot stream produced.
+///
+/// The aggregate arrives already summed (see [`crate::audit_streaming`]) rather
+/// than being recomputed from a ballot list, so this runs in constant memory
+/// regardless of population size.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn verify_partial_decryptions(
     parameters: &ElectionParameters,
-    eligible_ballots: &[&Ballot],
+    aggregate_pads: &[RistrettoPoint],
+    aggregate_data: Vec<RistrettoPoint>,
     partial_decryptions: &[PartialDecryption],
     trustee_share_publics: &[RistrettoPoint],
     binding_context: &[u8],
     builder: &mut ReportBuilder,
-) -> Option<DecryptionVerification> {
+) -> DecryptionVerification {
     let contest_count = parameters.contest_ids.len();
     let threshold = parameters.threshold as usize;
 
-    // -- 1. Per-contest aggregate ElGamal ciphertexts -----------------------
-
-    let mut aggregate_pads = vec![RistrettoPoint::identity(); contest_count];
-    let mut aggregate_data = vec![RistrettoPoint::identity(); contest_count];
-    for ballot in eligible_ballots {
-        // Map this ballot's local ciphertexts to their global contest indices
-        // (ADR-0007 one-record-per-position; empty position = whole ballot). A
-        // ballot only contributes to the contests its position covers.
-        let contest_idxs =
-            crate::contest_indices_for_position(&parameters.contest_ids, &ballot.position_id);
-        for (local_idx, ct) in ballot.ciphertexts.iter().enumerate() {
-            // `verify_ballots` already checked ciphertexts.len() == contest_idxs.len()
-            // for eligible ballots, so this index is always in range.
-            let c = contest_idxs[local_idx];
-            // Ballots that passed `verify_ballots` already had their
-            // ciphertexts decoded once; we redo it here so this module is
-            // standalone and we don't ferry decoded points around. Failures
-            // here are very unlikely (would mean a ballot that survived the
-            // shape check has a malformed point).
-            let pad_array: [u8; 32] = match ct.pad.as_slice().try_into() {
-                Ok(a) => a,
-                Err(_) => {
-                    builder.fail(
-                        "tally.aggregate",
-                        format!("eligible ballot contest {c}: ciphertext pad has wrong length"),
-                    );
-                    return None;
-                }
-            };
-            let data_array: [u8; 32] = match ct.data.as_slice().try_into() {
-                Ok(a) => a,
-                Err(_) => {
-                    builder.fail(
-                        "tally.aggregate",
-                        format!("eligible ballot contest {c}: ciphertext data has wrong length"),
-                    );
-                    return None;
-                }
-            };
-            let pad = match point_from_compressed(pad_array) {
-                Ok(p) => p,
-                Err(_) => {
-                    builder.fail(
-                        "tally.aggregate",
-                        format!("eligible ballot contest {c}: ciphertext pad is invalid"),
-                    );
-                    return None;
-                }
-            };
-            let data = match point_from_compressed(data_array) {
-                Ok(p) => p,
-                Err(_) => {
-                    builder.fail(
-                        "tally.aggregate",
-                        format!("eligible ballot contest {c}: ciphertext data is invalid"),
-                    );
-                    return None;
-                }
-            };
-            aggregate_pads[c] += pad;
-            aggregate_data[c] += data;
-        }
-    }
     builder.pass(
         "tally.aggregate",
         "aggregate ElGamal ciphertexts assembled per contest",
@@ -335,12 +275,11 @@ pub(crate) fn verify_partial_decryptions(
         }
     }
 
-    Some(DecryptionVerification {
-        aggregate_pads,
+    DecryptionVerification {
         aggregate_data,
         verified_shares,
         threshold_satisfied,
-    })
+    }
 }
 
 /// Per-decryption Chaum-Pedersen transcript context:

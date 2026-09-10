@@ -251,3 +251,38 @@ func TestGenerateGroundTruthShellsTheRightSubcommand(t *testing.T) {
 		}
 	}
 }
+
+// TestExportServesTheLedgerDump: the chain's own copy of a run is downloadable,
+// so a reader can re-audit the LEDGER dump and not only the console's record of
+// it. The subdirectory is addressable because handleExport cuts the run id off
+// the first slash and allowlists the whole remainder.
+func TestExportServesTheLedgerDump(t *testing.T) {
+	s, h, _ := testServer(t, nil)
+	runID, dir, err := s.store.Create(good(), time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(dir, LedgerDir), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for name, body := range map[string]string{headerFile: `{"n":1}`, BallotsFile: "aa\n"} {
+		if err := os.WriteFile(filepath.Join(dir, LedgerDir, name), []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, name := range []string{headerFile, BallotsFile} {
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/export/"+runID+"/"+LedgerDir+"/"+name, nil))
+		if rec.Code != http.StatusOK || rec.Body.Len() == 0 {
+			t.Fatalf("ledger/%s: got %d %q", name, rec.Code, rec.Body)
+		}
+	}
+	// And it is listed as an available artifact.
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/runs", nil))
+	for _, want := range []string{LedgerDir + "/" + headerFile, LedgerDir + "/" + BallotsFile} {
+		if !strings.Contains(rec.Body.String(), want) {
+			t.Fatalf("/runs does not list %q:\n%s", want, rec.Body)
+		}
+	}
+}

@@ -32,6 +32,14 @@ saksi-demo ─────────┤                         (real ElGamal 
 voter, runs the DKG, encrypts every selection under the joint key, and attaches
 a CDS OR-proof per candidate. It also writes the ground-truth CSVs.
 
+It works in **chunks of `--chunk N` voters** (default 5,000): a chunk is built
+in parallel, appended to `ballots.ndjson` in voter order, folded into the
+running per-contest aggregate, and dropped — so peak memory tracks the chunk,
+not the electorate (20,000 voters x 3 positions x 4 candidates: 12 s wall,
+79 MB peak RSS, 206 MB of ballots on disk). Each run also writes
+`gen-timings.json` with the credential / encrypt / CDS-prove CPU sums and the
+wall time. `--chunk 0` selects the original single-pass writer.
+
 `gen-ground-truth` writes **only** the plaintext tables. No DKG, no credentials,
 no ciphertexts, no proofs. This is what makes the capstone tiers tractable:
 3,524,078 voters × 3 positions generates in **0.6 seconds**, where the same
@@ -366,7 +374,7 @@ saksi-demo gen-ground-truth \
   --out-dir ./out
 
 # Full cryptographic generation (also writes the ground-truth CSVs)
-saksi-demo gen --stream ./run \
+saksi-demo gen --stream ./run --chunk 5000 \
   --voters 1000 --positions 3 --candidates 4 \
   --trustees 3 --threshold 2 \
   --trustee-names COMELEC,Watchdog,University \

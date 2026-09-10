@@ -1,7 +1,10 @@
 package clientsdk
 
 import (
+	"crypto/sha256"
 	"encoding/hex"
+	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -101,5 +104,181 @@ func TestTxTimestampMalformedEnvelopeSkipped(t *testing.T) {
 	}
 	if _, ok := txTimestamp(block, "tx-abc"); !ok {
 		t.Fatal("txTimestamp: expected to find tx after skipping malformed envelope")
+	}
+}
+
+// testDataHash stands in for fabric protoutil.BlockDataHash, which is not
+// vendored here (only fabric-protos-go-apiv2 and fabric-gateway are, neither
+// of which carries protoutil) — sha256 over the concatenated envelope bytes.
+// This only needs to be a deterministic hash consistent with itself: neither
+// VerifyChain nor blockHeaderHash recomputes DataHash from block data, they
+// only ever chain blockHeaderHash off the header's stored PreviousHash/
+// DataHash fields.
+func testDataHash(data [][]byte) []byte {
+	h := sha256.New()
+	for _, d := range data {
+		h.Write(d)
+	}
+	return h.Sum(nil)
+}
+
+// buildTestChain builds n linked synthetic blocks numbered 0..n-1, each
+// carrying one envelope for "tx-<i>", with real blockHeaderHash chaining
+// (block i's PreviousHash is blockHeaderHash of block i-1).
+func buildTestChain(t *testing.T, n int) []*common.Block {
+	t.Helper()
+	blocks := make([]*common.Block, n)
+	var prevHash []byte
+	for i := 0; i < n; i++ {
+		data := [][]byte{buildEnvelope(t, fmt.Sprintf("tx-%d", i), timestamppb.New(time.Now()))}
+		dataHash := testDataHash(data)
+		blocks[i] = &common.Block{
+			Header: &common.BlockHeader{Number: uint64(i), PreviousHash: prevHash, DataHash: dataHash},
+			Data:   &common.BlockData{Data: data},
+		}
+		prevHash = blockHeaderHash(uint64(i), prevHash, dataHash)
+	}
+	return blocks
+}
+
+func getBlockFromSlice(blocks []*common.Block) func(uint64) (*common.Block, error) {
+	return func(n uint64) (*common.Block, error) {
+		if n >= uint64(len(blocks)) {
+			return nil, fmt.Errorf("no block %d", n)
+		}
+		return blocks[n], nil
+	}
+}
+
+func TestVerifyChainLinkedPasses(t *testing.T) {
+	blocks := buildTestChain(t, 3)
+	report, err := verifyChain(0, 2, nil, getBlockFromSlice(blocks))
+	if err != nil {
+		t.Fatalf("verifyChain: %v", err)
+	}
+	if report.Status != "PASS" {
+		t.Fatalf("Status = %q, want PASS (report: %+v)", report.Status, report)
+	}
+	if !report.Linked || report.FirstBreak != nil || report.Blocks != 3 {
+		t.Fatalf("unexpected report: %+v", report)
+	}
+}
+
+func TestVerifyChainTamperedPreviousHashFails(t *testing.T) {
+	blocks := buildTestChain(t, 3)
+	blocks[2].Header.PreviousHash = []byte("tampered")
+	report, err := verifyChain(0, 2, nil, getBlockFromSlice(blocks))
+	if err != nil {
+		t.Fatalf("verifyChain: %v", err)
+	}
+	if report.Status != "FAIL" {
+		t.Fatalf("Status = %q, want FAIL", report.Status)
+	}
+	if report.Linked {
+		t.Fatal("Linked = true, want false")
+	}
+	if report.FirstBreak == nil || *report.FirstBreak != 2 {
+		t.Fatalf("FirstBreak = %v, want 2", report.FirstBreak)
+	}
+}
+
+func TestVerifyChainTamperedReceiptFails(t *testing.T) {
+	blocks := buildTestChain(t, 3)
+	good := receiptFromBlock("tx-1", blocks[1])
+	bad := good
+	bad.BlockHash = []byte("wrong-hash")
+	report, err := verifyChain(0, 2, []Receipt{good, bad}, getBlockFromSlice(blocks))
+	if err != nil {
+		t.Fatalf("verifyChain: %v", err)
+	}
+	if report.ReceiptsChecked != 2 {
+		t.Fatalf("ReceiptsChecked = %d, want 2", report.ReceiptsChecked)
+	}
+	if report.ReceiptMismatches != 1 {
+		t.Fatalf("ReceiptMismatches = %d, want 1", report.ReceiptMismatches)
+	}
+	if !report.Linked {
+		t.Fatal("Linked = false, want true (only the receipt was tampered)")
+	}
+	if report.Status != "FAIL" {
+		t.Fatalf("Status = %q, want FAIL", report.Status)
+	}
+}
+
+func TestVerifyChainFetchErrorNotRun(t *testing.T) {
+	blocks := buildTestChain(t, 3)
+	getBlock := func(n uint64) (*common.Block, error) {
+		if n == 1 {
+			return nil, errors.New("boom")
+		}
+		return getBlockFromSlice(blocks)(n)
+	}
+	report, err := verifyChain(0, 2, nil, getBlock)
+	if err == nil {
+		t.Fatal("verifyChain: want error on fetch failure")
+	}
+	if report.Status != "not run" {
+		t.Fatalf("Status = %q, want %q", report.Status, "not run")
+	}
+	if report.Linked || report.Blocks != 0 {
+		t.Fatalf("want a zero-value report on fetch error, got %+v", report)
+	}
+}
+
+func TestVerifyChainSampleOutOfRangeSkipped(t *testing.T) {
+	blocks := buildTestChain(t, 3)
+	outOfRange := receiptFromBlock("tx-999", &common.Block{
+		Header: &common.BlockHeader{Number: 999, PreviousHash: []byte("x"), DataHash: []byte("y")},
+	})
+	report, err := verifyChain(0, 2, []Receipt{outOfRange}, getBlockFromSlice(blocks))
+	if err != nil {
+		t.Fatalf("verifyChain: %v", err)
+	}
+	if report.ReceiptsChecked != 0 || report.ReceiptMismatches != 0 {
+		t.Fatalf("out-of-range receipt should be skipped, got %+v", report)
+	}
+	if report.Status != "PASS" {
+		t.Fatalf("Status = %q, want PASS", report.Status)
+	}
+}
+
+func TestVerifyChainToBeforeFromErrors(t *testing.T) {
+	report, err := verifyChain(5, 3, nil, getBlockFromSlice(buildTestChain(t, 6)))
+	if err == nil {
+		t.Fatal("verifyChain: want error when to < from")
+	}
+	if report.Status != "not run" {
+		t.Fatalf("Status = %q, want %q", report.Status, "not run")
+	}
+}
+
+func TestReceiptsForBlockTwoOfThreePresent(t *testing.T) {
+	block := &common.Block{
+		Header: &common.BlockHeader{Number: 5},
+		Data: &common.BlockData{
+			Data: [][]byte{
+				buildEnvelope(t, "tx-a", timestamppb.New(time.Now())),
+				buildEnvelope(t, "tx-b", timestamppb.New(time.Now())),
+				buildEnvelope(t, "tx-c", timestamppb.New(time.Now())),
+			},
+		},
+	}
+	got := receiptsFromBlock(block, []string{"tx-a", "tx-c", "tx-missing"})
+	if len(got) != 2 {
+		t.Fatalf("want 2 receipts, got %d: %+v", len(got), got)
+	}
+	if got[0].TxID != "tx-a" || got[1].TxID != "tx-c" {
+		t.Fatalf("want [tx-a, tx-c] in order, got %+v", got)
+	}
+}
+
+func TestReceiptsForBlockNonePresent(t *testing.T) {
+	block := &common.Block{
+		Header: &common.BlockHeader{Number: 5},
+		Data:   &common.BlockData{Data: [][]byte{buildEnvelope(t, "tx-a", timestamppb.New(time.Now()))}},
+	}
+	got := receiptsFromBlock(block, []string{"tx-missing"})
+	if len(got) != 0 {
+		t.Fatalf("want 0 receipts, got %d: %+v", len(got), got)
 	}
 }

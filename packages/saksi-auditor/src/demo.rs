@@ -61,6 +61,31 @@ pub struct ContestCorrectness {
     pub recovered_point: String,
 }
 
+/// Per-stage audit timings in whole milliseconds — the `timings_ms` object the
+/// console copies into its `timings.json`. Mirrors [`crate::Timings`].
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct TimingsMs {
+    /// Per-ballot CDS + credential verification.
+    pub verify_ballots: u64,
+    /// Folding eligible ballots into the per-contest aggregate ciphertext.
+    pub aggregate: u64,
+    /// Lagrange recombination of the threshold partial decryptions.
+    pub combine: u64,
+    /// Discrete-log recovery of the integer tally.
+    pub decode: u64,
+}
+
+impl From<crate::Timings> for TimingsMs {
+    fn from(t: crate::Timings) -> Self {
+        Self {
+            verify_ballots: t.verify_ballots.as_millis() as u64,
+            aggregate: t.aggregate.as_millis() as u64,
+            combine: t.combine.as_millis() as u64,
+            decode: t.decode.as_millis() as u64,
+        }
+    }
+}
+
 /// Machine-readable result of auditing a **stream run folder** — the structured
 /// output the console's Verify phase consumes instead of string-parsing the
 /// human-readable audit findings.
@@ -70,6 +95,10 @@ pub struct StreamAudit {
     pub overall: String,
     /// Per-contest correctness rows.
     pub contests: Vec<ContestCorrectness>,
+    /// Milliseconds spent in each measured audit stage. `#[serde(default)]` so a
+    /// pre-existing v1 document without it still parses.
+    #[serde(default)]
+    pub timings_ms: TimingsMs,
 }
 
 impl StreamAudit {
@@ -190,6 +219,26 @@ pub fn write_election_stream_params(
     // is inspectable without re-running anything. Selections are replayed from
     // the same pure `select_candidate` the fixture used, so the two agree by
     // construction; the replay costs nothing beside the crypto above it.
+    crate::ground_truth::write_ground_truth_csvs(dir, params)
+}
+
+/// Streaming generator, **chunked**: same output shape as
+/// [`write_election_stream_params`], but the population is built
+/// `chunk_voters` voters at a time (rayon inside a chunk, ordered output,
+/// dropped after write) so peak memory does not grow with the electorate.
+///
+/// The whole-population `validate_population` gate cannot run here — by design
+/// the population is never resident. Its structural checks run per chunk inside
+/// the writer instead (record count per voter, ciphertext/proof count per
+/// ballot, nullifier distinctness within the chunk) plus a whole-run check that
+/// the line count and every position's seeded aggregate equal the voter count.
+pub fn write_election_stream_params_chunked(
+    dir: &std::path::Path,
+    params: &GenParams,
+    chunk_voters: usize,
+) -> Result<(), String> {
+    validate_params(params)?;
+    crate::stream::write_election_stream_chunked(dir, params, chunk_voters)?;
     crate::ground_truth::write_ground_truth_csvs(dir, params)
 }
 
@@ -417,6 +466,15 @@ pub fn audit_bundle_json(bundle: &str) -> Result<AuditReport, String> {
 /// the audit verified equals the homomorphic decode; a divergence fails the
 /// audit, so `pass` (= overall clean AND `E == 0`) never reports a false green.
 pub fn audit_stream_dir(dir: &std::path::Path) -> Result<StreamAudit, String> {
+    audit_stream_dir_full(dir).map(|(sa, _)| sa)
+}
+
+/// [`audit_stream_dir`] plus the full [`AuditReport`] behind it — the report is
+/// what the in-memory path returns, so tests can require the two paths to agree
+/// finding for finding.
+pub(crate) fn audit_stream_dir_full(
+    dir: &std::path::Path,
+) -> Result<(StreamAudit, AuditReport), String> {
     let header = crate::stream::read_header(dir)?;
     let hexd = |s: &str, what: &str| hex::decode(s).map_err(|e| format!("{what} not hex: {e}"));
 
@@ -442,32 +500,24 @@ pub fn audit_stream_dir(dir: &std::path::Path) -> Result<StreamAudit, String> {
         })
         .collect::<Result<_, String>>()?;
 
-    // Ballots stream from ballots.ndjson (hex-protobuf, one per line).
-    let ballots_path = dir.join(crate::stream::BALLOTS_FILE);
-    let raw = std::fs::read_to_string(&ballots_path)
-        .map_err(|e| format!("read {}: {e}", ballots_path.display()))?;
-    let mut ballots: Vec<Ballot> = Vec::new();
-    for (i, line) in raw.lines().enumerate() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        let bytes = hex::decode(line).map_err(|e| format!("ballot line {} not hex: {e}", i + 1))?;
-        ballots
-            .push(Ballot::decode(&bytes[..]).map_err(|e| format!("decode ballot {}: {e}", i + 1))?);
-    }
+    // Ballots stream from ballots.ndjson (hex-protobuf, one per line) — the file
+    // is never read into memory, only iterated.
+    let ballots = crate::stream::BallotLines::open(dir)?;
 
     let ground_truth = header.ground_truth.clone();
-    let (report, evidence) = crate::audit_with_evidence(ElectionArtifacts {
-        parameters: &parameters,
-        dkg_transcript: &dkg_transcript,
-        ballots: &ballots,
-        partial_decryptions: &partial_decryptions,
-        tally: &tally,
-        binding_context: &binding_context,
-        issuer_public_key: &issuer_public_key,
-        ground_truth: Some(&ground_truth),
-    });
+    let (report, evidence, timings) = crate::audit_streaming(
+        crate::AuditInputs {
+            parameters: &parameters,
+            dkg_transcript: &dkg_transcript,
+            partial_decryptions: &partial_decryptions,
+            tally: &tally,
+            binding_context: &binding_context,
+            issuer_public_key: &issuer_public_key,
+            ground_truth: Some(&ground_truth),
+            expected_ballots: Some(header.n),
+        },
+        ballots,
+    );
     let overall_pass = report.overall == AuditStatus::Pass;
 
     // Index the per-contest crypto evidence by contest id.
@@ -511,10 +561,14 @@ pub fn audit_stream_dir(dir: &std::path::Path) -> Result<StreamAudit, String> {
         })
         .collect();
 
-    Ok(StreamAudit {
-        overall: if overall_pass { "pass" } else { "fail" }.to_string(),
-        contests,
-    })
+    Ok((
+        StreamAudit {
+            overall: if overall_pass { "pass" } else { "fail" }.to_string(),
+            contests,
+            timings_ms: timings.into(),
+        },
+        report,
+    ))
 }
 
 #[cfg(test)]

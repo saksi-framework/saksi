@@ -15,6 +15,11 @@ type FabricConfig struct {
 	Key          string
 	Channel      string
 	Chaincode    string
+	// PeerVolume is the host path of the peer's ledger volume. Optional: set
+	// it to have the ballot window record on-disk ledger growth
+	// (perf.csv's ledger_bytes_delta). Not part of Enabled() — a missing
+	// volume path costs a column, not a connection.
+	PeerVolume string
 }
 
 // Enabled reports whether every field needed to reach a live network is set.

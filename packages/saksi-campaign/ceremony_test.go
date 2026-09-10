@@ -1,6 +1,7 @@
 package campaign
 
 import (
+	"bytes"
 	"context"
 	"encoding/hex"
 	"encoding/json"
@@ -8,6 +9,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"testing"
 	"time"
@@ -195,5 +197,186 @@ func TestCeremonyRefusesGroundTruthRuns(t *testing.T) {
 		if w.Code != http.StatusConflict {
 			t.Fatalf("%s on a ground-truth run: got %d, want %d", path, w.Code, http.StatusConflict)
 		}
+	}
+}
+
+// hexSignedTally builds a TallyResult signed by trustees "1".."n" (the wire
+// ids the generator emits) and hex-encodes it. Signature bytes are opaque
+// here: the console only ever filters this list, it never verifies it — the
+// chaincode and the auditor do that.
+func hexSignedTally(t *testing.T, electionID string, trustees int) string {
+	t.Helper()
+	tr := &saksiprotocolv1.TallyResult{
+		Version:    1,
+		ElectionId: electionID,
+		Totals:     []uint64{7, 3},
+	}
+	for i := 1; i <= trustees; i++ {
+		tr.Signatures = append(tr.Signatures, &saksiprotocolv1.TrusteeSignature{
+			TrusteeId: strconv.Itoa(i),
+			Signature: bytes.Repeat([]byte{byte(i)}, 64),
+		})
+	}
+	raw, err := proto.Marshal(tr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return hex.EncodeToString(raw)
+}
+
+// signaturesIn returns the trustee ids signing a hex-encoded tally, in order.
+func signaturesIn(t *testing.T, tallyHex string) []string {
+	t.Helper()
+	raw, err := hex.DecodeString(tallyHex)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var tr saksiprotocolv1.TallyResult
+	if err := proto.Unmarshal(raw, &tr); err != nil {
+		t.Fatal(err)
+	}
+	var ids []string
+	for _, s := range tr.GetSignatures() {
+		ids = append(ids, s.GetTrusteeId())
+	}
+	return ids
+}
+
+// The published tally must carry the signatures of the trustees who actually
+// acted — not every signature the generator produced. Publishing the full list
+// would make a 1-of-5 ceremony look like a 5-of-5 one on-chain.
+func TestPublishedTallyCarriesOnlySubmittedSignatures(t *testing.T) {
+	state := CeremonyState{
+		Threshold: 2,
+		Trustees: []CeremonyTrustee{
+			{ID: "1", Submitted: true},
+			{ID: "2"},
+			{ID: "3", Submitted: true},
+		},
+	}
+	got, err := tallyToPublish(hexSignedTally(t, "run-1", 3), state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ids := signaturesIn(t, got); !reflect.DeepEqual(ids, []string{"1", "3"}) {
+		t.Fatalf("published signatures = %v, want [1 3]", ids)
+	}
+}
+
+// The rest of the tally must survive the re-encoding untouched.
+func TestPublishedTallyPreservesTotalsAndElectionID(t *testing.T) {
+	state := CeremonyState{Trustees: []CeremonyTrustee{{ID: "1", Submitted: true}}}
+	got, err := tallyToPublish(hexSignedTally(t, "run-7", 3), state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := hex.DecodeString(got)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var tr saksiprotocolv1.TallyResult
+	if err := proto.Unmarshal(raw, &tr); err != nil {
+		t.Fatal(err)
+	}
+	if tr.GetElectionId() != "run-7" || !reflect.DeepEqual(tr.GetTotals(), []uint64{7, 3}) {
+		t.Fatalf("re-encoding changed the tally: %+v", &tr)
+	}
+}
+
+// A bundle generated before tally signatures existed has none to filter. It is
+// published verbatim — the chaincode is what refuses it, honestly, rather than
+// this console silently rewriting an old artifact.
+func TestPublishedTallyLeavesLegacyUnsignedTallyUnchanged(t *testing.T) {
+	tallyHex := hexSignedTally(t, "run-1", 0)
+	got, err := tallyToPublish(tallyHex, CeremonyState{Trustees: []CeremonyTrustee{{ID: "1", Submitted: true}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != tallyHex {
+		t.Fatalf("legacy tally was rewritten: %q -> %q", tallyHex, got)
+	}
+}
+
+func TestPublishedTallyRejectsUndecodableTally(t *testing.T) {
+	if _, err := tallyToPublish("nothex", CeremonyState{}); err == nil {
+		t.Fatal("a tally that is not hex must be an error, not a silent publish")
+	}
+}
+
+// The wiring, end to end on the console side: real CeremonySubmit calls decide
+// which signatures the tally carries.
+func TestCeremonySubmitDecidesPublishedSignatures(t *testing.T) {
+	s, _, exec := testServer(t, nil)
+	c := good()
+	c.Trustees = mk(3)
+	c.Threshold = 2
+	runID, dir, err := s.store.Create(c, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeBundle(t, dir, runID, 2, 3)
+
+	// Plant a signed tally in the bundle the way the generator now emits it.
+	raw, err := os.ReadFile(filepath.Join(dir, "bundle.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var b onChainBundle
+	if err := json.Unmarshal(raw, &b); err != nil {
+		t.Fatal(err)
+	}
+	b.Tally = hexSignedTally(t, runID, 3)
+	data, err := json.Marshal(b)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "bundle.json"), data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, id := range []string{"2", "3"} {
+		if err := exec.CeremonySubmit(context.Background(), runID, c, id); err != nil {
+			t.Fatalf("trustee %s: %v", id, err)
+		}
+	}
+	state, err := exec.CeremonyStatus(runID, c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := tallyToPublish(b.Tally, state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ids := signaturesIn(t, got); !reflect.DeepEqual(ids, []string{"2", "3"}) {
+		t.Fatalf("published signatures = %v, want [2 3] (the trustees that submitted)", ids)
+	}
+}
+
+// generateBundle copies the generator's tally verbatim; the signatures must
+// survive that copy or there is nothing for the ceremony to filter.
+func TestGenerateBundleKeepsTallySignatures(t *testing.T) {
+	s, _, exec := testServer(t, nil)
+	c := good()
+	runID, dir, err := s.store.Create(c, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	tallyHex := hexSignedTally(t, runID, 3)
+	header, err := json.Marshal(electionHeader{ElectionID: runID, Params: "aa", Dkg: "bb", N: 0, Tally: tallyHex})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "header.json"), header, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := exec.generateBundle(runID); err != nil {
+		t.Fatal(err)
+	}
+	b, err := exec.readBundle(runID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ids := signaturesIn(t, b.Tally); !reflect.DeepEqual(ids, []string{"1", "2", "3"}) {
+		t.Fatalf("bundle tally signatures = %v, want all three", ids)
 	}
 }

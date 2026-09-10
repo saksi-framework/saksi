@@ -36,9 +36,16 @@ func writeFakeStream(t *testing.T, dir string, n int) {
 		[]byte(strings.Join(lines, "\n")+"\n"), 0o644); err != nil {
 		t.Fatalf("write ndjson: %v", err)
 	}
+	// voter_ids is one per ballot, as the real generator writes it and as the
+	// v1 header contract requires (stream.rs verify_stream).
+	ids := make([]string, n)
+	for i := range ids {
+		ids[i] = fmt.Sprintf("%q", fmt.Sprintf("voter-%d", i))
+	}
 	header := fmt.Sprintf(`{"election_id":"test","election_name":"Test Election",`+
 		`"trustee_names":["A","B","C"],"partial_decryptions":["aa","bb"],`+
-		`"ground_truth":[3,3],"positions":1,"candidates":2,"n":%d}`, n)
+		`"ground_truth":[3,3],"positions":1,"candidates":2,`+
+		`"voter_ids":[%s],"n":%d}`, strings.Join(ids, ","), n)
 	if err := os.WriteFile(filepath.Join(dir, "header.json"), []byte(header), 0o644); err != nil {
 		t.Fatalf("write header: %v", err)
 	}
@@ -114,7 +121,7 @@ func TestVerifyWritesCorrectnessCSV(t *testing.T) {
 			{"contest":"president/cand1","ground_truth":3,"decoded":3,"E":0,"pass":true}]}`), nil
 	}
 
-	sa, err := e.Verify(context.Background(), runID)
+	sa, err := e.Verify(context.Background(), runID, good())
 	if err != nil {
 		t.Fatalf("Verify: %v", err)
 	}
@@ -126,7 +133,7 @@ func TestVerifyWritesCorrectnessCSV(t *testing.T) {
 		t.Fatalf("correctness.csv not written: %v", err)
 	}
 	got := string(data)
-	if !strings.HasPrefix(got, "contest,ground_truth,decoded,E,pass,published_tally,recovered_point,aggregate_ciphertext,dkg_sha256,tally_sha256,ballots_sha256\n") {
+	if !strings.HasPrefix(got, "contest,ground_truth,decoded,E,pass,published_tally,recovered_point,aggregate_ciphertext,dkg_sha256,tally_sha256,ballots_sha256,source,ledger_matches_local\n") {
 		t.Fatalf("bad csv header: %q", got)
 	}
 	if !strings.Contains(got, "president/cand0,3,3,0,true") {
@@ -143,7 +150,7 @@ func TestVerifyReportsAuditFailWithoutErroring(t *testing.T) {
 		return []byte(`{"overall":"fail","contests":[{"contest":"c","ground_truth":3,"decoded":4,"E":1,"pass":false}]}`),
 			fmt.Errorf("exit status 1")
 	}
-	sa, err := e.Verify(context.Background(), runID)
+	sa, err := e.Verify(context.Background(), runID, good())
 	if err != nil {
 		t.Fatalf("a valid audit-fail must not be a Go error: %v", err)
 	}
@@ -158,7 +165,7 @@ func TestVerifyErrorsOnUnparseableOutput(t *testing.T) {
 	e.run = func(_ context.Context, _ string, _ ...string) ([]byte, error) {
 		return []byte("panic: segfault"), fmt.Errorf("exit status 139")
 	}
-	if _, err := e.Verify(context.Background(), runID); err == nil {
+	if _, err := e.Verify(context.Background(), runID, good()); err == nil {
 		t.Fatal("an unparseable audit-stream output must be a Go error")
 	}
 }

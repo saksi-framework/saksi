@@ -258,8 +258,9 @@
     <button class="small" id="addTrustee" type="button">+ Add trustee</button>
 
     <div class="grid2">
-      <div><label for="threshold">Threshold (t) — how many must agree to decrypt</label>
-        <input id="threshold" type="number" min="1" value="2" class="tnum" /></div>
+      <div><label for="threshold">Threshold (t) — how many must agree to decrypt
+          <span class="muted small">— 3 of 5 (paper configuration)</span></label>
+        <input id="threshold" type="number" min="1" value="3" class="tnum" /></div>
       <div><label for="nDisplay">Trustees (n)</label>
         <input id="nDisplay" disabled class="tnum" /></div>
     </div>
@@ -299,6 +300,24 @@
         Attacks are offered inside the steps they belong to. Tick this for a clean end-to-end run.
       </div>
     </div>
+
+    <details style="margin-top:13px">
+      <summary class="small muted" style="cursor:pointer">Advanced — on-chain submission load</summary>
+      <div class="grid2" style="margin-top:9px">
+        <div><label for="concurrency">Ballots in flight</label>
+          <input id="concurrency" type="number" min="1" value="8" class="tnum" />
+          <div class="small muted" style="margin-top:4px">
+            How many ballot submissions are open at once. 1 measures this console's own
+            round-trip, not the network's throughput.
+          </div></div>
+        <div><label for="sendRate">Send rate (ballots/s)</label>
+          <input id="sendRate" type="number" min="0" step="any" value="0" class="tnum" />
+          <div class="small muted" style="margin-top:4px">
+            Caps dispatch to a fixed arrival rate (open loop). 0 sends as fast as the
+            workers drain.
+          </div></div>
+      </div>
+    </details>
 
     <div class="err" id="configErr"></div>
     <div class="actions"><div class="right"><button class="primary" id="btnStart">Generate ballots →</button></div></div>
@@ -435,12 +454,12 @@ const PRESETS = [1, 10, 100, 1000, 10000, 50000, 483000, 1000000, 1921917, 35240
 const OFFLINE_CEILING = 10000;
 const FILE_ORDER = ["election.csv","ballots.csv","correctness.csv","negative-tests.csv",
                     "ground-truth-ballots.csv","ground-truth-summary.csv","perf.csv",
-                    "header.json","ballots.ndjson","run.json","receipts.csv","trail.json"];
+                    "header.json","ballots.ndjson","run.json","receipts.csv","trail.ndjson"];
 const FILE_LABEL = { "election.csv":"election.csv","ballots.csv":"ballots.csv",
   "correctness.csv":"correctness.csv","negative-tests.csv":"negatives.csv","perf.csv":"perf.csv",
   "ground-truth-ballots.csv":"Ground truth — ballots","ground-truth-summary.csv":"Ground truth — tally",
   "header.json":"header.json (raw)","ballots.ndjson":"ballots.ndjson (raw)","run.json":"run.json (raw)",
-  "receipts.csv":"Ledger receipts","trail.json":"Trail events" };
+  "receipts.csv":"Ledger receipts","trail.ndjson":"Trail events" };
 const STUDY = new Set(["election.csv","ballots.csv","correctness.csv","negative-tests.csv",
                        "ground-truth-ballots.csv","ground-truth-summary.csv","perf.csv"]);
 
@@ -582,6 +601,8 @@ const config = () => ({
   voters: +$("voters").value,
   distribution: $("distribution").value,
   senate_seats: +$("senateSeats").value,
+  concurrency: +$("concurrency").value,
+  send_rate: +$("sendRate").value,
   skip_attacks: $("skipAttacks").checked,
   mode: $("mode").value,
 });
@@ -788,9 +809,10 @@ async function refreshCeremony() {
   });
 
   $("gateNote").innerHTML = st.on_chain
-    ? `The threshold is enforced by this console and proven by the independent verifier, which counts
-       distinct verified trustees. The chaincode validates each share it accepts but does not itself
-       count them before publishing.`
+    ? `The threshold is enforced by this console, which gates the ceremony at t, and proven by the
+       independent verifier, which counts distinct verified trustees. A chaincode built with the
+       signature gate also rejects a tally carrying fewer than t valid trustee signatures at
+       endorsement.`
     : `Local ceremony — real cryptographic shares, no ledger. The threshold gate is enforced here.`;
 
   $("btnPublish").disabled = !st.unlocked || st.published;
@@ -1130,7 +1152,7 @@ $("btnRestart").onclick = () => {
   }
 })();
 
-renderTrustees(["COMELEC", "Civil Society Watch", "University IT"]);
+renderTrustees(["COMELEC", "Civil Society Watch", "University IT", "Academe Observer", "Bar Association"]);
 renderPresets();
 renderRail();
 </script>
