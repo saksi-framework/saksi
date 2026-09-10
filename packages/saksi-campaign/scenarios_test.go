@@ -18,13 +18,17 @@ func findDemo(t *testing.T) string {
 	if p := os.Getenv("SAKSI_DEMO_BIN"); p != "" {
 		return p
 	}
+	// ".exe" as well: on Windows the cargo build lands as saksi-demo.exe, and
+	// target/ is not on PATH for LookPath to find it.
 	for _, rel := range []string{
 		"../../target/release/saksi-demo",
 		"../../target/debug/saksi-demo",
 	} {
-		if abs, err := filepath.Abs(rel); err == nil {
-			if _, err := os.Stat(abs); err == nil {
-				return abs
+		for _, cand := range []string{rel, rel + ".exe"} {
+			if abs, err := filepath.Abs(cand); err == nil {
+				if _, err := os.Stat(abs); err == nil {
+					return abs
+				}
 			}
 		}
 	}

@@ -5,7 +5,6 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -349,13 +348,68 @@ func TestLedgerDumpRejectsUndecodableChainParams(t *testing.T) {
 // Skipped unless saksi-demo is on PATH (CI's path; a dev box without the Rust
 // build still runs everything else).
 func TestLedgerHeaderIsAcceptedByAuditStream(t *testing.T) {
-	bin, err := exec.LookPath("saksi-demo")
-	if err != nil {
-		t.Skip("saksi-demo not on PATH")
+	bin := findDemo(t)
+	dir, led := realGeneratedChain(t, bin, ledgerElectionID)
+
+	if _, err := dumpLedger(dir, ledgerElectionID, led); err != nil {
+		t.Fatalf("dumpLedger: %v", err)
 	}
+	out, runErr := execRunner(context.Background(), bin, "audit-stream", filepath.Join(dir, LedgerDir), "--json")
+	var sa StreamAudit
+	if err := json.Unmarshal(out, &sa); err != nil {
+		t.Fatalf("audit-stream rejected the ledger dump: %v (stdout: %s)", runErr, out)
+	}
+	if sa.Overall != "pass" {
+		t.Fatalf("the dumped ledger must audit as cleanly as the generated run: %+v", sa)
+	}
+}
+
+// TestLedgerHeaderIsAcceptedWhenTheChainIsShort is the same cross-language
+// round trip against the case the audit exists for: the chain holds FEWER
+// ballots than the console generated. The dumped header must still be a legal
+// v1 stream header — voter_ids sized to the CHAIN's count, not the console's —
+// and the real reader must still take it.
+//
+// Note what this does and does not pin. audit-stream reads the header without
+// running verify_stream, so it accepts a mis-sized voter_ids list today; this
+// test would pass without the resize. What it guards is the round trip itself:
+// that a short dump is still a directory the real auditor reaches a verdict on.
+// The size contract is pinned by TestLedgerAuditRunsWhenTheChainHoldsFewerBallots.
+func TestLedgerHeaderIsAcceptedWhenTheChainIsShort(t *testing.T) {
+	bin := findDemo(t)
+	dir, led := realGeneratedChain(t, bin, ledgerElectionID)
+	// The chain lost one ballot.
+	last := led.accepted[len(led.accepted)-1]
+	led.accepted = led.accepted[:len(led.accepted)-1]
+	delete(led.Ballots, last)
+
+	n, err := dumpLedger(dir, ledgerElectionID, led)
+	if err != nil {
+		t.Fatalf("dumpLedger: %v", err)
+	}
+	out, runErr := execRunner(context.Background(), bin, "audit-stream", filepath.Join(dir, LedgerDir), "--json")
+	var sa StreamAudit
+	if err := json.Unmarshal(out, &sa); err != nil {
+		t.Fatalf("audit-stream rejected the short chain's header (%d ballots): %v (stdout: %s)", n, runErr, out)
+	}
+	// A short chain decodes fewer votes than the seeded ground truth, so the
+	// audit is EXPECTED to fail on accuracy — that is the finding. What must
+	// not happen is a header rejection, which is what this pins.
+	if sa.Overall == "" {
+		t.Fatalf("audit-stream produced no verdict for the short chain: %s", out)
+	}
+}
+
+// ledgerElectionID is the election id the real-binary ledger tests generate.
+const ledgerElectionID = "ledger-audit-test"
+
+// realGeneratedChain generates a real election with saksi-demo into a temp dir
+// and returns that dir plus a fakeLedger serving exactly those ballots and
+// artifacts — a chain that agrees with the console, byte for byte.
+func realGeneratedChain(t *testing.T, bin, electionID string) (string, *fakeLedger) {
+	t.Helper()
 	ctx := context.Background()
 	dir := t.TempDir()
-	const electionID = "ledger-audit-test"
 	if _, err := execRunner(ctx, bin, "gen", "--stream", dir,
 		"--voters", "2", "--positions", "1", "--candidates", "2",
 		"--trustees", "3", "--threshold", "2", "--election-id", electionID,
@@ -406,16 +460,54 @@ func TestLedgerHeaderIsAcceptedByAuditStream(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("read generated ballots: %v", err)
 	}
+	return dir, led
+}
 
-	if _, err := dumpLedger(dir, electionID, led); err != nil {
-		t.Fatalf("dumpLedger: %v", err)
+// TestLedgerAuditRunsWhenTheChainHoldsFewerBallots is the case the whole ledger
+// audit exists for: the chain does not hold what the console generated. The
+// dumped header must still satisfy saksi-auditor's reader (voter_ids one per
+// ballot, sized to the CHAIN's count), so the audit RUNS and reports a mismatch
+// instead of being written off as "not run".
+//
+// It is also the normal state of every time-bounded sweep step, where the
+// console generates a population and the window commits a slice of it.
+func TestLedgerAuditRunsWhenTheChainHoldsFewerBallots(t *testing.T) {
+	e, runID, dir, led := newLedgerRun(t, 4)
+	e.run = passingAudit("")
+	// The chain lost the last ballot: 3 on chain, 4 in the console's header.
+	// accepted is in accept (index) order, and ListNullifiers sorts.
+	last := led.accepted[len(led.accepted)-1]
+	led.accepted = led.accepted[:len(led.accepted)-1]
+	delete(led.Ballots, last)
+
+	if _, err := e.verify(context.Background(), runID, good(), led); err != nil {
+		t.Fatalf("a short chain is a finding, not an error: %v", err)
 	}
-	out, runErr := execRunner(ctx, bin, "audit-stream", filepath.Join(dir, LedgerDir), "--json")
-	var sa StreamAudit
-	if err := json.Unmarshal(out, &sa); err != nil {
-		t.Fatalf("audit-stream rejected the ledger dump: %v (stdout: %s)", runErr, out)
+	end := readRunEnd(t, dir)
+	if end["ledger_audit"] != "ok" {
+		t.Fatalf("run.end ledger_audit = %v, want \"ok\" — the header must stay valid", end["ledger_audit"])
 	}
-	if sa.Overall != "pass" {
-		t.Fatalf("the dumped ledger must audit as cleanly as the generated run: %+v", sa)
+	if got := end["ledger_matches_local"]; got != false {
+		t.Fatalf("run.end ledger_matches_local = %v, want false", got)
+	}
+
+	// The dumped header describes the chain: n and voter_ids both 3.
+	var h map[string]any
+	if err := readJSON(filepath.Join(dir, LedgerDir, headerFile), &h); err != nil {
+		t.Fatalf("read ledger header: %v", err)
+	}
+	if n, _ := h["n"].(float64); int(n) != 3 {
+		t.Fatalf("ledger header n = %v, want 3", h["n"])
+	}
+	ids, _ := h["voter_ids"].([]any)
+	if len(ids) != 3 {
+		t.Fatalf("ledger header voter_ids has %d entries, want 3 (one per chain ballot)", len(ids))
+	}
+	lines, err := os.ReadFile(filepath.Join(dir, LedgerDir, BallotsFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := len(strings.Split(strings.TrimSpace(string(lines)), "\n")); got != 3 {
+		t.Fatalf("ledger ballots.ndjson has %d lines, want 3", got)
 	}
 }

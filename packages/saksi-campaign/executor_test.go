@@ -36,9 +36,16 @@ func writeFakeStream(t *testing.T, dir string, n int) {
 		[]byte(strings.Join(lines, "\n")+"\n"), 0o644); err != nil {
 		t.Fatalf("write ndjson: %v", err)
 	}
+	// voter_ids is one per ballot, as the real generator writes it and as the
+	// v1 header contract requires (stream.rs verify_stream).
+	ids := make([]string, n)
+	for i := range ids {
+		ids[i] = fmt.Sprintf("%q", fmt.Sprintf("voter-%d", i))
+	}
 	header := fmt.Sprintf(`{"election_id":"test","election_name":"Test Election",`+
 		`"trustee_names":["A","B","C"],"partial_decryptions":["aa","bb"],`+
-		`"ground_truth":[3,3],"positions":1,"candidates":2,"n":%d}`, n)
+		`"ground_truth":[3,3],"positions":1,"candidates":2,`+
+		`"voter_ids":[%s],"n":%d}`, strings.Join(ids, ","), n)
 	if err := os.WriteFile(filepath.Join(dir, "header.json"), []byte(header), 0o644); err != nil {
 		t.Fatalf("write header: %v", err)
 	}

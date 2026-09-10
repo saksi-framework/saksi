@@ -139,12 +139,14 @@ func dumpLedgerBallots(dir, electionID string, r ledgerReader) (int, error) {
 //
 // The fields left as the console wrote them are the ones that are NOT on the
 // chain and never could be: ground_truth (the seeded plaintext totals — the
-// whole point of the audit is that they are secret from the ledger), voter_ids
-// (off-wire generation metadata, deliberately absent so on-chain unlinkability
-// holds), issuer_pk, binding_context, and the display names. Copying those is
-// what lets the same auditor score the chain's ballots; it is also the reason a
-// ledger audit checks the CHAIN's ciphertexts against the console's ground
-// truth, not the chain's ground truth against itself.
+// whole point of the audit is that they are secret from the ledger),
+// issuer_pk, binding_context, and the display names. Copying those is what lets
+// the same auditor score the chain's ballots; it is also the reason a ledger
+// audit checks the CHAIN's ciphertexts against the console's ground truth, not
+// the chain's ground truth against itself.
+//
+// voter_ids is the one such field that cannot simply be copied: the chain
+// publishes none, and the auditor requires one per ballot. See ledgerVoterIDs.
 func writeLedgerHeader(runDir, dir, electionID string, n int, r ledgerReader) error {
 	var h map[string]any
 	if err := readJSON(filepath.Join(runDir, headerFile), &h); err != nil {
@@ -172,7 +174,52 @@ func writeLedgerHeader(runDir, dir, electionID string, n int, r ledgerReader) er
 	h["tally"] = tally
 	h["partial_decryptions"] = partials
 	h["n"] = n
+	h["voter_ids"] = ledgerVoterIDs(h["voter_ids"], n)
 	return writeJSON(filepath.Join(dir, headerFile), h)
+}
+
+// ledgerVoterIDs resizes the console's voter-id list to exactly n entries, n
+// being the CHAIN's ballot count.
+//
+// The chain publishes no voter ids at all — they are off-wire generation
+// metadata, deliberately absent so on-chain unlinkability holds — so there is
+// nothing to copy from it and nothing to check against. What there is instead
+// is the v1 header contract: voter_ids holds one entry per ballot, which
+// saksi-auditor's stream.rs verify_stream enforces and rejects a header for.
+// The console's list is sized to the population it GENERATED, which is exactly
+// not the chain's count in the two cases that matter — a chain holding a
+// different number of ballots (the divergence this audit exists to catch) and
+// any time-bounded window (the normal state of every sweep step). Copying it
+// unresized therefore writes a dump whose header claims voter ids for ballots
+// the directory does not contain.
+//
+// `audit-stream` reads the header without calling verify_stream today, so the
+// mis-sized list is not yet load-bearing on that path. It is written correctly
+// anyway: the dump is a published artifact that claims to be a v1 stream
+// directory, and any reader that does enforce the contract — verify_stream
+// itself, or the auditor's own population gates — would reject it.
+//
+// So the list is truncated to n, or padded with placeholders naming what they
+// are. The ids are labels here: the ledger audit compares nullifier sets and
+// aggregate ciphertexts, never voter ids, and the chain's ballots come back in
+// the chain's order anyway, so a positional id would be meaningless even if one
+// existed. Placeholders are distinct so no per-voter uniqueness check can be
+// tripped by the padding itself.
+func ledgerVoterIDs(local any, n int) []string {
+	out := make([]string, 0, n)
+	if ids, ok := local.([]any); ok {
+		for _, id := range ids {
+			if len(out) == n {
+				break
+			}
+			s, _ := id.(string)
+			out = append(out, s)
+		}
+	}
+	for len(out) < n {
+		out = append(out, fmt.Sprintf("chain-publishes-none-%d", len(out)))
+	}
+	return out
 }
 
 // chainPartials collects the published partial decryptions by asking for every
