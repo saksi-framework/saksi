@@ -12,6 +12,7 @@ package campaign
 import (
 	"fmt"
 	"strings"
+	"time"
 )
 
 // MaxTrustees is the UI/validation cap on trustee count.
@@ -59,6 +60,15 @@ type ElectionConfig struct {
 	// SendRate caps dispatch to that many submissions per second (open-loop
 	// load). Zero dispatches as fast as the workers drain (closed-loop).
 	SendRate float64 `json:"send_rate"`
+	// WindowS time-bounds the ballot window to that many seconds
+	// (bench.RunOpts.MaxDuration). Zero means unbounded: the window closes
+	// when every ballot has been dispatched. A sweep step sets it so each
+	// step measures the same slice of wall clock at a different offered rate.
+	WindowS float64 `json:"window_s"`
+	// Rep tags this run as one repetition of a --repeat campaign. Optional and
+	// purely descriptive: it is stamped into the journal at run.start (and onto
+	// the ballot window's segment) so a run folder says which repetition it is.
+	Rep *RepTag `json:"rep,omitempty"`
 	// SkipAttacks hides the in-lifecycle attack panels for a clean end-to-end
 	// run. The attacks are opt-in either way; this removes the offer entirely
 	// so a straight demonstration is one click.
@@ -68,6 +78,22 @@ type ElectionConfig struct {
 // DefaultConcurrency is the in-flight ballot submission count when the config
 // does not say otherwise.
 const DefaultConcurrency = 8
+
+// RepTag identifies one repetition of a --repeat campaign: which repetition it
+// is and what it counts as. Kind is "warmup" (discarded), "measured" (counted
+// in summary.csv), "sweep" (one rate step) or "burst".
+type RepTag struct {
+	Index int    `json:"index"`
+	Kind  string `json:"kind"`
+}
+
+// Window is the ballot window's time bound, or 0 for unbounded.
+func (c ElectionConfig) Window() time.Duration {
+	if c.WindowS <= 0 {
+		return 0
+	}
+	return time.Duration(c.WindowS * float64(time.Second))
+}
 
 // applyDefaults fills the fields the UI may omit. Called on every decoded
 // config before Validate, so validation never has to special-case "unset".
@@ -143,6 +169,9 @@ func (c ElectionConfig) Validate() error {
 	}
 	if c.SendRate < 0 {
 		return fmt.Errorf("send rate must be >= 0 (got %v)", c.SendRate)
+	}
+	if c.WindowS < 0 {
+		return fmt.Errorf("window must be >= 0 seconds (got %v)", c.WindowS)
 	}
 	switch c.Mode {
 	case "offline", "onchain", ModeGroundTruth:

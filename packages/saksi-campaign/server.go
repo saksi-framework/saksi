@@ -4,6 +4,7 @@ import (
 	"context"
 	"embed"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -72,6 +73,18 @@ type Server struct {
 	chainMu   sync.Mutex
 	chainConn *clientsdk.Connection // lazily opened, cached across /api/trail requests
 
+	// gitHead resolves the console binary's own commit, for the validation
+	// ladder gate. Cached: it shells git, and the answer cannot change while
+	// this process is running. Tests override it.
+	gitHead  func() (string, bool)
+	headOnce sync.Once
+	head     string
+	headOK   bool
+
+	// freeSpace reports the bytes available on the volume holding path.
+	// Overridden by tests, which must not depend on the disk they run on.
+	freeSpace func(path string) (uint64, error)
+
 	// dial resolves the chain reader + ledger for /api/trail. Defaults to
 	// dialChain (lazy-connect via fabric); tests override it to inject fakes.
 	dial func() (chainReader, clientsdk.Ledger, error)
@@ -92,6 +105,8 @@ func NewServer(store *RunStore, exec *Executor, hub *Hub, fabric FabricConfig, a
 		busy:       make(map[string]context.CancelFunc),
 	}
 	s.dial = s.dialChain
+	s.gitHead = s.consoleHead
+	s.freeSpace = freeSpaceOn
 	for _, h := range allowHosts {
 		s.allowHosts[h] = true
 	}
@@ -115,7 +130,7 @@ func NewServer(store *RunStore, exec *Executor, hub *Hub, fabric FabricConfig, a
 	mux.HandleFunc("/api/ceremony/", s.handleCeremonyStatus)
 	mux.HandleFunc("/api/check/", s.handleCheck)
 	mux.HandleFunc("/api/scenarios/", s.handleScenarioList)
-	mux.HandleFunc("/api/runs/", s.handleResume)
+	mux.HandleFunc("/api/runs/", s.handleRunAction)
 	mux.HandleFunc("/api/capabilities", s.handleCapabilities)
 	mux.HandleFunc("/api/trail", s.handleTrailIndex)
 	mux.HandleFunc("/attack", s.handleStagedAttack)
@@ -214,6 +229,9 @@ func (s *Server) handleGenerate(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, errNoFabric().Error(), http.StatusBadRequest)
 		return
 	}
+	if !s.admit(w, c) {
+		return
+	}
 	runID, _, err := s.store.Create(c, time.Now())
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
@@ -273,6 +291,13 @@ func (s *Server) handleSubmit(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleRunAll(w http.ResponseWriter, r *http.Request) {
 	c, ok := decodeConfig(w, r)
 	if !ok {
+		return
+	}
+	if c.Mode == "onchain" && !s.fabric.Enabled() {
+		http.Error(w, errNoFabric().Error(), http.StatusBadRequest)
+		return
+	}
+	if !s.admit(w, c) {
 		return
 	}
 	runID, _, err := s.store.Create(c, time.Now())
@@ -765,6 +790,74 @@ func (s *Server) handleCheck(w http.ResponseWriter, r *http.Request) {
 	writeJSONResp(w, http.StatusOK, rep)
 }
 
+// handleRunAction routes /api/runs/{id}/{action}: `status` (GET) reports
+// whether a phase is running, `resume` and `verify-only` (POST) act on the run.
+func (s *Server) handleRunAction(w http.ResponseWriter, r *http.Request) {
+	id, action, ok := strings.Cut(strings.TrimPrefix(r.URL.Path, "/api/runs/"), "/")
+	if !ok {
+		http.NotFound(w, r)
+		return
+	}
+	switch action {
+	case "status":
+		s.handleRunStatus(w, r, id)
+	case "resume":
+		s.handleResume(w, r, id)
+	case "verify-only":
+		s.handleVerifyOnly(w, r, id)
+	default:
+		http.NotFound(w, r)
+	}
+}
+
+// handleRunStatus answers whether a phase is currently running on the run. The
+// per-run lock is claimed before a dispatch answers 202, so a driver that saw
+// the 202 and then polls this gets an exact answer rather than a race.
+func (s *Server) handleRunStatus(w http.ResponseWriter, r *http.Request, id string) {
+	runID, err := validRun(s, id)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	s.mu.Lock()
+	_, busy := s.busy[runID]
+	s.mu.Unlock()
+	writeJSONResp(w, http.StatusOK, map[string]any{"run_id": runID, "busy": busy})
+}
+
+// handleVerifyOnly serves POST /api/runs/{id}/verify-only: after an
+// interruption (T3 — the peer was stopped mid-window), reconcile what the
+// chain holds against this run's committed set and walk the chain, WITHOUT
+// submitting anything more. It marks the run interrupted, which is what makes
+// the difference visible instead of quietly resuming over it.
+func (s *Server) handleVerifyOnly(w http.ResponseWriter, r *http.Request, id string) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "POST only", http.StatusMethodNotAllowed)
+		return
+	}
+	runID, err := validRun(s, id)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	rec, err := s.record(runID)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusNotFound)
+		return
+	}
+	if rec.Config.Mode != "onchain" {
+		http.Error(w, fmt.Sprintf(
+			"run mode is %q: only an on-chain run has a chain to reconcile against", rec.Config.Mode),
+			http.StatusConflict)
+		return
+	}
+	if !s.fabric.Enabled() {
+		http.Error(w, errNoFabric().Error(), http.StatusBadRequest)
+		return
+	}
+	s.dispatch(w, runID, func(ctx context.Context) { _ = s.exec.VerifyOnly(ctx, runID, rec.Config) })
+}
+
 // handleResume serves POST /api/runs/{id}/resume: restart an interrupted
 // ballot window over the ballots the chain does not already hold.
 //
@@ -778,14 +871,9 @@ func (s *Server) handleCheck(w http.ResponseWriter, r *http.Request) {
 // this request must not block for it. The exact count is stamped as
 // `segment.start {pending}` once the resume has taken its snapshot, and
 // published on the run's event stream.
-func (s *Server) handleResume(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleResume(w http.ResponseWriter, r *http.Request, id string) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "POST only", http.StatusMethodNotAllowed)
-		return
-	}
-	id, action, ok := strings.Cut(strings.TrimPrefix(r.URL.Path, "/api/runs/"), "/")
-	if !ok || action != "resume" {
-		http.NotFound(w, r)
 		return
 	}
 	runID, err := validRun(s, id)
@@ -821,4 +909,105 @@ func (s *Server) handleResume(w http.ResponseWriter, r *http.Request) {
 		_ = s.exec.Resume(ctx, runID, rec.Config)
 	}()
 	writeJSONResp(w, http.StatusAccepted, plan)
+}
+
+// --- admission gates --------------------------------------------------------
+//
+// Two things can waste a whole tier's worth of wall clock: running a large tier
+// on a build whose small tiers were never shown to be correct, and starting an
+// on-chain tier the disk cannot hold. Both are refused here, at run creation,
+// where the cost is an error message.
+
+// LadderFile is the validation ladder's record, written beside the run folders.
+const LadderFile = "ladder.json"
+
+// LadderVoterCeiling is the largest tier that may run without the validation
+// ladder having been run for this build.
+const LadderVoterCeiling = 1000
+
+// errLadderNotRun is the exact refusal text: one string, so a caller can match
+// on it rather than on a message that varies with the tier.
+const errLadderNotRun = "validation ladder has not been run for this build; run tools/ladder.sh first"
+
+// LedgerBytesPerBallot is the ledger footprint budgeted for one ballot record
+// (one voter x one position), used by the disk guard's projection.
+const LedgerBytesPerBallot = 12000
+
+// ladderRecord is <runs-root>/ladder.json: which build the ladder passed on,
+// when, and the runs that prove it.
+type ladderRecord struct {
+	Commit string    `json:"commit"`
+	RanAt  time.Time `json:"ran_at"`
+	Runs   []string  `json:"runs"`
+}
+
+// admit applies both gates to a config before any run folder is created — a
+// tier that cannot produce a trustworthy measurement should cost nothing but
+// the error message. Every path that creates a run goes through here, so a
+// second entry point cannot quietly skip them.
+func (s *Server) admit(w http.ResponseWriter, c ElectionConfig) bool {
+	for _, gate := range []func(ElectionConfig) error{s.ladderGate, s.diskGate} {
+		if err := gate(c); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return false
+		}
+	}
+	return true
+}
+
+// consoleHead is the console binary's own git commit, cached for the process.
+func (s *Server) consoleHead() (string, bool) {
+	s.headOnce.Do(func() { s.head, s.headOK = consoleGitHead() })
+	return s.head, s.headOK
+}
+
+// ladderGate refuses a large offline/on-chain tier unless the validation ladder
+// has been run for exactly this build. Ground-truth is exempt: it runs no
+// cryptography and no chain, so there is nothing for the ladder to validate.
+//
+// A console that cannot resolve its own commit refuses too. The gate exists to
+// prove a correspondence between a build and a passing ladder, and "I cannot
+// tell which build I am" is not that proof.
+func (s *Server) ladderGate(c ElectionConfig) error {
+	if c.Mode == ModeGroundTruth || c.Voters <= LadderVoterCeiling {
+		return nil
+	}
+	var rec ladderRecord
+	if err := readJSON(filepath.Join(s.store.Root(), LadderFile), &rec); err != nil {
+		return errors.New(errLadderNotRun)
+	}
+	head, ok := s.gitHead()
+	if !ok || rec.Commit == "" || rec.Commit != head {
+		return errors.New(errLadderNotRun)
+	}
+	return nil
+}
+
+// diskGate refuses an on-chain tier whose projected ledger will not fit. The
+// message carries the numbers, because "not enough disk" without them tells an
+// operator nothing about which knob to turn.
+//
+// A probe that fails does NOT refuse: an unreadable volume is an
+// instrumentation loss, and instrumentation must never be the thing that
+// blocks a run.
+func (s *Server) diskGate(c ElectionConfig) error {
+	if c.Mode != "onchain" {
+		return nil
+	}
+	path := s.fabric.PeerVolume
+	if path == "" {
+		path = s.store.Root()
+	}
+	free, err := s.freeSpace(path)
+	if err != nil {
+		return nil
+	}
+	need := uint64(c.Voters) * uint64(c.Positions) * LedgerBytesPerBallot
+	if need <= free {
+		return nil
+	}
+	return fmt.Errorf(
+		"this run projects %d bytes of ledger (%d voters x %d positions x %d bytes per ballot) "+
+			"but only %d bytes are free on %s: free space or run a smaller tier",
+		need, c.Voters, c.Positions, LedgerBytesPerBallot, free, path)
 }

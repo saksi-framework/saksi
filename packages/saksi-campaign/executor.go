@@ -120,6 +120,9 @@ func (e *Executor) Generate(ctx context.Context, runID string, c ElectionConfig)
 		"positions": c.Positions, "candidates": c.Candidates,
 		"distribution": c.Distribution,
 	})
+	if c.Rep != nil {
+		_ = j.Stamp("rep.start", map[string]any{"index": c.Rep.Index, "kind": c.Rep.Kind})
+	}
 	e.recordCommit(runID, env)
 	_ = j.Stamp("stage.generate.start", nil)
 
@@ -696,7 +699,13 @@ func (e *Executor) submitBallots(ctx context.Context, runID string, c ElectionCo
 		start["ledger_bytes"] = startBytes
 	}
 	_ = j.Stamp("stage.ballots.start", start)
-	_ = j.Stamp("segment.start", map[string]any{"index": 0})
+	seg := map[string]any{"index": 0}
+	// A burst (or any other tagged repetition) is its own segment: the tag is
+	// what lets a reader tell a burst window from the measured one.
+	if c.Rep != nil && c.Rep.Kind != "" {
+		seg["tag"] = c.Rep.Kind
+	}
+	_ = j.Stamp("segment.start", seg)
 	e.publish(runID, "ceremony", "info",
 		fmt.Sprintf("submitting %d ballots (%d in flight)…", count, concurrency))
 
@@ -726,6 +735,7 @@ func (e *Executor) submitBallots(ctx context.Context, runID string, c ElectionCo
 	}, bench.RunOpts{
 		Concurrency: concurrency,
 		SendRate:    c.SendRate,
+		MaxDuration: c.Window(),
 		OnProgress: func(done int) {
 			_ = j.Stamp("ballots.progress", map[string]any{"done": done})
 		},
@@ -1480,4 +1490,131 @@ func segmentFromEvent(m map[string]any) Segment {
 		WindowMs: int64(jfloat(m, "window_ms")), TPS: jfloat(m, "tps"),
 		P50Ms: jfloat(m, "p50_ms"), DriverCeilingTPS: jfloat(m, "driver_ceiling_tps"),
 	}
+}
+
+// --- T3: verify without resuming --------------------------------------------
+
+// reconcileReader is the chain half of a verify-only pass: the committed-ballot
+// count the chaincode reports, and the nullifier pages the committed set is
+// intersected against.
+type reconcileReader interface {
+	nullifierLister
+	CountCommittedBallots(electionID string) (int, error)
+}
+
+var _ reconcileReader = (*clientsdk.BulletinClient)(nil)
+
+// VerifyOnly is the T3 (peer-restart) audit: after the network came back, ask
+// the chain what it holds for this run and reconcile it against the run's own
+// committed set, then walk the chain over the blocks this run's receipts name.
+//
+// It submits NOTHING. A resume would paper over the interruption by filling the
+// gap; T3's question is what the gap actually was, so the run is marked
+// interrupted and the two counts are recorded side by side.
+func (e *Executor) VerifyOnly(ctx context.Context, runID string, c ElectionConfig) error {
+	conn, err := e.fabric.Connect()
+	if err != nil {
+		e.publish(runID, "verify", "error", "connect to Fabric: "+err.Error())
+		return err
+	}
+	defer conn.Close()
+	return e.verifyOnly(runID, conn.Bulletin, conn.Ledger())
+}
+
+// verifyOnly is VerifyOnly's body with the chain injected, so the reconciliation
+// is testable without a network.
+func (e *Executor) verifyOnly(runID string, rr reconcileReader, led clientsdk.Ledger) error {
+	dir, err := e.store.Dir(runID)
+	if err != nil {
+		return err
+	}
+	j := e.journalFor(runID)
+	defer j.Close()
+
+	// The interruption is stamped first: whatever the reconciliation finds, the
+	// fact that this window was interrupted must survive a crash in the middle
+	// of finding it.
+	_ = j.Stamp("interrupted_at", map[string]any{"phase": "verify-only"})
+
+	bundlePath, err := e.bundlePath(runID)
+	if err != nil {
+		return err
+	}
+	b, err := loadBundle(bundlePath)
+	if err != nil {
+		return err
+	}
+
+	chainCount, countErr := rr.CountCommittedBallots(b.ElectionID)
+	committed, setErr := committedByIndex(dir, b, rr)
+	local := 0
+	for _, ok := range committed {
+		if ok {
+			local++
+		}
+	}
+	fields := map[string]any{
+		"election_id": b.ElectionID,
+		"expected":    b.BallotCount,
+	}
+	switch {
+	case countErr != nil:
+		fields["chain_count_error"] = countErr.Error()
+	case setErr != nil:
+		fields["committed_set_error"] = setErr.Error()
+	default:
+		fields["chain_count"] = chainCount
+		fields["committed_local"] = local
+		fields["reconciled"] = chainCount == local
+		fields["missing"] = b.BallotCount - local
+	}
+	_ = j.Stamp("verify_only.reconcile", fields)
+	if setErr == nil {
+		crossCheckReceipts(dir, j, committed)
+	}
+
+	e.verifyOnlyChain(j, dir, led)
+	e.publish(runID, "verify", "done", fmt.Sprintf(
+		"verify-only: the chain holds %d of this run's %d ballots (chain reports %d committed)",
+		local, b.BallotCount, chainCount))
+	if countErr != nil {
+		return countErr
+	}
+	return setErr
+}
+
+// verifyOnlyChain walks the blocks this run's receipts landed in and spot-checks
+// each receipt against the block the peer serves now. No receipts means no
+// range to walk — stamped as not run rather than as a pass.
+func (e *Executor) verifyOnlyChain(j *Journal, dir string, led clientsdk.Ledger) {
+	events, err := readReceipts(dir)
+	if err != nil && !errors.Is(err, ErrTruncatedReceipts) {
+		_ = j.Stamp("verify_only.chain", map[string]any{"status": "not run", "error": err.Error()})
+		return
+	}
+	sample := make([]clientsdk.Receipt, 0, len(events))
+	var from, to uint64
+	for _, ev := range events {
+		n := ev.Receipt.BlockNumber
+		if len(sample) == 0 || n < from {
+			from = n
+		}
+		if n > to {
+			to = n
+		}
+		sample = append(sample, ev.Receipt)
+	}
+	if len(sample) == 0 {
+		_ = j.Stamp("verify_only.chain", map[string]any{"status": "not run", "error": "no receipts to sample"})
+		return
+	}
+	report, err := led.VerifyChain(from, to, sample)
+	if err != nil {
+		_ = j.Stamp("verify_only.chain", map[string]any{"status": "not run", "error": err.Error()})
+		return
+	}
+	_ = j.Stamp("verify_only.chain", map[string]any{
+		"status": report.Status, "from": from, "to": to,
+		"blocks": report.Blocks, "linked": report.Linked, "sampled": len(sample),
+	})
 }
