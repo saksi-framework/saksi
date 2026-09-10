@@ -115,6 +115,7 @@ func NewServer(store *RunStore, exec *Executor, hub *Hub, fabric FabricConfig, a
 	mux.HandleFunc("/api/ceremony/", s.handleCeremonyStatus)
 	mux.HandleFunc("/api/check/", s.handleCheck)
 	mux.HandleFunc("/api/scenarios/", s.handleScenarioList)
+	mux.HandleFunc("/api/runs/", s.handleResume)
 	mux.HandleFunc("/api/capabilities", s.handleCapabilities)
 	mux.HandleFunc("/api/trail", s.handleTrailIndex)
 	mux.HandleFunc("/attack", s.handleStagedAttack)
@@ -762,4 +763,55 @@ func (s *Server) handleCheck(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSONResp(w, http.StatusOK, rep)
+}
+
+// handleResume serves POST /api/runs/{id}/resume: restart an interrupted
+// ballot window over the ballots the chain does not already hold.
+//
+// The refusal is decided BEFORE anything is dispatched (planResume reads the
+// run's journal, no network), so a run that cannot be resumed gets a 409 with
+// the reason instead of a second window quietly opening on top of the first.
+func (s *Server) handleResume(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "POST only", http.StatusMethodNotAllowed)
+		return
+	}
+	id, action, ok := strings.Cut(strings.TrimPrefix(r.URL.Path, "/api/runs/"), "/")
+	if !ok || action != "resume" {
+		http.NotFound(w, r)
+		return
+	}
+	runID, err := validRun(s, id)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	rec, err := s.record(runID)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusNotFound)
+		return
+	}
+	dir, err := s.store.Dir(runID)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	plan, err := planResume(dir, rec.Config)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusConflict)
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), s.timeout)
+	if !s.tryStart(runID, cancel) {
+		cancel()
+		http.Error(w, "a phase is already running on this run", http.StatusConflict)
+		return
+	}
+	go func() {
+		defer cancel()
+		defer s.finish(runID)
+		_ = s.exec.Resume(ctx, runID, rec.Config)
+	}()
+	writeJSONResp(w, http.StatusAccepted, plan)
 }

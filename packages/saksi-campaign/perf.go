@@ -291,6 +291,43 @@ func writeLatenciesCSV(dir string, res bench.RunResult, segment int) error {
 	return w.Flush()
 }
 
+// appendLatenciesCSV appends one resumed segment's rows to latencies.csv,
+// keeping the rows segment 0 already wrote. index maps the compact slot k
+// bench.Run dispatched back to the ballot index it carried; replay reports
+// whether slot k's rejection was the chain telling us the ballot was already
+// committed (ok=replay) rather than a drop.
+func appendLatenciesCSV(dir string, res bench.RunResult, segment int, index func(k int) int, replay func(k int) bool) error {
+	f, err := os.OpenFile(filepath.Join(dir, LatenciesCSV), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
+		return fmt.Errorf("open %s: %w", LatenciesCSV, err)
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		return fmt.Errorf("stat %s: %w", LatenciesCSV, err)
+	}
+	w := bufio.NewWriter(f)
+	if info.Size() == 0 {
+		if _, err := w.WriteString("index,segment,ms,ok\n"); err != nil {
+			return err
+		}
+	}
+	for k := 0; k <= res.LastIndex && k < len(res.ByIndex); k++ {
+		status := "drop"
+		switch {
+		case res.OK[k]:
+			status = "commit"
+		case replay(k):
+			status = "replay"
+		}
+		if _, err := fmt.Fprintf(w, "%d,%d,%.3f,%s\n",
+			index(k), segment, float64(res.ByIndex[k].Microseconds())/1000.0, status); err != nil {
+			return err
+		}
+	}
+	return w.Flush()
+}
+
 // perfSchema documents every perf.csv column and its producer. Written once per
 // run folder so a downloaded CSV carries its own definitions — perf.csv itself
 // stays comment-free so it loads straight into a spreadsheet.

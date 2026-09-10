@@ -2,17 +2,23 @@ package campaign
 
 import (
 	"context"
+	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
 
 	"github.com/hyperledger/fabric-protos-go-apiv2/common"
 	clientsdk "github.com/saksi-framework/saksi/packages/saksi-bulletin/client-sdk"
+	pb "github.com/saksi-framework/saksi/packages/saksi-protocol/go/saksiprotocolv1"
+	"google.golang.org/protobuf/proto"
 )
 
 // fakeLedger is the in-memory stand-in for a Fabric ledger. The ballot window
@@ -38,6 +44,119 @@ type fakeLedger struct {
 	// is enough here — nothing in campaign asserts on VerifyChain's output,
 	// this just has to compile and stay deterministic.
 	blocks map[uint64][]string
+
+	// FailAt is the ballot ordinal (1-based) from which SubmitBallot fails and
+	// cancels the run's context — the crash the resume path exists for. 0 =
+	// never. Set it back to 0 to model the ledger coming back up.
+	FailAt int
+	cancel context.CancelFunc
+	// RejectDuplicates makes a second SubmitBallot for an already-accepted
+	// nullifier fail the way the chaincode's double-vote gate does.
+	RejectDuplicates bool
+
+	ballots     int             // SubmitBallot attempts, accepted or not
+	accepted    []string        // accepted nullifiers, in accept order
+	acceptedSet map[string]bool // the same set, for the duplicate gate
+	hidden      map[string]bool // accepted but withheld from ListNullifiers
+}
+
+// hide withholds an accepted nullifier from ListNullifiers: the late commit
+// that raced the resume's snapshot.
+func (f *fakeLedger) hide(nullifierHex string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.hidden == nil {
+		f.hidden = map[string]bool{}
+	}
+	f.hidden[nullifierHex] = true
+}
+
+// acceptedIndices maps the accepted nullifiers back to ballot indices, using
+// the same deterministic nullifier the test stream writes for index i.
+func (f *fakeLedger) acceptedIndices() map[int]bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make(map[int]bool, len(f.accepted))
+	for _, n := range f.accepted {
+		raw, err := hex.DecodeString(n)
+		if err != nil || len(raw) != 32 {
+			continue
+		}
+		out[int(binary.BigEndian.Uint32(raw[28:]))-1] = true
+	}
+	return out
+}
+
+// ballotGate is the chaincode-side half of SubmitBallot: the crash point, the
+// double-vote check, and the accepted-nullifier set ListNullifiers serves.
+//
+// A payload that is not a decodable Ballot carries no nullifier, so it is
+// committed without any of that bookkeeping — the older window tests submit
+// opaque hex, which the real peer would reject but which is not what they are
+// measuring.
+func (f *fakeLedger) ballotGate(args []string) error {
+	if len(args) == 0 {
+		return errors.New("SubmitBallot without a ballot")
+	}
+	nul := ""
+	if raw, err := hex.DecodeString(args[0]); err == nil {
+		var b pb.Ballot
+		if proto.Unmarshal(raw, &b) == nil {
+			nul = hex.EncodeToString(b.GetCredentialPresentation().GetNullifier().GetValue())
+		}
+	}
+
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.ballots++
+	if f.FailAt > 0 && f.ballots >= f.FailAt {
+		if f.cancel != nil {
+			f.cancel()
+		}
+		return errors.New("peer unavailable")
+	}
+	if nul == "" {
+		return nil
+	}
+	if f.RejectDuplicates && f.acceptedSet[nul] {
+		return fmt.Errorf("nullifier already spent (double vote)")
+	}
+	if f.acceptedSet == nil {
+		f.acceptedSet = map[string]bool{}
+	}
+	f.acceptedSet[nul] = true
+	f.accepted = append(f.accepted, nul)
+	return nil
+}
+
+// ListNullifiers serves the accepted set one page at a time, ordered, with an
+// offset bookmark — the same contract *clientsdk.BulletinClient has.
+func (f *fakeLedger) ListNullifiers(_ string, pageSize int, bookmark string) (clientsdk.NullifierPage, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	list := make([]string, 0, len(f.accepted))
+	for _, n := range f.accepted {
+		if !f.hidden[n] {
+			list = append(list, n)
+		}
+	}
+	sort.Strings(list)
+	off, _ := strconv.Atoi(bookmark)
+	if off < 0 || off > len(list) {
+		off = len(list)
+	}
+	if pageSize <= 0 {
+		pageSize = len(list)
+	}
+	end := off + pageSize
+	if end > len(list) {
+		end = len(list)
+	}
+	page := clientsdk.NullifierPage{Nullifiers: list[off:end]}
+	if end < len(list) {
+		page.NextBookmark = strconv.Itoa(end)
+	}
+	return page, nil
 }
 
 // commit assigns the next txID and its block, honouring blockSize. Callers hold
@@ -94,6 +213,11 @@ func (f *fakeLedger) SubmitWithReceipt(fn string, args ...string) ([]byte, clien
 	return nil, clientsdk.Receipt{TxID: txID, BlockNumber: blk}, nil
 }
 func (f *fakeLedger) Submit(fn string, args ...string) (string, uint64, error) {
+	if fn == "SubmitBallot" {
+		if err := f.ballotGate(args); err != nil {
+			return "", 0, err
+		}
+	}
 	txID, blk, ok := f.commit(fn)
 	if !ok {
 		return "", 0, errors.New("boom")

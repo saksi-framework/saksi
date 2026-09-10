@@ -1,10 +1,13 @@
 package campaign
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/csv"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -17,6 +20,8 @@ import (
 
 	clientsdk "github.com/saksi-framework/saksi/packages/saksi-bulletin/client-sdk"
 	"github.com/saksi-framework/saksi/packages/saksi-bulletin/client-sdk/bench"
+	pb "github.com/saksi-framework/saksi/packages/saksi-protocol/go/saksiprotocolv1"
+	"google.golang.org/protobuf/proto"
 )
 
 // CorrectnessFile is the per-contest cross-check CSV written by Verify.
@@ -325,6 +330,13 @@ func finaliseInput(dir string, c ElectionConfig, sa StreamAudit, stageErr error)
 		TPS: sm.CommittedTPS, P50Ms: sm.LatencyP50Ms,
 		DriverCeilingTPS: sm.DriverCeilingTPS,
 	}}
+	// A resumed run has one segment per window, and the journal is the only
+	// place that records them all — submit-metrics.json carries run-level
+	// totals, not the per-window split. One window in, one window out, so this
+	// changes nothing for a run that was never resumed.
+	if segs := segmentsFromJournal(dir); len(segs) > 0 {
+		in.Segments = segs
+	}
 	return in
 }
 
@@ -431,13 +443,9 @@ type lifecycleStep func(ctx context.Context, event, ref, fn string, args ...stri
 // then reject the run as a duplicate. Every ceremony click must see the same
 // bundle the election was created from.
 func (e *Executor) lifecycle(runID string, led clientsdk.Ledger, bundlePath, phase string) (*onChainBundle, lifecycleStep, error) {
-	raw, err := os.ReadFile(bundlePath)
+	b, err := loadBundle(bundlePath)
 	if err != nil {
-		return nil, nil, fmt.Errorf("read bundle: %w", err)
-	}
-	var b onChainBundle
-	if err := json.Unmarshal(raw, &b); err != nil {
-		return nil, nil, fmt.Errorf("parse bundle: %w", err)
+		return nil, nil, err
 	}
 	runDir, err := e.store.Dir(runID)
 	if err != nil {
@@ -472,7 +480,7 @@ func (e *Executor) lifecycle(runID string, led clientsdk.Ledger, bundlePath, pha
 			event, ref, receipt.BlockNumber, receipt.TxID))
 		return nil
 	}
-	return &b, step, nil
+	return b, step, nil
 }
 
 // openReceiptsFor returns the run's receiptsWriter, opening it lazily (and
@@ -601,6 +609,7 @@ func (e *Executor) submitBallots(ctx context.Context, runID string, c ElectionCo
 		start["ledger_bytes"] = startBytes
 	}
 	_ = j.Stamp("stage.ballots.start", start)
+	_ = j.Stamp("segment.start", map[string]any{"index": 0})
 	e.publish(runID, "ceremony", "info",
 		fmt.Sprintf("submitting %d ballots (%d in flight)…", count, concurrency))
 
@@ -644,7 +653,8 @@ func (e *Executor) submitBallots(ctx context.Context, runID string, c ElectionCo
 	if haveEndBytes {
 		end["ledger_bytes"] = endBytes
 	}
-	_ = j.Stamp("stage.ballots.end", end)
+	stampWindowEnd(j, end, res.Stopped)
+	stampSegmentEnd(j, segmentOf(0, res, res.Committed))
 
 	if readErr != nil {
 		return readErr
@@ -840,4 +850,481 @@ func truncate(b []byte, n int) string {
 		return s[:n] + "…"
 	}
 	return s
+}
+
+// ---- Checkpoint / resume ---------------------------------------------------
+//
+// A ballot window that dies mid-flight (peer restart, cancelled run, killed
+// console) leaves an election half-committed. Re-running it would resubmit
+// every ballot and the chaincode would reject the already-spent nullifiers as
+// double votes, so the run has to know what the CHAIN holds before it submits
+// anything: the committed set is ListNullifiers intersected with this run's
+// ballots, by index. receipts.csv is only a cross-check — it is written by us,
+// after the fact, and a crash is exactly when it is least trustworthy.
+
+// nullifierPageSize is how many committed nullifiers one ListNullifiers page
+// asks for, matching the chaincode's own per-page cap.
+const nullifierPageSize = 10000
+
+// nullifierLister reads an election's committed nullifiers, one page at a
+// time. *clientsdk.BulletinClient satisfies it; it is deliberately a
+// one-method interface rather than an addition to clientsdk.Ledger, which is
+// the transaction surface.
+type nullifierLister interface {
+	ListNullifiers(electionID string, pageSize int, bookmark string) (clientsdk.NullifierPage, error)
+}
+
+// loadBundle reads a run's cached on-chain bundle from path.
+func loadBundle(path string) (*onChainBundle, error) {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("read bundle: %w", err)
+	}
+	var b onChainBundle
+	if err := json.Unmarshal(raw, &b); err != nil {
+		return nil, fmt.Errorf("parse bundle: %w", err)
+	}
+	return &b, nil
+}
+
+// Resume re-drives an interrupted ballot window against the live network,
+// submitting only what the chain does not already hold. Same connection path
+// as Submit — the ledger for the transactions, the bulletin client for the
+// committed set.
+func (e *Executor) Resume(ctx context.Context, runID string, c ElectionConfig) error {
+	path, err := e.bundlePath(runID)
+	if err != nil {
+		return err
+	}
+	if !e.fabric.Enabled() {
+		return errNoFabric()
+	}
+	conn, err := e.fabric.Connect()
+	if err != nil {
+		e.publish(runID, "submit", "error", "connect to Fabric: "+err.Error())
+		return err
+	}
+	defer conn.Close()
+	return e.resumeBallots(ctx, runID, c, conn.Ledger(), conn.Bulletin, path)
+}
+
+// resumeBallots is the resumed ballot window: one more segment, over the
+// indices the chain does not hold.
+func (e *Executor) resumeBallots(ctx context.Context, runID string, c ElectionConfig,
+	led clientsdk.Ledger, nl nullifierLister, bundlePath string) error {
+	dir, err := e.store.Dir(runID)
+	if err != nil {
+		return err
+	}
+	b, err := loadBundle(bundlePath)
+	if err != nil {
+		return err
+	}
+	plan, err := planResume(dir, c)
+	if err != nil {
+		return err
+	}
+
+	j := e.journalFor(runID)
+	defer j.Close()
+
+	committed, err := committedByIndex(dir, b, nl)
+	if err != nil {
+		return err
+	}
+	crossCheckReceipts(dir, j, committed)
+
+	if !plan.stamped {
+		_ = j.Stamp("interrupted_at", map[string]any{"last_done": plan.lastDone})
+	}
+	pending := make([]int, 0, len(committed))
+	for i, ok := range committed {
+		if !ok {
+			pending = append(pending, i)
+		}
+	}
+	_ = j.Stamp("segment.start", map[string]any{"index": plan.Segment, "pending": len(pending)})
+	e.publish(runID, "submit", "info", fmt.Sprintf(
+		"resuming: %d of %d ballots are already on chain, %d to submit",
+		len(committed)-len(pending), len(committed), len(pending)))
+
+	reader, err := openBallotReader(dir)
+	if err != nil {
+		return err
+	}
+	defer reader.Close()
+	// Committed indices are never requested, so their lines must be dropped as
+	// the scan passes them rather than parked for a caller that never comes.
+	reader.wanted = func(i int) bool { return i >= 0 && i < len(committed) && !committed[i] }
+
+	w, err := e.openReceiptsFor(runID, dir)
+	if err != nil {
+		return err
+	}
+	defer e.closeReceipts(runID)
+
+	concurrency := c.submitConcurrency()
+	_ = j.Stamp("stage.ballots.start", map[string]any{
+		"n": len(pending), "concurrency": concurrency,
+		"send_rate": c.SendRate, "segment": plan.Segment,
+	})
+
+	var mu sync.Mutex
+	landed := make([]landedTx, 0, len(pending))
+	replays := make(map[int]bool)
+	var readErr error
+
+	res := bench.Run(ctx, len(pending), func(k int) error {
+		i := pending[k]
+		line, err := reader.At(i)
+		if err != nil {
+			mu.Lock()
+			if readErr == nil {
+				readErr = err
+			}
+			mu.Unlock()
+			return err
+		}
+		txID, block, err := led.Submit("SubmitBallot", line)
+		if err != nil {
+			// The chain says this nullifier is already spent: the ballot
+			// committed after the snapshot was taken. That is a replay, not a
+			// lost vote — and never a negative-test result.
+			if isDoubleVote(err) {
+				mu.Lock()
+				replays[k] = true
+				mu.Unlock()
+			}
+			return err
+		}
+		mu.Lock()
+		landed = append(landed, landedTx{index: i, txID: txID, block: block})
+		mu.Unlock()
+		return nil
+	}, bench.RunOpts{
+		Concurrency: concurrency,
+		SendRate:    c.SendRate,
+		OnProgress: func(done int) {
+			_ = j.Stamp("ballots.progress", map[string]any{"done": done, "segment": plan.Segment})
+		},
+	})
+
+	replayed := len(replays)
+	dropped := res.Dropped - replayed
+	if dropped < 0 {
+		dropped = 0
+	}
+	onChain := res.Committed + replayed
+
+	stampWindowEnd(j, map[string]any{
+		"submitted": res.Submitted, "committed": res.Committed, "replayed": replayed,
+		"dropped": dropped, "window_ms": res.Window.Milliseconds(),
+		"stopped": res.Stopped, "segment": plan.Segment,
+	}, res.Stopped)
+	seg := segmentOf(plan.Segment, res, onChain)
+	stampSegmentEnd(j, seg)
+
+	if readErr != nil {
+		return readErr
+	}
+	e.collectReceipts(runID, j, w, led, landed)
+	if err := appendLatenciesCSV(dir, res, plan.Segment,
+		func(k int) int { return pending[k] },
+		func(k int) bool { return replays[k] }); err != nil {
+		return err
+	}
+
+	in := FinaliseInput{
+		Voters: c.Voters, Positions: c.Positions,
+		Segments: append(plan.segments, seg), Dropped: dropped,
+		Interrupted: res.Stopped, EByContest: map[string]int64{},
+	}
+	in.ReconcileErr = bench.Reconcile(res.Submitted, onChain, len(pending))
+	in.ReconcileOK = in.ReconcileErr == nil
+	Finalise(j, in)
+
+	if err := rollUpSubmitMetrics(dir, len(committed)-len(pending), res, onChain, dropped); err != nil {
+		e.publish(runID, "submit", "info", "submit metrics not updated: "+err.Error())
+	}
+
+	if dropped > 0 {
+		return fmt.Errorf("%d of %d resubmitted ballots did not commit", dropped, res.Submitted)
+	}
+	e.publish(runID, "submit", "done", fmt.Sprintf(
+		"segment %d committed %d ballots (%d were already on chain)", plan.Segment, res.Committed, replayed))
+	return nil
+}
+
+// isDoubleVote reports whether err is the chaincode refusing a ballot whose
+// nullifier is already spent (contract.go's double-vote gate).
+func isDoubleVote(err error) bool {
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "double vote") || strings.Contains(msg, "already spent")
+}
+
+// committedByIndex is the committed set: every ballot in this run whose
+// nullifier the chain already holds, by ballot index.
+//
+// The bundle side is streamed (one ballot decoded at a time, never the whole
+// population) and the chain side is paged, so the only resident structure is
+// the nullifier -> index map the intersection needs.
+func committedByIndex(dir string, b *onChainBundle, nl nullifierLister) ([]bool, error) {
+	byNullifier, err := nullifierIndex(dir, b.BallotCount)
+	if err != nil {
+		return nil, err
+	}
+	committed := make([]bool, b.BallotCount)
+	bookmark := ""
+	for {
+		page, err := nl.ListNullifiers(b.ElectionID, nullifierPageSize, bookmark)
+		if err != nil {
+			return nil, fmt.Errorf("list committed nullifiers: %w", err)
+		}
+		for _, h := range page.Nullifiers {
+			key, ok := nullifierKey(h)
+			if !ok {
+				continue // not 32 bytes: it cannot be one of this run's ballots
+			}
+			if i, ok := byNullifier[key]; ok {
+				committed[i] = true
+			}
+		}
+		// A repeated bookmark would page forever; the empty one ends the walk.
+		if page.NextBookmark == "" || page.NextBookmark == bookmark {
+			return committed, nil
+		}
+		bookmark = page.NextBookmark
+	}
+}
+
+// nullifierIndex maps each ballot's nullifier to its index in ballots.ndjson,
+// decoding one ballot at a time. A ballot without a 32-byte nullifier is
+// fatal: it could never be matched against the chain, so the resume would
+// silently resubmit it.
+func nullifierIndex(dir string, count int) (map[[32]byte]int, error) {
+	byNullifier := make(map[[32]byte]int, count)
+	n := 0
+	err := scanBallotLines(dir, func(i int, line string) error {
+		raw, err := hex.DecodeString(line)
+		if err != nil {
+			return fmt.Errorf("ballot %d is not hex: %w", i, err)
+		}
+		var b pb.Ballot
+		if err := proto.Unmarshal(raw, &b); err != nil {
+			return fmt.Errorf("decode ballot %d: %w", i, err)
+		}
+		value := b.GetCredentialPresentation().GetNullifier().GetValue()
+		key, ok := nullifierKey(hex.EncodeToString(value))
+		if !ok {
+			return fmt.Errorf("ballot %d carries no 32-byte nullifier: it cannot be matched against the chain", i)
+		}
+		byNullifier[key] = i
+		n++
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	if n != count {
+		return nil, fmt.Errorf("bundle ballot_count is %d but %s holds %d ballots", count, BallotsFile, n)
+	}
+	return byNullifier, nil
+}
+
+// nullifierKey turns a hex nullifier into the fixed-size map key the
+// intersection uses. Anything that is not 32 bytes is not a nullifier.
+func nullifierKey(h string) ([32]byte, bool) {
+	var key [32]byte
+	raw, err := hex.DecodeString(h)
+	if err != nil || len(raw) != 32 {
+		return key, false
+	}
+	copy(key[:], raw)
+	return key, true
+}
+
+// crossCheckReceipts compares what we recorded against what the chain holds.
+// Every SubmitBallot receipt whose index is not in the committed set is a
+// finding (receipt_without_nullifier) — recorded, never fatal, because the
+// chain is the authority and the resume still has a set to work from. A
+// truncated receipts.csv is likewise a warning: a crash mid-Append is the
+// expected state here.
+func crossCheckReceipts(dir string, j *Journal, committed []bool) {
+	events, err := readReceipts(dir)
+	if errors.Is(err, ErrTruncatedReceipts) {
+		_ = j.Stamp("receipts_truncated", map[string]any{"rows": len(events)})
+	} else if err != nil {
+		_ = j.Stamp("receipts_unreadable", map[string]any{"error": err.Error()})
+		return
+	}
+	for _, ev := range events {
+		if ev.Event != "SubmitBallot" {
+			continue
+		}
+		i, err := strconv.Atoi(ev.Ref)
+		if err != nil {
+			continue
+		}
+		if i < 0 || i >= len(committed) || !committed[i] {
+			_ = j.Stamp("receipt_without_nullifier", map[string]any{"index": i})
+		}
+	}
+}
+
+// resumePlan is what the journal says about an interrupted ballot window.
+type resumePlan struct {
+	// Segment is the segment number the resume will write. Segment 0 is the
+	// original window; every resume increments.
+	Segment int `json:"segment"`
+	// Remaining is how many ballots the interrupted window had not dispatched,
+	// as its last checkpoint saw it. The exact figure needs the chain (see
+	// committedByIndex); this is the cheap number the API answers with.
+	Remaining int `json:"remaining"`
+
+	lastDone int
+	stamped  bool      // interrupted_at was already recorded
+	segments []Segment // every window this run has completed, from segment.end
+}
+
+// planResume decides whether a run may be resumed and, if so, with what. It
+// refuses unless the run is on-chain and its journal's last ballot-window
+// checkpoint left the window open (stage.ballots.start or ballots.progress
+// with no stage.ballots.end after it).
+func planResume(dir string, c ElectionConfig) (resumePlan, error) {
+	var p resumePlan
+	if c.Mode != "onchain" {
+		return p, fmt.Errorf("run mode is %q: only an on-chain run has a ballot window to resume", c.Mode)
+	}
+	events, err := readJournalEvents(dir)
+	if err != nil {
+		return p, fmt.Errorf("this run has no readable journal, so there is no checkpoint to resume from: %w", err)
+	}
+	open := false
+	n := 0
+	p.Segment = 1 // journals recorded before segment.start existed still resume into a new segment
+	for _, ev := range events {
+		switch jstring(ev, "event") {
+		case "stage.ballots.start":
+			open, n = true, jint(ev, "n")
+		case "ballots.progress":
+			open, p.lastDone = true, jint(ev, "done")
+		case "stage.ballots.interrupted":
+			open = true
+		case "stage.ballots.end":
+			open = false
+		case "segment.start":
+			p.Segment = jint(ev, "index") + 1
+		case "segment.end":
+			p.segments = append(p.segments, segmentFromEvent(ev))
+		case "interrupted_at":
+			p.stamped = true
+		}
+	}
+	if !open {
+		return resumePlan{}, errors.New("this run's ballot window is not interrupted: there is nothing to resume")
+	}
+	if p.Segment < 1 {
+		p.Segment = 1
+	}
+	if p.Remaining = n - p.lastDone; p.Remaining < 0 {
+		p.Remaining = 0
+	}
+	return p, nil
+}
+
+// readJournalEvents decodes journal.ndjson into one map per event. A torn last
+// line (a crash mid-write) is skipped rather than failing the read — surviving
+// exactly that is what the journal is for.
+func readJournalEvents(dir string) ([]map[string]any, error) {
+	f, err := os.Open(filepath.Join(dir, JournalFile))
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	sc := bufio.NewScanner(f)
+	sc.Buffer(make([]byte, 0, 64*1024), maxBallotLine)
+	var out []map[string]any
+	for sc.Scan() {
+		var m map[string]any
+		if json.Unmarshal(sc.Bytes(), &m) == nil {
+			out = append(out, m)
+		}
+	}
+	return out, sc.Err()
+}
+
+func jstring(m map[string]any, k string) string { s, _ := m[k].(string); return s }
+func jfloat(m map[string]any, k string) float64 { f, _ := m[k].(float64); return f }
+func jint(m map[string]any, k string) int       { return int(jfloat(m, k)) }
+
+// stampWindowEnd closes a ballot window in the journal. An interrupted window
+// is stamped stage.ballots.interrupted, NOT stage.ballots.end: the difference
+// is what tells a later resume the window is still open.
+func stampWindowEnd(j *Journal, fields map[string]any, interrupted bool) {
+	event := "stage.ballots.end"
+	if interrupted {
+		event = "stage.ballots.interrupted"
+	}
+	_ = j.Stamp(event, fields)
+}
+
+// segmentOf is one window's Segment record. committed is passed in because a
+// resumed segment counts replays (ballots the chain already had) as landed.
+func segmentOf(index int, res bench.RunResult, committed int) Segment {
+	stats := bench.Summary(res.Latencies)
+	return Segment{
+		Index: index, Committed: committed, WindowMs: res.Window.Milliseconds(),
+		TPS:              bench.ThroughputTPS(committed, res.Window),
+		P50Ms:            float64(stats.Median.Microseconds()) / 1000.0,
+		DriverCeilingTPS: res.DriverCeilingTPS(),
+	}
+}
+
+func stampSegmentEnd(j *Journal, s Segment) {
+	_ = j.Stamp("segment.end", map[string]any{
+		"index": s.Index, "committed": s.Committed, "window_ms": s.WindowMs,
+		"tps": s.TPS, "p50_ms": s.P50Ms, "driver_ceiling_tps": s.DriverCeilingTPS,
+	})
+}
+
+// rollUpSubmitMetrics updates the run-level counters in submit-metrics.json
+// after a resumed window, so the Verify phase judges the WHOLE run rather than
+// the interrupted first window (which, on its own, reads as "dropped 500").
+// The window and latency measurements stay as the first window recorded them:
+// they measure one window, and a resumed run is not a sustained measurement.
+func rollUpSubmitMetrics(dir string, alreadyCommitted int, res bench.RunResult, onChain, dropped int) error {
+	path := filepath.Join(dir, submitMetricsFile)
+	var sm submitMetrics
+	if err := readJSON(path, &sm); err != nil {
+		return err
+	}
+	sm.Submitted = alreadyCommitted + res.Submitted
+	sm.Committed = alreadyCommitted + onChain
+	sm.Dropped = dropped
+	sm.Stopped = res.Stopped
+	return writeJSON(path, sm)
+}
+
+// segmentsFromJournal reads back every window this run completed, in order.
+func segmentsFromJournal(dir string) []Segment {
+	events, err := readJournalEvents(dir)
+	if err != nil {
+		return nil
+	}
+	var segs []Segment
+	for _, ev := range events {
+		if jstring(ev, "event") == "segment.end" {
+			segs = append(segs, segmentFromEvent(ev))
+		}
+	}
+	return segs
+}
+
+// segmentFromEvent reads a segment.end event back into its Segment.
+func segmentFromEvent(m map[string]any) Segment {
+	return Segment{
+		Index: jint(m, "index"), Committed: jint(m, "committed"),
+		WindowMs: int64(jfloat(m, "window_ms")), TPS: jfloat(m, "tps"),
+		P50Ms: jfloat(m, "p50_ms"), DriverCeilingTPS: jfloat(m, "driver_ceiling_tps"),
+	}
 }

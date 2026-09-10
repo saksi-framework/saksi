@@ -98,11 +98,16 @@ func validateBallots(dir string) (int, error) {
 // of order, so lines scanned past a caller's index are parked in ahead — at
 // most one per in-flight worker, never the whole population.
 type ballotReader struct {
-	mu    sync.Mutex
-	f     *os.File
-	sc    *bufio.Scanner
-	next  int // index the scanner will produce on its next Scan
-	ahead map[int]string
+	mu   sync.Mutex
+	f    *os.File
+	sc   *bufio.Scanner
+	next int // index the scanner will produce on its next Scan
+	// wanted reports whether index i will ever be asked for. Lines it rejects
+	// are dropped instead of parked in ahead — a resume skips every already
+	// committed index, and parking those would hold the whole committed
+	// population in memory. nil = every line may be asked for.
+	wanted func(i int) bool
+	ahead  map[int]string
 }
 
 func openBallotReader(dir string) (*ballotReader, error) {
@@ -143,7 +148,9 @@ func (r *ballotReader) At(i int) (string, error) {
 		if idx == i {
 			return line, nil
 		}
-		r.ahead[idx] = line
+		if r.wanted == nil || r.wanted(idx) {
+			r.ahead[idx] = line
+		}
 	}
 }
 
