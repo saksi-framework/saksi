@@ -54,6 +54,19 @@ type fakeLedger struct {
 	// nullifier fail the way the chaincode's double-vote gate does.
 	RejectDuplicates bool
 
+	// Ballots is the chain's own copy of each accepted ballot, keyed by
+	// nullifier hex — what GetBallot serves the ledger dump. A test mutates an
+	// entry to model a chain holding something the console never wrote.
+	Ballots map[string]string
+	// The election's published artifacts, as GetElection / GetDKGTranscript /
+	// GetTally / GetPartialDecryption (keyed "<contest>|<trustee>") serve them.
+	Params, DKG, Tally string
+	Partials           map[string]string
+	// FailGetBallotAt is the 1-based GetBallot call that fails — the chain
+	// going away mid-dump. 0 = never.
+	FailGetBallotAt int
+	getBallots      []string // nullifiers GetBallot was asked for, in call order
+
 	ballots     int             // SubmitBallot attempts, accepted or not
 	accepted    []string        // accepted nullifiers, in accept order
 	acceptedSet map[string]bool // the same set, for the duplicate gate
@@ -190,6 +203,57 @@ func (f *fakeLedger) ListNullifiers(_ string, pageSize int, bookmark string) (cl
 		f.hidden = nil // the walk is complete; a hidden late commit is visible from here on
 	}
 	return page, nil
+}
+
+// accept records a nullifier as committed without going through SubmitBallot,
+// so a test can start from a chain that already holds a run.
+func (f *fakeLedger) accept(nullifierHex string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.acceptedSet == nil {
+		f.acceptedSet = map[string]bool{}
+	}
+	f.acceptedSet[nullifierHex] = true
+	f.accepted = append(f.accepted, nullifierHex)
+}
+
+// GetBallot serves the chain's copy of one ballot, one call at a time — the
+// only way the ledger dump can read the population.
+func (f *fakeLedger) GetBallot(_, nullifier string) (string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.getBallots = append(f.getBallots, nullifier)
+	if f.FailGetBallotAt > 0 && len(f.getBallots) >= f.FailGetBallotAt {
+		return "", errors.New("peer unavailable")
+	}
+	hexBallot, ok := f.Ballots[nullifier]
+	if !ok {
+		return "", fmt.Errorf("no ballot for nullifier %s", nullifier)
+	}
+	return hexBallot, nil
+}
+
+func (f *fakeLedger) GetElection(string) (string, error)      { return f.Params, nil }
+func (f *fakeLedger) GetDKGTranscript(string) (string, error) { return f.DKG, nil }
+func (f *fakeLedger) GetTally(string) (string, error)         { return f.Tally, nil }
+func (f *fakeLedger) GetPartialDecryption(_, contestID, trusteeID string) (string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	pd, ok := f.Partials[contestID+"|"+trusteeID]
+	if !ok {
+		return "", fmt.Errorf("no partial decryption for %s/%s", contestID, trusteeID)
+	}
+	return pd, nil
+}
+
+func (f *fakeLedger) getBallotCalls() int { return len(f.getBallotOrder()) }
+
+func (f *fakeLedger) getBallotOrder() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]string, len(f.getBallots))
+	copy(out, f.getBallots)
+	return out
 }
 
 // commit assigns the next txID and its block, honouring blockSize. Callers hold

@@ -258,6 +258,14 @@ type FinaliseInput struct {
 	EByContest   map[string]int64
 	StageErr     error
 	Interrupted  bool
+	// LedgerAudit is the on-chain cross-audit's fate: "" when there was no
+	// chain to audit, "ok" when the chain's own record was dumped and audited,
+	// "not run" when that could not be completed.
+	LedgerAudit string
+	// LedgerMatchesLocal is whether the chain's record and the console's agree.
+	// Set only when LedgerAudit is "ok"; a mismatch is a finding, NOT a
+	// failed run — it is a result the instrument exists to report.
+	LedgerMatchesLocal *bool
 }
 
 // FinaliseResult is the run.end verdict.
@@ -334,14 +342,23 @@ func Finalise(j *Journal, f FinaliseInput) FinaliseResult {
 		if res.SustainedTPS != nil {
 			sustainedTPS = *res.SustainedTPS
 		}
-		_ = j.Stamp("run.end", map[string]any{
+		end := map[string]any{
 			"failed":        res.Failed,
 			"reason":        res.Reason,
 			"sustained_tps": sustainedTPS,
 			"arrival_tps":   res.ArrivalTPS,
 			"scaling_limit": res.ScalingLimit,
 			"sustained":     res.Sustained,
-		})
+		}
+		// Absent, not false: an offline run has no chain to disagree with, and
+		// a reader must be able to tell that from a chain that disagreed.
+		if f.LedgerAudit != "" {
+			end["ledger_audit"] = f.LedgerAudit
+		}
+		if f.LedgerMatchesLocal != nil {
+			end["ledger_matches_local"] = *f.LedgerMatchesLocal
+		}
+		_ = j.Stamp("run.end", end)
 	}
 	return res
 }

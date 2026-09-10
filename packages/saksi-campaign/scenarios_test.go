@@ -96,7 +96,7 @@ func TestScenariosRejectTheirMutations(t *testing.T) {
 		t.Fatalf("correctness.csv has no data rows:\n%s", ccs)
 	}
 	cols := strings.Split(ccLines[1], ",")
-	if len(cols) != 11 || len(cols[6]) != 64 {
+	if len(cols) != 13 || len(cols[6]) != 64 {
 		t.Fatalf("correctness row missing 64-hex recovered_point: %q", ccLines[1])
 	}
 

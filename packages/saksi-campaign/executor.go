@@ -250,7 +250,26 @@ func groundTruthOnly(c ElectionConfig) bool { return c.Mode == ModeGroundTruth }
 // real audit rejection (overall=fail — the tool WORKED, returned as a result,
 // not a Go error), and a crash / unparseable output (a Go error). Only the last
 // returns err.
+//
+// An on-chain run additionally audits the chain's OWN record of itself (see
+// ledger_dump.go). A chain that cannot be reached costs the cross-check, never
+// the audit: the local audit is what this phase owes the caller.
 func (e *Executor) Verify(ctx context.Context, runID string, c ElectionConfig) (StreamAudit, error) {
+	if c.Mode != "onchain" || !e.fabric.Enabled() {
+		return e.verify(ctx, runID, c, nil)
+	}
+	conn, err := e.fabric.Connect()
+	if err != nil {
+		e.publish(runID, "verify", "info", "ledger audit skipped: "+err.Error())
+		return e.verify(ctx, runID, c, nil)
+	}
+	defer conn.Close()
+	return e.verify(ctx, runID, c, conn.Bulletin)
+}
+
+// verify is Verify's body with the chain injected, so the ledger audit is
+// testable without a network.
+func (e *Executor) verify(ctx context.Context, runID string, c ElectionConfig, lr ledgerReader) (StreamAudit, error) {
 	dir, err := e.store.Dir(runID)
 	if err != nil {
 		return StreamAudit{}, err
@@ -258,6 +277,11 @@ func (e *Executor) Verify(ctx context.Context, runID string, c ElectionConfig) (
 	j := e.journalFor(runID)
 	defer j.Close()
 	_ = j.Stamp("stage.verify.start", nil)
+
+	// The chain's own record is dumped and audited FIRST: it is the evidence
+	// the console did not write, and a reader who only gets one of the two
+	// should get that one.
+	lc := e.auditLedger(ctx, runID, dir, lr)
 
 	e.publish(runID, "verify", "info", "auditing run…")
 	out, runErr := e.run(ctx, e.demoBin, "audit-stream", dir, "--json")
@@ -269,7 +293,7 @@ func (e *Executor) Verify(ctx context.Context, runID string, c ElectionConfig) (
 		e.publish(runID, "verify", "error", "audit-stream produced no valid result")
 		crashErr := fmt.Errorf("audit-stream crashed: %v (output: %s)", runErr, truncate(out, 200))
 		_ = j.Stamp("stage.verify.end", stageEnd(crashErr))
-		e.finalise(j, dir, runID, c, sa, crashErr)
+		e.finalise(j, dir, runID, c, sa, crashErr, lc)
 		return StreamAudit{}, crashErr
 	}
 	// timings.json is the auditor's own in-process stage timing, kept as a
@@ -277,10 +301,12 @@ func (e *Executor) Verify(ctx context.Context, runID string, c ElectionConfig) (
 	// reader can check.
 	_ = writeJSON(filepath.Join(dir, TimingsFile), sa.TimingsMs)
 
+	e.recordLedgerVerdict(runID, dir, sa, lc)
+
 	dkgHash, tallyHash, ballotsHash := runDigests(dir)
-	if err := writeCorrectnessCSV(filepath.Join(dir, CorrectnessFile), sa, dkgHash, tallyHash, ballotsHash); err != nil {
+	if err := writeCorrectnessCSV(filepath.Join(dir, CorrectnessFile), sa, dkgHash, tallyHash, ballotsHash, lc); err != nil {
 		_ = j.Stamp("stage.verify.end", stageEnd(err))
-		e.finalise(j, dir, runID, c, sa, err)
+		e.finalise(j, dir, runID, c, sa, err, lc)
 		return sa, err
 	}
 	if sa.Overall == "pass" {
@@ -289,15 +315,69 @@ func (e *Executor) Verify(ctx context.Context, runID string, c ElectionConfig) (
 		e.publish(runID, "verify", "error", "audit FAIL (see correctness.csv)")
 	}
 	_ = j.Stamp("stage.verify.end", map[string]any{"ok": true, "overall": sa.Overall})
-	e.finalise(j, dir, runID, c, sa, nil)
+	e.finalise(j, dir, runID, c, sa, nil, lc)
 	return sa, nil
+}
+
+// auditLedger dumps the chain's own record of the run into <dir>/ledger/ and
+// audits that directory with the same auditor the console's own directory
+// gets. nil lr (no chain) yields a nil result and no ledger dump at all.
+//
+// A dump or audit that fails is stamped "not run" and nothing else: the chain
+// going away mid-dump is an instrumentation loss, not a verdict on the run, and
+// Verify continues with the local audit.
+func (e *Executor) auditLedger(ctx context.Context, runID, dir string, lr ledgerReader) *ledgerCheck {
+	if lr == nil {
+		return nil
+	}
+	e.publish(runID, "verify", "info", "dumping the chain's own record of this election…")
+	n, err := dumpLedger(dir, runID, lr)
+	if err != nil {
+		e.publish(runID, "verify", "error", "ledger audit not run: "+err.Error())
+		return &ledgerCheck{status: "not run"}
+	}
+	out, runErr := e.run(ctx, e.demoBin, "audit-stream", filepath.Join(dir, LedgerDir), "--json")
+	var sa StreamAudit
+	if jsonErr := json.Unmarshal(out, &sa); jsonErr != nil {
+		e.publish(runID, "verify", "error", fmt.Sprintf(
+			"ledger audit not run: audit-stream produced no valid result for the ledger dump: %v (output: %s)",
+			runErr, truncate(out, 200)))
+		return &ledgerCheck{status: "not run"}
+	}
+	e.publish(runID, "verify", "info", fmt.Sprintf(
+		"audited %d ballots read back from the chain: %s", n, sa.Overall))
+	return &ledgerCheck{status: "ok", audit: sa}
+}
+
+// recordLedgerVerdict fills in the ledger check's verdict: whether the chain holds
+// the same ballots and recovered the same aggregate ciphertexts as the console.
+// A disagreement is a FINDING — reported red, written to correctness.csv and
+// run.end — never an error, because "the chain says something else" is exactly
+// the result this instrument exists to be able to report.
+func (e *Executor) recordLedgerVerdict(runID, dir string, sa StreamAudit, lc *ledgerCheck) {
+	if lc == nil || lc.status != "ok" {
+		return
+	}
+	same, err := compareLedger(dir, sa, lc.audit)
+	if err != nil {
+		e.publish(runID, "verify", "error", "ledger audit not run: "+err.Error())
+		lc.status, lc.matches = "not run", ""
+		return
+	}
+	lc.matches = strconv.FormatBool(same)
+	if same {
+		e.publish(runID, "verify", "info", "ledger audit: the chain's record matches this console's")
+	} else {
+		e.publish(runID, "verify", "error",
+			"ledger audit MISMATCH: the chain's ballots or tally differ from this console's (see correctness.csv)")
+	}
 }
 
 // finalise closes the run out: the run.end verdict, then the perf.csv row it
 // carries. Instrumentation failures are reported, never fatal — the audit
 // result the caller asked for has already been decided.
-func (e *Executor) finalise(j *Journal, dir, runID string, c ElectionConfig, sa StreamAudit, stageErr error) {
-	fin := Finalise(j, finaliseInput(dir, c, sa, stageErr))
+func (e *Executor) finalise(j *Journal, dir, runID string, c ElectionConfig, sa StreamAudit, stageErr error, lc *ledgerCheck) {
+	fin := Finalise(j, finaliseInput(dir, c, sa, stageErr, lc))
 	if err := writePerfRow(dir, runID, c, fin); err != nil {
 		e.publish(runID, "verify", "info", "perf.csv not written: "+err.Error())
 	}
@@ -306,7 +386,7 @@ func (e *Executor) finalise(j *Journal, dir, runID string, c ElectionConfig, sa 
 // finaliseInput assembles the run-failed predicate's inputs. Without a
 // submission window (offline runs) there is nothing to reconcile and no
 // segment, so only the audit's per-contest E decides the verdict.
-func finaliseInput(dir string, c ElectionConfig, sa StreamAudit, stageErr error) FinaliseInput {
+func finaliseInput(dir string, c ElectionConfig, sa StreamAudit, stageErr error, lc *ledgerCheck) FinaliseInput {
 	in := FinaliseInput{
 		Voters: c.Voters, Positions: c.Positions,
 		ReconcileOK: true, StageErr: stageErr,
@@ -314,6 +394,13 @@ func finaliseInput(dir string, c ElectionConfig, sa StreamAudit, stageErr error)
 	}
 	for _, ct := range sa.Contests {
 		in.EByContest[ct.Contest] = ct.E
+	}
+	if lc != nil {
+		in.LedgerAudit = lc.status
+		if lc.matches != "" {
+			m := lc.matches == "true"
+			in.LedgerMatchesLocal = &m
+		}
 	}
 	var sm submitMetrics
 	if readJSON(filepath.Join(dir, submitMetricsFile), &sm) != nil {
@@ -808,7 +895,12 @@ func (e *Executor) ledgerBytes() (int64, bool) {
 // the cryptographic evidence needed to re-verify it — the recovered plaintext
 // point, the aggregate (encrypted) tally it came from, and the run's artifact
 // hashes (DKG, tally, ballot-set). Each row is self-contained proof.
-func writeCorrectnessCSV(path string, sa StreamAudit, dkgHash, tallyHash, ballotsHash string) error {
+//
+// An on-chain run whose ledger audit ran contributes a SECOND block of rows,
+// source=ledger, holding the same audit run over the record read back from the
+// chain, and every row carries the ledger_matches_local verdict. Without a
+// ledger audit the file is source=local rows with that column empty.
+func writeCorrectnessCSV(path string, sa StreamAudit, dkgHash, tallyHash, ballotsHash string, lc *ledgerCheck) error {
 	f, err := os.Create(path)
 	if err != nil {
 		return fmt.Errorf("create %s: %w", path, err)
@@ -819,24 +911,46 @@ func writeCorrectnessCSV(path string, sa StreamAudit, dkgHash, tallyHash, ballot
 		"contest", "ground_truth", "decoded", "E", "pass",
 		"published_tally", "recovered_point", "aggregate_ciphertext",
 		"dkg_sha256", "tally_sha256", "ballots_sha256",
+		"source", "ledger_matches_local",
 	}); err != nil {
 		return err
 	}
-	for _, c := range sa.Contests {
-		row := []string{
-			c.Contest,
-			strconv.FormatUint(c.GroundTruth, 10),
-			strconv.FormatUint(c.Decoded, 10),
-			strconv.FormatInt(c.E, 10),
-			strconv.FormatBool(c.Pass),
-			strconv.FormatUint(c.PublishedTally, 10),
-			c.RecoveredPoint,
-			c.AggregateCiphertext,
-			dkgHash,
-			tallyHash,
-			ballotsHash,
+	matches := ""
+	if lc != nil {
+		matches = lc.matches
+	}
+	// Each block of rows carries the provenance hashes of the directory IT was
+	// audited from, so a source=ledger row is checkable against the ledger
+	// dump rather than pointing at the console's artifacts.
+	writeRows := func(source, dkgHash, tallyHash, ballotsHash string, contests []ContestCorrectness) error {
+		for _, c := range contests {
+			row := []string{
+				c.Contest,
+				strconv.FormatUint(c.GroundTruth, 10),
+				strconv.FormatUint(c.Decoded, 10),
+				strconv.FormatInt(c.E, 10),
+				strconv.FormatBool(c.Pass),
+				strconv.FormatUint(c.PublishedTally, 10),
+				c.RecoveredPoint,
+				c.AggregateCiphertext,
+				dkgHash,
+				tallyHash,
+				ballotsHash,
+				source,
+				matches,
+			}
+			if err := w.Write(row); err != nil {
+				return err
+			}
 		}
-		if err := w.Write(row); err != nil {
+		return nil
+	}
+	if err := writeRows("local", dkgHash, tallyHash, ballotsHash, sa.Contests); err != nil {
+		return err
+	}
+	if lc != nil && lc.status == "ok" {
+		lDkg, lTally, lBallots := runDigests(filepath.Join(filepath.Dir(path), LedgerDir))
+		if err := writeRows("ledger", lDkg, lTally, lBallots, lc.audit.Contests); err != nil {
 			return err
 		}
 	}

@@ -41,6 +41,11 @@ type trailResponse struct {
 	// on a sealed response); nil (never an empty map) if decoding failed —
 	// the failure is instead surfaced as Live.Partial/PartialReason.
 	Results map[string]map[string]uint64 `json:"results,omitempty"`
+	// LedgerMatchesLocal is the Verify phase's ledger cross-check: false means
+	// the record read back from the chain is not the one this console
+	// published, which the page shows as a red finding. Absent when the run
+	// never ran a ledger audit.
+	LedgerMatchesLocal *bool `json:"ledger_matches_local,omitempty"`
 }
 
 // liveProof is a fresh, on-chain-only re-read taken at render time (never
@@ -148,8 +153,30 @@ func buildTrail(reader chainReader, led clientsdk.Ledger, runDir, electionID str
 			Partial:       partial,
 			PartialReason: partialReason,
 		},
-		Results: results,
+		Results:            results,
+		LedgerMatchesLocal: ledgerVerdict(runDir),
 	}, nil
+}
+
+// ledgerVerdict reads back the ledger cross-check the Verify phase stamped into
+// run.end, or nil if this run never ran one. The journal is the record of what
+// the run concluded; nothing here re-derives it.
+func ledgerVerdict(runDir string) *bool {
+	events, err := readJournalEvents(runDir)
+	if err != nil {
+		return nil
+	}
+	var v *bool
+	for _, ev := range events {
+		if jstring(ev, "event") != "run.end" {
+			continue
+		}
+		if b, ok := ev["ledger_matches_local"].(bool); ok {
+			match := b
+			v = &match
+		}
+	}
+	return v
 }
 
 // decodeTally decodes a hex-encoded saksi.protocol.v1.TallyResult against its

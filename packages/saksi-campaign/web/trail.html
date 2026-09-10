@@ -121,6 +121,7 @@
       <div class="kv"><span class="k">Chain height</span><span id="chainHeight" class="tnum"></span></div>
       <div class="kv"><span class="k">Tip hash</span><span id="tipHash" class="mono hash" title="click to copy full hash"></span></div>
       <div class="warn" id="partialWarn" style="display:none"></div>
+      <div class="warn" id="ledgerWarn" style="display:none">Ledger audit MISMATCH: the record read back from the chain is not the one this console published (see correctness.csv).</div>
     </section>
 
     <section class="panel">
@@ -307,6 +308,8 @@ function render(data) {
   } else {
     $("partialWarn").style.display = "none";
   }
+
+  $("ledgerWarn").style.display = data.ledger_matches_local === false ? "block" : "none";
 
   renderTimeline(data.events);
   renderResults(data.results);
