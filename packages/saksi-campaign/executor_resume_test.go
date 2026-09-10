@@ -519,3 +519,92 @@ func TestBallotReaderDropsUnwantedLines(t *testing.T) {
 		t.Fatalf("reader parked %d unwanted lines, want 0", len(r.ahead))
 	}
 }
+
+// TestResumeAfterAHardKillIsNotSustained is the hard-kill case: the console
+// died INSIDE the ballot window, so the journal carries stage.ballots.start and
+// ballots.progress and no segment.end at all. The interrupted window therefore
+// leaves no segment on record, and without care the resume finalises as the
+// run's only segment — one segment, not interrupted, so "sustained", with the
+// remainder's TPS published as the whole run's.
+//
+// A resumed run is sustained:false and has no whole-run TPS, whatever the
+// journal survived.
+func TestResumeAfterAHardKillIsNotSustained(t *testing.T) {
+	dir := t.TempDir()
+	runDir := filepath.Join(dir, "run-1")
+	e := newTestExecutor(t, dir)
+	path := writeRealBallotStream(t, runDir, 40)
+	c := ElectionConfig{Mode: "onchain", Voters: 40, Positions: 1, Candidates: 2, Concurrency: 4}
+
+	// The journal a kill -9 mid-window leaves behind: the window opened, 20
+	// ballots were checkpointed, nothing closed it.
+	writeJournalLines(t, runDir,
+		`{"event":"stage.ballots.start","n":40,"concurrency":4,"segment":0}`,
+		`{"event":"ballots.progress","done":20,"segment":0}`,
+	)
+	// The chain holds those 20.
+	led := &fakeLedger{Ballots: map[string]string{}}
+	for i := 0; i < 20; i++ {
+		led.accept(testNullifierHex(i))
+	}
+
+	// The killed window is on the segment list even though it stamped no
+	// segment.end: it ran, it just measured nothing.
+	plan, err := planResume(runDir, c)
+	if err != nil {
+		t.Fatalf("planResume: %v", err)
+	}
+	if len(plan.segments) != 1 || plan.segments[0].Index != 0 || plan.segments[0].WindowMs != 0 ||
+		plan.segments[0].TPS != 0 {
+		t.Fatalf("segments = %+v, want one placeholder segment 0 with no window and no TPS", plan.segments)
+	}
+
+	if err := e.resumeBallots(context.Background(), "run-1", c, led, led, path); err != nil {
+		t.Fatalf("resume: %v", err)
+	}
+
+	end := readRunEnd(t, runDir)
+	if end["sustained"] != false {
+		t.Fatalf("run.end sustained = %v, want false: the resume is one of two windows", end["sustained"])
+	}
+	if end["sustained_tps"] != nil {
+		t.Fatalf("run.end sustained_tps = %v, want no figure: it would be the remainder's, not the run's",
+			end["sustained_tps"])
+	}
+	if end["scaling_limit"] != "inconclusive" {
+		t.Fatalf("run.end scaling_limit = %v, want \"inconclusive\"", end["scaling_limit"])
+	}
+	if end["resumed"] != true {
+		t.Fatalf("run.end resumed = %v, want true: that is why there is no whole-run figure", end["resumed"])
+	}
+	// Two windows are on record: the killed one and the resume's.
+	if segs, resumed := segmentsFromJournal(runDir); !resumed {
+		t.Fatalf("segmentsFromJournal did not see the resume (segments %+v)", segs)
+	}
+
+	// And Verify, which writes the run's LAST run.end, must not undo it.
+	e.run = func(_ context.Context, _ string, _ ...string) ([]byte, error) {
+		return []byte(auditJSON), nil
+	}
+	if _, err := e.Verify(context.Background(), "run-1", c); err != nil {
+		t.Fatalf("Verify: %v", err)
+	}
+	end = readRunEnd(t, runDir)
+	if end["sustained"] != false || end["sustained_tps"] != nil ||
+		end["scaling_limit"] != "inconclusive" || end["resumed"] != true {
+		t.Fatalf("Verify overwrote the resumed verdict: %v", end)
+	}
+	if cells := perfCells(t, runDir); cells["sustained_tps"] != "" {
+		t.Fatalf("perf.csv sustained_tps = %q, want empty", cells["sustained_tps"])
+	}
+}
+
+// writeJournalLines seeds a run's journal.ndjson with hand-written events, for
+// the crash shapes a live run cannot be made to produce.
+func writeJournalLines(t *testing.T, runDir string, lines ...string) {
+	t.Helper()
+	if err := os.WriteFile(filepath.Join(runDir, JournalFile),
+		[]byte(strings.Join(lines, "\n")+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}

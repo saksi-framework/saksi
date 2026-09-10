@@ -405,6 +405,12 @@ func finaliseInput(dir string, c ElectionConfig, sa StreamAudit, stageErr error,
 			in.LedgerMatchesLocal = &m
 		}
 	}
+	// The journal is the only record that a resume happened, and Verify writes
+	// the run's LAST run.end — so this is read before anything that can return
+	// early, or a resumed run's non-sustained verdict gets overwritten by a
+	// fresh one that no longer knows.
+	segs, resumed := segmentsFromJournal(dir)
+	in.Resumed = resumed
 	var sm submitMetrics
 	if readJSON(filepath.Join(dir, submitMetricsFile), &sm) != nil {
 		return in
@@ -434,7 +440,7 @@ func finaliseInput(dir string, c ElectionConfig, sa StreamAudit, stageErr error,
 	// place that records them all — submit-metrics.json carries run-level
 	// totals, not the per-window split. One window in, one window out, so this
 	// changes nothing for a run that was never resumed.
-	if segs := segmentsFromJournal(dir); len(segs) > 0 {
+	if len(segs) > 0 {
 		in.Segments = segs
 	}
 	return in
@@ -1190,7 +1196,7 @@ func (e *Executor) resumeBallots(ctx context.Context, runID string, c ElectionCo
 	in := FinaliseInput{
 		Voters: c.Voters, Positions: c.Positions,
 		Segments: append(plan.segments, seg), Dropped: dropped,
-		Interrupted: res.Stopped, EByContest: map[string]int64{},
+		Interrupted: res.Stopped, Resumed: true, EByContest: map[string]int64{},
 	}
 	in.ReconcileErr = bench.Reconcile(res.Submitted, onChain, len(pending))
 	in.ReconcileOK = in.ReconcileErr == nil
@@ -1420,6 +1426,16 @@ func planResume(dir string, c ElectionConfig) (resumePlan, error) {
 	if p.Remaining = n - p.lastDone; p.Remaining < 0 {
 		p.Remaining = 0
 	}
+	// A hard kill (the console died inside the window) stamps no segment.end,
+	// so the interrupted window leaves no segment on record and the resume
+	// would finalise as the run's ONLY segment — a single-segment,
+	// uninterrupted-looking run whose "whole-run" TPS is really the
+	// remainder's. The window happened; only its measurements were lost. So it
+	// is listed as a segment with a zero window and no TPS: honest about
+	// having run, honest about having measured nothing.
+	if len(p.segments) == 0 {
+		p.segments = []Segment{{Index: 0}}
+	}
 	return p, nil
 }
 
@@ -1496,19 +1512,29 @@ func rollUpSubmitMetrics(dir string, alreadyCommitted int, res bench.RunResult, 
 	return writeJSON(path, sm)
 }
 
-// segmentsFromJournal reads back every window this run completed, in order.
-func segmentsFromJournal(dir string) []Segment {
+// segmentsFromJournal reads back every window this run completed, in order,
+// and whether a resume opened one of them. Both come from the same single pass
+// because the answer to the second is an event in the same log.
+func segmentsFromJournal(dir string) ([]Segment, bool) {
 	events, err := readJournalEvents(dir)
 	if err != nil {
-		return nil
+		return nil, false
 	}
 	var segs []Segment
+	resumed := false
 	for _, ev := range events {
-		if jstring(ev, "event") == "segment.end" {
+		switch jstring(ev, "event") {
+		case "segment.end":
 			segs = append(segs, segmentFromEvent(ev))
+		case "segment.start":
+			// Segment 0 is the original window; only a resume opens a later
+			// one, and it stamps this before it submits anything.
+			if jint(ev, "index") >= 1 {
+				resumed = true
+			}
 		}
 	}
-	return segs
+	return segs, resumed
 }
 
 // segmentFromEvent reads a segment.end event back into its Segment.

@@ -269,6 +269,17 @@ type FinaliseInput struct {
 	// Without this, every sweep step would be recorded as a failed run and the
 	// campaign's failure rate would measure the sweep rather than the network.
 	Bounded bool
+	// Resumed reports that this finalisation closes a RESUMED window: the run
+	// was interrupted once, and what is being finalised is the remainder.
+	//
+	// A resumed run can look single-segment from the journal alone — a hard
+	// kill leaves no segment.end for the window it killed, so the only segment
+	// on record is the resume's own. Its window and TPS describe the remainder,
+	// never the population, so publishing them as a whole-run sustained figure
+	// would report the tail of a run as the run. Sustained therefore requires
+	// !Resumed, which is what drops SustainedTPS and leaves the scaling verdict
+	// inconclusive.
+	Resumed bool
 	// LedgerAudit is the on-chain cross-audit's fate: "" when there was no
 	// chain to audit, "ok" when the chain's own record was dumped and audited,
 	// "not run" when that could not be completed.
@@ -333,7 +344,7 @@ func Finalise(j *Journal, f FinaliseInput) FinaliseResult {
 		Failed:     failed,
 		Reason:     reason,
 		ArrivalTPS: float64(f.Voters) / 36000,
-		Sustained:  len(f.Segments) == 1 && !f.Interrupted,
+		Sustained:  len(f.Segments) == 1 && !f.Interrupted && !f.Resumed,
 	}
 
 	res.ScalingLimit = "inconclusive"
@@ -370,6 +381,12 @@ func Finalise(j *Journal, f FinaliseInput) FinaliseResult {
 		// not carry a field claiming it was considered and ruled out.
 		if f.Bounded {
 			end["bounded"] = true
+		}
+		// Same rule, and the reason sustained is false and there is no
+		// whole-run TPS: a reader must be able to tell a resumed run from one
+		// that simply did not sustain.
+		if f.Resumed {
+			end["resumed"] = true
 		}
 		// Absent, not false: an offline run has no chain to disagree with, and
 		// a reader must be able to tell that from a chain that disagreed.
