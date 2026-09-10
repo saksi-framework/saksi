@@ -283,45 +283,52 @@ func (l *ledger) VerifyChain(from, to uint64, sample []Receipt) (ChainReport, er
 // it's testable without a live qscc. Any fetch error aborts immediately with
 // Status "not run" — it must never report PASS without having walked the
 // whole range.
+//
+// The walk holds two blocks' worth of state, not the range: the recomputed
+// header hash of the block just passed, and the block currently in hand. A
+// capstone range is millions of blocks, and every one of them was only ever
+// needed to check its successor's previous_hash and its own sampled receipts —
+// both of which are decided the moment the block is fetched.
 func verifyChain(from, to uint64, sample []Receipt, getBlock func(uint64) (*common.Block, error)) (ChainReport, error) {
 	report := ChainReport{Status: "not run"}
 	if to < from {
 		return report, fmt.Errorf("verify chain: to (%d) < from (%d)", to, from)
 	}
 
-	blocks := make(map[uint64]*common.Block, to-from+1)
+	// Sampled receipts by the block they claim, so each is checked as the walk
+	// reaches that block rather than by looking a passed block up again.
+	sampled := make(map[uint64][]Receipt, len(sample))
+	for _, r := range sample {
+		if r.BlockNumber >= from && r.BlockNumber <= to {
+			sampled[r.BlockNumber] = append(sampled[r.BlockNumber], r)
+		}
+	}
+
+	report.Linked = true
+	var prevHash []byte // recomputed header hash of block n-1
 	for n := from; n <= to; n++ {
 		block, err := getBlock(n)
 		if err != nil {
-			return report, fmt.Errorf("verify chain: fetch block %d: %w", n, err)
+			return ChainReport{Status: "not run"}, fmt.Errorf("verify chain: fetch block %d: %w", n, err)
 		}
-		blocks[n] = block
-	}
-
-	report.Blocks = len(blocks)
-	report.Linked = true
-	for n := from + 1; n <= to; n++ {
-		prevHeader := blocks[n-1].GetHeader()
-		wantPrevHash := blockHeaderHash(prevHeader.GetNumber(), prevHeader.GetPreviousHash(), prevHeader.GetDataHash())
-		gotPrevHash := blocks[n].GetHeader().GetPreviousHash()
-		if !bytes.Equal(gotPrevHash, wantPrevHash) {
+		h := block.GetHeader()
+		hash := blockHeaderHash(h.GetNumber(), h.GetPreviousHash(), h.GetDataHash())
+		// A break is recorded once and the walk continues: the range still has
+		// to be fetched to be reported as walked, and the sampled receipts
+		// past the break are still worth checking.
+		if n > from && !bytes.Equal(h.GetPreviousHash(), prevHash) && report.FirstBreak == nil {
 			report.Linked = false
 			broken := n
 			report.FirstBreak = &broken
-			break
 		}
-	}
-
-	for _, r := range sample {
-		if r.BlockNumber < from || r.BlockNumber > to {
-			continue
+		for _, r := range sampled[n] {
+			report.ReceiptsChecked++
+			if !bytes.Equal(r.BlockHash, hash) {
+				report.ReceiptMismatches++
+			}
 		}
-		report.ReceiptsChecked++
-		h := blocks[r.BlockNumber].GetHeader()
-		want := blockHeaderHash(h.GetNumber(), h.GetPreviousHash(), h.GetDataHash())
-		if !bytes.Equal(r.BlockHash, want) {
-			report.ReceiptMismatches++
-		}
+		report.Blocks++
+		prevHash = hash
 	}
 
 	if report.Linked && report.ReceiptMismatches == 0 {

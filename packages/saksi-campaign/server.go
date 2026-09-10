@@ -40,11 +40,20 @@ var exportOrder = []string{
 	BallotsFile,
 	JournalFile,
 	TimingsFile,
+	GenTimingsFile,
+	submitMetricsFile,
 	RunFile,
 	"receipts.csv",
 	CheckFile,
 	trailNDJSONFile, // new runs (Task 2+)
 	trailJSONFile,   // legacy runs recorded before trail.ndjson
+	// The chain's own copy of the run, so a reader can re-audit the LEDGER
+	// dump rather than only the console's record of it. A subdirectory is
+	// addressable because handleExport cuts the run id off the FIRST slash
+	// and matches the whole remainder against this allowlist — nothing here
+	// widens what may be served.
+	LedgerDir + "/" + headerFile,
+	LedgerDir + "/" + BallotsFile,
 }
 
 var exportAllowlist = func() map[string]bool {
