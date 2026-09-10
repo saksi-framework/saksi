@@ -365,11 +365,7 @@ pub(crate) fn write_election_stream_chunked(
     // -- trustee ceremony over the running aggregate ------------------------
 
     let partial_decryptions = build_partial_decryptions(&pro, &aggregate_pads);
-    let tally = build_tally(
-        &pro.parameters.election_id,
-        counts.clone(),
-        partial_decryptions.clone(),
-    );
+    let tally = build_tally(&pro, counts.clone(), partial_decryptions.clone());
 
     let header = StreamHeader {
         election_id: pro.parameters.election_id.clone(),

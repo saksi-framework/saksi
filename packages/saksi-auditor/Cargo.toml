@@ -33,3 +33,4 @@ demo = ["dep:rand_core", "dep:serde_json", "dep:hex", "dep:prost", "dep:rayon"]
 
 [dev-dependencies]
 rand_core.workspace = true
+hex = "0.4"

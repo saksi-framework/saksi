@@ -95,11 +95,37 @@ message PartialDecryption {
   string contest_id = 5;
 }
 
+// A trustee's signature over a published TallyResult: proof that the trustee
+// holding DKG share s_i endorses exactly these totals for this election.
+//
+// `signature` is the 64-byte canonical Schnorr proof (compressed commitment ‖
+// scalar) of knowledge of s_i such that `trustee_public_share = s_i·G`, taken
+// over the context
+//   b"saksi.tally.sig.v1" || election_id || totals[0..n] as little-endian u64s
+// The context carries NO length prefixes, so distinct (election_id, totals)
+// pairs could collide if the election id were attacker-chosen: its safety rests
+// on the id being fixed by the deployment at election creation. A v2 domain
+// should length-prefix the id instead of relying on that.
+//
+// The verification key is derived from the DKG transcript alone:
+//   vk_i = Σ_j Σ_k C_{j,k} · i^k
+// over every dealer's `coefficient_commitments`, where `i` is the trustee's
+// **1-based position in ElectionParameters.trustee_ids**, never a number parsed
+// out of `trustee_id` (ids are opaque labels). The DKG evaluates dealer
+// polynomials at exactly those positions, 1..n.
+message TrusteeSignature {
+  string trustee_id = 1;
+  bytes signature = 2;
+}
+
 message TallyResult {
   uint32 version = 1;
   string election_id = 2;
   repeated uint64 totals = 3;
   repeated PartialDecryption partial_decryptions = 4;
+  // One entry per trustee, in trustee order. Empty on a tally published before
+  // trustee signatures existed; the auditor treats that as a failure.
+  repeated TrusteeSignature signatures = 5;
 }
 
 message ElectionParameters {

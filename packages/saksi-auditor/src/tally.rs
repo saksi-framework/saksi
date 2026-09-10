@@ -6,12 +6,13 @@
 //! integer in `[0, total_ballots]`, and compares against
 //! `tally.totals[contest]`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
 use curve25519_dalek::{ristretto::RistrettoPoint, scalar::Scalar, traits::Identity};
 
 use saksi_crypto::group::basepoint;
+use saksi_crypto::nizk::schnorr::{SchnorrProof, SCHNORR_PROOF_LENGTH};
 use saksi_protocol::{ElectionParameters, TallyResult, WIRE_VERSION};
 
 use crate::{
@@ -36,6 +37,118 @@ pub(crate) struct ContestEvidence {
     pub(crate) recovered_point: Option<RistrettoPoint>,
     /// The integer recovered from `recovered_point` (`None` if it did not decode).
     pub(crate) decoded: Option<u64>,
+}
+
+/// Domain separator for a trustee's signature over a published tally (v1).
+const TALLY_SIG_DOMAIN: &[u8] = b"saksi.tally.sig.v1";
+
+/// The exact bytes a trustee signs when endorsing a published tally:
+/// `b"saksi.tally.sig.v1" || election_id || totals[0..n]`, each total as 8
+/// little-endian bytes in contest order.
+///
+/// **There are no length prefixes.** The only variable-length part is the
+/// election id, so distinct `(election_id, totals)` pairs can collide: an id
+/// ending in eight attacker-chosen bytes absorbs a total, or vice versa. The
+/// encoding is therefore only unambiguous because the election id is fixed by
+/// the deployment (it is set at election creation and checked against
+/// `ElectionParameters` before this context is ever built), never chosen by a
+/// party who benefits from the collision. A v2 of this domain should
+/// length-prefix the id rather than rely on that assumption. The Go chaincode
+/// mirrors these bytes exactly (golden vector `test-vectors/tally-sig-v1.hex`),
+/// so the layout cannot change without a new domain separator.
+pub(crate) fn tally_sig_context(election_id: &str, totals: &[u64]) -> Vec<u8> {
+    let mut context =
+        Vec::with_capacity(TALLY_SIG_DOMAIN.len() + election_id.len() + totals.len() * 8);
+    context.extend_from_slice(TALLY_SIG_DOMAIN);
+    context.extend_from_slice(election_id.as_bytes());
+    for total in totals {
+        context.extend_from_slice(&total.to_le_bytes());
+    }
+    context
+}
+
+/// Verifies `tally.signatures`: every published trustee signature must be a
+/// canonical Schnorr proof of knowledge of that trustee's DKG share, taken over
+/// [`tally_sig_context`] of the *published* totals, under the verification key
+/// derived from the DKG transcript alone (`trustee_verification_keys`, indexed
+/// by position in `parameters.trustee_ids`).
+///
+/// Strict: an empty `signatures` list fails with detail `missing` — a tally
+/// nobody endorsed is not an audited tally, and there is no legacy exemption.
+/// Any unknown or duplicated `trustee_id`, any signature that does not verify,
+/// or fewer than `threshold` valid signatures fails the check.
+pub(crate) fn verify_tally_signatures(
+    parameters: &ElectionParameters,
+    tally: &TallyResult,
+    trustee_verification_keys: &[RistrettoPoint],
+    builder: &mut ReportBuilder,
+) {
+    if tally.signatures.is_empty() {
+        builder.fail("tally.signatures", "missing");
+        return;
+    }
+
+    // The election id comes from the parameters, not from the tally: the id is
+    // the deployment's, and a tally that disagrees is caught by `tally.shape`.
+    let context = tally_sig_context(&parameters.election_id, &tally.totals);
+    let g = basepoint();
+    let mut seen: HashSet<&str> = HashSet::new();
+    let mut problems: Vec<String> = Vec::new();
+    let mut valid = 0usize;
+
+    for signature in &tally.signatures {
+        let id = signature.trustee_id.as_str();
+        let Some(index) = parameters.trustee_ids.iter().position(|t| t == id) else {
+            problems.push(format!("unknown trustee_id {id:?}"));
+            continue;
+        };
+        if !seen.insert(id) {
+            problems.push(format!("duplicate trustee_id {id:?}"));
+            continue;
+        }
+        let Ok(bytes) = <[u8; SCHNORR_PROOF_LENGTH]>::try_from(signature.signature.as_slice())
+        else {
+            problems.push(format!(
+                "trustee {id}: signature is {} bytes, expected {SCHNORR_PROOF_LENGTH}",
+                signature.signature.len()
+            ));
+            continue;
+        };
+        let Ok(proof) = SchnorrProof::from_bytes(&bytes) else {
+            problems.push(format!(
+                "trustee {id}: signature is not a canonical Schnorr proof"
+            ));
+            continue;
+        };
+        if proof
+            .verify(&g, &trustee_verification_keys[index], &context)
+            .is_ok()
+        {
+            valid += 1;
+        } else {
+            problems.push(format!(
+                "trustee {id}: signature does not verify over the published totals"
+            ));
+        }
+    }
+
+    let threshold = parameters.threshold as usize;
+    if valid < threshold {
+        problems.push(format!(
+            "only {valid} valid signature(s), below the threshold of {threshold}"
+        ));
+    }
+
+    if problems.is_empty() {
+        builder.pass(
+            "tally.signatures",
+            format!(
+                "{valid} trustee signature(s) endorse the published totals (threshold {threshold})"
+            ),
+        );
+    } else {
+        builder.fail("tally.signatures", problems.join("; "));
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
