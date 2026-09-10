@@ -300,6 +300,24 @@
       </div>
     </div>
 
+    <details style="margin-top:13px">
+      <summary class="small muted" style="cursor:pointer">Advanced — on-chain submission load</summary>
+      <div class="grid2" style="margin-top:9px">
+        <div><label for="concurrency">Ballots in flight</label>
+          <input id="concurrency" type="number" min="1" value="8" class="tnum" />
+          <div class="small muted" style="margin-top:4px">
+            How many ballot submissions are open at once. 1 measures this console's own
+            round-trip, not the network's throughput.
+          </div></div>
+        <div><label for="sendRate">Send rate (ballots/s)</label>
+          <input id="sendRate" type="number" min="0" step="any" value="0" class="tnum" />
+          <div class="small muted" style="margin-top:4px">
+            Caps dispatch to a fixed arrival rate (open loop). 0 sends as fast as the
+            workers drain.
+          </div></div>
+      </div>
+    </details>
+
     <div class="err" id="configErr"></div>
     <div class="actions"><div class="right"><button class="primary" id="btnStart">Generate ballots →</button></div></div>
   </section>
@@ -582,6 +600,8 @@ const config = () => ({
   voters: +$("voters").value,
   distribution: $("distribution").value,
   senate_seats: +$("senateSeats").value,
+  concurrency: +$("concurrency").value,
+  send_rate: +$("sendRate").value,
   skip_attacks: $("skipAttacks").checked,
   mode: $("mode").value,
 });

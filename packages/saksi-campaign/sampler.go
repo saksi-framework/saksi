@@ -70,6 +70,22 @@ func StartSampler(ctx context.Context, j *Journal, containers []string, interval
 	}
 }
 
+// samplerContainers lists the running Fabric containers worth sampling. The
+// same peer/orderer name convention CollectEnv's probeContainers uses.
+func samplerContainers() []string {
+	out, ok := runProbe("docker", "ps", "--format", "{{.Names}}")
+	if !ok {
+		return nil
+	}
+	var names []string
+	for _, n := range strings.Fields(out) {
+		if strings.HasPrefix(n, "peer") || strings.HasPrefix(n, "orderer") {
+			names = append(names, n)
+		}
+	}
+	return names
+}
+
 func sampleOnce(ctx context.Context, j *Journal, containers []string, agg *sampleAgg) {
 	sctx, cancel := context.WithTimeout(ctx, envProbeTimeout)
 	defer cancel()

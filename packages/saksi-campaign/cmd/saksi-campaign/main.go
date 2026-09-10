@@ -47,6 +47,7 @@ func main() {
 	fabricKey := fs.String("fabric-key", "", "path to the client identity private key")
 	fabricChannel := fs.String("fabric-channel", "saksi", "Fabric channel the bulletin board runs on")
 	fabricChaincode := fs.String("fabric-chaincode", "saksi-bulletin", "deployed chaincode name")
+	fabricPeerVolume := fs.String("fabric-peer-volume", "", "host path of the peer's ledger volume (enables perf.csv's ledger_bytes_delta)")
 	var allow multiFlag
 	fs.Var(&allow, "allow-host", "additional accepted Host header (repeatable; for LAN)")
 	_ = fs.Parse(os.Args[2:])
@@ -60,6 +61,7 @@ func main() {
 		Key:          *fabricKey,
 		Channel:      *fabricChannel,
 		Chaincode:    *fabricChaincode,
+		PeerVolume:   *fabricPeerVolume,
 	}
 
 	if err := os.MkdirAll(*runsDir, 0o755); err != nil {

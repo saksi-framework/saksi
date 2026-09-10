@@ -121,10 +121,27 @@ func (e *Executor) readBundle(runID string) (*onChainBundle, error) {
 	return &b, nil
 }
 
-// generateBundle shells the demo binary to write the run's bundle exactly once.
-// Regenerating would draw fresh randomness, changing every share and making
-// CreateElection a duplicate, so an existing bundle is reused as-is.
-func (e *Executor) generateBundle(ctx context.Context, runID string, c ElectionConfig) (string, error) {
+// generateBundle writes the run's bundle.json from the stream Generate already
+// produced, exactly once.
+//
+// The small artifacts (parameters, DKG transcript, partial decryptions, tally)
+// are copied out of header.json and the population is REFERENCED by file. It
+// deliberately does NOT re-run the generator: `saksi-demo gen` draws from
+// OsRng, so a second generation would produce a bundle whose ballots are not
+// the ones in ballots.ndjson — the election would be created from one
+// population and filled from another.
+// The stage boundary is stamped here rather than at the call sites so both
+// entry points (Submit and CeremonyStart) record it identically.
+func (e *Executor) generateBundle(runID string) (string, error) {
+	j := e.journalFor(runID)
+	defer j.Close()
+	_ = j.Stamp("stage.bundle.start", nil)
+	path, err := e.bundleFrom(runID)
+	_ = j.Stamp("stage.bundle.end", stageEnd(err))
+	return path, err
+}
+
+func (e *Executor) bundleFrom(runID string) (string, error) {
 	path, err := e.bundlePath(runID)
 	if err != nil {
 		return "", err
@@ -133,22 +150,25 @@ func (e *Executor) generateBundle(ctx context.Context, runID string, c ElectionC
 		e.publish(runID, "ceremony", "info", "reusing this run's generated bundle")
 		return path, nil
 	}
-	args := []string{
-		"gen",
-		"--voters", strconv.Itoa(c.Voters),
-		"--positions", strconv.Itoa(c.Positions),
-		"--candidates", strconv.Itoa(c.Candidates),
-		"--trustees", strconv.Itoa(len(c.Trustees)),
-		"--threshold", strconv.Itoa(c.Threshold),
-		"--election-id", runID,
-		"--election-name", c.Name,
-		"--trustee-names", strings.Join(c.TrusteeNames(), ","),
-		"--distribution", c.Distribution,
-		path,
+	dir, err := e.store.Dir(runID)
+	if err != nil {
+		return "", err
 	}
-	e.publish(runID, "ceremony", "info", "generating the election bundle…")
-	if _, err := e.run(ctx, e.demoBin, args...); err != nil {
-		e.publish(runID, "ceremony", "error", "bundle generation failed: "+err.Error())
+	var h electionHeader
+	if err := readJSON(filepath.Join(dir, "header.json"), &h); err != nil {
+		return "", fmt.Errorf("this run has no generated election to submit — run Generate first: %w", err)
+	}
+	e.publish(runID, "ceremony", "info", "preparing the election bundle…")
+	b := onChainBundle{
+		ElectionID:         h.ElectionID,
+		Params:             h.Params,
+		DKG:                h.Dkg,
+		BallotsFile:        BallotsFile,
+		BallotCount:        h.N,
+		PartialDecryptions: h.PartialDecryptions,
+		Tally:              h.Tally,
+	}
+	if err := writeJSON(path, b); err != nil {
 		return "", err
 	}
 	return path, nil
@@ -176,10 +196,14 @@ func localCeremonyOK(c ElectionConfig) bool {
 }
 
 func (e *Executor) CeremonyStart(ctx context.Context, runID string, c ElectionConfig) error {
-	path, err := e.generateBundle(ctx, runID, c)
+	j := e.journalFor(runID)
+	defer j.Close()
+	path, err := e.generateBundle(runID)
 	if err != nil {
 		return err
 	}
+	_ = j.Stamp("stage.ceremony.start", nil)
+	defer func() { _ = j.Stamp("stage.ceremony.end", nil) }()
 	if !e.fabric.Enabled() {
 		if !localCeremonyOK(c) {
 			e.publish(runID, "ceremony", "error", errNoFabric().Error())
@@ -201,7 +225,7 @@ func (e *Executor) CeremonyStart(ctx context.Context, runID string, c ElectionCo
 		return err
 	}
 	defer e.closeReceipts(runID)
-	if err := e.setupOnChain(ctx, b, step); err != nil {
+	if err := e.setupOnChain(ctx, runID, c, b, conn.Ledger(), step); err != nil {
 		return err
 	}
 	e.publish(runID, "ceremony", "done", "election closed — trustees may now contribute")
@@ -226,6 +250,10 @@ func (e *Executor) CeremonySubmit(ctx context.Context, runID string, c ElectionC
 	}
 
 	name := trusteeDisplayName(c, trusteeID)
+	j := e.journalFor(runID)
+	defer j.Close()
+	_ = j.Stamp("stage.ceremony.trustee.start", map[string]any{"trustee": trusteeID, "partials": len(mine)})
+	defer func() { _ = j.Stamp("stage.ceremony.trustee.end", map[string]any{"trustee": trusteeID}) }()
 	if !e.fabric.Enabled() {
 		if !localCeremonyOK(c) {
 			return errNoFabric()
@@ -277,6 +305,10 @@ func (e *Executor) CeremonyPublish(ctx context.Context, runID string, c Election
 	if err != nil {
 		return err
 	}
+	j := e.journalFor(runID)
+	defer j.Close()
+	_ = j.Stamp("stage.ceremony.publish.start", map[string]any{"submitted": state.Submitted, "threshold": state.Threshold})
+	defer func() { _ = j.Stamp("stage.ceremony.publish.end", nil) }()
 	if !e.fabric.Enabled() {
 		if !localCeremonyOK(c) {
 			return errNoFabric()

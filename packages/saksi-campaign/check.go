@@ -71,6 +71,10 @@ func (e *Executor) RunCheck(runID string, c ElectionConfig) (CheckReport, error)
 	if err != nil {
 		return CheckReport{}, err
 	}
+	j := e.journalFor(runID)
+	defer j.Close()
+	_ = j.Stamp("stage.check.start", nil)
+
 	rep := CheckReport{
 		Voters: c.Voters, Positions: c.Positions, Candidates: c.Candidates,
 		Distribution: c.Distribution, ElectionID: runID,
@@ -135,6 +139,7 @@ func (e *Executor) RunCheck(runID string, c ElectionConfig) (CheckReport, error)
 		}
 	}
 	_ = writeJSON(filepath.Join(dir, CheckFile), rep)
+	_ = j.Stamp("stage.check.end", map[string]any{"ok": rep.Pass, "rows": rep.Rows})
 	return rep, nil
 }
 

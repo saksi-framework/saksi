@@ -15,10 +15,23 @@ import (
 	clientsdk "github.com/saksi-framework/saksi/packages/saksi-bulletin/client-sdk"
 )
 
+// fakeLedger is the in-memory stand-in for a Fabric ledger. The ballot window
+// submits concurrently, so every field is guarded by mu.
 type fakeLedger struct {
+	mu      sync.Mutex
 	calls   []string // fn name, in call order
 	failOn  string   // fn name to fail on ("" = never)
+	nextTx  uint64
 	nextBlk uint64
+	// blockSize batches transactions into blocks the way a real orderer does:
+	// blockSize submissions share one block number. 0 = one block per
+	// transaction (the original behaviour).
+	blockSize int
+	inBlock   int
+	// qscc counts the system-chaincode round trips (block/receipt reads) the
+	// console made — the cost the receipts-after-the-window design exists to
+	// bound.
+	qscc int
 	// blocks is the minimal in-memory chain fakeLedger hands out: block n
 	// holds the txIDs Submit/SubmitWithReceipt reported as landing there.
 	// A trivially "linked" chain (previous_hash = the block number as bytes)
@@ -27,26 +40,68 @@ type fakeLedger struct {
 	blocks map[uint64][]string
 }
 
-func (f *fakeLedger) SubmitWithReceipt(fn string, args ...string) ([]byte, clientsdk.Receipt, error) {
+// commit assigns the next txID and its block, honouring blockSize. Callers hold
+// no lock; commit takes it.
+func (f *fakeLedger) commit(fn string) (string, uint64, bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.calls = append(f.calls, fn)
 	if fn == f.failOn {
+		return "", 0, false
+	}
+	f.nextTx++
+	if f.blockSize <= 1 || f.inBlock >= f.blockSize || f.nextBlk == 0 {
+		f.nextBlk++
+		f.inBlock = 0
+	}
+	f.inBlock++
+	txID := fmt.Sprintf("tx-%d", f.nextTx)
+	f.recordBlock(f.nextBlk, txID)
+	return txID, f.nextBlk, true
+}
+
+// distinctBlocks is how many blocks the run actually landed in.
+func (f *fakeLedger) distinctBlocks() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.blocks)
+}
+
+// qsccCalls is how many block/receipt reads the console made.
+func (f *fakeLedger) qsccCalls() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.qscc
+}
+
+func (f *fakeLedger) callNames() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]string, len(f.calls))
+	copy(out, f.calls)
+	return out
+}
+
+func (f *fakeLedger) SubmitWithReceipt(fn string, args ...string) ([]byte, clientsdk.Receipt, error) {
+	txID, blk, ok := f.commit(fn)
+	if !ok {
 		return nil, clientsdk.Receipt{}, errors.New("boom")
 	}
-	f.nextBlk++
-	txID := fmt.Sprintf("tx-%d", f.nextBlk)
-	f.recordBlock(f.nextBlk, txID)
-	return nil, clientsdk.Receipt{TxID: txID, BlockNumber: f.nextBlk}, nil
+	// The real SubmitWithReceipt follows the commit with a qscc lookup.
+	f.mu.Lock()
+	f.qscc++
+	f.mu.Unlock()
+	return nil, clientsdk.Receipt{TxID: txID, BlockNumber: blk}, nil
 }
 func (f *fakeLedger) Submit(fn string, args ...string) (string, uint64, error) {
-	f.calls = append(f.calls, fn)
-	if fn == f.failOn {
+	txID, blk, ok := f.commit(fn)
+	if !ok {
 		return "", 0, errors.New("boom")
 	}
-	f.nextBlk++
-	txID := fmt.Sprintf("tx-%d", f.nextBlk)
-	f.recordBlock(f.nextBlk, txID)
-	return txID, f.nextBlk, nil
+	return txID, blk, nil
 }
+
+// recordBlock appends txID to block n. Callers hold f.mu.
 func (f *fakeLedger) recordBlock(n uint64, txID string) {
 	if f.blocks == nil {
 		f.blocks = map[uint64][]string{}
@@ -54,12 +109,21 @@ func (f *fakeLedger) recordBlock(n uint64, txID string) {
 	f.blocks[n] = append(f.blocks[n], txID)
 }
 func (f *fakeLedger) LedgerReceipt(string) (clientsdk.Receipt, error) {
+	f.mu.Lock()
+	f.qscc++
+	f.mu.Unlock()
 	return clientsdk.Receipt{}, nil
 }
 func (f *fakeLedger) GetBlockByNumber(n uint64) (*common.Block, error) {
+	f.mu.Lock()
+	f.qscc++
+	f.mu.Unlock()
 	return &common.Block{Header: &common.BlockHeader{Number: n}}, nil
 }
 func (f *fakeLedger) ReceiptsForBlock(n uint64, txIDs []string) ([]clientsdk.Receipt, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.qscc++ // one block fetch, however many txIDs it covers
 	present := make(map[string]bool, len(f.blocks[n]))
 	for _, id := range f.blocks[n] {
 		present[id] = true
@@ -75,37 +139,54 @@ func (f *fakeLedger) ReceiptsForBlock(n uint64, txIDs []string) ([]clientsdk.Rec
 func (f *fakeLedger) VerifyChain(from, to uint64, sample []clientsdk.Receipt) (clientsdk.ChainReport, error) {
 	return clientsdk.ChainReport{Blocks: int(to - from + 1), Linked: true, Status: "PASS"}, nil
 }
-func (f *fakeLedger) ChainInfo() (uint64, []byte, error) { return f.nextBlk + 1, nil, nil }
+func (f *fakeLedger) ChainInfo() (uint64, []byte, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.nextBlk + 1, nil, nil
+}
 
-// writeTestBundle writes a minimal bundle: 2 ballots, 2 partial decryptions.
-// The hex payloads are opaque to the orchestrator — any string works against
-// the fake ledger.
-func writeTestBundle(t *testing.T, dir string) string {
+// writeTestBundle writes a minimal run: 2 ballots in ballots.ndjson and a
+// bundle with 2 partial decryptions referencing them. The hex payloads are
+// opaque to the orchestrator — any hex works against the fake ledger.
+func writeTestBundle(t *testing.T, runDir string) string {
 	t.Helper()
-	path := filepath.Join(dir, "bundle.json")
-	data := `{"election_id":"run-1","params":"aa","dkg":"bb","ballots":["b0","b1"],"partial_decryptions":["p0","p1"],"tally":"tt"}`
+	writeBallotLinesFile(t, runDir, 2)
+	path := filepath.Join(runDir, "bundle.json")
+	data := `{"election_id":"run-1","params":"aa","dkg":"bb","ballots_file":"ballots.ndjson","ballot_count":2,"partial_decryptions":["p0","p1"],"tally":"tt"}`
 	if err := os.WriteFile(path, []byte(data), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	return path
 }
 
-// writeTestBundleWithBallots writes a bundle with n ballots and no partial
+// writeBallotLinesFile writes n hex ballot lines into runDir.
+func writeBallotLinesFile(t *testing.T, runDir string, n int) {
+	t.Helper()
+	var b strings.Builder
+	for i := 0; i < n; i++ {
+		fmt.Fprintf(&b, "%08x\n", i)
+	}
+	if err := os.WriteFile(filepath.Join(runDir, BallotsFile), []byte(b.String()), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// writeTestBundleWithBallots writes a run with n ballots and no partial
 // decryptions, so submitOnChain's setup prefix (CreateElection,
 // PublishDKGTranscript, N x SubmitBallot, CloseElection) is the only part of
 // the lifecycle that records anything before a caller-chosen failure point.
-func writeTestBundleWithBallots(t *testing.T, dir string, n int) string {
+func writeTestBundleWithBallots(t *testing.T, runDir string, n int) string {
 	t.Helper()
-	ballots := make([]string, n)
-	for i := range ballots {
-		ballots[i] = fmt.Sprintf("b%d", i)
+	writeBallotLinesFile(t, runDir, n)
+	b := onChainBundle{
+		ElectionID: "run-1", Params: "aa", DKG: "bb", Tally: "tt",
+		BallotsFile: BallotsFile, BallotCount: n,
 	}
-	b := onChainBundle{ElectionID: "run-1", Params: "aa", DKG: "bb", Ballots: ballots, Tally: "tt"}
 	data, err := json.Marshal(b)
 	if err != nil {
 		t.Fatal(err)
 	}
-	path := filepath.Join(dir, "bundle.json")
+	path := filepath.Join(runDir, "bundle.json")
 	if err := os.WriteFile(path, data, 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -128,7 +209,7 @@ func TestSubmitOnChainOrder(t *testing.T) {
 	dir := t.TempDir()
 	led := &fakeLedger{}
 	e := newTestExecutor(t, dir)
-	err := e.submitOnChain(context.Background(), "run-1", ElectionConfig{}, led, writeTestBundle(t, dir))
+	err := e.submitOnChain(context.Background(), "run-1", ElectionConfig{}, led, writeTestBundle(t, filepath.Join(dir, "run-1")))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -147,7 +228,7 @@ func TestSubmitOnChainFailsLoudMidLifecycle(t *testing.T) {
 	dir := t.TempDir()
 	led := &fakeLedger{failOn: "CloseElection"}
 	e := newTestExecutor(t, dir)
-	err := e.submitOnChain(context.Background(), "run-1", ElectionConfig{}, led, writeTestBundle(t, dir))
+	err := e.submitOnChain(context.Background(), "run-1", ElectionConfig{}, led, writeTestBundle(t, filepath.Join(dir, "run-1")))
 	if err == nil {
 		t.Fatal("want error when CloseElection fails")
 	}
@@ -176,7 +257,7 @@ func TestSubmitOnChainRoutesLifecycleEventsToNDJSONOnly(t *testing.T) {
 	const nBallots = 3
 	led := &fakeLedger{failOn: "PublishTally"}
 	e := newTestExecutor(t, dir)
-	path := writeTestBundleWithBallots(t, dir, nBallots)
+	path := writeTestBundleWithBallots(t, filepath.Join(dir, "run-1"), nBallots)
 
 	err := e.submitOnChain(context.Background(), "run-1", ElectionConfig{}, led, path)
 	if err == nil {

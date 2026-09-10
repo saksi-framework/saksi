@@ -16,6 +16,7 @@ func good() ElectionConfig {
 		Name: "midterm", Trustees: mk(3), Threshold: 2,
 		Positions: 1, Candidates: 2, Voters: 10,
 		Distribution: "uniform", Mode: "offline",
+		Concurrency: DefaultConcurrency,
 	}
 }
 

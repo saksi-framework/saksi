@@ -114,7 +114,7 @@ func TestVerifyWritesCorrectnessCSV(t *testing.T) {
 			{"contest":"president/cand1","ground_truth":3,"decoded":3,"E":0,"pass":true}]}`), nil
 	}
 
-	sa, err := e.Verify(context.Background(), runID)
+	sa, err := e.Verify(context.Background(), runID, good())
 	if err != nil {
 		t.Fatalf("Verify: %v", err)
 	}
@@ -143,7 +143,7 @@ func TestVerifyReportsAuditFailWithoutErroring(t *testing.T) {
 		return []byte(`{"overall":"fail","contests":[{"contest":"c","ground_truth":3,"decoded":4,"E":1,"pass":false}]}`),
 			fmt.Errorf("exit status 1")
 	}
-	sa, err := e.Verify(context.Background(), runID)
+	sa, err := e.Verify(context.Background(), runID, good())
 	if err != nil {
 		t.Fatalf("a valid audit-fail must not be a Go error: %v", err)
 	}
@@ -158,7 +158,7 @@ func TestVerifyErrorsOnUnparseableOutput(t *testing.T) {
 	e.run = func(_ context.Context, _ string, _ ...string) ([]byte, error) {
 		return []byte("panic: segfault"), fmt.Errorf("exit status 139")
 	}
-	if _, err := e.Verify(context.Background(), runID); err == nil {
+	if _, err := e.Verify(context.Background(), runID, good()); err == nil {
 		t.Fatal("an unparseable audit-stream output must be a Go error")
 	}
 }

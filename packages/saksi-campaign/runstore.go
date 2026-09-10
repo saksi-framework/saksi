@@ -52,6 +52,9 @@ func (s *RunStore) Root() string { return s.root }
 // name + timestamp + a monotonic counter, creates the run folder, and writes
 // run.json. Returns the run id and its directory.
 func (s *RunStore) Create(c ElectionConfig, ts time.Time) (string, string, error) {
+	// Defaults first, so run.json records the values the run actually used
+	// rather than the zeros the caller left unset.
+	c.applyDefaults()
 	if err := c.Validate(); err != nil {
 		return "", "", err
 	}

@@ -89,7 +89,14 @@ func newJournal(f journalFile, opened time.Time) *Journal {
 // Stamp appends {"event":event,"ts":...,"mono_ms":<since open>,...fields} and
 // fsyncs if event is a checkpoint. A prior Sync error is returned on every
 // later call, without writing.
+//
+// A nil Journal accepts and discards every Stamp: a run folder whose journal
+// could not be opened still runs, it just goes unrecorded. Instrumentation
+// must never be the thing that fails a phase.
 func (j *Journal) Stamp(event string, fields map[string]any) error {
+	if j == nil {
+		return nil
+	}
 	line := make(map[string]any, len(fields)+3)
 	for k, v := range fields {
 		line[k] = v
@@ -124,8 +131,11 @@ func (j *Journal) writeLine(line map[string]any, checkpoint bool) error {
 	return nil
 }
 
-// Close closes the underlying journal file.
+// Close closes the underlying journal file. Nil-safe, like Stamp.
 func (j *Journal) Close() error {
+	if j == nil {
+		return nil
+	}
 	j.mu.Lock()
 	defer j.mu.Unlock()
 	return j.f.Close()

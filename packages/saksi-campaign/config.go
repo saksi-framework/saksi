@@ -50,10 +50,40 @@ type ElectionConfig struct {
 	// READ, not how it is produced, which is why this never reaches
 	// saksi-demo. Zero means "single-winner", the previous behaviour.
 	SenateSeats int `json:"senate_seats"`
+	// Concurrency is how many ballot submissions are in flight at once during
+	// the on-chain ballot window. Serial submission measures the driver's own
+	// round-trip ceiling rather than Fabric throughput, so this is never 1 by
+	// default. Zero means DefaultConcurrency (configs recorded before this
+	// field existed read as zero).
+	Concurrency int `json:"concurrency"`
+	// SendRate caps dispatch to that many submissions per second (open-loop
+	// load). Zero dispatches as fast as the workers drain (closed-loop).
+	SendRate float64 `json:"send_rate"`
 	// SkipAttacks hides the in-lifecycle attack panels for a clean end-to-end
 	// run. The attacks are opt-in either way; this removes the offer entirely
 	// so a straight demonstration is one click.
 	SkipAttacks bool `json:"skip_attacks"`
+}
+
+// DefaultConcurrency is the in-flight ballot submission count when the config
+// does not say otherwise.
+const DefaultConcurrency = 8
+
+// applyDefaults fills the fields the UI may omit. Called on every decoded
+// config before Validate, so validation never has to special-case "unset".
+func (c *ElectionConfig) applyDefaults() {
+	if c.Concurrency == 0 {
+		c.Concurrency = DefaultConcurrency
+	}
+}
+
+// submitConcurrency is the worker count the on-chain ballot window runs with,
+// defaulting for run records written before Concurrency existed.
+func (c ElectionConfig) submitConcurrency() int {
+	if c.Concurrency < 1 {
+		return DefaultConcurrency
+	}
+	return c.Concurrency
 }
 
 // SenatePosition is the ballot index of the multi-seat race (President 0,
@@ -107,6 +137,12 @@ func (c ElectionConfig) Validate() error {
 	// elected and the race decides nothing.
 	if c.SenateSeats < 0 || c.SenateSeats >= c.Candidates {
 		return fmt.Errorf("senate seats must be 0..%d (got %d)", c.Candidates-1, c.SenateSeats)
+	}
+	if c.Concurrency < 1 {
+		return fmt.Errorf("concurrency must be >= 1 (got %d)", c.Concurrency)
+	}
+	if c.SendRate < 0 {
+		return fmt.Errorf("send rate must be >= 0 (got %v)", c.SendRate)
 	}
 	switch c.Mode {
 	case "offline", "onchain", ModeGroundTruth:

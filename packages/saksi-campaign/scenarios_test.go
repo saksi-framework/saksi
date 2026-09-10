@@ -75,7 +75,7 @@ func TestScenariosRejectTheirMutations(t *testing.T) {
 	}
 
 	// Sanity: the clean run audits pass.
-	if sa, err := e.Verify(ctx, runID); err != nil || sa.Overall != "pass" {
+	if sa, err := e.Verify(ctx, runID, c); err != nil || sa.Overall != "pass" {
 		t.Fatalf("clean run must verify pass: %v %+v", err, sa)
 	}
 	// correctness.csv is the proof: carries the recovered point, aggregate

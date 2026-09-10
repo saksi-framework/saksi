@@ -9,11 +9,14 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	clientsdk "github.com/saksi-framework/saksi/packages/saksi-bulletin/client-sdk"
+	"github.com/saksi-framework/saksi/packages/saksi-bulletin/client-sdk/bench"
 )
 
 // CorrectnessFile is the per-contest cross-check CSV written by Verify.
@@ -35,6 +38,10 @@ type ContestCorrectness struct {
 type StreamAudit struct {
 	Overall  string               `json:"overall"` // pass | fail
 	Contests []ContestCorrectness `json:"contests"`
+	// TimingsMs is the auditor's own per-stage in-process timing, copied
+	// verbatim into timings.json. Absent from pre-v2 audit documents, which
+	// decode as zeros.
+	TimingsMs TimingsMs `json:"timings_ms"`
 }
 
 // Runner shells an external command and returns its stdout. Injected so tests
@@ -95,8 +102,26 @@ func (e *Executor) Generate(ctx context.Context, runID string, c ElectionConfig)
 	if err != nil {
 		return err
 	}
+	// The journal is created here, at the run's first stage, and reopened for
+	// appending by every later stage (journalFor).
+	env := CollectEnv(e.demoBin)
+	j, jerr := OpenJournal(dir, env)
+	if jerr != nil {
+		e.publish(runID, "generate", "info", "run journal unavailable: "+jerr.Error())
+	}
+	defer j.Close()
+	_ = j.Stamp("run.start", map[string]any{
+		"run_id": runID, "mode": c.Mode, "voters": c.Voters,
+		"positions": c.Positions, "candidates": c.Candidates,
+		"distribution": c.Distribution,
+	})
+	e.recordCommit(runID, env)
+	_ = j.Stamp("stage.generate.start", nil)
+
 	if c.Mode == ModeGroundTruth {
-		return e.generateGroundTruth(ctx, runID, c, dir)
+		err := e.generateGroundTruth(ctx, runID, c, dir)
+		_ = j.Stamp("stage.generate.end", stageEnd(err))
+		return err
 	}
 	args := []string{
 		"gen", "--stream", dir,
@@ -115,16 +140,68 @@ func (e *Executor) Generate(ctx context.Context, runID string, c ElectionConfig)
 		c.Voters, c.Positions, c.Candidates, c.Threshold, len(c.Trustees)))
 	if _, err := e.run(ctx, e.demoBin, args...); err != nil {
 		e.publish(runID, "generate", "error", err.Error())
+		_ = j.Stamp("stage.generate.end", stageEnd(err))
 		return err
 	}
 	// Flatten the stream into CSVs (ballots.csv + election.csv) so every export
 	// is a proper spreadsheet.
 	if err := writeDerivedCSVs(dir, c); err != nil {
 		e.publish(runID, "generate", "error", "csv export failed: "+err.Error())
+		_ = j.Stamp("stage.generate.end", stageEnd(err))
 		return err
 	}
 	e.publish(runID, "generate", "done", "ballots generated (+ ballots.csv, election.csv)")
+	_ = j.Stamp("stage.generate.end", stageEnd(nil))
 	return nil
+}
+
+// journalFor reopens the run's journal for appending. It never writes a second
+// environment snapshot — that belongs to OpenJournal at run.start. A run folder
+// without a journal (or an unwritable one) yields nil, and every Journal method
+// is nil-safe, so instrumentation can never fail a phase.
+func (e *Executor) journalFor(runID string) *Journal {
+	dir, err := e.store.Dir(runID)
+	if err != nil {
+		return nil
+	}
+	path := filepath.Join(dir, JournalFile)
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
+		return nil
+	}
+	j := newJournal(f, time.Now())
+	j.path = path
+	return j
+}
+
+// stageEnd is the standard stage.*.end payload: ok, plus the error if not.
+func stageEnd(err error) map[string]any {
+	if err != nil {
+		return map[string]any{"ok": false, "error": err.Error()}
+	}
+	return map[string]any{"ok": true}
+}
+
+// recordCommit pins the code the run executed against into run.json, from the
+// environment snapshot the journal already recorded.
+func (e *Executor) recordCommit(runID string, env map[string]any) {
+	dir, err := e.store.Dir(runID)
+	if err != nil {
+		return
+	}
+	path := filepath.Join(dir, RunFile)
+	var rec RunRecord
+	if err := readJSON(path, &rec); err != nil {
+		return
+	}
+	commit := map[string]string{}
+	for _, k := range []string{"git_head_saksi", "git_head_console"} {
+		if v, ok := env[k].(string); ok && v != "" {
+			commit[k] = v
+		}
+	}
+	rec.Commit = commit
+	_ = writeJSON(path, rec)
 }
 
 // generateGroundTruth shells `saksi-demo gen-ground-truth`, producing only the
@@ -168,11 +245,15 @@ func groundTruthOnly(c ElectionConfig) bool { return c.Mode == ModeGroundTruth }
 // real audit rejection (overall=fail — the tool WORKED, returned as a result,
 // not a Go error), and a crash / unparseable output (a Go error). Only the last
 // returns err.
-func (e *Executor) Verify(ctx context.Context, runID string) (StreamAudit, error) {
+func (e *Executor) Verify(ctx context.Context, runID string, c ElectionConfig) (StreamAudit, error) {
 	dir, err := e.store.Dir(runID)
 	if err != nil {
 		return StreamAudit{}, err
 	}
+	j := e.journalFor(runID)
+	defer j.Close()
+	_ = j.Stamp("stage.verify.start", nil)
+
 	e.publish(runID, "verify", "info", "auditing run…")
 	out, runErr := e.run(ctx, e.demoBin, "audit-stream", dir, "--json")
 
@@ -181,11 +262,20 @@ func (e *Executor) Verify(ctx context.Context, runID string) (StreamAudit, error
 		// Unparseable stdout means the binary crashed / drifted — a real error,
 		// never silently read as "audit fail".
 		e.publish(runID, "verify", "error", "audit-stream produced no valid result")
-		return StreamAudit{}, fmt.Errorf("audit-stream crashed: %v (output: %s)",
-			runErr, truncate(out, 200))
+		crashErr := fmt.Errorf("audit-stream crashed: %v (output: %s)", runErr, truncate(out, 200))
+		_ = j.Stamp("stage.verify.end", stageEnd(crashErr))
+		e.finalise(j, dir, runID, c, sa, crashErr)
+		return StreamAudit{}, crashErr
 	}
+	// timings.json is the auditor's own in-process stage timing, kept as a
+	// standalone artifact so perf.csv's *_inproc_ms columns have a source a
+	// reader can check.
+	_ = writeJSON(filepath.Join(dir, TimingsFile), sa.TimingsMs)
+
 	dkgHash, tallyHash, ballotsHash := runDigests(dir)
 	if err := writeCorrectnessCSV(filepath.Join(dir, CorrectnessFile), sa, dkgHash, tallyHash, ballotsHash); err != nil {
+		_ = j.Stamp("stage.verify.end", stageEnd(err))
+		e.finalise(j, dir, runID, c, sa, err)
 		return sa, err
 	}
 	if sa.Overall == "pass" {
@@ -193,7 +283,46 @@ func (e *Executor) Verify(ctx context.Context, runID string) (StreamAudit, error
 	} else {
 		e.publish(runID, "verify", "error", "audit FAIL (see correctness.csv)")
 	}
+	_ = j.Stamp("stage.verify.end", map[string]any{"ok": true, "overall": sa.Overall})
+	e.finalise(j, dir, runID, c, sa, nil)
 	return sa, nil
+}
+
+// finalise closes the run out: the run.end verdict, then the perf.csv row it
+// carries. Instrumentation failures are reported, never fatal — the audit
+// result the caller asked for has already been decided.
+func (e *Executor) finalise(j *Journal, dir, runID string, c ElectionConfig, sa StreamAudit, stageErr error) {
+	fin := Finalise(j, finaliseInput(dir, c, sa, stageErr))
+	if err := writePerfRow(dir, runID, c, fin); err != nil {
+		e.publish(runID, "verify", "info", "perf.csv not written: "+err.Error())
+	}
+}
+
+// finaliseInput assembles the run-failed predicate's inputs. Without a
+// submission window (offline runs) there is nothing to reconcile and no
+// segment, so only the audit's per-contest E decides the verdict.
+func finaliseInput(dir string, c ElectionConfig, sa StreamAudit, stageErr error) FinaliseInput {
+	in := FinaliseInput{
+		Voters: c.Voters, Positions: c.Positions,
+		ReconcileOK: true, StageErr: stageErr,
+		EByContest: make(map[string]int64, len(sa.Contests)),
+	}
+	for _, ct := range sa.Contests {
+		in.EByContest[ct.Contest] = ct.E
+	}
+	var sm submitMetrics
+	if readJSON(filepath.Join(dir, submitMetricsFile), &sm) != nil {
+		return in
+	}
+	in.Dropped = sm.Dropped
+	in.ReconcileOK = sm.Committed == sm.Submitted && sm.Committed == sm.Expected
+	in.Interrupted = sm.Stopped
+	in.Segments = []Segment{{
+		Index: 0, Committed: sm.Committed, WindowMs: sm.WindowMs,
+		TPS: sm.CommittedTPS, P50Ms: sm.LatencyP50Ms,
+		DriverCeilingTPS: sm.DriverCeilingTPS,
+	}}
+	return in
 }
 
 // Submit is a no-op offline (documented). On-chain, when a live Fabric network
@@ -216,23 +345,9 @@ func (e *Executor) Submit(ctx context.Context, runID string, c ElectionConfig) e
 		return err
 	}
 	if e.fabric.Enabled() {
-		bundlePath := filepath.Join(dir, "bundle.json")
-		args := []string{
-			"gen",
-			"--voters", strconv.Itoa(c.Voters),
-			"--positions", strconv.Itoa(c.Positions),
-			"--candidates", strconv.Itoa(c.Candidates),
-			"--trustees", strconv.Itoa(len(c.Trustees)),
-			"--threshold", strconv.Itoa(c.Threshold),
-			"--election-id", runID,
-			"--election-name", c.Name,
-			"--trustee-names", strings.Join(c.TrusteeNames(), ","),
-			"--distribution", c.Distribution,
-			bundlePath,
-		}
-		e.publish(runID, "submit", "info", "generating on-chain bundle…")
-		if _, err := e.run(ctx, e.demoBin, args...); err != nil {
-			e.publish(runID, "submit", "error", "bundle generation failed: "+err.Error())
+		bundlePath, err := e.generateBundle(runID)
+		if err != nil {
+			e.publish(runID, "submit", "error", "bundle: "+err.Error())
 			return err
 		}
 		conn, err := e.fabric.Connect()
@@ -260,10 +375,14 @@ func (e *Executor) Submit(ctx context.Context, runID string, c ElectionConfig) e
 // onChainBundle mirrors the JSON emitted by `saksi-demo gen` (fields the
 // on-chain lifecycle needs; same shape as cmd/saksi-console's bundle).
 type onChainBundle struct {
-	ElectionID         string   `json:"election_id"`
-	Params             string   `json:"params"`
-	DKG                string   `json:"dkg"`
-	Ballots            []string `json:"ballots"`
+	ElectionID string `json:"election_id"`
+	Params     string `json:"params"`
+	DKG        string `json:"dkg"`
+	// BallotsFile names the ndjson stream holding the population. The ballots
+	// are REFERENCED, never inlined: a 1M-voter bundle would otherwise have to
+	// be parsed into memory whole before the first ballot could be submitted.
+	BallotsFile        string   `json:"ballots_file"`
+	BallotCount        int      `json:"ballot_count"`
 	PartialDecryptions []string `json:"partial_decryptions"`
 	Tally              string   `json:"tally"`
 }
@@ -280,7 +399,7 @@ func (e *Executor) submitOnChain(ctx context.Context, runID string, c ElectionCo
 		return err
 	}
 	defer e.closeReceipts(runID)
-	if err := e.setupOnChain(ctx, b, step); err != nil {
+	if err := e.setupOnChain(ctx, runID, c, b, led, step); err != nil {
 		return err
 	}
 	for i, pd := range b.PartialDecryptions {
@@ -408,19 +527,267 @@ func (e *Executor) closeReceipts(runID string) error {
 // It stops there — the chaincode only accepts partial decryptions once the
 // election is closed (contract.go's status gate), and the ceremony hands the
 // next move to the trustees.
-func (e *Executor) setupOnChain(ctx context.Context, b *onChainBundle, step lifecycleStep) error {
+func (e *Executor) setupOnChain(ctx context.Context, runID string, c ElectionConfig, b *onChainBundle, led clientsdk.Ledger, step lifecycleStep) error {
 	if err := step(ctx, "CreateElection", "", "CreateElection", b.Params); err != nil {
 		return err
 	}
 	if err := step(ctx, "PublishDKGTranscript", "", "PublishDKGTranscript", b.DKG); err != nil {
 		return err
 	}
-	for i, ballot := range b.Ballots {
-		if err := step(ctx, "SubmitBallot", strconv.Itoa(i), "SubmitBallot", ballot); err != nil {
-			return err
-		}
+	if err := e.submitBallots(ctx, runID, c, b, led); err != nil {
+		return err
 	}
 	return step(ctx, "CloseElection", "", "CloseElection", b.ElectionID)
+}
+
+// landedTx is one ballot as the timed window left it: which index it was, and
+// where it committed. Receipts are fetched for these AFTER the window.
+type landedTx struct {
+	index int
+	txID  string
+	block uint64
+}
+
+// submitBallots is the measured ballot window.
+//
+// Only Submit (SubmitAsync → commit status) runs inside it: no qscc call, no
+// receipt fetch, no file write. Anything else in there would be timed as if it
+// were the chain's cost. Receipts are collected afterwards with ONE
+// ReceiptsForBlock per distinct block, so a 1,000-ballot run that lands in 100
+// blocks makes 100 fetches, not 1,000.
+//
+// The population is streamed: bench.Run's workers pull one line each from a
+// single forward scan of ballots.ndjson (see ballotReader).
+func (e *Executor) submitBallots(ctx context.Context, runID string, c ElectionConfig, b *onChainBundle, led clientsdk.Ledger) error {
+	dir, err := e.store.Dir(runID)
+	if err != nil {
+		return err
+	}
+	if b.BallotsFile == "" {
+		return fmt.Errorf("bundle.json has no \"ballots_file\" field: this run's bundle predates the streaming ballot format — delete bundle.json and re-run the ceremony to regenerate it")
+	}
+	// Validate the whole stream before committing anything: a truncated or
+	// non-hex line must fail the run, not land as a prefix of an election.
+	count, err := validateBallots(dir)
+	if err != nil {
+		return err
+	}
+	if count != b.BallotCount {
+		return fmt.Errorf("bundle ballot_count is %d but %s holds %d ballots", b.BallotCount, b.BallotsFile, count)
+	}
+
+	reader, err := openBallotReader(dir)
+	if err != nil {
+		return err
+	}
+	defer reader.Close()
+
+	w, err := e.openReceiptsFor(runID, dir)
+	if err != nil {
+		return err
+	}
+	defer e.closeReceipts(runID)
+
+	j := e.journalFor(runID)
+	defer j.Close()
+
+	concurrency := c.submitConcurrency()
+	startBytes, haveBytes := e.ledgerBytes()
+	start := map[string]any{"n": count, "concurrency": concurrency, "send_rate": c.SendRate}
+	if haveBytes {
+		start["ledger_bytes"] = startBytes
+	}
+	_ = j.Stamp("stage.ballots.start", start)
+	e.publish(runID, "ceremony", "info",
+		fmt.Sprintf("submitting %d ballots (%d in flight)…", count, concurrency))
+
+	var mu sync.Mutex
+	landed := make([]landedTx, 0, count)
+	var readErr error
+
+	stopSampler := e.startSampler(ctx, j)
+	res := bench.Run(ctx, count, func(i int) error {
+		line, err := reader.At(i)
+		if err != nil {
+			mu.Lock()
+			if readErr == nil {
+				readErr = err
+			}
+			mu.Unlock()
+			return err
+		}
+		txID, block, err := led.Submit("SubmitBallot", line)
+		if err != nil {
+			return err
+		}
+		mu.Lock()
+		landed = append(landed, landedTx{index: i, txID: txID, block: block})
+		mu.Unlock()
+		return nil
+	}, bench.RunOpts{
+		Concurrency: concurrency,
+		SendRate:    c.SendRate,
+		OnProgress: func(done int) {
+			_ = j.Stamp("ballots.progress", map[string]any{"done": done})
+		},
+	})
+	samples := stopSampler()
+
+	endBytes, haveEndBytes := e.ledgerBytes()
+	end := map[string]any{
+		"submitted": res.Submitted, "committed": res.Committed, "dropped": res.Dropped,
+		"window_ms": res.Window.Milliseconds(), "stopped": res.Stopped,
+	}
+	if haveEndBytes {
+		end["ledger_bytes"] = endBytes
+	}
+	_ = j.Stamp("stage.ballots.end", end)
+
+	if readErr != nil {
+		return readErr
+	}
+	e.collectReceipts(runID, j, w, led, landed)
+	if err := writeLatenciesCSV(dir, res, 0); err != nil {
+		return err
+	}
+	if err := e.writeSubmitMetrics(dir, c, res, samples, count, startBytes, endBytes, haveBytes && haveEndBytes); err != nil {
+		return err
+	}
+	if res.Dropped > 0 {
+		return fmt.Errorf("%d of %d ballots did not commit", res.Dropped, res.Submitted)
+	}
+	e.publish(runID, "ceremony", "info",
+		fmt.Sprintf("%d ballots committed in %s", res.Committed, res.Window.Round(time.Millisecond)))
+	return nil
+}
+
+// collectReceipts fetches ledger receipts for the window's transactions one
+// block at a time, in ascending block order, and appends each to receipts.csv
+// (never to trail.ndjson — per-ballot events would drown the lifecycle trail).
+// A block that cannot be fetched is stamped and skipped: the ballots committed,
+// and losing their receipts must not fail the run.
+func (e *Executor) collectReceipts(runID string, j *Journal, w *receiptsWriter, led clientsdk.Ledger, landed []landedTx) {
+	sort.Slice(landed, func(i, k int) bool { return landed[i].index < landed[k].index })
+	byBlock := make(map[uint64][]landedTx)
+	for _, l := range landed {
+		byBlock[l.block] = append(byBlock[l.block], l)
+	}
+	blocks := make([]uint64, 0, len(byBlock))
+	for n := range byBlock {
+		blocks = append(blocks, n)
+	}
+	sort.Slice(blocks, func(i, k int) bool { return blocks[i] < blocks[k] })
+
+	for _, n := range blocks {
+		items := byBlock[n]
+		txIDs := make([]string, len(items))
+		for i, it := range items {
+			txIDs[i] = it.txID
+		}
+		receipts, err := led.ReceiptsForBlock(n, txIDs)
+		if err != nil {
+			_ = j.Stamp("receipts.missing", map[string]any{"block": n, "count": len(items)})
+			e.publish(runID, "ceremony", "info",
+				fmt.Sprintf("receipts for block %d unavailable (%d ballots): %v", n, len(items), err))
+			continue
+		}
+		byTx := make(map[string]clientsdk.Receipt, len(receipts))
+		for _, r := range receipts {
+			byTx[r.TxID] = r
+		}
+		for _, it := range items {
+			r, ok := byTx[it.txID]
+			if !ok {
+				// The transaction committed (Submit said so) but the block as
+				// served now does not carry it. Record what is known rather
+				// than dropping the row.
+				r = clientsdk.Receipt{TxID: it.txID, BlockNumber: it.block}
+			}
+			_ = w.Append(TrailEvent{Event: "SubmitBallot", Ref: strconv.Itoa(it.index), Receipt: r})
+		}
+	}
+}
+
+// writeSubmitMetrics hands the ballot window's measurements to Verify, which
+// runs as a separate phase and cannot see them any other way.
+func (e *Executor) writeSubmitMetrics(dir string, c ElectionConfig, res bench.RunResult, samples Samples, expected int, startBytes, endBytes int64, haveBytes bool) error {
+	stats := bench.Summary(res.Latencies)
+	toMs := func(d time.Duration) float64 { return float64(d.Microseconds()) / 1000.0 }
+	sm := submitMetrics{
+		WindowMs:         res.Window.Milliseconds(),
+		Submitted:        res.Submitted,
+		Committed:        res.Committed,
+		Dropped:          res.Dropped,
+		Expected:         expected,
+		CommittedTPS:     bench.ThroughputTPS(res.Committed, res.Window),
+		DriverCeilingTPS: res.DriverCeilingTPS(),
+		Concurrency:      res.Concurrency,
+		SendRate:         c.SendRate,
+		Stopped:          res.Stopped,
+		LatencyMinMs:     toMs(stats.Min),
+		LatencyP50Ms:     toMs(stats.Median),
+		LatencyMeanMs:    toMs(stats.Mean),
+		LatencyP95Ms:     toMs(stats.P95),
+		LatencyP99Ms:     toMs(stats.P99),
+		LatencyStdDevMs:  toMs(stats.StdDev),
+		PeakCPUPct:       map[string]float64{},
+		PeakMemMB:        map[string]float64{},
+	}
+	for name, st := range samples.PerContainer {
+		role := containerRole(name)
+		if role == "" {
+			continue
+		}
+		if v, ok := sm.PeakCPUPct[role]; !ok || st.PeakCPU > v {
+			sm.PeakCPUPct[role] = st.PeakCPU
+		}
+		mem := float64(st.PeakMem) / (1024 * 1024)
+		if v, ok := sm.PeakMemMB[role]; !ok || mem > v {
+			sm.PeakMemMB[role] = mem
+		}
+	}
+	if haveBytes {
+		delta := endBytes - startBytes
+		sm.LedgerBytesDelta = &delta
+	}
+	return writeJSON(filepath.Join(dir, submitMetricsFile), sm)
+}
+
+// containerRole maps a sampled container name to the perf.csv role column it
+// belongs to. Anything else is not a role the schema reports.
+func containerRole(name string) string {
+	switch {
+	case name == "client":
+		return "client"
+	case strings.HasPrefix(name, "peer"):
+		return "peer"
+	case strings.HasPrefix(name, "orderer"):
+		return "orderer"
+	}
+	return ""
+}
+
+// startSampler runs the docker-stats sampler for the duration of the ballot
+// window. Only a live network has containers worth sampling, so the offline
+// and test paths never shell out to docker at all.
+func (e *Executor) startSampler(ctx context.Context, j *Journal) func() Samples {
+	if !e.fabric.Enabled() {
+		return func() Samples { return Samples{PerContainer: map[string]ContainerStats{}} }
+	}
+	return StartSampler(ctx, j, samplerContainers(), 0)
+}
+
+// ledgerBytes probes the on-disk ledger size, if a peer volume path was
+// configured. Reported as a delta across the ballot window.
+func (e *Executor) ledgerBytes() (int64, bool) {
+	if e.fabric.PeerVolume == "" {
+		return 0, false
+	}
+	n, err := LedgerBytes(e.fabric.PeerVolume)
+	if err != nil {
+		return 0, false
+	}
+	return n, true
 }
 
 // writeCorrectnessCSV writes the per-contest proof of correctness: the seeded

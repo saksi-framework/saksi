@@ -31,10 +31,14 @@ var exportOrder = []string{
 	NegativeTestsFile,
 	GroundTruthBallotsCSV,
 	GroundTruthSummaryCSV,
-	"perf.csv",
+	PerfCSV,
+	LatenciesCSV,
 	// Raw artifacts — kept for re-audit / provenance.
+	PerfSchemaFile,
 	"header.json",
-	"ballots.ndjson",
+	BallotsFile,
+	JournalFile,
+	TimingsFile,
 	RunFile,
 	"receipts.csv",
 	CheckFile,
@@ -225,7 +229,12 @@ func (s *Server) handleVerify(w http.ResponseWriter, r *http.Request) {
 	if !s.ballotPhaseAllowed(w, runID, "verify") {
 		return
 	}
-	s.dispatch(w, runID, func(ctx context.Context) { _, _ = s.exec.Verify(ctx, runID) })
+	rec, err := s.record(runID)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusNotFound)
+		return
+	}
+	s.dispatch(w, runID, func(ctx context.Context) { _, _ = s.exec.Verify(ctx, runID, rec.Config) })
 }
 
 // ballotPhaseAllowed rejects phases that need encrypted ballots when the run
@@ -282,7 +291,7 @@ func (s *Server) handleRunAll(w http.ResponseWriter, r *http.Request) {
 		if err := s.exec.Submit(ctx, runID, c); err != nil {
 			return
 		}
-		_, _ = s.exec.Verify(ctx, runID)
+		_, _ = s.exec.Verify(ctx, runID, c)
 	})
 }
 
@@ -517,6 +526,7 @@ func decodeConfig(w http.ResponseWriter, r *http.Request) (ElectionConfig, bool)
 	if !decodeJSON(w, r, &c) {
 		return c, false
 	}
+	c.applyDefaults()
 	if err := c.Validate(); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return c, false
