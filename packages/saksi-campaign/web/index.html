@@ -235,13 +235,13 @@ const OFFLINE_CEILING = 10000;
 // Data files: study CSVs first (prominent), then raw artifacts.
 const FILE_ORDER = ["election.csv", "ballots.csv", "correctness.csv", "negative-tests.csv",
                     "ground-truth-ballots.csv", "ground-truth-summary.csv", "perf.csv",
-                    "header.json", "ballots.ndjson", "run.json", "receipts.csv", "trail.json"];
+                    "header.json", "ballots.ndjson", "run.json", "receipts.csv", "trail.ndjson"];
 const FILE_LABEL = { "election.csv":"election.csv", "ballots.csv":"ballots.csv",
                      "correctness.csv":"correctness.csv", "negative-tests.csv":"negatives.csv", "perf.csv":"perf.csv",
                      "ground-truth-ballots.csv":"Ground truth — ballots (CSV)",
                      "ground-truth-summary.csv":"Ground truth — tally (CSV)",
                      "header.json":"header.json (raw)", "ballots.ndjson":"ballots.ndjson (raw)", "run.json":"run.json (raw)",
-                     "receipts.csv":"Ledger receipts (CSV)", "trail.json":"Trail events (JSON)" };
+                     "receipts.csv":"Ledger receipts (CSV)", "trail.ndjson":"Trail events (NDJSON)" };
 // Every .csv is study data → prominent; the raw audit/provenance files are quiet.
 const STUDY = new Set(["election.csv", "ballots.csv", "correctness.csv", "negative-tests.csv", "perf.csv",
                        "ground-truth-ballots.csv", "ground-truth-summary.csv"]);
