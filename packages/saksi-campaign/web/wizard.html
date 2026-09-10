@@ -258,8 +258,9 @@
     <button class="small" id="addTrustee" type="button">+ Add trustee</button>
 
     <div class="grid2">
-      <div><label for="threshold">Threshold (t) — how many must agree to decrypt</label>
-        <input id="threshold" type="number" min="1" value="2" class="tnum" /></div>
+      <div><label for="threshold">Threshold (t) — how many must agree to decrypt
+          <span class="muted small">— 3 of 5 (paper configuration)</span></label>
+        <input id="threshold" type="number" min="1" value="3" class="tnum" /></div>
       <div><label for="nDisplay">Trustees (n)</label>
         <input id="nDisplay" disabled class="tnum" /></div>
     </div>
@@ -453,12 +454,12 @@ const PRESETS = [1, 10, 100, 1000, 10000, 50000, 483000, 1000000, 1921917, 35240
 const OFFLINE_CEILING = 10000;
 const FILE_ORDER = ["election.csv","ballots.csv","correctness.csv","negative-tests.csv",
                     "ground-truth-ballots.csv","ground-truth-summary.csv","perf.csv",
-                    "header.json","ballots.ndjson","run.json","receipts.csv","trail.json"];
+                    "header.json","ballots.ndjson","run.json","receipts.csv","trail.ndjson"];
 const FILE_LABEL = { "election.csv":"election.csv","ballots.csv":"ballots.csv",
   "correctness.csv":"correctness.csv","negative-tests.csv":"negatives.csv","perf.csv":"perf.csv",
   "ground-truth-ballots.csv":"Ground truth — ballots","ground-truth-summary.csv":"Ground truth — tally",
   "header.json":"header.json (raw)","ballots.ndjson":"ballots.ndjson (raw)","run.json":"run.json (raw)",
-  "receipts.csv":"Ledger receipts","trail.json":"Trail events" };
+  "receipts.csv":"Ledger receipts","trail.ndjson":"Trail events" };
 const STUDY = new Set(["election.csv","ballots.csv","correctness.csv","negative-tests.csv",
                        "ground-truth-ballots.csv","ground-truth-summary.csv","perf.csv"]);
 
@@ -808,9 +809,10 @@ async function refreshCeremony() {
   });
 
   $("gateNote").innerHTML = st.on_chain
-    ? `The threshold is enforced by this console and proven by the independent verifier, which counts
-       distinct verified trustees. The chaincode validates each share it accepts but does not itself
-       count them before publishing.`
+    ? `The threshold is enforced by this console, which gates the ceremony at t, and proven by the
+       independent verifier, which counts distinct verified trustees. A chaincode built with the
+       signature gate also rejects a tally carrying fewer than t valid trustee signatures at
+       endorsement.`
     : `Local ceremony — real cryptographic shares, no ledger. The threshold gate is enforced here.`;
 
   $("btnPublish").disabled = !st.unlocked || st.published;
@@ -1150,7 +1152,7 @@ $("btnRestart").onclick = () => {
   }
 })();
 
-renderTrustees(["COMELEC", "Civil Society Watch", "University IT"]);
+renderTrustees(["COMELEC", "Civil Society Watch", "University IT", "Academe Observer", "Bar Association"]);
 renderPresets();
 renderRail();
 </script>

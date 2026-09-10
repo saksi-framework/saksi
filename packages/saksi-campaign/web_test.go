@@ -93,3 +93,33 @@ func TestWizardDefinesEveryFunctionItCalls(t *testing.T) {
 		}
 	}
 }
+
+// The wizard's defaults ARE the paper's configuration (3 of 5 trustees), and
+// its download chips name real files. Both are plain string literals no
+// compiler checks, and both have already drifted once: Task 2 renamed
+// trail.json to trail.ndjson while the chip label kept pointing at the old
+// name, offering a download that no longer exists.
+func TestWizardDefaultsMatchThePaper(t *testing.T) {
+	for _, f := range []string{"web/wizard.html", "web/index.html"} {
+		page, err := webFS.ReadFile(f)
+		if err != nil {
+			t.Fatalf("read %s: %v", f, err)
+		}
+		if strings.Contains(string(page), "trail.json") {
+			t.Errorf("%s still offers trail.json — Task 2 replaced it with trail.ndjson", f)
+		}
+	}
+	js, err := webFS.ReadFile("web/wizard.html")
+	if err != nil {
+		t.Fatalf("read wizard.html: %v", err)
+	}
+	for _, want := range []string{
+		`"COMELEC", "Civil Society Watch", "University IT", "Academe Observer", "Bar Association"`,
+		`id="threshold" type="number" min="1" value="3"`,
+		"3 of 5 (paper configuration)",
+	} {
+		if !strings.Contains(string(js), want) {
+			t.Errorf("wizard.html no longer carries the paper configuration %q", want)
+		}
+	}
+}

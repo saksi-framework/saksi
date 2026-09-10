@@ -1,10 +1,12 @@
 # Caliper benchmark config — Saksi bulletin-board SubmitBallot throughput
 # (thesis Phase 2 / paper Tables 3.4-3.6, Appendix C).
 #
-# One round per (scale tier x ballot axis). Caliper natively reports the
-# paper's metrics: send rate, committed-tps throughput, latency min/max/avg +
-# percentiles, and success/fail counts. The `monitors` block captures the
-# resource-consumption axis (peak CPU/mem of the peer + orderer containers).
+# One round per (scale tier x ballot axis). Caliper reports send rate,
+# committed-tps throughput, latency max/min/avg and success/fail counts — but
+# NO percentiles (Caliper issue #407), so the workload logs every transaction's
+# start/end to ../latencies.ndjson and `node ../report.js` derives p50/p95/p99
+# from it. The `monitors` block captures the resource-consumption axis (peak
+# CPU/mem of the peer + orderer containers).
 #
 # HOW TO SCALE: each round's `txNumber` MUST equal the ballot count in the
 # bundle it points at (the workload submits each unique ballot exactly once).
