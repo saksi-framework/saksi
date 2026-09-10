@@ -105,27 +105,20 @@ func TestScenariosRejectTheirMutations(t *testing.T) {
 	}
 
 	// Every offline scenario must have PASSED (attack rejected).
-	data, err := os.ReadFile(filepath.Join(srcDir, NegativeTestsFile))
-	if err != nil {
-		t.Fatalf("negative-tests.csv: %v", err)
-	}
-	rows := strings.Split(strings.TrimSpace(string(data)), "\n")
+	rows := readCSVRows(t, srcDir)
 	if len(rows) < 2 {
-		t.Fatalf("expected scenario rows, got: %s", data)
+		t.Fatalf("expected scenario rows, got: %v", rows)
 	}
+	// Look columns up by name: hardcoding indices means a schema change reads
+	// the wrong field instead of failing honestly.
+	layerCol, verdictCol := csvCol(t, rows[0], "layer"), csvCol(t, rows[0], "verdict")
 	offlineCount := 0
-	for _, line := range rows[1:] {
-		cols := strings.Split(line, ",")
-		// scenario,layer,action,expected,actual,verdict,property
-		if len(cols) < 6 {
-			t.Fatalf("bad csv row: %q", line)
-		}
-		layer, verdict := cols[1], cols[5]
-		if layer == "offline" {
+	for _, cols := range rows[1:] {
+		if cols[layerCol] == "offline" {
 			offlineCount++
-			if verdict != "PASS" {
+			if v := cols[verdictCol]; v != "PASS" {
 				t.Fatalf("offline scenario %q must PASS (be rejected), got %q — a gate that should have rejected did not",
-					cols[0], verdict)
+					cols[0], v)
 			}
 		}
 	}
@@ -176,6 +169,45 @@ func readCSVRows(t *testing.T, dir string) [][]string {
 		t.Fatalf("parse %s: %v", NegativeTestsFile, err)
 	}
 	return rows
+}
+
+// csvCol returns the index of a named column, failing loudly when the schema
+// no longer has it — a positional read would silently pick a neighbour.
+func csvCol(t *testing.T, header []string, name string) int {
+	t.Helper()
+	for i, h := range header {
+		if h == name {
+			return i
+		}
+	}
+	t.Fatalf("negative-tests.csv has no %q column: %v", name, header)
+	return -1
+}
+
+// The header and the row writer are two separate literals in
+// writeNegativeTestsCSV: if one gains a column and the other does not, every
+// reader silently reads the wrong field. Sentinel values catch that without
+// needing saksi-demo on PATH.
+func TestNegativeTestsCSVRowsMatchTheirHeader(t *testing.T) {
+	dir := t.TempDir()
+	exportOnce(t, dir, ScenarioResult{
+		Scenario: "dropped-ballot", Stage: StageClose, Layer: LayerOffline.String(),
+		Action: "act", Expected: "exp", Actual: "actual", Verdict: "PASS",
+		Property: "prop", OnChain: false,
+	})
+	rows := readCSVRows(t, dir)
+	if len(rows) != 2 {
+		t.Fatalf("csv rows = %d, want header + 1: %v", len(rows), rows)
+	}
+	for col, want := range map[string]string{
+		"scenario": "dropped-ballot", "stage": StageClose, "layer": "offline",
+		"action": "act", "expected": "exp", "actual": "actual",
+		"verdict": "PASS", "property": "prop", "on_chain": "false",
+	} {
+		if got := rows[1][csvCol(t, rows[0], col)]; got != want {
+			t.Errorf("column %q = %q, want %q — header and row writer are out of step", col, got, want)
+		}
+	}
 }
 
 // exportOnce merges one result and rewrites the CSV, mimicking what
@@ -230,16 +262,7 @@ func TestScenarioRerunUpdatesRowInPlace(t *testing.T) {
 	}
 	// Look the column up by name: hardcoding an index means a schema change
 	// silently reads the wrong field instead of failing honestly.
-	col := -1
-	for i, h := range rows[0] {
-		if h == "verdict" {
-			col = i
-		}
-	}
-	if col < 0 {
-		t.Fatalf("negative-tests.csv has no verdict column: %v", rows[0])
-	}
-	if verdict := rows[1][col]; verdict != "PASS" {
+	if verdict := rows[1][csvCol(t, rows[0], "verdict")]; verdict != "PASS" {
 		t.Errorf("verdict = %q, want PASS (the re-run should replace the earlier FAIL)", verdict)
 	}
 }
