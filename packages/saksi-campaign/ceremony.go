@@ -22,14 +22,21 @@ import (
 // partial decryption it receives (trustee must be in the election's trustee
 // set, contest must exist, Chaum-Pedersen proof must be present, election must
 // be closed) and rejects a repeat submission from the same trustee for the same
-// contest. It does NOT count partials before accepting PublishTally. So the
-// t-of-n gate here is enforced by this console, not by the ledger.
+// contest. It still does NOT count partials.
 //
-// That does not make the property unproven: the independent auditor verifies it
-// at audit time, counting distinct verified trustees per contest and failing
-// below threshold (saksi-auditor/src/decryption.rs). Threshold integrity is a
-// verification-time guarantee. Adding an endorsement-time check to PublishTally
-// would be a genuine improvement, and needs a chaincode redeploy.
+// It does now count SIGNATURES: PublishTally verifies each trustee's Schnorr
+// signature over the published totals and refuses a tally fewer than
+// `threshold` distinct trustees endorsed (chaincode/sigverify). That is why
+// CeremonyPublish sends only the submitted trustees' signatures — the ledger
+// gate has to be counting what actually happened in this ceremony, not the
+// full set the generator signed with. A chaincode built before that gate
+// existed accepts any tally, so on such a network the t-of-n rule is still
+// this console's alone.
+//
+// Either way the property is independently checked: the auditor counts
+// distinct verified trustees per contest and fails below threshold
+// (saksi-auditor/src/decryption.rs), and verifies the same signatures
+// (saksi-auditor/src/tally.rs, finding `tally.signatures`).
 //
 // Note also that the published tally is the generator's seeded result, not a
 // recomputation from the shares that happened to be submitted. The ceremony
@@ -333,12 +340,63 @@ func (e *Executor) CeremonyPublish(ctx context.Context, runID string, c Election
 		return err
 	}
 	defer e.closeReceipts(runID)
-	if err := step(ctx, "PublishTally", "", "PublishTally", b.Tally); err != nil {
+	tallyHex, err := tallyToPublish(b.Tally, state)
+	if err != nil {
+		e.publish(runID, "ceremony", "error", err.Error())
+		return err
+	}
+	if err := step(ctx, "PublishTally", "", "PublishTally", tallyHex); err != nil {
 		return err
 	}
 	e.publish(runID, "ceremony", "done",
 		fmt.Sprintf("threshold met (%d of %d) — tally published on-chain", state.Submitted, state.Threshold))
 	return e.markPublished(runID, c)
+}
+
+// tallyToPublish re-encodes the bundle's tally carrying only the signatures of
+// the trustees that actually submitted, and returns it hex-encoded.
+//
+// The generator signs the tally with EVERY trustee's share, because it holds
+// them all. Publishing that list unfiltered would put a 5-of-5 endorsement
+// on-chain for a ceremony only two trustees took part in — the ledger's own
+// threshold gate (the chaincode counts these signatures) would then be
+// counting a claim this console made up rather than what happened here.
+//
+// A bundle generated before tally signatures existed carries none; it is
+// returned verbatim, and the chaincode refuses it. Rewriting an old artifact to
+// look endorsed is exactly what must not happen.
+func tallyToPublish(tallyHex string, state CeremonyState) (string, error) {
+	raw, err := hex.DecodeString(tallyHex)
+	if err != nil {
+		return "", fmt.Errorf("this run's tally is not valid hex: %w", err)
+	}
+	var tally saksiprotocolv1.TallyResult
+	if err := proto.Unmarshal(raw, &tally); err != nil {
+		return "", fmt.Errorf("decode this run's tally: %w", err)
+	}
+	if len(tally.GetSignatures()) == 0 {
+		return tallyHex, nil
+	}
+
+	submitted := make(map[string]bool, len(state.Trustees))
+	for _, tr := range state.Trustees {
+		if tr.Submitted {
+			submitted[tr.ID] = true
+		}
+	}
+	kept := make([]*saksiprotocolv1.TrusteeSignature, 0, len(tally.GetSignatures()))
+	for _, sig := range tally.GetSignatures() {
+		if submitted[sig.GetTrusteeId()] {
+			kept = append(kept, sig)
+		}
+	}
+	tally.Signatures = kept
+
+	out, err := proto.Marshal(&tally)
+	if err != nil {
+		return "", fmt.Errorf("re-encode tally: %w", err)
+	}
+	return hex.EncodeToString(out), nil
 }
 
 // CeremonyStatus reports the roster. On-chain the ledger is consulted as the
