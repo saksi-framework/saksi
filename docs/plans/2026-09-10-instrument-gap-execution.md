@@ -38,11 +38,15 @@ sibling `balotachain` repo only for a docs file.
   by ballot index. `receipts.csv` is a cross-check. A nullifier-gate rejection
   on an index in the committed set is `ok=replay` in `latencies.csv` and never
   reaches `writeNegativeTestsCSV`. Throughput is per segment; a resumed run is
-  `sustained:false` and has no whole-run TPS.
+  `sustained:false` and has no whole-run TPS. **A resumed run never reports
+  sustained** — including after a hard kill that stamped no `segment.end`, where
+  the killed window is listed as a zero-window segment so the segment list is
+  honest.
 - **Failed run.** `runFailed` = any stage error OR `Dropped > 0` OR Reconcile
   mismatch OR `E != 0` on any contest OR interrupted. The reason string is
   recorded. Failed runs are excluded from throughput statistics and counted in
-  `runs_failed / runs_measured`.
+  `runs_failed / runs_measured`. A window that stopped because it reached its
+  configured time bound with zero drops (`bounded`) is not interrupted.
 - **Scaling limit.** `arrival_tps = voters / 36000`; `scaling_limit =
   sustained_tps < arrival_tps`, computed per segment, and reported only when
   `committed_tps < 0.8 × driver_ceiling_tps` is false (i.e. the driver was not

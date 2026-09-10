@@ -153,7 +153,7 @@ Each run is a folder under `--runs`, named `<slug>-<timestamp>-<n>`:
 | `run.json` | config + created_at + `commit` (saksi and console git heads, so a result traces to a build) |
 | `header.json` | election params/DKG/issuer/binding/partials/tally/ground-truth (hex protobuf) |
 | `ballots.ndjson` | one hex-protobuf ballot per line |
-| `correctness.csv` | `contest,ground_truth,decoded,E,pass` (written by Verify) |
+| `correctness.csv` | 13 columns (written by Verify) — see below |
 | `negative-tests.csv` | `scenario,layer,action,expected,actual,verdict,property` (written by Scenarios) |
 | `scenarios/<id>/` | the mutated copy each scenario audited |
 | `journal.ndjson` | the run's event log — see below |
@@ -165,6 +165,36 @@ Each run is a folder under `--runs`, named `<slug>-<timestamp>-<n>`:
 | `receipts.csv` | one row per on-chain receipt (ballots and lifecycle) |
 | `trail.ndjson` | lifecycle events, one JSON object per line (`trail.json` for legacy runs) |
 | `ground-truth-check.json` | the validation gate's report |
+
+### `correctness.csv` — the accuracy record
+
+Thirteen columns, one row per contest per audited directory:
+
+```
+contest,ground_truth,decoded,E,pass,
+published_tally,recovered_point,aggregate_ciphertext,
+dkg_sha256,tally_sha256,ballots_sha256,
+source,ledger_matches_local
+```
+
+The three `_sha256` columns are the provenance hashes of the directory that row
+was audited **from**, so a `source=ledger` row is checkable against the ledger
+dump rather than against the console's artifacts.
+
+`source` is `local` (the console's own run folder) or `ledger` (the chain's own
+record, dumped to `<run>/ledger/` and audited with the same auditor). An
+on-chain run writes both blocks; an offline run writes the `local` block only.
+`ledger_matches_local` carries the cross-check verdict — whether the two
+directories hold the same ballots (by nullifier set) and recovered the same
+per-contest aggregate ciphertexts — and is empty when no comparison ran.
+
+**On `source=ledger` rows, `ground_truth` comes from the local header.** The
+chain publishes no ground truth — the seeded plaintext totals are secret from
+the ledger, which is the whole point — so the ledger dump's header copies the
+console's, and a ledger row scores the CHAIN's ciphertexts against the
+CONSOLE's ground truth. `voter_ids` is the one header field that cannot be
+copied: the chain publishes none, and the reader requires one per ballot, so it
+is resized to the chain's own ballot count.
 
 ### `journal.ndjson` — the run's event log
 
@@ -253,7 +283,7 @@ so they can exceed wall time), `wall_ms`, `chunks`, `chunk_voters`.
 The measurement tooling below drives the console's HTTP API; start the server as
 in §4 and point the tools at it.
 
-### Repetitions, sweeps and bursts — `--repeat` *(lands with Task 9)*
+### Repetitions, sweeps and bursts — `--repeat`
 
 ```bash
 saksi-campaign --repeat --config run.json \
@@ -279,7 +309,7 @@ previous step's p99 so the closed-loop driver is not the ceiling, and recording
 drop; `plateau_tps` is the last good step. `--burst N` submits N ballots
 unthrottled after the measured window, as its own segment.
 
-### Validation ladder — `tools/ladder.sh` *(lands with Task 9)*
+### Validation ladder — `tools/ladder.sh`
 
 ```bash
 tools/ladder.sh
@@ -296,7 +326,7 @@ matches the console's own git head, with the error `validation ladder has not
 been run for this build; run tools/ladder.sh first`. `groundtruth` mode is
 exempt — it runs no cryptography.
 
-### Per-tier reset — `tools/tier.sh` *(lands with Task 9)*
+### Per-tier reset — `tools/tier.sh`
 
 ```bash
 tools/tier.sh <voters> <positions>
@@ -312,7 +342,7 @@ On-chain runs also refuse to start when the projected ledger size
 on the run directory's volume when no peer volume is configured — with both
 numbers in the message.
 
-### Node restart under load (T3) — `tools/t3-restart.sh` *(lands with Task 9)*
+### Node restart under load (T3) — `tools/t3-restart.sh`
 
 ```bash
 tools/t3-restart.sh <run-id>

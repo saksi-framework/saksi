@@ -96,6 +96,19 @@ jobs:
         # Research Election Console: it runs the real binary end-to-end.
         run: cargo test --workspace
 
+      # The campaign module's cross-language tests (ledger dump -> audit-stream,
+      # scenario mutations) shell out to the real saksi-demo. findDemo in
+      # packages/saksi-campaign locates it via SAKSI_DEMO_BIN, else
+      # target/{release,debug}/saksi-demo, else PATH — and SKIPS when it finds
+      # none. Building it and naming it is what makes those tests actually run
+      # here instead of silently skipping.
+      - name: Build saksi-demo for the Go cross-language tests
+        run: cargo build --release -p saksi-demo
+
+      - name: Point the Go tests at saksi-demo
+        shell: bash
+        run: echo "SAKSI_DEMO_BIN=${GITHUB_WORKSPACE}/target/release/saksi-demo" >> "${GITHUB_ENV}"
+
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
