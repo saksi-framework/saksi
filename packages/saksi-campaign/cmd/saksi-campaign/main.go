@@ -3,6 +3,7 @@
 //
 //	saksi-campaign serve [--addr host:port] [--runs dir] [--demo path]
 //	                     [--console path] [--allow-host host[:port]]... [--timeout d]
+//	                     [--web-dir dir]
 //	                     [--fabric-peer host:port] [--fabric-gateway-peer name]
 //	                     [--fabric-tls-cert path] [--fabric-msp-id id]
 //	                     [--fabric-cert path] [--fabric-key path]
@@ -119,6 +120,8 @@ func serve(args []string) {
 	runsDir := fs.String("runs", defaultRunsDir(), "run-folder store root")
 	demoBin := fs.String("demo", "saksi-demo", "path to the saksi-demo binary")
 	consBin := fs.String("console", "", "path to the on-chain console driver (optional)")
+	webDir := fs.String("web-dir", os.Getenv("SAKSI_WEB_DIR"),
+		"directory holding the browser apps to serve: <dir>/board and <dir>/trustee (env SAKSI_WEB_DIR)")
 	timeout := fs.Duration("timeout", 60*time.Minute, "per-phase timeout")
 	fabricPeer := fs.String("fabric-peer", "localhost:7051", "Fabric gateway peer endpoint (host:port)")
 	fabricGatewayPeer := fs.String("fabric-gateway-peer", "peer0.org1.example.com", "Fabric gateway peer TLS server name")
@@ -150,6 +153,16 @@ func serve(args []string) {
 		os.Exit(1)
 	}
 
+	// NewServer reads SAKSI_WEB_DIR, so the flag and the env var are one
+	// setting with the flag winning — no extra parameter on the constructor,
+	// which several call sites and tests share.
+	if *webDir != "" {
+		if err := os.Setenv("SAKSI_WEB_DIR", *webDir); err != nil {
+			fmt.Fprintf(os.Stderr, "cannot set SAKSI_WEB_DIR: %v\n", err)
+			os.Exit(1)
+		}
+	}
+
 	store := campaign.NewRunStore(*runsDir)
 	hub := campaign.NewHub()
 	exec := campaign.NewExecutor(store, hub, *demoBin, *consBin, fabric)
@@ -159,6 +172,9 @@ func serve(args []string) {
 	fmt.Printf("  serving   http://%s\n", displayHost(*addr))
 	fmt.Printf("  runs      %s\n", *runsDir)
 	fmt.Printf("  saksi-demo %s\n", *demoBin)
+	if *webDir != "" {
+		fmt.Printf("  apps      %s -> http://%s/board/ and /trustee/\n", *webDir, displayHost(*addr))
+	}
 	if fabric.Enabled() {
 		fmt.Printf("  on-chain  fabric gateway %s (channel %s)\n", fabric.PeerEndpoint, fabric.Channel)
 	} else if *consBin == "" {
