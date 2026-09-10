@@ -206,6 +206,11 @@ func TestLedgerDumpAbortsOnGetBallotFailure(t *testing.T) {
 	if n := led.getBallotCalls(); n != 3 {
 		t.Fatalf("GetBallot called %d times, want 3 — the dump must stop at the failure, not batch every ballot", n)
 	}
+	// "not run" has to mean nothing is there: a prefix of the chain's ballots
+	// left on disk is an artifact that would audit, and lie.
+	if _, err := os.Stat(filepath.Join(dir, LedgerDir)); !os.IsNotExist(err) {
+		t.Fatalf("the aborted dump must leave no ledger directory behind: %v", err)
+	}
 	// correctness.csv falls back to local-only rows with an empty verdict.
 	csvData, err := os.ReadFile(filepath.Join(dir, CorrectnessFile))
 	if err != nil {
@@ -269,6 +274,67 @@ func TestVerifyOfflineWritesNoLedgerRows(t *testing.T) {
 	}
 	if got, ok := readRunEnd(t, dir)["ledger_audit"]; ok {
 		t.Fatalf("run.end ledger_audit = %v, want absent offline", got)
+	}
+}
+
+// TestNullifierSetDigestIgnoresOrder is the property the whole comparison rests
+// on: the chain hands its ballots back in its own order, so the digest of the
+// same set must not depend on the order the lines were written in — and must
+// still change the moment one of the nullifiers does.
+func TestNullifierSetDigestIgnoresOrder(t *testing.T) {
+	writeSet := func(nullifiers ...[]byte) string {
+		dir := t.TempDir()
+		var lines []string
+		for _, n := range nullifiers {
+			lines = append(lines, ballotHexFor(t, n))
+		}
+		if err := os.WriteFile(filepath.Join(dir, BallotsFile),
+			[]byte(strings.Join(lines, "\n")+"\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return dir
+	}
+	digest := func(dir string) string {
+		d, err := nullifierSetDigest(dir)
+		if err != nil {
+			t.Fatalf("nullifierSetDigest: %v", err)
+		}
+		return d
+	}
+	a, b, c := []byte{1}, []byte{2}, []byte{3}
+	forward := digest(writeSet(a, b, c))
+	if got := digest(writeSet(c, a, b)); got != forward {
+		t.Fatalf("a reordered set digested differently:\n %s\n %s", forward, got)
+	}
+	if got := digest(writeSet(c, b, a)); got != forward {
+		t.Fatalf("a reversed set digested differently:\n %s\n %s", forward, got)
+	}
+	if got := digest(writeSet(a, b, []byte{4})); got == forward {
+		t.Fatal("changing a nullifier must change the digest")
+	}
+	// The count is folded in, so a strict subset can never collide either.
+	if got := digest(writeSet(a, b)); got == forward {
+		t.Fatal("dropping a nullifier must change the digest")
+	}
+}
+
+// TestLedgerDumpRejectsUndecodableChainParams: without decodable on-chain
+// parameters there is no list of (contest, trustee) pairs to ask for, so a
+// header claiming the election published no partial decryptions would be a
+// fabrication. The dump fails instead, and the run says so.
+func TestLedgerDumpRejectsUndecodableChainParams(t *testing.T) {
+	e, runID, dir, led := newLedgerRun(t, 2)
+	e.run = passingAudit("")
+	led.Params = "not-hex"
+
+	if _, err := e.verify(context.Background(), runID, good(), led); err != nil {
+		t.Fatalf("verify: %v", err)
+	}
+	if got := readRunEnd(t, dir)["ledger_audit"]; got != "not run" {
+		t.Fatalf("run.end ledger_audit = %v, want \"not run\"", got)
+	}
+	if _, err := os.Stat(filepath.Join(dir, LedgerDir)); !os.IsNotExist(err) {
+		t.Fatalf("the aborted dump must leave no ledger directory behind: %v", err)
 	}
 }
 

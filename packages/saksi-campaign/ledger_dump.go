@@ -3,8 +3,10 @@ package campaign
 import (
 	"bufio"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"fmt"
+	"math/big"
 	"os"
 	"path/filepath"
 	"sort"
@@ -160,24 +162,36 @@ func writeLedgerHeader(runDir, dir, electionID string, n int, r ledgerReader) er
 	if err != nil {
 		return fmt.Errorf("get tally: %w", err)
 	}
+	partials, err := chainPartials(electionID, params, r)
+	if err != nil {
+		return err
+	}
 	h["election_id"] = electionID
 	h["params"] = params
 	h["dkg"] = dkg
 	h["tally"] = tally
-	h["partial_decryptions"] = chainPartials(electionID, params, r)
+	h["partial_decryptions"] = partials
 	h["n"] = n
 	return writeJSON(filepath.Join(dir, headerFile), h)
 }
 
 // chainPartials collects the published partial decryptions by asking for every
 // (contest, trustee) pair the election parameters declare. The chaincode has no
-// list query for them, and a threshold election is expected to be missing
-// some — so a pair the chain does not hold is skipped, not an error.
-func chainPartials(electionID, paramsHex string, r ledgerReader) []string {
-	var p pb.ElectionParameters
+// list query for them.
+//
+// A pair the chain does not hold is skipped: a threshold election is expected
+// to be missing some, and that is the one absence that is not a fault. On-chain
+// parameters that do not decode ARE a fault — without them there is no list of
+// pairs to ask about, so the header would silently claim the election published
+// no partial decryptions at all.
+func chainPartials(electionID, paramsHex string, r ledgerReader) ([]string, error) {
 	raw, err := hex.DecodeString(paramsHex)
-	if err != nil || proto.Unmarshal(raw, &p) != nil {
-		return []string{}
+	if err != nil {
+		return nil, fmt.Errorf("on-chain election parameters are not hex: %w", err)
+	}
+	var p pb.ElectionParameters
+	if err := proto.Unmarshal(raw, &p); err != nil {
+		return nil, fmt.Errorf("decode on-chain election parameters: %w", err)
 	}
 	out := []string{}
 	for _, contest := range p.GetContestIds() {
@@ -187,7 +201,7 @@ func chainPartials(electionID, paramsHex string, r ledgerReader) []string {
 			}
 		}
 	}
-	return out
+	return out, nil
 }
 
 // compareLedger reports whether the chain's record and the console's are the
@@ -209,13 +223,22 @@ func compareLedger(runDir string, local, ledger StreamAudit) (bool, error) {
 	return localNulls == ledgerNulls && aggregateDigest(local) == aggregateDigest(ledger), nil
 }
 
-// nullifierSetDigest is the SHA-256 of a stream directory's nullifier set.
+// nullifierSetDigest identifies a stream directory's nullifier set, independent
+// of the order the ballots happen to be written in.
 //
-// Ballot lines are streamed one at a time; only the nullifiers are held, which
-// is the same set the resume path already builds (nullifierIndex) and the
-// smallest thing that can identify "the same ballots" across two orderings.
+// Sorting would need the whole set resident — at 1M ballots that is tens of
+// megabytes held only to be thrown away — so the combination is commutative
+// instead: each nullifier is hashed to a 256-bit value and those are ADDED
+// modulo 2^256. Addition does not care what order it sees its terms in, so one
+// running total and a count is the entire state, whatever the population size.
+// The count is folded into the final hash so that a set and a differently-sized
+// set that happens to sum the same cannot collide.
+//
+// Duplicate nullifiers are not this function's job: the auditor's
+// nullifier.unique check is what rejects a double vote, on both directories.
 func nullifierSetDigest(dir string) (string, error) {
-	var nulls []string
+	sum := new(big.Int)
+	count := uint64(0)
 	err := scanBallotLines(dir, func(i int, line string) error {
 		raw, err := hex.DecodeString(line)
 		if err != nil {
@@ -225,19 +248,28 @@ func nullifierSetDigest(dir string) (string, error) {
 		if err := proto.Unmarshal(raw, &b); err != nil {
 			return fmt.Errorf("decode ballot %d: %w", i, err)
 		}
-		nulls = append(nulls, hex.EncodeToString(b.GetCredentialPresentation().GetNullifier().GetValue()))
+		term := sha256.Sum256(b.GetCredentialPresentation().GetNullifier().GetValue())
+		sum.Add(sum, new(big.Int).SetBytes(term[:]))
+		count++
 		return nil
 	})
 	if err != nil {
 		return "", err
 	}
-	sort.Strings(nulls)
+	// Reduce to exactly 32 bytes: the running total can carry past 2^256, and a
+	// digest that changed width with the population would not be comparable.
+	var total [32]byte
+	sum.Mod(sum, twoTo256).FillBytes(total[:])
+
 	h := sha256.New()
-	for _, n := range nulls {
-		fmt.Fprintln(h, n)
-	}
+	_ = binary.Write(h, binary.LittleEndian, count)
+	h.Write(total[:])
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
+
+// twoTo256 is the modulus the nullifier sum is reduced by, so the accumulator
+// stays a fixed 32 bytes however many ballots it has seen.
+var twoTo256 = new(big.Int).Lsh(big.NewInt(1), 256)
 
 // aggregateDigest is the SHA-256 of an audit's per-contest aggregate
 // ciphertexts — the homomorphic sum the tally was decrypted from, which is what
