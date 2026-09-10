@@ -57,11 +57,14 @@ type fakeLedger struct {
 	ballots     int             // SubmitBallot attempts, accepted or not
 	accepted    []string        // accepted nullifiers, in accept order
 	acceptedSet map[string]bool // the same set, for the duplicate gate
-	hidden      map[string]bool // accepted but withheld from ListNullifiers
+	hidden      map[string]bool // accepted but withheld from the NEXT listing
+	failAfter   map[string]bool // committed, then reported as failed
+	reject      map[string]bool // never committed, always reported as failed
 }
 
-// hide withholds an accepted nullifier from ListNullifiers: the late commit
-// that raced the resume's snapshot.
+// hide withholds an accepted nullifier from the next completed ListNullifiers
+// walk and no later one: the late commit that raced the resume's snapshot and
+// is visible by the time the failures are re-checked.
 func (f *fakeLedger) hide(nullifierHex string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -69,6 +72,28 @@ func (f *fakeLedger) hide(nullifierHex string) {
 		f.hidden = map[string]bool{}
 	}
 	f.hidden[nullifierHex] = true
+}
+
+// acceptButFail commits a ballot and still reports a generic validation
+// failure to the caller — the peer losing the commit status of a transaction
+// that was ordered anyway.
+func (f *fakeLedger) acceptButFail(nullifierHex string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.failAfter == nil {
+		f.failAfter = map[string]bool{}
+	}
+	f.failAfter[nullifierHex] = true
+}
+
+// rejectBallot fails a ballot without committing it: a genuine drop.
+func (f *fakeLedger) rejectBallot(nullifierHex string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.reject == nil {
+		f.reject = map[string]bool{}
+	}
+	f.reject[nullifierHex] = true
 }
 
 // acceptedIndices maps the accepted nullifiers back to ballot indices, using
@@ -118,14 +143,20 @@ func (f *fakeLedger) ballotGate(args []string) error {
 	if nul == "" {
 		return nil
 	}
+	if f.reject[nul] {
+		return errors.New("tx did not validate (code 11)")
+	}
 	if f.RejectDuplicates && f.acceptedSet[nul] {
-		return fmt.Errorf("nullifier already spent (double vote)")
+		return errors.New("tx did not validate (code 11)")
 	}
 	if f.acceptedSet == nil {
 		f.acceptedSet = map[string]bool{}
 	}
 	f.acceptedSet[nul] = true
 	f.accepted = append(f.accepted, nul)
+	if f.failAfter[nul] {
+		return errors.New("tx did not validate (code 11)")
+	}
 	return nil
 }
 
@@ -155,6 +186,8 @@ func (f *fakeLedger) ListNullifiers(_ string, pageSize int, bookmark string) (cl
 	page := clientsdk.NullifierPage{Nullifiers: list[off:end]}
 	if end < len(list) {
 		page.NextBookmark = strconv.Itoa(end)
+	} else {
+		f.hidden = nil // the walk is complete; a hidden late commit is visible from here on
 	}
 	return page, nil
 }

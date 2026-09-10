@@ -928,7 +928,11 @@ func (e *Executor) resumeBallots(ctx context.Context, runID string, c ElectionCo
 	j := e.journalFor(runID)
 	defer j.Close()
 
-	committed, err := committedByIndex(dir, b, nl)
+	byNullifier, err := nullifierIndex(dir, b.BallotCount)
+	if err != nil {
+		return err
+	}
+	committed, err := chainCommitted(byNullifier, b, nl)
 	if err != nil {
 		return err
 	}
@@ -971,7 +975,6 @@ func (e *Executor) resumeBallots(ctx context.Context, runID string, c ElectionCo
 
 	var mu sync.Mutex
 	landed := make([]landedTx, 0, len(pending))
-	replays := make(map[int]bool)
 	var readErr error
 
 	res := bench.Run(ctx, len(pending), func(k int) error {
@@ -987,14 +990,6 @@ func (e *Executor) resumeBallots(ctx context.Context, runID string, c ElectionCo
 		}
 		txID, block, err := led.Submit("SubmitBallot", line)
 		if err != nil {
-			// The chain says this nullifier is already spent: the ballot
-			// committed after the snapshot was taken. That is a replay, not a
-			// lost vote — and never a negative-test result.
-			if isDoubleVote(err) {
-				mu.Lock()
-				replays[k] = true
-				mu.Unlock()
-			}
 			return err
 		}
 		mu.Lock()
@@ -1009,6 +1004,12 @@ func (e *Executor) resumeBallots(ctx context.Context, runID string, c ElectionCo
 		},
 	})
 
+	// A submission can fail and still have landed: the peer's commit status
+	// can be lost to an MVCC conflict or a broken connection while the ballot
+	// itself is ordered and committed. So a failure is never classified by its
+	// error text — the chain is re-read once and every failed index whose
+	// nullifier is now on it is a replay, not a drop.
+	replays := e.replayedIndices(j, byNullifier, b, nl, pending, res)
 	replayed := len(replays)
 	dropped := res.Dropped - replayed
 	if dropped < 0 {
@@ -1055,11 +1056,38 @@ func (e *Executor) resumeBallots(ctx context.Context, runID string, c ElectionCo
 	return nil
 }
 
-// isDoubleVote reports whether err is the chaincode refusing a ballot whose
-// nullifier is already spent (contract.go's double-vote gate).
-func isDoubleVote(err error) bool {
-	msg := strings.ToLower(err.Error())
-	return strings.Contains(msg, "double vote") || strings.Contains(msg, "already spent")
+// replayedIndices classifies the window's failures against the chain: it
+// re-reads the committed set once and returns the failed slots whose ballot is
+// on chain anyway. Those are replays (the ballot landed; only our knowledge of
+// it was lost), never drops, and never negative-test results — writeNegativeTestsCSV
+// reads scenario results only and never sees a latency row.
+//
+// If the refresh itself fails there is no evidence of a replay, so every
+// failure stays a drop: the run fails loudly rather than quietly forgiving
+// ballots that may really be missing.
+func (e *Executor) replayedIndices(j *Journal, byNullifier map[[32]byte]int, b *onChainBundle,
+	nl nullifierLister, pending []int, res bench.RunResult) map[int]bool {
+	replays := map[int]bool{}
+	failed := make([]int, 0, res.Dropped)
+	for k := 0; k <= res.LastIndex && k < len(res.OK); k++ {
+		if !res.OK[k] {
+			failed = append(failed, k)
+		}
+	}
+	if len(failed) == 0 {
+		return replays
+	}
+	committed, err := chainCommitted(byNullifier, b, nl)
+	if err != nil {
+		_ = j.Stamp("replay_check_failed", map[string]any{"failed": len(failed), "error": err.Error()})
+		return replays
+	}
+	for _, k := range failed {
+		if i := pending[k]; i < len(committed) && committed[i] {
+			replays[k] = true
+		}
+	}
+	return replays
 }
 
 // committedByIndex is the committed set: every ballot in this run whose
@@ -1073,6 +1101,14 @@ func committedByIndex(dir string, b *onChainBundle, nl nullifierLister) ([]bool,
 	if err != nil {
 		return nil, err
 	}
+	return chainCommitted(byNullifier, b, nl)
+}
+
+// chainCommitted is the chain half of the committed set: one paged walk of
+// ListNullifiers against an already-built nullifier -> index map. The resume
+// walks it twice (once for the plan, once to classify the window's failures),
+// and the second walk must not re-stream the population.
+func chainCommitted(byNullifier map[[32]byte]int, b *onChainBundle, nl nullifierLister) ([]bool, error) {
 	committed := make([]bool, b.BallotCount)
 	bookmark := ""
 	for {
@@ -1118,6 +1154,9 @@ func nullifierIndex(dir string, count int) (map[[32]byte]int, error) {
 		if !ok {
 			return fmt.Errorf("ballot %d carries no 32-byte nullifier: it cannot be matched against the chain", i)
 		}
+		// Two ballots sharing a nullifier is a generator bug the chain would
+		// reject as a double vote anyway; the later index wins and the earlier
+		// one is treated as uncommitted (resubmitted, then rejected).
 		byNullifier[key] = i
 		n++
 		return nil

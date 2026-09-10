@@ -771,6 +771,13 @@ func (s *Server) handleCheck(w http.ResponseWriter, r *http.Request) {
 // The refusal is decided BEFORE anything is dispatched (planResume reads the
 // run's journal, no network), so a run that cannot be resumed gets a 409 with
 // the reason instead of a second window quietly opening on top of the first.
+//
+// The 202 body's `remaining` is the JOURNAL'S ESTIMATE (the interrupted
+// window's ballot count minus its last progress checkpoint), because the exact
+// figure needs a paged ListNullifiers walk intersected with the population and
+// this request must not block for it. The exact count is stamped as
+// `segment.start {pending}` once the resume has taken its snapshot, and
+// published on the run's event stream.
 func (s *Server) handleResume(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "POST only", http.StatusMethodNotAllowed)

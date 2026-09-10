@@ -364,6 +364,14 @@ window) — it is never a measured zero.
 
 Per-ballot latencies are in ` + "`latencies.csv`" + ` (` + "`index,segment,ms,ok`" + `);
 the full event log with the environment snapshot is ` + "`journal.ndjson`" + `.
+
+A run that was RESUMED after an interrupted ballot window has more than one
+window. Its ` + "`committed`, `dropped`, `failed`" + ` cells cover the whole run, but the
+window and latency cells (` + "`submit_window_ms`, `committed_tps`, `driver_ceiling_tps`, `latency_*_ms`" + `)
+describe only the FIRST window — they measure one window, and a resumed run is
+not a sustained measurement (` + "`sustained`" + ` is false, ` + "`scaling_limit`" + ` inconclusive).
+The per-window figures are the ` + "`segment.end`" + ` events in ` + "`journal.ndjson`" + `,
+and each window's rows carry its segment number in ` + "`latencies.csv`" + `.
 `
 
 func writePerfSchema(dir string) error {

@@ -313,6 +313,104 @@ func TestCommittedSetIsTheChainSet(t *testing.T) {
 	}
 }
 
+// crashedRun writes an n-ballot on-chain run and drives its window until the
+// ledger dies at ballot fail, leaving exactly the interrupted state a resume
+// starts from. The returned ledger is healthy again.
+func crashedRun(t *testing.T, n, fail int) (*Executor, *fakeLedger, ElectionConfig, string, string) {
+	t.Helper()
+	dir := t.TempDir()
+	runDir := filepath.Join(dir, "run-1")
+	e := newTestExecutor(t, dir)
+	path := writeRealBallotStream(t, runDir, n)
+	c := ElectionConfig{Mode: "onchain", Voters: n, Positions: 1, Candidates: 2, Concurrency: 4}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	led := &fakeLedger{FailAt: fail, cancel: cancel}
+	if err := e.submitOnChain(ctx, "run-1", c, led, path); err == nil {
+		t.Fatalf("want an error from the ledger failing at ballot %d", fail)
+	}
+	led.FailAt = 0
+	return e, led, c, runDir, path
+}
+
+// TestResumeTagsCommittedFailuresAsReplay: a submission can fail and still
+// have landed — an MVCC conflict or a lost connection costs us the commit
+// status, not the ballot. The classification must come from the chain, not
+// from the error text, so a generic "did not validate" for a ballot the chain
+// holds is a replay, not a drop.
+func TestResumeTagsCommittedFailuresAsReplay(t *testing.T) {
+	e, led, c, runDir, path := crashedRun(t, 40, 20)
+	stranded := 39 // never reached before the crash, so the resume submits it
+	if led.acceptedIndices()[stranded] {
+		t.Fatalf("index %d committed before the crash", stranded)
+	}
+	led.acceptButFail(testNullifierHex(stranded))
+
+	if err := e.resumeBallots(context.Background(), "run-1", c, led, led, path); err != nil {
+		t.Fatalf("a committed-but-failed ballot must not fail the resume: %v", err)
+	}
+	if got := latencyRows(t, runDir, 1)[stranded]; got != "replay" {
+		t.Fatalf("index %d ok = %q, want replay", stranded, got)
+	}
+	ends := journalEventsOfType(t, runDir, "stage.ballots.end")
+	if len(ends) == 0 || jint(ends[len(ends)-1], "dropped") != 0 {
+		t.Fatalf("resumed window must report 0 dropped, got %v", ends)
+	}
+	if runEnd := journalEventsOfType(t, runDir, "run.end"); runEnd[0]["failed"] != false {
+		t.Fatalf("run.end failed = %v, want false", runEnd[0]["failed"])
+	}
+}
+
+// TestResumeFailsOnAGenuineDrop: a ballot that fails AND is absent from the
+// chain is a lost vote. It stays a drop, and the resume says so.
+func TestResumeFailsOnAGenuineDrop(t *testing.T) {
+	e, led, c, runDir, path := crashedRun(t, 40, 20)
+	lost := 39
+	led.rejectBallot(testNullifierHex(lost))
+
+	err := e.resumeBallots(context.Background(), "run-1", c, led, led, path)
+	if err == nil {
+		t.Fatal("want an error: a ballot that never landed is a drop")
+	}
+	if !strings.Contains(err.Error(), "did not commit") {
+		t.Fatalf("error = %v, want it to name the uncommitted ballots", err)
+	}
+	if got := latencyRows(t, runDir, 1)[lost]; got != "drop" {
+		t.Fatalf("index %d ok = %q, want drop", lost, got)
+	}
+	ends := journalEventsOfType(t, runDir, "stage.ballots.end")
+	if len(ends) == 0 || jint(ends[len(ends)-1], "dropped") != 1 {
+		t.Fatalf("resumed window must report 1 dropped, got %v", ends)
+	}
+}
+
+// TestResumeProceedsThroughTruncatedReceipts: receipts.csv is the file most
+// likely to be mid-write when the process died. A torn last row is a warning
+// on the journal, never a refusal — the chain, not this file, decides what is
+// committed.
+func TestResumeProceedsThroughTruncatedReceipts(t *testing.T) {
+	e, led, c, runDir, path := crashedRun(t, 40, 20)
+	receipts := filepath.Join(runDir, "receipts.csv")
+	data, err := os.ReadFile(receipts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(receipts, data[:len(data)-10], 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := e.resumeBallots(context.Background(), "run-1", c, led, led, path); err != nil {
+		t.Fatalf("a truncated receipts.csv must not refuse the resume: %v", err)
+	}
+	if warn := journalEventsOfType(t, runDir, "receipts_truncated"); len(warn) != 1 {
+		t.Fatalf("want one receipts_truncated warning, got %d", len(warn))
+	}
+	if got := len(led.acceptedIndices()); got != 40 {
+		t.Fatalf("chain holds %d ballots after the resume, want 40", got)
+	}
+}
+
 // TestVerifyAfterResumeJudgesTheWholeRun: the interrupted first window is not
 // the run. Once the resume has committed the rest, Verify's perf row must
 // report the whole election as landed — and still refuse to call it a
