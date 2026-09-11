@@ -243,6 +243,49 @@ func (f *fakeLedger) GetBallot(_, nullifier string) (string, error) {
 	return hexBallot, nil
 }
 
+// GetBallots is the batched read: the same ballots GetBallot serves, in the
+// order asked for, absent ones as empty strings. noBatch models chaincode
+// predating the function, which is what the dump falls back from.
+func (f *fakeLedger) GetBallots(electionID string, nullifiers []string) ([]string, error) {
+	f.mu.Lock()
+	if f.noBatch {
+		f.mu.Unlock()
+		return nil, errors.New("Function GetBallots not found in contract SmartContract")
+	}
+	if len(nullifiers) > clientsdk.BallotBatchSize {
+		f.mu.Unlock()
+		return nil, fmt.Errorf("nullifier count %d exceeds the %d cap per GetBallots page",
+			len(nullifiers), clientsdk.BallotBatchSize)
+	}
+	f.getBallotsBatches = append(f.getBallotsBatches, len(nullifiers))
+	f.mu.Unlock()
+
+	out := make([]string, len(nullifiers))
+	for i, nul := range nullifiers {
+		// Route through GetBallot so both paths share the chain's copy (and
+		// FailGetBallotAt), then translate its absence error into the empty
+		// entry the chaincode returns.
+		line, err := f.GetBallot(electionID, nul)
+		if err != nil {
+			if strings.HasPrefix(err.Error(), "no ballot for nullifier ") {
+				continue
+			}
+			return nil, err
+		}
+		out[i] = line
+	}
+	return out, nil
+}
+
+// batchSizes is the size of each GetBallots page the dump asked for.
+func (f *fakeLedger) batchSizes() []int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]int, len(f.getBallotsBatches))
+	copy(out, f.getBallotsBatches)
+	return out
+}
+
 func (f *fakeLedger) GetElection(string) (string, error)      { return f.Params, nil }
 func (f *fakeLedger) GetDKGTranscript(string) (string, error) { return f.DKG, nil }
 func (f *fakeLedger) GetTally(string) (string, error)         { return f.Tally, nil }

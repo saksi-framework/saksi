@@ -46,7 +46,7 @@ func writeTestBundleWithPartials(t *testing.T, runDir string, n int) string {
 // bound that leaked would push the observed peak above maxPartialsInFlight.
 func TestSubmitPartialsRunConcurrentlyWithinTheBound(t *testing.T) {
 	dir := t.TempDir()
-	const partials = maxPartialsInFlight * 2 + 3
+	const partials = maxPartialsInFlight*2 + 3
 
 	var (
 		mu       sync.Mutex

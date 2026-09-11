@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strconv"
+	"strings"
 )
 
 // nullifierPageSize is the per-page cap for ListNullifiers. It matches the
@@ -94,6 +95,60 @@ func (b *BulletinClient) GetBallot(electionID, nullifier string) (string, error)
 		return "", fmt.Errorf("get ballot: %w", err)
 	}
 	return string(out), nil
+}
+
+// BallotBatchSize is the largest page GetBallots will accept. It matches the
+// chaincode's maxBallotBatchSize, so a caller that sizes its pages by this
+// constant never trips the on-chain cap.
+const BallotBatchSize = 500
+
+// GetBallots evaluates the batched GetBallots query and returns the recorded
+// ballots as hex strings, in the order the nullifiers were given. A nullifier
+// the chain holds no ballot for comes back as an empty string at its position
+// (the chaincode's documented absence marker), never as an error — the caller
+// decides whether an absence is a fault.
+//
+// Pages longer than BallotBatchSize are rejected on-chain, not split here: a
+// caller that silently got fewer ballots than it asked for would be worse than
+// one that got an error.
+//
+// Older chaincode does not have this function at all; UnknownChaincodeFunction
+// recognises that error so a caller can fall back to per-ballot GetBallot.
+func (b *BulletinClient) GetBallots(electionID string, nullifiers []string) ([]string, error) {
+	arg, err := json.Marshal(nullifiers)
+	if err != nil {
+		return nil, fmt.Errorf("encode nullifier list: %w", err)
+	}
+	out, err := b.contract.EvaluateTransaction("GetBallots", electionID, string(arg))
+	if err != nil {
+		return nil, fmt.Errorf("get ballots: %w", err)
+	}
+	var ballots []string
+	if err := json.Unmarshal(out, &ballots); err != nil {
+		return nil, fmt.Errorf("decode ballot page: %w", err)
+	}
+	if len(ballots) != len(nullifiers) {
+		return nil, fmt.Errorf("ballot page holds %d entries for %d nullifiers", len(ballots), len(nullifiers))
+	}
+	return ballots, nil
+}
+
+// UnknownChaincodeFunction reports whether err is the peer refusing a function
+// the deployed chaincode does not define — as opposed to the function running
+// and failing.
+//
+// This is a string match because that is all the gateway gives: contractapi
+// answers an unknown name with "Function <name> not found in contract
+// <Contract>", carried back as a plain endorsement error with no code of its
+// own. It exists so a client can use a newer query against an older deployment
+// and fall back, instead of failing a whole run over a chaincode version.
+func UnknownChaincodeFunction(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "not found in contract") ||
+		strings.Contains(msg, "function not found")
 }
 
 // CreateElection records a new election on the bulletin board. paramsHex is the

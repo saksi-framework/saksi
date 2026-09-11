@@ -284,7 +284,7 @@ func (e *Executor) verify(ctx context.Context, runID string, c ElectionConfig, l
 	// The chain's own record is dumped and audited FIRST: it is the evidence
 	// the console did not write, and a reader who only gets one of the two
 	// should get that one.
-	lc := e.auditLedger(ctx, runID, dir, lr)
+	lc := e.auditLedger(ctx, j, runID, dir, lr)
 
 	e.publish(runID, "verify", "info", "auditing run…")
 	out, runErr := e.run(ctx, e.demoBin, "audit-stream", dir, "--json")
@@ -329,12 +329,17 @@ func (e *Executor) verify(ctx context.Context, runID string, c ElectionConfig, l
 // A dump or audit that fails is stamped "not run" and nothing else: the chain
 // going away mid-dump is an instrumentation loss, not a verdict on the run, and
 // Verify continues with the local audit.
-func (e *Executor) auditLedger(ctx context.Context, runID, dir string, lr ledgerReader) *ledgerCheck {
+func (e *Executor) auditLedger(ctx context.Context, j *Journal, runID, dir string, lr ledgerReader) *ledgerCheck {
 	if lr == nil {
 		return nil
 	}
 	e.publish(runID, "verify", "info", "dumping the chain's own record of this election…")
-	n, err := dumpLedger(dir, runID, lr)
+	n, readPath, err := dumpLedger(dir, runID, lr)
+	// Which read path served the dump is journalled either way: "per-ballot"
+	// means the deployed chaincode predates GetBallots, which is the difference
+	// between a dump that costs one round trip per 500 ballots and one that
+	// costs one per ballot.
+	_ = j.Stamp("ledger.dump", map[string]any{"ballots": n, "read_path": readPath, "ok": err == nil})
 	if err != nil {
 		e.publish(runID, "verify", "error", "ledger audit not run: "+err.Error())
 		return &ledgerCheck{status: "not run"}
