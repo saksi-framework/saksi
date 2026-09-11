@@ -81,11 +81,6 @@ install_configtx() {
 		exit 1
 	fi
 
-	# Back up the pristine file once, and never over a copy of our own.
-	if [ ! -f "${backup}" ] && ! grep -qF "${CONFIGTX_MARKER}" "${dst}"; then
-		cp "${dst}" "${backup}"
-	fi
-
 	if [ "${SAKSI_CONFIGTX}" = default ]; then
 		if [ -f "${backup}" ]; then
 			cp "${backup}" "${dst}"
@@ -101,6 +96,13 @@ install_configtx() {
 			echo "configtx: test-network defaults already in place (SAKSI_CONFIGTX=default)"
 		fi
 		return
+	fi
+
+	# Back up the pristine file once, and never over a copy of our own. Only
+	# the install path needs it: the default path above restores from it, or
+	# finds the pristine file already in place.
+	if [ ! -f "${backup}" ] && ! grep -qF "${CONFIGTX_MARKER}" "${dst}"; then
+		cp "${dst}" "${backup}"
 	fi
 
 	cp "${src}" "${dst}"

@@ -55,10 +55,14 @@ if SAKSI_CONFIGTX=default FABRIC_SAMPLES="${TMP}" "${NETWORK}" configtx >/dev/nu
 fi
 [ "$(cat "${DST}")" = "${before}" ] || fail "failed opt-out modified the file"
 
-# 6. A lost backup with the pristine file already in place is fine.
+# 6. A lost backup with the pristine file already in place is fine, and the
+#    script must say so rather than claim it restored anything.
 printf 'PRISTINE test-network configtx
 ' >"${DST}"
-SAKSI_CONFIGTX=default FABRIC_SAMPLES="${TMP}" "${NETWORK}" configtx >/dev/null 	|| fail "opt-out failed when defaults were already in place"
+out="$(SAKSI_CONFIGTX=default FABRIC_SAMPLES="${TMP}" "${NETWORK}" configtx)" ||
+	fail "opt-out failed when defaults were already in place"
+grep -q 'already in place' <<<"${out}" || fail "opt-out did not report defaults already in place: ${out}"
 grep -q '^PRISTINE' "${DST}" || fail "opt-out disturbed an already-pristine file"
+[ ! -f "${BACKUP}" ] || fail "the default path created a backup it never needed"
 
 echo "ok: configtx install, backup, idempotency, opt-out, lost-backup refusal"
