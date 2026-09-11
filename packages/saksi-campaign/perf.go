@@ -45,11 +45,17 @@ const (
 // TimingsMs mirrors the `timings_ms` object of `saksi-demo audit-stream --json`
 // (saksi-auditor/src/demo.rs TimingsMs) — milliseconds spent in each measured
 // audit stage, in-process, with no I/O in between.
+//
+// VerifyBallots is the WALL time of the parallel ballot-verification phase on
+// VerifyThreads threads, not CPU summed across them. VerifyThreads is 0 when
+// the auditor did not report it (an older binary, or no ballot phase ran), and
+// is then omitted from timings.json rather than written as a measured zero.
 type TimingsMs struct {
 	VerifyBallots uint64 `json:"verify_ballots"`
 	Aggregate     uint64 `json:"aggregate"`
 	Combine       uint64 `json:"combine"`
 	Decode        uint64 `json:"decode"`
+	VerifyThreads uint64 `json:"verify_threads,omitempty"`
 }
 
 // genTimings mirrors gen-timings.json (saksi-auditor/src/stream.rs GenTimings).
@@ -109,6 +115,7 @@ var perfColumns = []string{
 	"peak_cpu_pct_peer", "peak_cpu_pct_orderer", "peak_cpu_pct_client",
 	"peak_mem_mb_peer", "peak_mem_mb_orderer", "peak_mem_mb_client",
 	"ledger_bytes_delta", "sustained", "scaling_limit", "failed", "fail_reason",
+	"verify_threads",
 }
 
 // millis renders a duration measured in milliseconds; ms3 renders a float with
@@ -180,6 +187,7 @@ func perfRow(dir, runID string, c ElectionConfig, fin FinaliseResult) []string {
 		ledgerDelta,
 		strconv.FormatBool(fin.Sustained), fin.ScalingLimit,
 		strconv.FormatBool(fin.Failed), fin.Reason,
+		uintCell(haveTimings && tm.VerifyThreads > 0, tm.VerifyThreads),
 	}
 }
 
@@ -351,7 +359,7 @@ window) — it is never a measured zero.
 | ` + "`gen_wall_ms`" + ` | ms | ` + "`gen-timings.json` `wall_ms`" + ` — generator wall time |
 | ` + "`gen_cpu_ms`" + ` | ms | ` + "`gen-timings.json`" + `: credential + encrypt + CDS-prove CPU, summed across worker threads (may exceed wall) |
 | ` + "`proof_gen_cpu_ms`" + ` | ms | ` + "`gen-timings.json` `cds_prove_cpu_ms`" + ` |
-| ` + "`proof_verify_inproc_ms`" + ` | ms | ` + "`timings.json` `verify_ballots`" + ` — in-auditor-process, per-ballot CDS + credential verification |
+| ` + "`proof_verify_inproc_ms`" + ` | ms | ` + "`timings.json` `verify_ballots`" + ` — in-auditor-process CDS + credential verification of every ballot. **Wall-clock** time of the parallel verify phase on ` + "`verify_threads`" + ` threads, not CPU time summed across them; compare runs only at the same thread count |
 | ` + "`aggregate_inproc_ms`" + ` | ms | ` + "`timings.json` `aggregate`" + ` |
 | ` + "`combine_inproc_ms`" + ` | ms | ` + "`timings.json` `combine`" + ` — Lagrange recombination |
 | ` + "`decrypt_inproc_ms`" + ` | ms | ` + "`timings.json` `decode`" + ` — discrete-log tally recovery |
@@ -366,6 +374,7 @@ window) — it is never a measured zero.
 | ` + "`sustained`" + ` | bool | the run was one uninterrupted window |
 | ` + "`scaling_limit`" + ` | true\|false\|inconclusive | sustained TPS vs. the arrival rate the tier demands; ` + "`inconclusive`" + ` when the driver was the ceiling |
 | ` + "`failed`, `fail_reason`" + ` | bool, text | the run-failed predicate: stage error, any drop, reconcile mismatch, nonzero E, or interruption |
+| ` + "`verify_threads`" + ` | count | ` + "`timings.json` `verify_threads`" + ` — threads the auditor verified ballots on (all cores by default; ` + "`SAKSI_AUDIT_THREADS`" + ` pins it). Empty when the auditor did not report it |
 
 A window that closed because it reached its own configured time bound
 (` + "`window_s`" + `, as a rate sweep's steps do) is **not** an interruption and not a

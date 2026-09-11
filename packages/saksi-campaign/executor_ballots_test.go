@@ -156,7 +156,7 @@ func perfCells(t *testing.T, dir string) map[string]string {
 // auditJSON is a passing audit document carrying the auditor's in-process
 // stage timings.
 const auditJSON = `{"overall":"pass","timings_ms":{"verify_ballots":41,"aggregate":7,` +
-	`"combine":3,"decode":12},"contests":[{"contest":"president/cand0",` +
+	`"combine":3,"decode":12,"verify_threads":16},"contests":[{"contest":"president/cand0",` +
 	`"ground_truth":3,"decoded":3,"E":0,"pass":true}]}`
 
 // TestVerifyWritesPerfRowForOnChainRun: the submitted run's row carries the
@@ -192,6 +192,7 @@ func TestVerifyWritesPerfRowForOnChainRun(t *testing.T) {
 	for col, want := range map[string]string{
 		"proof_verify_inproc_ms": "41", "aggregate_inproc_ms": "7",
 		"combine_inproc_ms": "3", "decrypt_inproc_ms": "12",
+		"verify_threads": "16",
 	} {
 		if cells[col] != want {
 			t.Fatalf("%s = %q, want %q", col, cells[col], want)
@@ -313,6 +314,11 @@ func TestVerifyReplacesThePerfRowOnReAudit(t *testing.T) {
 	}
 	if cells["decrypt_inproc_ms"] != "77" || cells["proof_verify_inproc_ms"] != "99" {
 		t.Fatalf("the surviving row is not the second audit's: %v", cells)
+	}
+	// The second document (an older auditor's) reports no thread count: the
+	// cell is empty, never a fabricated 0.
+	if cells["verify_threads"] != "" {
+		t.Fatalf("verify_threads = %q, want empty for an audit that did not report it", cells["verify_threads"])
 	}
 	if cells["failed"] != "true" || !strings.Contains(cells["fail_reason"], "e_nonzero") {
 		t.Fatalf("failed/fail_reason = %q/%q", cells["failed"], cells["fail_reason"])
