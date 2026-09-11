@@ -428,7 +428,8 @@ pub(crate) fn write_election_stream_chunked(
 /// Streams `ballots.ndjson` one decoded [`Ballot`] at a time.
 ///
 /// The auditor's whole ballot phase runs off this iterator, so a 10M-ballot
-/// stream costs one line of memory rather than a `Vec<Ballot>`. Errors are
+/// stream costs one verify batch of memory (the auditor's `VERIFY_CHUNK`
+/// ballots) rather than a `Vec<Ballot>`. Errors are
 /// per-line and carry the 1-based line number; a malformed line yields an `Err`
 /// item and iteration continues, except when the reader itself failed or a line
 /// blew the [`MAX_BALLOT_LINE_BYTES`] cap, which ends the stream.

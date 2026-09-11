@@ -763,15 +763,16 @@ fn audit_on(
 }
 
 /// The 1-thread audit is the reference; 8 threads — in the same small batches,
-/// in one-ballot batches, and in production-size batches — must reproduce it
-/// byte for byte. Returns the reference report for the caller's own checks.
+/// in one-ballot batches, in exactly one batch, and in production-size batches —
+/// must reproduce it byte for byte. Returns the reference report for the
+/// caller's own checks.
 fn assert_parallel_matches_serial(
     f: &ElectionFixture,
     ballots: &[Result<Ballot, String>],
 ) -> AuditReport {
     let (serial, report, used) = audit_on(f, ballots, 1, TEST_CHUNK);
     assert_eq!(used, 1, "verify_threads reports the pool size");
-    for chunk in [TEST_CHUNK, 1, crate::VERIFY_CHUNK] {
+    for chunk in [TEST_CHUNK, 1, ballots.len().max(1), crate::VERIFY_CHUNK] {
         let (parallel, _, used) = audit_on(f, ballots, 8, chunk);
         assert_eq!(used, 8, "verify_threads reports the pool size");
         assert_eq!(
@@ -815,6 +816,15 @@ fn parallel_verify_matches_serial_on_a_clean_election() {
     let f = seven_by_three();
     let report = assert_parallel_matches_serial(&f, &ok_ballots(&f));
     assert!(report.passed(), "{report:#?}");
+}
+
+#[test]
+fn parallel_verify_matches_serial_on_an_empty_stream() {
+    let report = assert_parallel_matches_serial(&seven_by_three(), &[]);
+    assert!(
+        report.finding("nullifier.unique").is_some(),
+        "an empty stream still reports uniqueness: {report:#?}"
+    );
 }
 
 #[test]

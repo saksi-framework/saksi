@@ -154,9 +154,14 @@ pub struct Timings {
 /// stream order, so peak memory is one batch of ballots plus the nullifier set
 /// (realistic ballots are a few KB, so ~10 MB here).
 ///
-/// ponytail: bounded by count, not bytes — a hostile stream of lines at the
-/// 4 MiB read cap would hold VERIFY_CHUNK of them at once. Cap batch bytes too
-/// if the auditor ever ingests ballots the chaincode has not already shaped.
+/// ponytail: bounded by count, not bytes. A line may be 4 MiB of hex (2 MiB
+/// decoded), so a hostile stream can make one batch hold ~4096 x 2 MiB = 8 GiB.
+/// That fails closed: running out of memory yields no verdict, which the
+/// console records as an audit crash, never a pass. The auditor already takes
+/// unshaped ballots — `audit-stream` audits any folder, not only what the
+/// chaincode accepted — and findings already grow per failing ballot regardless
+/// of the batch (a shape failure copies the ballot's `position_id`). Upgrade
+/// path: a byte budget per batch (~6 lines).
 pub(crate) const VERIFY_CHUNK: usize = 4096;
 
 /// Everything the auditor needs **except** the ballots: the small, resident part
@@ -250,7 +255,7 @@ pub(crate) fn audit_streaming(
 /// folded serially, in stream order, after the batch returns.
 fn audit_streaming_chunked(
     inputs: AuditInputs<'_>,
-    mut ballots: impl Iterator<Item = Result<Ballot, String>>,
+    ballots: impl Iterator<Item = Result<Ballot, String>>,
     pool: Option<&rayon::ThreadPool>,
     chunk_size: usize,
 ) -> (AuditReport, Vec<crate::tally::ContestEvidence>, Timings) {
@@ -300,6 +305,9 @@ fn audit_streaming_chunked(
         rayon::ThreadPool::current_num_threads,
     );
 
+    // Fused: a caller's iterator that yields again after its first `None`
+    // (`take` asks once more at the end of every batch) cannot change results.
+    let mut ballots = ballots.fuse();
     loop {
         // Serial read: the stream is sequential.
         let chunk: Vec<Result<Ballot, String>> = ballots.by_ref().take(chunk_size).collect();
