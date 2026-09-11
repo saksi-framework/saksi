@@ -119,12 +119,17 @@ jobs:
             packages/saksi-bulletin/chaincode/go.mod
             packages/saksi-bulletin/client-sdk/go.mod
 
+      # -race, not plain `go test`: the campaign console fans out goroutines in
+      # business logic (the ballot window's workers, and the post-window partial
+      # decryptions), and a data race there would corrupt receipts or the trail
+      # without ever failing a test. Both hosted runners ship a C toolchain, so
+      # cgo — which the race detector requires — is available on each.
       - name: Test Go modules
         shell: bash
         run: |
           set -euo pipefail
           for module in ${GO_MODULES}; do
-            (cd "${module}" && go test ./...)
+            (cd "${module}" && CGO_ENABLED=1 go test -race ./...)
           done
 
   build:
