@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -331,7 +332,8 @@ func TestWritePerfRowKeepsOtherRuns(t *testing.T) {
 	dir := t.TempDir()
 	other := make([]string, len(perfColumns))
 	other[0] = "run-other"
-	other[len(other)-1] = `boom, "quoted"`
+	reasonCol := slices.Index(perfColumns, "fail_reason") // the free-text column
+	other[reasonCol] = `boom, "quoted"`
 	if err := os.WriteFile(filepath.Join(dir, PerfCSV),
 		[]byte(strings.Join(perfColumns, ",")+"\n"+
 			strings.Join(csvEscape(other), ",")+"\n"), 0o644); err != nil {
@@ -356,7 +358,7 @@ func TestWritePerfRowKeepsOtherRuns(t *testing.T) {
 	if len(rows) != 3 {
 		t.Fatalf("want header + run-other + run-1, got %d rows", len(rows))
 	}
-	if rows[1][0] != "run-other" || rows[1][len(perfColumns)-1] != `boom, "quoted"` {
+	if rows[1][0] != "run-other" || rows[1][reasonCol] != `boom, "quoted"` {
 		t.Fatalf("the other run's row was disturbed: %q", rows[1])
 	}
 	if rows[2][0] != "run-1" {
