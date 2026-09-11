@@ -89,8 +89,17 @@ install_configtx() {
 	if [ "${SAKSI_CONFIGTX}" = default ]; then
 		if [ -f "${backup}" ]; then
 			cp "${backup}" "${dst}"
+			echo "configtx: test-network defaults restored (SAKSI_CONFIGTX=default)"
+		elif grep -qF "${CONFIGTX_MARKER}" "${dst}"; then
+			# Our file is installed and the pristine copy is gone: proceeding
+			# would run an A/B "control" against the tuned parameters and
+			# report it as the default. Refuse rather than lie.
+			echo "no pristine backup at ${backup}; cannot restore test-network defaults" >&2
+			echo "reinstall fabric-samples (or restore that file) and retry" >&2
+			exit 1
+		else
+			echo "configtx: test-network defaults already in place (SAKSI_CONFIGTX=default)"
 		fi
-		echo "configtx: test-network defaults (SAKSI_CONFIGTX=default)"
 		return
 	fi
 

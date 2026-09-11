@@ -46,4 +46,19 @@ if SAKSI_CONFIGTX=deafult FABRIC_SAMPLES="${TMP}" "${NETWORK}" configtx >/dev/nu
 	fail "an unknown SAKSI_CONFIGTX value was accepted"
 fi
 
-echo "ok: configtx install, backup, idempotency, opt-out"
+# 5. A lost backup while our file is installed must be a hard error, not a
+#    silent "control" run against the tuned parameters.
+before="$(cat "${DST}")"
+rm -f "${BACKUP}"
+if SAKSI_CONFIGTX=default FABRIC_SAMPLES="${TMP}" "${NETWORK}" configtx >/dev/null 2>&1; then
+	fail "opt-out succeeded with no pristine backup and our file installed"
+fi
+[ "$(cat "${DST}")" = "${before}" ] || fail "failed opt-out modified the file"
+
+# 6. A lost backup with the pristine file already in place is fine.
+printf 'PRISTINE test-network configtx
+' >"${DST}"
+SAKSI_CONFIGTX=default FABRIC_SAMPLES="${TMP}" "${NETWORK}" configtx >/dev/null 	|| fail "opt-out failed when defaults were already in place"
+grep -q '^PRISTINE' "${DST}" || fail "opt-out disturbed an already-pristine file"
+
+echo "ok: configtx install, backup, idempotency, opt-out, lost-backup refusal"
