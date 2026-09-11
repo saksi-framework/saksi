@@ -102,6 +102,47 @@ Flags:
 - `--allow-host host[:port]` extra accepted Host header (for LAN — see below).
 - `--timeout` per-phase timeout (default `60m`).
 
+### Orderer batch parameters
+
+The Fabric orderer's batching parameters are part of the **declared measurement
+environment**, not an operator choice. `packages/saksi-bulletin/network/configtx.yaml`
+is the stock `test-network` file with four values changed, and `network.sh`
+installs it into `$FABRIC_SAMPLES/test-network/configtx/` before the channel is
+created — so `tools/up.sh`, `tools/tier.sh` and `./network.sh all` all bring the
+network up under it, and the genesis block carries it.
+
+| Parameter | Declared | test-network default |
+| --- | --- | --- |
+| `Orderer.BatchTimeout` | `2s` | `2s` (unchanged) |
+| `Orderer.BatchSize.MaxMessageCount` | **50** | 10 |
+| `Orderer.BatchSize.PreferredMaxBytes` | **2 MB** | 512 KB |
+| `Orderer.BatchSize.AbsoluteMaxBytes` | `99 MB` | `99 MB` (unchanged) |
+| `EtcdRaft.Options.SnapshotIntervalSize` | **256 MB** | 16 MB (Fabric default) |
+
+Measured 2026-09-11 (SP-10K, NVMe-backed Docker storage): 812 TPS at
+concurrency 96 and 1006 at 192, against 488 and 465 on the defaults, with p99
+submit latency halved and zero block gaps. Full write-up, including the two
+rejected variants, in balotachain `docs/desktop-runs/2026-09-11-orderer-probe.md`.
+
+The rule behind the numbers, to re-apply before changing any of them:
+**`MaxMessageCount` must be ≤ the steady in-flight ballot count, or
+`BatchTimeout` must be far below the target per-ballot latency.** A
+configuration satisfying neither never fills a block, so every block waits out
+the timeout and the run measures the timeout and nothing else. `MaxMessageCount`
+50 and the declared operating point of concurrency ≥ 96 therefore go together.
+
+**Opting out (A/B runs).** Set `SAKSI_CONFIGTX=default` before the bring-up and
+`network.sh` restores the pristine test-network file (backed up on first
+install) instead:
+
+```bash
+SAKSI_CONFIGTX=default ./tools/tier.sh 10000 1
+```
+
+The run journal's environment snapshot records which was used, as
+`orderer_batch.saksi_configtx`, with the four values alongside it when the
+declared file is in force.
+
 ## 5. Reaching it from another device
 
 The server has **no login** — anyone who can reach the address can drive it. Pick one:

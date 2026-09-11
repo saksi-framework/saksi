@@ -71,6 +71,7 @@ func CollectEnv(demoBin string) map[string]any {
 		null("git_head_console")
 	}
 
+	probeOrdererBatch(demoBin, env, null)
 	probeDockerVersion(env, null)
 	probeDockerInfo(env, null)
 	probeContainers(env, null)
@@ -123,6 +124,94 @@ func findGitRoot(dir string) (string, bool) {
 		}
 		dir = parent
 	}
+}
+
+// ordererConfigtxPath is the declared orderer configuration network.sh
+// installs into fabric-samples before it creates the channel.
+const ordererConfigtxPath = "packages/saksi-bulletin/network/configtx.yaml"
+
+// ordererBatchKeys are the configtx.yaml keys that set the orderer's batching
+// behaviour, which is the part of the environment that moves throughput and
+// latency most (see configtx.yaml's header for the measurements).
+var ordererBatchKeys = []string{
+	"BatchTimeout",
+	"MaxMessageCount",
+	"AbsoluteMaxBytes",
+	"PreferredMaxBytes",
+	"SnapshotIntervalSize",
+}
+
+// probeOrdererBatch records the orderer batching parameters this run's channel
+// was created under, as `orderer_batch`. It reads the DECLARED file committed
+// in the repository rather than fetching the live channel config, so it is
+// accurate exactly when the network was brought up through network.sh — which
+// is every path this console is used from (tools/up.sh, tools/tier.sh). With
+// SAKSI_CONFIGTX=default the operator opted out of the declared file for an
+// A/B run and the stock test-network values apply; the mode is recorded and
+// the values are not, since they then live in fabric-samples rather than here.
+func probeOrdererBatch(demoBin string, env map[string]any, null func(string)) {
+	mode := os.Getenv("SAKSI_CONFIGTX")
+	if mode == "" {
+		mode = "saksi"
+	}
+	out := map[string]any{"saksi_configtx": mode}
+	if mode != "saksi" {
+		env["orderer_batch"] = out
+		return
+	}
+
+	root, ok := findGitRoot(filepath.Dir(demoBin))
+	if !ok {
+		null("orderer_batch")
+		return
+	}
+	values, err := parseOrdererBatch(filepath.Join(root, ordererConfigtxPath))
+	if err != nil {
+		null("orderer_batch")
+		return
+	}
+	for k, v := range values {
+		out[k] = v
+	}
+	env["orderer_batch"] = out
+}
+
+// parseOrdererBatch pulls the ordererBatchKeys out of a configtx.yaml by
+// scanning for "Key: value" lines. Each key appears exactly once in the file
+// and only under the Orderer section, so this needs no YAML parser; comment
+// lines (the header's own table of these values included) are skipped.
+func parseOrdererBatch(path string) (map[string]string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	found := map[string]string{}
+	sc := bufio.NewScanner(f)
+	for sc.Scan() {
+		line := strings.TrimSpace(sc.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		for _, key := range ordererBatchKeys {
+			if _, seen := found[key]; seen {
+				continue
+			}
+			rest, ok := strings.CutPrefix(line, key+":")
+			if !ok {
+				continue
+			}
+			if i := strings.Index(rest, "#"); i >= 0 {
+				rest = rest[:i]
+			}
+			found[key] = strings.TrimSpace(rest)
+		}
+	}
+	if err := sc.Err(); err != nil {
+		return nil, err
+	}
+	return found, nil
 }
 
 func probeDockerVersion(env map[string]any, null func(string)) {

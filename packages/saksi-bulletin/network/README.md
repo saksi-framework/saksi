@@ -62,7 +62,9 @@ fresh `saksi-demo gen` bundle) to re-run. Requires `jq`.
 
 | Piece | Role |
 | --- | --- |
-| `network.sh up` | starts peers + orderer + CA and creates the `saksi` channel |
+| `configtx.yaml` | Saksi's declared orderer configuration — the stock test-network file with four batching parameters changed (see its header); `network.sh up` installs it into fabric-samples before the channel is created |
+| `network.sh up` | installs `configtx.yaml`, then starts peers + orderer + CA and creates the `saksi` channel |
+| `network.sh configtx` | installs `configtx.yaml` only (what `configtx_test.sh` exercises) |
 | `network.sh deploy` | packages, installs, approves, and commits the `saksi-bulletin` chaincode (`-ccp ../chaincode -ccl go`) |
 | `run-one-transaction.sh` | submits + reads one ballot through the gateway with Org1 MSP material |
 
@@ -74,6 +76,7 @@ fresh `saksi-demo gen` bundle) to re-run. Requires `jq`.
 | `SAKSI_CHANNEL` | `saksi` | channel name |
 | `SAKSI_CC_NAME` | `saksi-bulletin` | chaincode name |
 | `SAKSI_BUNDLE` | `bundle-v1.json` fixture | election bundle (from `saksi-demo gen`) to set up + submit from |
+| `SAKSI_CONFIGTX` | `saksi` | `default` restores the pristine test-network `configtx.yaml` instead of installing ours, for A/B measurement runs |
 
 ## Target topology (per locked architecture)
 
