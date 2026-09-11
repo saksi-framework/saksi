@@ -33,19 +33,26 @@ func TestOnChainCeremonyRefusesWithoutFabric(t *testing.T) {
 }
 
 // The fallback is narrowed, not removed: modes that never involve a ledger must
-// still run locally exactly as before.
+// still run locally exactly as before — and, crucially, must stay local even
+// when a network IS configured.
 func TestLocalModesStillRunWithoutFabric(t *testing.T) {
+	store := NewRunStore(t.TempDir())
+	wired := NewExecutor(store, NewHub(), "saksi-demo", "", reachableLookingFabric(t))
+	bare := NewExecutor(store, NewHub(), "saksi-demo", "", FabricConfig{})
 	for _, mode := range []string{"offline", ModeGroundTruth} {
 		c := good()
 		c.Mode = mode
-		if !localCeremonyOK(c) {
-			t.Errorf("%s mode should still be allowed to run without a ledger", mode)
+		if bare.onChainRun(c) || wired.onChainRun(c) {
+			t.Errorf("%s mode must never be treated as an on-chain run", mode)
 		}
 	}
 	c := good()
 	c.Mode = "onchain"
-	if localCeremonyOK(c) {
-		t.Error("onchain mode must not be treated as a local ceremony")
+	if !wired.onChainRun(c) {
+		t.Error("an on-chain run on a wired console must use the ledger")
+	}
+	if bare.onChainRun(c) {
+		t.Error("an on-chain run with no network is a misconfiguration, not a chain run")
 	}
 }
 
