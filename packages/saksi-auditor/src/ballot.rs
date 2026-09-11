@@ -47,6 +47,14 @@ pub(crate) struct BallotPassCounts {
 }
 
 impl BallotPassCounts {
+    /// Adds one ballot's counts (verified on a worker thread) into the total.
+    pub(crate) fn add(&mut self, other: &Self) {
+        self.shape += other.shape;
+        self.cds_proof += other.cds_proof;
+        self.issuer_binding += other.issuer_binding;
+        self.credential += other.credential;
+    }
+
     /// Emits one rollup Pass finding per check that passed at least once.
     ///
     /// A check with no passes emits nothing, which is what an empty ballot list

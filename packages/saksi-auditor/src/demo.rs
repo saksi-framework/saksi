@@ -29,7 +29,7 @@ use saksi_protocol::{Ballot, DKGTranscript, ElectionParameters, PartialDecryptio
 use crate::fixtures::{
     happy_path_fixture, multi_position_fixture, ph_position_id, ElectionFixture,
 };
-use crate::{audit, AuditReport, AuditStatus, ElectionArtifacts};
+use crate::{AuditReport, AuditStatus, ElectionArtifacts};
 
 /// Machine-readable per-contest correctness for one contest: the seeded
 /// `ground_truth`, the `decoded` tally the auditor verified, `E = decoded −
@@ -65,7 +65,8 @@ pub struct ContestCorrectness {
 /// console copies into its `timings.json`. Mirrors [`crate::Timings`].
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct TimingsMs {
-    /// Per-ballot CDS + credential verification.
+    /// Per-ballot CDS + credential verification: wall time of the parallel
+    /// verify phase on `verify_threads` threads, not CPU summed across them.
     pub verify_ballots: u64,
     /// Folding eligible ballots into the per-contest aggregate ciphertext.
     pub aggregate: u64,
@@ -73,6 +74,10 @@ pub struct TimingsMs {
     pub combine: u64,
     /// Discrete-log recovery of the integer tally.
     pub decode: u64,
+    /// Threads `verify_ballots` ran on — a count, not milliseconds. `0` when
+    /// the ballot phase never ran; absent (read as `0`) from older documents.
+    #[serde(default)]
+    pub verify_threads: usize,
 }
 
 impl From<crate::Timings> for TimingsMs {
@@ -82,8 +87,42 @@ impl From<crate::Timings> for TimingsMs {
             aggregate: t.aggregate.as_millis() as u64,
             combine: t.combine.as_millis() as u64,
             decode: t.decode.as_millis() as u64,
+            verify_threads: t.verify_threads,
         }
     }
+}
+
+/// Environment variable that pins the ballot-verification thread count for the
+/// `audit` and `audit-stream` entry points. Unset = rayon's global pool (every
+/// core, or `RAYON_NUM_THREADS`). `1` reproduces the serial path — the output
+/// is identical at any count, only the wall time changes.
+pub const AUDIT_THREADS_ENV: &str = "SAKSI_AUDIT_THREADS";
+
+/// A thread count for [`AUDIT_THREADS_ENV`]: a positive integer, nothing else.
+fn parse_audit_threads(raw: &str) -> Result<usize, String> {
+    raw.trim()
+        .parse::<usize>()
+        .ok()
+        .filter(|&n| n >= 1)
+        .ok_or_else(|| {
+            format!("{AUDIT_THREADS_ENV}={raw:?} is not a positive integer thread count")
+        })
+}
+
+/// The pool [`AUDIT_THREADS_ENV`] asks for: `None` when it is unset, an error
+/// when it is set to anything but a positive integer.
+fn audit_pool_from_env() -> Result<Option<rayon::ThreadPool>, String> {
+    let raw = match std::env::var(AUDIT_THREADS_ENV) {
+        Err(std::env::VarError::NotPresent) => return Ok(None),
+        Err(e) => return Err(format!("{AUDIT_THREADS_ENV}: {e}")),
+        Ok(raw) => raw,
+    };
+    let n = parse_audit_threads(&raw)?;
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(n)
+        .build()
+        .map(Some)
+        .map_err(|e| format!("{AUDIT_THREADS_ENV}={n}: cannot start the thread pool: {e}"))
 }
 
 /// Machine-readable result of auditing a **stream run folder** — the structured
@@ -451,7 +490,8 @@ pub fn audit_bundle_json(bundle: &str) -> Result<AuditReport, String> {
         issuer_public_key: &issuer_public_key,
         ground_truth: ground_truth.as_deref(),
     };
-    Ok(audit(artifacts))
+    let pool = audit_pool_from_env()?;
+    Ok(crate::audit_with_evidence(artifacts, pool.as_ref()).0)
 }
 
 /// Audits a **stream run folder** (`header.json` + `ballots.ndjson`, the shape
@@ -503,6 +543,7 @@ pub(crate) fn audit_stream_dir_full(
     // Ballots stream from ballots.ndjson (hex-protobuf, one per line) — the file
     // is never read into memory, only iterated.
     let ballots = crate::stream::BallotLines::open(dir)?;
+    let pool = audit_pool_from_env()?;
 
     let ground_truth = header.ground_truth.clone();
     let (report, evidence, timings) = crate::audit_streaming(
@@ -517,6 +558,7 @@ pub(crate) fn audit_stream_dir_full(
             expected_ballots: Some(header.n),
         },
         ballots,
+        pool.as_ref(),
     );
     let overall_pass = report.overall == AuditStatus::Pass;
 
@@ -615,6 +657,16 @@ mod tests {
         let bundle = election_bundle_json_params(&p).expect("gate passes");
         let report = audit_bundle_json(&bundle).expect("bundle audits");
         assert_eq!(report.overall, AuditStatus::Pass, "{report:#?}");
+    }
+
+    #[test]
+    fn audit_threads_accepts_only_a_positive_integer() {
+        assert_eq!(parse_audit_threads("8"), Ok(8));
+        assert_eq!(parse_audit_threads(" 1 "), Ok(1));
+        for bad in ["", "0", "-2", "four", "2.5"] {
+            let err = parse_audit_threads(bad).expect_err(bad);
+            assert!(err.contains(AUDIT_THREADS_ENV), "unhelpful error: {err}");
+        }
     }
 
     #[test]

@@ -6,8 +6,12 @@ use rand_core::OsRng;
 
 use saksi_credentials::IssuerSecretKey;
 
-use crate::fixtures::{happy_path_fixture, multi_position_fixture, GenParams, SelectionProfile};
-use crate::{audit, AuditStatus};
+use saksi_protocol::Ballot;
+
+use crate::fixtures::{
+    happy_path_fixture, multi_position_fixture, ElectionFixture, GenParams, SelectionProfile,
+};
+use crate::{audit, AuditReport, AuditStatus};
 
 // ---------------------------------------------------------------------------
 // 0. Multi-position model (ADR-0007 one-record-per-position)
@@ -546,7 +550,7 @@ fn duplicate_partial_decryption_for_contest_is_caught() {
 fn audit_stage_timings_are_measured_and_within_the_wall() {
     let fixture = multi_position_fixture(&GenParams::simple(100, 1, 2, SelectionProfile::Uniform));
     let started = std::time::Instant::now();
-    let (report, _evidence, timings) = crate::audit_with_evidence(fixture.artifacts());
+    let (report, _evidence, timings) = crate::audit_with_evidence(fixture.artifacts(), None);
     let wall = started.elapsed();
 
     assert!(
@@ -710,4 +714,161 @@ fn malformed_tally_signature_is_caught() {
     let report = audit(fixture.artifacts());
     assert_eq!(report.overall, AuditStatus::Fail);
     assert_eq!(signature_finding(&report).status, AuditStatus::Fail);
+}
+
+// ---------------------------------------------------------------------------
+// Parallel ballot verification is byte-identical to the serial path
+// ---------------------------------------------------------------------------
+
+/// Batch size for the differential tests: a 7-voter x 3-position fixture (21
+/// ballots) spans six batches `[0-3] [4-7] [8-11] [12-15] [16-19] [20]`, the
+/// last one partial.
+const TEST_CHUNK: usize = 4;
+
+/// Everything one audit produces, rendered as JSON: the full report (every
+/// finding, in order) and the per-contest evidence (aggregate ciphertext,
+/// recovered point, decoded tally). Returns it with the report itself and the
+/// `verify_threads` the audit recorded.
+fn audit_on(
+    f: &ElectionFixture,
+    ballots: &[Result<Ballot, String>],
+    threads: usize,
+    chunk: usize,
+) -> (String, AuditReport, usize) {
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(threads)
+        .build()
+        .expect("thread pool");
+    let (report, evidence, timings) = crate::audit_streaming_chunked(
+        f.artifacts().inputs(),
+        ballots.iter().cloned(),
+        Some(&pool),
+        chunk,
+    );
+    let evidence: Vec<_> = evidence
+        .iter()
+        .map(|e| {
+            (
+                e.contest_id.clone(),
+                e.aggregate_ciphertext.compress().to_bytes(),
+                e.recovered_point.map(|p| p.compress().to_bytes()),
+                e.decoded,
+            )
+        })
+        .collect();
+    let json =
+        serde_json::to_string(&serde_json::json!({ "report": report, "evidence": evidence }))
+            .expect("audit output serializes");
+    (json, report, timings.verify_threads)
+}
+
+/// The 1-thread audit is the reference; 8 threads — in the same small batches,
+/// in one-ballot batches, and in production-size batches — must reproduce it
+/// byte for byte. Returns the reference report for the caller's own checks.
+fn assert_parallel_matches_serial(
+    f: &ElectionFixture,
+    ballots: &[Result<Ballot, String>],
+) -> AuditReport {
+    let (serial, report, used) = audit_on(f, ballots, 1, TEST_CHUNK);
+    assert_eq!(used, 1, "verify_threads reports the pool size");
+    for chunk in [TEST_CHUNK, 1, crate::VERIFY_CHUNK] {
+        let (parallel, _, used) = audit_on(f, ballots, 8, chunk);
+        assert_eq!(used, 8, "verify_threads reports the pool size");
+        assert_eq!(
+            parallel, serial,
+            "8 threads in batches of {chunk} diverged from the 1-thread audit"
+        );
+    }
+    report
+}
+
+fn ok_ballots(f: &ElectionFixture) -> Vec<Result<Ballot, String>> {
+    f.ballots.iter().cloned().map(Ok).collect()
+}
+
+/// Indices of the ballots a failing `check` names (`"ballot[<idx>] ..."`), in
+/// report order, one entry per ballot.
+fn failed_ballots(report: &AuditReport, check: &str) -> Vec<usize> {
+    let mut idxs: Vec<usize> = report
+        .findings
+        .iter()
+        .filter(|x| x.check == check && x.status == AuditStatus::Fail)
+        .filter_map(|x| {
+            x.detail
+                .strip_prefix("ballot[")?
+                .split(']')
+                .next()?
+                .parse()
+                .ok()
+        })
+        .collect();
+    idxs.dedup();
+    idxs
+}
+
+fn seven_by_three() -> ElectionFixture {
+    multi_position_fixture(&GenParams::simple(7, 3, 2, SelectionProfile::Uniform))
+}
+
+#[test]
+fn parallel_verify_matches_serial_on_a_clean_election() {
+    let f = seven_by_three();
+    let report = assert_parallel_matches_serial(&f, &ok_ballots(&f));
+    assert!(report.passed(), "{report:#?}");
+}
+
+#[test]
+fn parallel_verify_matches_serial_on_bad_proofs_at_batch_edges() {
+    let mut f = seven_by_three();
+    // First of a batch, a middle, the last of a batch, and a pair straddling a
+    // boundary (20 is also the lone ballot of the final, partial batch).
+    let tampered = [4, 9, 15, 19, 20];
+    for &i in &tampered {
+        f.ballots[i].well_formedness_proofs[0].branches[0].response[0] ^= 0x01;
+    }
+    let report = assert_parallel_matches_serial(&f, &ok_ballots(&f));
+    assert_eq!(report.overall, AuditStatus::Fail);
+    assert_eq!(failed_ballots(&report, "ballot.cds_proof"), tampered);
+}
+
+#[test]
+fn parallel_verify_matches_serial_on_a_duplicate_nullifier_across_batches() {
+    let mut f = seven_by_three();
+    // Ballot 1 sits in batch 0; its replay lands at index 21, in batch 5.
+    let replay = f.ballots[1].clone();
+    f.ballots.push(replay);
+    let report = assert_parallel_matches_serial(&f, &ok_ballots(&f));
+    let dup = report.finding("nullifier.unique").expect("uniqueness ran");
+    assert_eq!(dup.status, AuditStatus::Fail);
+    assert!(dup.detail.contains("ballots 1 and 21"), "{dup:#?}");
+}
+
+#[test]
+fn parallel_verify_matches_serial_on_wrong_election_and_position_ballots() {
+    let mut f = seven_by_three();
+    // A ballot cast in a different election (different keys, issuer and id).
+    let other = multi_position_fixture(&GenParams {
+        election_id: "another-election".into(),
+        ..GenParams::simple(1, 3, 2, SelectionProfile::Uniform)
+    });
+    f.ballots[6] = other.ballots[0].clone();
+    // Ballot 10 is a vice-president record relabelled as a senator one; ballot
+    // 13 names a position the election does not have.
+    f.ballots[10].position_id = crate::fixtures::ph_position_id(2);
+    f.ballots[13].position_id = "no-such-position".into();
+    let mut ballots = ok_ballots(&f);
+    // And one line the stream could not decode, mid-batch.
+    ballots[17] = Err("ballot line 18 is not valid hex".into());
+
+    let report = assert_parallel_matches_serial(&f, &ballots);
+    assert_eq!(failed_ballots(&report, "ballot.cds_proof"), [6, 10]);
+    assert_eq!(failed_ballots(&report, "ballot.credential"), [6, 10]);
+    assert_eq!(failed_ballots(&report, "ballot.shape"), [13]);
+    assert!(
+        report
+            .findings
+            .iter()
+            .any(|x| x.check == "ballot.decode" && x.detail.contains("line 18")),
+        "{report:#?}"
+    );
 }

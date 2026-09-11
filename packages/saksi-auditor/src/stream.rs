@@ -715,6 +715,7 @@ mod tests {
                 Err("ballot line 2 is not valid hex".to_string()),
             ]
             .into_iter(),
+            None,
         );
 
         assert!(

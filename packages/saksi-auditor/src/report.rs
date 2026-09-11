@@ -122,6 +122,12 @@ impl ReportBuilder {
         self.push(AuditFinding::fatal_fail(check, detail));
     }
 
+    /// Appends `other`'s findings after this builder's, in their order — how a
+    /// ballot verified on a worker thread joins the report.
+    pub(crate) fn absorb(&mut self, other: ReportBuilder) {
+        self.findings.extend(other.findings);
+    }
+
     pub(crate) fn finish(self) -> AuditReport {
         let any_fatal = self
             .findings
