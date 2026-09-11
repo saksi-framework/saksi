@@ -12,10 +12,11 @@
 # binaries on PATH. See README.md.
 #
 # Usage:
-#   ./network.sh up       # start network + create the saksi channel
+#   ./network.sh up       # install configtx.yaml, start network + create channel
 #   ./network.sh deploy   # package, install, approve, commit the chaincode
 #   ./network.sh all      # up + deploy
 #   ./network.sh down     # tear everything down
+#   ./network.sh configtx # only install configtx.yaml (used by the tests)
 set -euo pipefail
 
 CHANNEL="${SAKSI_CHANNEL:-saksi}"
@@ -49,8 +50,57 @@ EOF
 # can commit without wiring Org2. Override with SAKSI_CC_POLICY.
 CC_POLICY="${SAKSI_CC_POLICY:-OR('Org1MSP.peer')}"
 
+# Saksi declares the orderer's batching parameters (see configtx.yaml's header
+# for the values and the measurements behind them). They only take effect if
+# they are in the file the test-network reads when it generates the channel
+# genesis block, so install ours there before creating the channel. Set
+# SAKSI_CONFIGTX=default to restore the pristine test-network file instead,
+# which is how an A/B run measures against stock Fabric.
+SAKSI_CONFIGTX="${SAKSI_CONFIGTX:-saksi}"
+
+# Marker line identifying our file, so a second run does not save it as the
+# "pristine" backup and quietly make SAKSI_CONFIGTX=default a no-op.
+CONFIGTX_MARKER="# Saksi's declared orderer configuration"
+
+install_configtx() {
+	local dst="${TEST_NETWORK}/configtx/configtx.yaml"
+	local backup="${dst}.test-network-default"
+	local src="${SCRIPT_DIR}/configtx.yaml"
+
+	case "${SAKSI_CONFIGTX}" in
+	saksi | default) ;;
+	*)
+		echo "SAKSI_CONFIGTX must be 'saksi' (default) or 'default', got '${SAKSI_CONFIGTX}'" >&2
+		exit 1
+		;;
+	esac
+
+	[ -f "${src}" ] || { echo "missing ${src}" >&2; exit 1; }
+	if [ ! -f "${dst}" ]; then
+		echo "test-network configtx.yaml not found at ${dst}" >&2
+		exit 1
+	fi
+
+	# Back up the pristine file once, and never over a copy of our own.
+	if [ ! -f "${backup}" ] && ! grep -qF "${CONFIGTX_MARKER}" "${dst}"; then
+		cp "${dst}" "${backup}"
+	fi
+
+	if [ "${SAKSI_CONFIGTX}" = default ]; then
+		if [ -f "${backup}" ]; then
+			cp "${backup}" "${dst}"
+		fi
+		echo "configtx: test-network defaults (SAKSI_CONFIGTX=default)"
+		return
+	fi
+
+	cp "${src}" "${dst}"
+	echo "configtx: saksi orderer parameters installed (BatchTimeout 2s, MaxMessageCount 50, PreferredMaxBytes 2 MB, SnapshotIntervalSize 256 MB)"
+}
+
 cmd_up() {
 	require_test_network up
+	install_configtx
 	cd "${TEST_NETWORK}"
 	# cryptogen (no -ca): avoids needing fabric-ca-client on PATH for dev.
 	./network.sh up createChannel -c "${CHANNEL}"
@@ -71,6 +121,10 @@ cmd_down() {
 
 case "${1:-}" in
 up) cmd_up ;;
+configtx)
+	require_test_network configtx
+	install_configtx
+	;;
 deploy) cmd_deploy ;;
 all)
 	cmd_up
@@ -78,7 +132,7 @@ all)
 	;;
 down) cmd_down ;;
 *)
-	echo "usage: $0 {up|deploy|all|down}" >&2
+	echo "usage: $0 {up|deploy|all|down|configtx}" >&2
 	exit 1
 	;;
 esac

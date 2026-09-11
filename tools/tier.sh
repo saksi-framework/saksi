@@ -59,7 +59,7 @@ if [ "${DRY_RUN}" = 1 ]; then
 	echo "preflight"
 	echo "install_fabric"
 	echo "cmd_down                 # network.sh down"
-	echo "bring_up_network         # network.sh all == up createChannel + deployCC"
+	echo "bring_up_network         # network.sh all == install configtx, up createChannel, deployCC"
 	exit 0
 fi
 

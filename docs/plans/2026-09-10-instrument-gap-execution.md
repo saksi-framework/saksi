@@ -26,6 +26,13 @@ sibling `balotachain` repo only for a docs file.
   written. Line 1 is the environment snapshot. The journal carries events only:
   never per-ballot latencies, never docker samples' raw output beyond one line
   per sample.
+- **Declared orderer parameters.** Every measured run is brought up under
+  `packages/saksi-bulletin/network/configtx.yaml` (`BatchTimeout` 2s,
+  `MaxMessageCount` 50, `PreferredMaxBytes` 2 MB, `SnapshotIntervalSize` 256 MB),
+  which `network.sh` installs into fabric-samples before the channel is created;
+  `SAKSI_CONFIGTX=default` opts out for A/B runs and is recorded in the journal's
+  environment snapshot. `MaxMessageCount` 50 is only valid at the declared
+  operating point of concurrency ≥ 96 — the two are declared together.
 - **No fabricated numbers.** A CSV column with no producer is written as an
   empty cell, never `0`. `perf.csv` has no comment lines; provenance is in the
   column name (`_inproc_ms` for in-process Rust timers, `_wall_ms` for console
