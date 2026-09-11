@@ -57,8 +57,7 @@ fi
 
 # 6. A lost backup with the pristine file already in place is fine, and the
 #    script must say so rather than claim it restored anything.
-printf 'PRISTINE test-network configtx
-' >"${DST}"
+printf 'PRISTINE test-network configtx\n' >"${DST}"
 out="$(SAKSI_CONFIGTX=default FABRIC_SAMPLES="${TMP}" "${NETWORK}" configtx)" ||
 	fail "opt-out failed when defaults were already in place"
 grep -q 'already in place' <<<"${out}" || fail "opt-out did not report defaults already in place: ${out}"
