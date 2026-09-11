@@ -67,6 +67,16 @@ type fakeLedger struct {
 	FailGetBallotAt int
 	getBallots      []string // nullifiers GetBallot was asked for, in call order
 
+	// beforeCommit, when set, runs before every SubmitWithReceipt commit and
+	// OUTSIDE f.mu — the hook the concurrency test uses to hold transactions in
+	// flight while it counts them.
+	beforeCommit func(fn string)
+	// noBatch makes GetBallots report the error an older chaincode gives for an
+	// unknown function, so the dump's fallback path can be exercised.
+	noBatch bool
+	// getBallotsBatches records the size of each GetBallots page asked for.
+	getBallotsBatches []int
+
 	ballots     int             // SubmitBallot attempts, accepted or not
 	accepted    []string        // accepted nullifiers, in accept order
 	acceptedSet map[string]bool // the same set, for the duplicate gate
@@ -299,6 +309,9 @@ func (f *fakeLedger) callNames() []string {
 }
 
 func (f *fakeLedger) SubmitWithReceipt(fn string, args ...string) ([]byte, clientsdk.Receipt, error) {
+	if f.beforeCommit != nil {
+		f.beforeCommit(fn)
+	}
 	txID, blk, ok := f.commit(fn)
 	if !ok {
 		return nil, clientsdk.Receipt{}, errors.New("boom")

@@ -523,16 +523,77 @@ func (e *Executor) submitOnChain(ctx context.Context, runID string, c ElectionCo
 	if err := e.setupOnChain(ctx, runID, c, b, led, step); err != nil {
 		return err
 	}
-	for i, pd := range b.PartialDecryptions {
-		if err := step(ctx, "SubmitPartialDecryption", strconv.Itoa(i), "SubmitPartialDecryption", b.ElectionID, pd); err != nil {
-			return err
-		}
+	if err := submitPartials(ctx, b, step); err != nil {
+		return err
 	}
 	if err := step(ctx, "PublishTally", "", "PublishTally", b.Tally); err != nil {
 		return err
 	}
 	e.publish(runID, "submit", "done", "full lifecycle committed on-chain")
 	return nil
+}
+
+// maxPartialsInFlight bounds how many SubmitPartialDecryption transactions the
+// post-window lifecycle keeps outstanding at once.
+const maxPartialsInFlight = 16
+
+// submitPartials commits every partial decryption in the bundle CONCURRENTLY,
+// bounded to maxPartialsInFlight.
+//
+// They are independent transactions — one per (contest, trustee) — and the
+// chaincode's only ordering requirement is that the election is already closed
+// and the tally not yet published, which submitOnChain guarantees by calling
+// this strictly between CloseElection and PublishTally. Sequentially, each one
+// landed alone in its own block and paid the orderer's full BatchTimeout (2 s),
+// so the post-window tail was a fixed ~2 s x count regardless of the
+// population: 48 s for a 5-trustee single-position run, 128 s for a
+// multi-position one. Submitted together they share a handful of blocks.
+//
+// Nothing measured moves: the ballot window (submitBallots) and every stage
+// timer are untouched, and this code runs after the window has closed.
+//
+// The trail and receipt rows are written by the step function itself, which is
+// mutex-serialised (receiptsWriter), so every partial still gets its row — in
+// commit order rather than bundle order, which no reader of receipts.csv or
+// trail.ndjson depends on (rows carry their own ref).
+//
+// Failure semantics are unchanged: the first error is returned with the same
+// wording sequential submission produced, and no further partials are started
+// once one has failed.
+func submitPartials(ctx context.Context, b *onChainBundle, step lifecycleStep) error {
+	var (
+		wg       sync.WaitGroup
+		mu       sync.Mutex
+		firstErr error
+	)
+	sem := make(chan struct{}, maxPartialsInFlight)
+	failed := func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return firstErr != nil
+	}
+	for i, pd := range b.PartialDecryptions {
+		if failed() {
+			break
+		}
+		sem <- struct{}{}
+		wg.Add(1)
+		go func(i int, pd string) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			err := step(ctx, "SubmitPartialDecryption", strconv.Itoa(i),
+				"SubmitPartialDecryption", b.ElectionID, pd)
+			if err != nil {
+				mu.Lock()
+				if firstErr == nil {
+					firstErr = err
+				}
+				mu.Unlock()
+			}
+		}(i, pd)
+	}
+	wg.Wait()
+	return firstErr
 }
 
 // lifecycleStep commits one chaincode call, records its ledger receipt, and
