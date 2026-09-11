@@ -27,9 +27,9 @@ import (
 // nullifier, GetElection/DKG/partials/tally — audits THAT directory with the
 // same auditor, and reports whether the two agree.
 //
-// The dump is streamed: one nullifier page at a time, one GetBallot at a time,
-// one line written out before the next is fetched. Nothing here holds the
-// population.
+// The dump is streamed: one nullifier page at a time, one page of ballots
+// fetched at a time, each line written out before the next page is asked for.
+// Nothing here holds the population.
 
 // LedgerDir is the run-folder-relative directory holding the chain's own copy
 // of a run: the ballots GetBallot returned, plus a header rebuilt from the
@@ -52,6 +52,10 @@ const headerFile = "header.json"
 type ledgerReader interface {
 	nullifierLister
 	GetBallot(electionID, nullifier string) (string, error)
+	// GetBallots is the batched form: the ballots for a page of nullifiers, in
+	// the order given, absent ones as empty strings. Chaincode older than this
+	// function reports it as unknown, which the dump falls back from.
+	GetBallots(electionID string, nullifiers []string) ([]string, error)
 	GetElection(electionID string) (string, error)
 	GetDKGTranscript(electionID string) (string, error)
 	GetPartialDecryption(electionID, contestID, trusteeID string) (string, error)
@@ -71,18 +75,20 @@ type ledgerCheck struct {
 }
 
 // dumpLedger writes the chain's own record of electionID into
-// <runDir>/ledger/ and returns how many ballots it holds.
+// <runDir>/ledger/ and returns how many ballots it holds and which read path
+// served them (see dumpLedgerBallots).
 //
-// Ballots are fetched one at a time, in the order ListNullifiers returns them,
-// and each is written out before the next is asked for. A GetBallot failure
-// aborts the dump on the spot: a partial ledger directory audited as if it were
-// complete would report a false mismatch, which is worse than no answer.
-func dumpLedger(runDir, electionID string, r ledgerReader) (int, error) {
+// Ballots are fetched a page at a time, in the order ListNullifiers returns
+// them, and each page is written out before the next is asked for. A read
+// failure aborts the dump on the spot: a partial ledger directory audited as if
+// it were complete would report a false mismatch, which is worse than no
+// answer.
+func dumpLedger(runDir, electionID string, r ledgerReader) (int, string, error) {
 	dir := filepath.Join(runDir, LedgerDir)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return 0, fmt.Errorf("create %s: %w", dir, err)
+		return 0, "", fmt.Errorf("create %s: %w", dir, err)
 	}
-	n, err := dumpLedgerBallots(dir, electionID, r)
+	n, path, err := dumpLedgerBallots(dir, electionID, r)
 	if err == nil {
 		err = writeLedgerHeader(runDir, dir, electionID, n, r)
 	}
@@ -91,35 +97,92 @@ func dumpLedger(runDir, electionID string, r ledgerReader) (int, error) {
 		// next to an earlier run's header is an artifact that would audit, and
 		// lie. "not run" has to mean nothing is there.
 		_ = os.RemoveAll(dir)
-		return 0, err
+		return 0, "", err
 	}
-	return n, nil
+	return n, path, nil
 }
 
-func dumpLedgerBallots(dir, electionID string, r ledgerReader) (int, error) {
+// The two read paths dumpLedgerBallots can take, journalled so a reader of a
+// run folder can tell which one produced it.
+const (
+	ledgerReadBatched   = "batched"
+	ledgerReadPerBallot = "per-ballot"
+)
+
+// dumpLedgerBallots writes the chain's ballots, in ListNullifiers order, and
+// reports the count and the read path it used.
+//
+// The read is batched: each ListNullifiers page is fetched in GetBallots pages
+// of clientsdk.BallotBatchSize, which is one gateway round trip per 500 ballots
+// instead of one per ballot. That per-ballot round trip measured ~3.3 ms end to
+// end — about half of Verify's whole per-ballot cost, and hours of it at the
+// large tiers — and it buys nothing: the dump already knows every nullifier it
+// wants before it asks for the first ballot.
+//
+// Chaincode older than GetBallots reports the function as unknown, and the dump
+// then falls back to GetBallot for the rest of the run and says so in its
+// return. The two paths are byte-identical by construction: same nullifier
+// order, same hex, same one-line-per-ballot framing.
+func dumpLedgerBallots(dir, electionID string, r ledgerReader) (int, string, error) {
 	f, err := os.Create(filepath.Join(dir, BallotsFile))
 	if err != nil {
-		return 0, fmt.Errorf("create ledger ballots: %w", err)
+		return 0, "", fmt.Errorf("create ledger ballots: %w", err)
 	}
 	defer f.Close()
 
 	w := bufio.NewWriter(f)
 	n := 0
 	bookmark := ""
+	batched := true
 	for {
 		page, err := r.ListNullifiers(electionID, nullifierPageSize, bookmark)
 		if err != nil {
-			return 0, fmt.Errorf("list committed nullifiers: %w", err)
+			return 0, "", fmt.Errorf("list committed nullifiers: %w", err)
 		}
-		for _, nul := range page.Nullifiers {
-			line, err := r.GetBallot(electionID, nul)
-			if err != nil {
-				return 0, fmt.Errorf("get ballot %s: %w", nul, err)
+		for rest := page.Nullifiers; len(rest) > 0; {
+			take := len(rest)
+			if batched && take > clientsdk.BallotBatchSize {
+				take = clientsdk.BallotBatchSize
 			}
-			if _, err := w.WriteString(line + "\n"); err != nil {
-				return 0, fmt.Errorf("write ledger ballot: %w", err)
+			chunk := rest[:take]
+
+			var lines []string
+			if batched {
+				lines, err = r.GetBallots(electionID, chunk)
+				if clientsdk.UnknownChaincodeFunction(err) {
+					// Older chaincode. Redo this chunk one ballot at a time and
+					// stay on that path for the rest of the dump.
+					batched, err = false, nil
+					continue
+				}
+				if err != nil {
+					return 0, "", fmt.Errorf("get ballots: %w", err)
+				}
+			} else {
+				lines = make([]string, len(chunk))
+				for i, nul := range chunk {
+					if lines[i], err = r.GetBallot(electionID, nul); err != nil {
+						return 0, "", fmt.Errorf("get ballot %s: %w", nul, err)
+					}
+				}
 			}
-			n++
+
+			for i, line := range lines {
+				// The batched read marks an absent ballot with an empty entry.
+				// Here that is a fault, not a tolerable gap: every nullifier in
+				// this chunk was reported committed moments ago, so a missing
+				// ballot means the chain and its own index disagree — the same
+				// condition GetBallot fails on, reported the same way.
+				if line == "" {
+					return 0, "", fmt.Errorf(
+						"get ballot %s: the chain holds no ballot for a nullifier it lists as committed", chunk[i])
+				}
+				if _, err := w.WriteString(line + "\n"); err != nil {
+					return 0, "", fmt.Errorf("write ledger ballot: %w", err)
+				}
+				n++
+			}
+			rest = rest[take:]
 		}
 		// A repeated bookmark would page forever; the empty one ends the walk.
 		if page.NextBookmark == "" || page.NextBookmark == bookmark {
@@ -128,9 +191,12 @@ func dumpLedgerBallots(dir, electionID string, r ledgerReader) (int, error) {
 		bookmark = page.NextBookmark
 	}
 	if err := w.Flush(); err != nil {
-		return 0, fmt.Errorf("write ledger ballots: %w", err)
+		return 0, "", fmt.Errorf("write ledger ballots: %w", err)
 	}
-	return n, nil
+	if batched {
+		return n, ledgerReadBatched, nil
+	}
+	return n, ledgerReadPerBallot, nil
 }
 
 // writeLedgerHeader builds the ledger dump's header.json: the run's own header

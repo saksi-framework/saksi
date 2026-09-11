@@ -284,7 +284,7 @@ func (e *Executor) verify(ctx context.Context, runID string, c ElectionConfig, l
 	// The chain's own record is dumped and audited FIRST: it is the evidence
 	// the console did not write, and a reader who only gets one of the two
 	// should get that one.
-	lc := e.auditLedger(ctx, runID, dir, lr)
+	lc := e.auditLedger(ctx, j, runID, dir, lr)
 
 	e.publish(runID, "verify", "info", "auditing run…")
 	out, runErr := e.run(ctx, e.demoBin, "audit-stream", dir, "--json")
@@ -329,12 +329,17 @@ func (e *Executor) verify(ctx context.Context, runID string, c ElectionConfig, l
 // A dump or audit that fails is stamped "not run" and nothing else: the chain
 // going away mid-dump is an instrumentation loss, not a verdict on the run, and
 // Verify continues with the local audit.
-func (e *Executor) auditLedger(ctx context.Context, runID, dir string, lr ledgerReader) *ledgerCheck {
+func (e *Executor) auditLedger(ctx context.Context, j *Journal, runID, dir string, lr ledgerReader) *ledgerCheck {
 	if lr == nil {
 		return nil
 	}
 	e.publish(runID, "verify", "info", "dumping the chain's own record of this election…")
-	n, err := dumpLedger(dir, runID, lr)
+	n, readPath, err := dumpLedger(dir, runID, lr)
+	// Which read path served the dump is journalled either way: "per-ballot"
+	// means the deployed chaincode predates GetBallots, which is the difference
+	// between a dump that costs one round trip per 500 ballots and one that
+	// costs one per ballot.
+	_ = j.Stamp("ledger.dump", map[string]any{"ballots": n, "read_path": readPath, "ok": err == nil})
 	if err != nil {
 		e.publish(runID, "verify", "error", "ledger audit not run: "+err.Error())
 		return &ledgerCheck{status: "not run"}
@@ -523,16 +528,87 @@ func (e *Executor) submitOnChain(ctx context.Context, runID string, c ElectionCo
 	if err := e.setupOnChain(ctx, runID, c, b, led, step); err != nil {
 		return err
 	}
-	for i, pd := range b.PartialDecryptions {
-		if err := step(ctx, "SubmitPartialDecryption", strconv.Itoa(i), "SubmitPartialDecryption", b.ElectionID, pd); err != nil {
-			return err
-		}
+	if err := submitPartials(ctx, b, step); err != nil {
+		return err
 	}
 	if err := step(ctx, "PublishTally", "", "PublishTally", b.Tally); err != nil {
 		return err
 	}
 	e.publish(runID, "submit", "done", "full lifecycle committed on-chain")
 	return nil
+}
+
+// maxPartialsInFlight bounds how many SubmitPartialDecryption transactions the
+// post-window lifecycle keeps outstanding at once.
+const maxPartialsInFlight = 16
+
+// submitPartials commits every partial decryption in the bundle CONCURRENTLY,
+// bounded to maxPartialsInFlight.
+//
+// They are independent transactions — one per (contest, trustee) — and the
+// chaincode's only ordering requirement is that the election is already closed
+// and the tally not yet published, which submitOnChain guarantees by calling
+// this strictly between CloseElection and PublishTally. Sequentially, each one
+// landed alone in its own block and paid the orderer's full BatchTimeout (2 s),
+// so the post-window tail was a fixed ~2 s x count regardless of the
+// population: 48 s for a 5-trustee single-position run, 128 s for a
+// multi-position one. Submitted together they share a handful of blocks.
+//
+// Nothing measured moves: the ballot window (submitBallots) and every stage
+// timer are untouched, and this code runs after the window has closed.
+//
+// The trail and receipt rows are written by the step function itself, which is
+// mutex-serialised (receiptsWriter), so every partial still gets its row — in
+// commit order rather than bundle order, which no reader of receipts.csv or
+// trail.ndjson depends on (rows carry their own ref).
+//
+// Failure semantics are unchanged: the first error is returned with the same
+// wording sequential submission produced, and no further partials are started
+// once one has failed.
+func submitPartials(ctx context.Context, b *onChainBundle, step lifecycleStep) error {
+	// Cancelled on the first failure, so a partial that has already taken a
+	// slot but not yet started its transaction gives up at step's context
+	// check instead of committing into an election that is about to be
+	// abandoned. The outer context is untouched.
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	var (
+		wg       sync.WaitGroup
+		mu       sync.Mutex
+		firstErr error
+	)
+	sem := make(chan struct{}, maxPartialsInFlight)
+	failed := func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return firstErr != nil
+	}
+	for i, pd := range b.PartialDecryptions {
+		if failed() {
+			break
+		}
+		sem <- struct{}{}
+		wg.Add(1)
+		go func(i int, pd string) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			err := step(ctx, "SubmitPartialDecryption", strconv.Itoa(i),
+				"SubmitPartialDecryption", b.ElectionID, pd)
+			if err != nil {
+				mu.Lock()
+				if firstErr == nil {
+					firstErr = err
+				}
+				mu.Unlock()
+				// First error wins: the cancellation only ever makes LATER
+				// partials fail with a context error, which is discarded above.
+				cancel()
+			}
+		}(i, pd)
+	}
+	wg.Wait()
+	return firstErr
 }
 
 // lifecycleStep commits one chaincode call, records its ledger receipt, and
@@ -1022,7 +1098,12 @@ func truncate(b []byte, n int) string {
 
 // nullifierPageSize is how many committed nullifiers one ListNullifiers page
 // asks for, matching the chaincode's own per-page cap.
-const nullifierPageSize = 10000
+//
+// A var, not a const, purely so tests can shrink it: the paging behaviour that
+// matters (an outer walk of several pages, each fetched in several batched
+// ballot reads) is otherwise only reachable with 10,000+ ballots per test.
+// Nothing outside tests assigns to it.
+var nullifierPageSize = 10000
 
 // nullifierLister reads an election's committed nullifiers, one page at a
 // time. *clientsdk.BulletinClient satisfies it; it is deliberately a

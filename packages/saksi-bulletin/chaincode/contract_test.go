@@ -23,6 +23,9 @@ import (
 type fakeStub struct {
 	shim.ChaincodeStubInterface
 	state map[string][]byte
+	// puts counts PutState calls, so a test can prove an evaluate-only
+	// function wrote nothing.
+	puts int
 }
 
 func newFakeStub() *fakeStub { return &fakeStub{state: map[string][]byte{}} }
@@ -34,6 +37,7 @@ func (f *fakeStub) CreateCompositeKey(objectType string, attributes []string) (s
 func (f *fakeStub) GetState(key string) ([]byte, error) { return f.state[key], nil }
 
 func (f *fakeStub) PutState(key string, value []byte) error {
+	f.puts++
 	f.state[key] = value
 	return nil
 }

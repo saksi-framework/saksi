@@ -223,10 +223,13 @@ func TestLedgerDumpAbortsOnGetBallotFailure(t *testing.T) {
 	}
 }
 
-// TestLedgerDumpStreamsOneBallotAtATime pins the streaming contract from the
-// other side: one GetBallot per listed nullifier, in listing order, and the
-// dumped file is written in that same order.
-func TestLedgerDumpStreamsOneBallotAtATime(t *testing.T) {
+// TestLedgerDumpReadsInListingOrder pins the streaming contract from the other
+// side: every listed nullifier is asked for exactly once, in listing order, and
+// the dumped file is written in that same order. The reads are batched into
+// GetBallots pages now (the fake serves a page by reading its own ballots in
+// the order asked, as the chaincode does), which changes how many round trips
+// it takes and nothing about the order.
+func TestLedgerDumpReadsInListingOrder(t *testing.T) {
 	e, runID, dir, led := newLedgerRun(t, 4)
 	e.run = passingAudit("")
 
@@ -238,7 +241,7 @@ func TestLedgerDumpStreamsOneBallotAtATime(t *testing.T) {
 		t.Fatal(err)
 	}
 	if got := led.getBallotOrder(); len(got) != len(page.Nullifiers) {
-		t.Fatalf("GetBallot calls = %d, want one per nullifier (%d)", len(got), len(page.Nullifiers))
+		t.Fatalf("ballot reads = %d, want one per nullifier (%d)", len(got), len(page.Nullifiers))
 	}
 	for i, nul := range page.Nullifiers {
 		if led.getBallotOrder()[i] != nul {
@@ -351,7 +354,7 @@ func TestLedgerHeaderIsAcceptedByAuditStream(t *testing.T) {
 	bin := findDemo(t)
 	dir, led := realGeneratedChain(t, bin, ledgerElectionID)
 
-	if _, err := dumpLedger(dir, ledgerElectionID, led); err != nil {
+	if _, _, err := dumpLedger(dir, ledgerElectionID, led); err != nil {
 		t.Fatalf("dumpLedger: %v", err)
 	}
 	out, runErr := execRunner(context.Background(), bin, "audit-stream", filepath.Join(dir, LedgerDir), "--json")
@@ -383,7 +386,7 @@ func TestLedgerHeaderIsAcceptedWhenTheChainIsShort(t *testing.T) {
 	led.accepted = led.accepted[:len(led.accepted)-1]
 	delete(led.Ballots, last)
 
-	n, err := dumpLedger(dir, ledgerElectionID, led)
+	n, _, err := dumpLedger(dir, ledgerElectionID, led)
 	if err != nil {
 		t.Fatalf("dumpLedger: %v", err)
 	}

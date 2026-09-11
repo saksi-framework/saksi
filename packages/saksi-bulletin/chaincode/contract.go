@@ -369,6 +369,72 @@ func (s *SmartContract) GetBallot(ctx contractapi.TransactionContextInterface, e
 	return hex.EncodeToString(raw), nil
 }
 
+// maxBallotBatchSize caps how many nullifiers one GetBallots call may name.
+//
+// The cap is the point of the function, not a safety afterthought: an
+// unbounded list would let one evaluate pull the whole population through a
+// single peer response, which is exactly the failure mode ListNullifiers is
+// paginated to avoid. 500 ballots is ~a megabyte of hex at the current ballot
+// size — comfortably inside the gateway's default response limits, and two
+// orders of magnitude fewer round trips than one GetBallot per nullifier.
+const maxBallotBatchSize = 500
+
+// GetBallots returns the hex-encoded ballots for a page of nullifiers, in the
+// order the nullifiers were given, as a JSON array of strings.
+//
+// This is the batched form of GetBallot, and exists for one reader: the
+// campaign console's ledger dump, which re-reads the whole committed
+// population back off the chain to audit the chain's own copy of a run. One
+// GetBallot per nullifier costs a full gateway round trip per ballot (~3 ms
+// end to end, measured), which at the larger tiers is hours of pure
+// instrumentation overhead.
+//
+// A nullifier the chain holds no ballot for yields an EMPTY STRING at its
+// position rather than an error. The alternative — failing the whole page —
+// would make one absent ballot indistinguishable from a chain that is down,
+// and the caller is the one that knows whether an absence is a fault: the
+// ledger dump treats it as one, because it only ever asks about nullifiers
+// ListNullifiers just reported as committed.
+//
+// Evaluate-only: this reads state and writes none, so it never needs to be
+// ordered and can be served by a single peer.
+func (s *SmartContract) GetBallots(
+	ctx contractapi.TransactionContextInterface, electionID string, nullifiersJSON string,
+) (string, error) {
+	var nullifiers []string
+	if err := json.Unmarshal([]byte(nullifiersJSON), &nullifiers); err != nil {
+		return "", fmt.Errorf("decode nullifier list: %w", err)
+	}
+	if len(nullifiers) > maxBallotBatchSize {
+		return "", fmt.Errorf(
+			"nullifier count %d exceeds the %d cap per GetBallots page", len(nullifiers), maxBallotBatchSize,
+		)
+	}
+
+	stub := ctx.GetStub()
+	// Non-nil empty slice so an empty request marshals as [], not null.
+	ballots := make([]string, 0, len(nullifiers))
+	for _, nullifier := range nullifiers {
+		ballotKey, err := stub.CreateCompositeKey(ballotIndex, []string{electionID, nullifier})
+		if err != nil {
+			return "", fmt.Errorf("build ballot key: %w", err)
+		}
+		raw, err := stub.GetState(ballotKey)
+		if err != nil {
+			return "", fmt.Errorf("read ballot state: %w", err)
+		}
+		// hex.EncodeToString(nil) is "", which is exactly the "no such ballot"
+		// marker documented above.
+		ballots = append(ballots, hex.EncodeToString(raw))
+	}
+
+	out, err := json.Marshal(ballots)
+	if err != nil {
+		return "", fmt.Errorf("encode ballot page: %w", err)
+	}
+	return string(out), nil
+}
+
 // CreateElection records the parameters of a new election. The argument is the
 // hex-encoded canonical protobuf encoding of a saksi.protocol.v1.ElectionParameters.
 //
