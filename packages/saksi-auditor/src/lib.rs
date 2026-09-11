@@ -73,6 +73,7 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use curve25519_dalek::{ristretto::RistrettoPoint, traits::Identity};
+use rayon::prelude::*;
 
 use saksi_credentials::IssuerPublicKey;
 use saksi_crypto::elgamal;
@@ -124,11 +125,17 @@ pub struct ElectionArtifacts<'a> {
 /// (folding eligible ciphertexts into the per-contest homomorphic sum),
 /// `combine` (Lagrange-at-zero over the threshold partial decryptions), and
 /// `decode` (recovering the integer tally from the plaintext point). The four
-/// are disjoint spans of one thread, so their sum is at most the audit's wall
-/// time — the rest is DKG, partial-decryption proofs, and reporting.
+/// are disjoint spans of the calling thread's timeline, so their sum is at most
+/// the audit's wall time — the rest is ballot I/O, DKG, partial-decryption
+/// proofs, and reporting.
+///
+/// `verify_ballots` is **wall** time: ballot verification runs on
+/// `verify_threads` threads, and the span is how long the caller waited for
+/// them, not their CPU time summed.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Timings {
-    /// Per-ballot CDS OR-proof + credential-presentation verification.
+    /// Per-ballot CDS OR-proof + credential-presentation verification: the wall
+    /// time of the parallel verify phase, on `verify_threads` threads.
     pub verify_ballots: Duration,
     /// Folding eligible ballots into the per-contest aggregate ciphertext.
     pub aggregate: Duration,
@@ -136,7 +143,26 @@ pub struct Timings {
     pub combine: Duration,
     /// Discrete-log recovery of the integer tally from the plaintext point.
     pub decode: Duration,
+    /// Threads the ballot verification ran on. `0` when the ballot phase never
+    /// ran (unusable parameters or DKG transcript).
+    pub verify_threads: usize,
 }
+
+/// Ballots pulled off the stream per parallel verification batch.
+///
+/// Each batch is read serially, verified in parallel, then folded serially in
+/// stream order, so peak memory is one batch of ballots plus the nullifier set
+/// (realistic ballots are a few KB, so ~10 MB here).
+///
+/// ponytail: bounded by count, not bytes. A line may be 4 MiB of hex (2 MiB
+/// decoded), so a hostile stream can make one batch hold ~4096 x 2 MiB = 8 GiB.
+/// That fails closed: running out of memory yields no verdict, which the
+/// console records as an audit crash, never a pass. The auditor already takes
+/// unshaped ballots — `audit-stream` audits any folder, not only what the
+/// chaincode accepted — and findings already grow per failing ballot regardless
+/// of the batch (a shape failure copies the ballot's `position_id`). Upgrade
+/// path: a byte budget per batch (~6 lines).
+pub(crate) const VERIFY_CHUNK: usize = 4096;
 
 /// Everything the auditor needs **except** the ballots: the small, resident part
 /// of [`ElectionArtifacts`] that stays in memory while ballots stream past one
@@ -181,26 +207,32 @@ impl<'a> ElectionArtifacts<'a> {
 /// soundness failure is converted into a Fatal finding with status `Fail`.
 /// Audit an election and return only the pass/fail report.
 pub fn audit(artifacts: ElectionArtifacts) -> AuditReport {
-    audit_with_evidence(artifacts).0
+    audit_with_evidence(artifacts, None).0
 }
 
 /// Audit an in-memory `&[Ballot]` election: the thin wrapper over
 /// [`audit_streaming`] for callers that already hold every ballot (the one-blob
-/// bundle path and the auditor's own tests). Ballots are cloned one at a time
-/// into the streaming core and dropped after each is verified.
+/// bundle path and the auditor's own tests). Ballots are cloned one batch at a
+/// time into the streaming core and dropped after they are verified.
 pub(crate) fn audit_with_evidence(
     artifacts: ElectionArtifacts,
+    pool: Option<&rayon::ThreadPool>,
 ) -> (AuditReport, Vec<crate::tally::ContestEvidence>, Timings) {
     let ballots = artifacts.ballots.iter().cloned().map(Ok);
-    audit_streaming(artifacts.inputs(), ballots)
+    audit_streaming(artifacts.inputs(), ballots, pool)
 }
 
 /// Audit an election whose ballots arrive as a stream.
 ///
-/// Nothing per-ballot is retained: each item is verified, folded into the
-/// running per-contest aggregate ciphertext and the nullifier set, and dropped.
-/// Peak memory is therefore the nullifier set plus a constant, not the
-/// population — which is what makes the capstone tiers auditable at all.
+/// Nothing per-ballot is retained: ballots are pulled [`VERIFY_CHUNK`] at a
+/// time, verified, folded into the running per-contest aggregate ciphertext and
+/// the nullifier set, and dropped. Peak memory is therefore the nullifier set
+/// plus one batch, not the population — which is what makes the capstone tiers
+/// auditable at all.
+///
+/// Verification runs on `pool` (`None` = rayon's global pool, i.e. every core).
+/// The result does not depend on the thread count: see
+/// [`audit_streaming_chunked`].
 ///
 /// A ballot the stream could not produce (`Err`) is recorded as a Fatal
 /// `ballot.decode` finding and iteration continues; the report never
@@ -208,6 +240,24 @@ pub(crate) fn audit_with_evidence(
 pub(crate) fn audit_streaming(
     inputs: AuditInputs<'_>,
     ballots: impl Iterator<Item = Result<Ballot, String>>,
+    pool: Option<&rayon::ThreadPool>,
+) -> (AuditReport, Vec<crate::tally::ContestEvidence>, Timings) {
+    audit_streaming_chunked(inputs, ballots, pool, VERIFY_CHUNK)
+}
+
+/// [`audit_streaming`] with the batch size exposed, so tests can put batch
+/// boundaries between the ballots they tamper with.
+///
+/// Byte-identical to a one-thread loop by construction: only the per-ballot
+/// checks run in parallel, and they are pure — each worker writes into its own
+/// findings and pass counts. Everything that depends on order (the findings
+/// sequence, nullifier first-use indices, the aggregate, the counters) is
+/// folded serially, in stream order, after the batch returns.
+fn audit_streaming_chunked(
+    inputs: AuditInputs<'_>,
+    ballots: impl Iterator<Item = Result<Ballot, String>>,
+    pool: Option<&rayon::ThreadPool>,
+    chunk_size: usize,
 ) -> (AuditReport, Vec<crate::tally::ContestEvidence>, Timings) {
     let mut builder = ReportBuilder::new();
     let mut timings = Timings::default();
@@ -250,42 +300,81 @@ pub(crate) fn audit_streaming(
     let mut passes = crate::ballot::BallotPassCounts::default();
     let mut eligible_count = 0usize;
     let mut observed = 0usize;
+    timings.verify_threads = pool.map_or_else(
+        rayon::current_num_threads,
+        rayon::ThreadPool::current_num_threads,
+    );
 
-    for (idx, item) in ballots.enumerate() {
-        observed += 1;
-        let ballot = match item {
-            Ok(b) => b,
-            Err(err) => {
-                builder.fail("ballot.decode", err);
-                continue;
-            }
+    // Fused: a caller's iterator that yields again after its first `None`
+    // (`take` asks once more at the end of every batch) cannot change results.
+    let mut ballots = ballots.fuse();
+    loop {
+        // Serial read: the stream is sequential.
+        let chunk: Vec<Result<Ballot, String>> = ballots.by_ref().take(chunk_size).collect();
+        if chunk.is_empty() {
+            break;
+        }
+        let base = observed;
+
+        // Parallel verify. Collecting an indexed parallel iterator keeps stream
+        // order; each ballot travels with its own findings and pass counts.
+        let verify = || {
+            chunk
+                .into_par_iter()
+                .enumerate()
+                .map(|(offset, item)| {
+                    item.map(|ballot| {
+                        let mut findings = ReportBuilder::new();
+                        let mut ballot_passes = crate::ballot::BallotPassCounts::default();
+                        let decoded = crate::ballot::verify_ballot(
+                            base + offset,
+                            &ballot,
+                            inputs.parameters,
+                            &election_public_key,
+                            inputs.issuer_public_key,
+                            inputs.binding_context,
+                            &mut ballot_passes,
+                            &mut findings,
+                        );
+                        (ballot, findings, ballot_passes, decoded)
+                    })
+                })
+                .collect::<Vec<_>>()
         };
-
         let started = Instant::now();
-        let decoded = crate::ballot::verify_ballot(
-            idx,
-            &ballot,
-            inputs.parameters,
-            &election_public_key,
-            inputs.issuer_public_key,
-            inputs.binding_context,
-            &mut passes,
-            &mut builder,
-        );
+        let verified = match pool {
+            Some(pool) => pool.install(verify),
+            None => verify(),
+        };
         timings.verify_ballots += started.elapsed();
 
-        nullifiers.observe(idx, &ballot);
+        // Serial fold, in stream order: the same builder pushes, nullifier
+        // observations and aggregate additions a one-thread loop makes.
+        for item in verified {
+            let idx = observed;
+            observed += 1;
+            let (ballot, findings, ballot_passes, decoded) = match item {
+                Ok(v) => v,
+                Err(err) => {
+                    builder.fail("ballot.decode", err);
+                    continue;
+                }
+            };
+            builder.absorb(findings);
+            passes.add(&ballot_passes);
+            nullifiers.observe(idx, &ballot);
 
-        if let Some(decoded) = decoded {
-            let started = Instant::now();
-            for ct in &decoded {
-                aggregate_pads[ct.contest] += ct.pad;
-                aggregate_data[ct.contest] += ct.data;
+            if let Some(decoded) = decoded {
+                let started = Instant::now();
+                for ct in &decoded {
+                    aggregate_pads[ct.contest] += ct.pad;
+                    aggregate_data[ct.contest] += ct.data;
+                }
+                timings.aggregate += started.elapsed();
+                eligible_count += 1;
             }
-            timings.aggregate += started.elapsed();
-            eligible_count += 1;
+            // `ballot` drops here.
         }
-        // `ballot` drops here.
     }
 
     // A stream that stopped early (a line over the read cap, a truncated file)

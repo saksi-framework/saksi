@@ -667,6 +667,7 @@ pub(crate) struct CpuTimes {
 
 impl CpuTimes {
     /// Folds another thread's totals into this one.
+    #[cfg_attr(not(feature = "demo"), allow(dead_code))]
     pub(crate) fn add(&mut self, other: &CpuTimes) {
         self.credential += other.credential;
         self.encrypt += other.encrypt;
@@ -702,6 +703,7 @@ pub(crate) struct VoterWork {
     /// as a decompressed point so the aggregate never re-decompresses the wire
     /// bytes it just wrote.
     pub(crate) pads: Vec<RistrettoPoint>,
+    #[cfg_attr(not(feature = "demo"), allow(dead_code))]
     pub(crate) cpu: CpuTimes,
 }
 

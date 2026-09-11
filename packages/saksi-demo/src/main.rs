@@ -16,6 +16,10 @@
 //! - `audit-stream <dir> [--json]` — audit a stream run folder; with `--json`,
 //!   prints structured per-contest correctness `{overall, contests:[{contest,
 //!   ground_truth, decoded, E, pass}]}`. Exits non-zero on FAIL.
+//!
+//! Both audit subcommands verify ballots on every core. `SAKSI_AUDIT_THREADS=<n>`
+//! pins the thread count (`1` = the serial path); the output is identical at any
+//! `n`, and an invalid value is an error.
 
 use std::path::Path;
 use std::process::ExitCode;

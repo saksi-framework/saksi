@@ -255,7 +255,7 @@ Each run is a folder under `--runs`, named `<slug>-<timestamp>-<n>`:
 | `perf.csv` | one row per run: the whole performance record — see below |
 | `perf-schema.md` | every `perf.csv` column and its producer, dropped beside the CSV |
 | `latencies.csv` | `index,segment,ms,ok` — one row per dispatched ballot |
-| `timings.json` | the auditor's four in-process stage timers (`timings_ms`) |
+| `timings.json` | the auditor's four in-process stage timers (`timings_ms`) and the `verify_threads` they ran on |
 | `gen-timings.json` | the generator's CPU/wall sidecar (`saksi-demo gen --stream`) |
 | `receipts.csv` | one row per on-chain receipt (ballots and lifecycle) |
 | `trail.ndjson` | lifecycle events, one JSON object per line (`trail.json` for legacy runs) |
@@ -331,7 +331,8 @@ submit_window_ms,committed,dropped,committed_tps,driver_ceiling_tps,
 latency_min_ms,latency_p50_ms,latency_mean_ms,latency_p95_ms,latency_p99_ms,latency_stddev_ms,
 peak_cpu_pct_peer,peak_cpu_pct_orderer,peak_cpu_pct_client,
 peak_mem_mb_peer,peak_mem_mb_orderer,peak_mem_mb_client,
-ledger_bytes_delta,sustained,scaling_limit,failed,fail_reason
+ledger_bytes_delta,sustained,scaling_limit,failed,fail_reason,
+verify_threads
 ```
 
 Read the suffixes: `_inproc_ms` is measured inside the auditor process,
@@ -343,8 +344,14 @@ never written where nothing was measured. `perf-schema.md` is written into the
 run folder alongside, so a downloaded CSV carries its own definitions;
 `perf.csv` itself has no comment lines and loads straight into a spreadsheet.
 
-Two caveats worth knowing before quoting a number:
+Three caveats worth knowing before quoting a number:
 
+- `proof_verify_inproc_ms` is the **wall-clock** time of the auditor's parallel
+  ballot verification on `verify_threads` threads (every core by default), not
+  CPU time summed across them. Compare it only between runs at the same thread
+  count, and not with figures from before verification went parallel. Set
+  `SAKSI_AUDIT_THREADS=<n>` in the console's environment to pin the count
+  (`1` is the serial path); the audit output is identical at any count.
 - `aggregate_inproc_ms` times **point addition only** — point decompression
   moved into ballot verification, so this figure is not comparable with any
   aggregation number from before that change.
