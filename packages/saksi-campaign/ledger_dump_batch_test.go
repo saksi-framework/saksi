@@ -155,3 +155,122 @@ func TestLedgerDumpFailsOnABallotTheChainLists(t *testing.T) {
 		t.Fatal("a listed nullifier with no ballot must fail the dump")
 	}
 }
+
+// bigFakeChain is a chain holding n ballots under deterministic 32-byte
+// nullifiers, plus the expected ballots.ndjson for it in ListNullifiers order.
+func bigFakeChain(t *testing.T, n int) (*fakeLedger, []byte) {
+	t.Helper()
+	led := &fakeLedger{Ballots: map[string]string{}}
+	for i := 0; i < n; i++ {
+		nul := fmt.Sprintf("%064x", i+1)
+		led.accept(nul)
+		led.Ballots[nul] = hex.EncodeToString([]byte(nul))
+	}
+	var want bytes.Buffer
+	bookmark := ""
+	for {
+		page, err := led.ListNullifiers("election-2026", nullifierPageSize, bookmark)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, nul := range page.Nullifiers {
+			want.WriteString(led.Ballots[nul] + "\n")
+		}
+		if page.NextBookmark == "" || page.NextBookmark == bookmark {
+			break
+		}
+		bookmark = page.NextBookmark
+	}
+	return led, want.Bytes()
+}
+
+// smallNullifierPages shrinks the ListNullifiers page size for one test, so a
+// multi-page outer walk is reachable without seeding 10,000 ballots.
+func smallNullifierPages(t *testing.T, size int) {
+	t.Helper()
+	was := nullifierPageSize
+	nullifierPageSize = size
+	t.Cleanup(func() { nullifierPageSize = was })
+}
+
+// TestLedgerDumpSpansMultipleNullifierPages walks more than one ListNullifiers
+// page, each of which needs more than one GetBallots page. The nesting is the
+// part that can go wrong — a chunk loop that reset per outer page, or a
+// bookmark advanced before the last chunk was written, would lose or repeat
+// ballots — so the dump is compared line for line against the chain's own
+// listing order, and the batch sizes against the page arithmetic.
+func TestLedgerDumpSpansMultipleNullifierPages(t *testing.T) {
+	smallNullifierPages(t, 1200)
+	const n = 2600 // outer pages of 1200, 1200, 200
+	led, want := bigFakeChain(t, n)
+
+	dir := t.TempDir()
+	got, path, err := dumpLedgerBallots(dir, "election-2026", led)
+	if err != nil {
+		t.Fatalf("dumpLedgerBallots: %v", err)
+	}
+	if got != n || path != ledgerReadBatched {
+		t.Fatalf("dumped %d ballots via %q, want %d via %q", got, path, n, ledgerReadBatched)
+	}
+	// 1200 = 500+500+200 twice, then 200.
+	wantSizes := []int{500, 500, 200, 500, 500, 200, 200}
+	if fmt.Sprint(led.batchSizes()) != fmt.Sprint(wantSizes) {
+		t.Fatalf("GetBallots pages = %v, want %v", led.batchSizes(), wantSizes)
+	}
+	data, err := os.ReadFile(filepath.Join(dir, BallotsFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(data, want) {
+		t.Fatal("a multi-page dump is not the chain's ballots in listing order")
+	}
+}
+
+// TestLedgerDumpFallsBackPartwayThroughAPopulation is the upgrade-in-flight
+// case the fallback exists for, at its most awkward: the batched read works for
+// a while and then stops being available. The chunk in progress must be redone
+// per ballot (not skipped, not duplicated), the rest of the population must
+// follow the same path, and the file must still come out byte-identical to a
+// dump that never batched at all.
+func TestLedgerDumpFallsBackPartwayThroughAPopulation(t *testing.T) {
+	smallNullifierPages(t, 1200)
+	const n = 2600
+	led, want := bigFakeChain(t, n)
+	led.noBatchAfter = 4 // batched through the first outer page and one chunk of the second
+
+	dir := t.TempDir()
+	got, path, err := dumpLedgerBallots(dir, "election-2026", led)
+	if err != nil {
+		t.Fatalf("dumpLedgerBallots: %v", err)
+	}
+	if got != n {
+		t.Fatalf("dumped %d ballots, want %d", got, n)
+	}
+	if path != ledgerReadPerBallot {
+		t.Fatalf("read path = %q, want %q once the fallback has fired", path, ledgerReadPerBallot)
+	}
+	data, err := os.ReadFile(filepath.Join(dir, BallotsFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(data, want) {
+		t.Fatal("the dump that fell back partway is not byte-identical to the chain's listing order")
+	}
+
+	// And identical to a dump that never batched: same bytes, different path.
+	plain, _ := bigFakeChain(t, n)
+	plain.noBatch = true
+	plainDir := t.TempDir()
+	if _, plainPath, err := dumpLedgerBallots(plainDir, "election-2026", plain); err != nil {
+		t.Fatalf("per-ballot dumpLedgerBallots: %v", err)
+	} else if plainPath != ledgerReadPerBallot {
+		t.Fatalf("read path = %q, want %q", plainPath, ledgerReadPerBallot)
+	}
+	plainData, err := os.ReadFile(filepath.Join(plainDir, BallotsFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(data, plainData) {
+		t.Fatal("the partway-fallback dump and the never-batched dump differ")
+	}
+}

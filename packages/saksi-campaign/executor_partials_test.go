@@ -173,3 +173,81 @@ func TestSubmitPartialsFailLoud(t *testing.T) {
 		}
 	}
 }
+
+// TestSubmitPartialsStopAfterAFailure is the other half of the failure
+// contract, and the reason the fan-out carries a cancellable child context: a
+// run whose first partial decryption fails must not go on to submit the rest
+// of them into an election it is about to abandon.
+//
+// It is made deterministic by holding the fake: every partial after the first
+// blocks inside the ledger until the watcher below has SEEN the first one
+// commit-and-fail, so the failure is always observed before any further
+// transaction can be attempted. The bound is the semaphore's: nothing beyond
+// the maxPartialsInFlight already in flight when the failure landed may reach
+// the chain, because a goroutine that takes a freed slot afterwards finds the
+// context cancelled and returns at step's entry check without submitting.
+func TestSubmitPartialsStopAfterAFailure(t *testing.T) {
+	dir := t.TempDir()
+	const partials = maxPartialsInFlight * 4
+
+	var first sync.Once
+	release := make(chan struct{})
+	led := &fakeLedger{failOn: "SubmitPartialDecryption"}
+	led.beforeCommit = func(fn string) {
+		if fn != "SubmitPartialDecryption" {
+			return
+		}
+		lead := false
+		first.Do(func() { lead = true })
+		if lead {
+			return // this one commits, fails, and cancels the rest
+		}
+		select {
+		case <-release:
+		case <-time.After(10 * time.Second):
+		}
+	}
+	// Release the held partials once the first has actually reached the ledger
+	// and failed. commit() records the call before returning the failure, and
+	// the goroutine records the error before freeing its semaphore slot, so a
+	// visible call means the failure is in hand.
+	done := make(chan struct{})
+	defer close(done)
+	go func() {
+		for {
+			select {
+			case <-done:
+				return
+			default:
+			}
+			for _, fn := range led.callNames() {
+				if fn == "SubmitPartialDecryption" {
+					close(release)
+					return
+				}
+			}
+			time.Sleep(time.Millisecond)
+		}
+	}()
+
+	e := newTestExecutor(t, dir)
+	path := writeTestBundleWithPartials(t, filepath.Join(dir, "run-1"), partials)
+	if err := e.submitOnChain(context.Background(), "run-1", ElectionConfig{}, led, path); err == nil {
+		t.Fatal("want an error when a partial decryption fails")
+	}
+
+	attempted := 0
+	for _, fn := range led.callNames() {
+		if fn == "SubmitPartialDecryption" {
+			attempted++
+		}
+	}
+	if attempted >= partials {
+		t.Fatalf("all %d partial decryptions were submitted after the first failed", partials)
+	}
+	if attempted > maxPartialsInFlight {
+		t.Fatalf("%d partial decryptions reached the chain after the failure, "+
+			"want at most the %d that were already in flight",
+			attempted, maxPartialsInFlight)
+	}
+}

@@ -566,6 +566,13 @@ const maxPartialsInFlight = 16
 // wording sequential submission produced, and no further partials are started
 // once one has failed.
 func submitPartials(ctx context.Context, b *onChainBundle, step lifecycleStep) error {
+	// Cancelled on the first failure, so a partial that has already taken a
+	// slot but not yet started its transaction gives up at step's context
+	// check instead of committing into an election that is about to be
+	// abandoned. The outer context is untouched.
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
 	var (
 		wg       sync.WaitGroup
 		mu       sync.Mutex
@@ -594,6 +601,9 @@ func submitPartials(ctx context.Context, b *onChainBundle, step lifecycleStep) e
 					firstErr = err
 				}
 				mu.Unlock()
+				// First error wins: the cancellation only ever makes LATER
+				// partials fail with a context error, which is discarded above.
+				cancel()
 			}
 		}(i, pd)
 	}
@@ -1088,7 +1098,12 @@ func truncate(b []byte, n int) string {
 
 // nullifierPageSize is how many committed nullifiers one ListNullifiers page
 // asks for, matching the chaincode's own per-page cap.
-const nullifierPageSize = 10000
+//
+// A var, not a const, purely so tests can shrink it: the paging behaviour that
+// matters (an outer walk of several pages, each fetched in several batched
+// ballot reads) is otherwise only reachable with 10,000+ ballots per test.
+// Nothing outside tests assigns to it.
+var nullifierPageSize = 10000
 
 // nullifierLister reads an election's committed nullifiers, one page at a
 // time. *clientsdk.BulletinClient satisfies it; it is deliberately a

@@ -74,6 +74,10 @@ type fakeLedger struct {
 	// noBatch makes GetBallots report the error an older chaincode gives for an
 	// unknown function, so the dump's fallback path can be exercised.
 	noBatch bool
+	// noBatchAfter, when positive, serves that many GetBallots pages and then
+	// starts reporting the function as unknown — the dump falling back partway
+	// through a population rather than at the first page.
+	noBatchAfter int
 	// getBallotsBatches records the size of each GetBallots page asked for.
 	getBallotsBatches []int
 
@@ -248,7 +252,7 @@ func (f *fakeLedger) GetBallot(_, nullifier string) (string, error) {
 // predating the function, which is what the dump falls back from.
 func (f *fakeLedger) GetBallots(electionID string, nullifiers []string) ([]string, error) {
 	f.mu.Lock()
-	if f.noBatch {
+	if f.noBatch || (f.noBatchAfter > 0 && len(f.getBallotsBatches) >= f.noBatchAfter) {
 		f.mu.Unlock()
 		return nil, errors.New("Function GetBallots not found in contract SmartContract")
 	}
