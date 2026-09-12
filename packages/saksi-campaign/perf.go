@@ -103,6 +103,13 @@ type submitMetrics struct {
 	PeakMemMB  map[string]float64 `json:"peak_mem_mb"`
 	// LedgerBytesDelta is nil unless a peer volume path was configured.
 	LedgerBytesDelta *int64 `json:"ledger_bytes_delta"`
+
+	// JournalError is set when the run journal failed DURING this window. The
+	// journal cannot carry its own failure — a failed journal refuses every
+	// later write, run.end included — and Verify finalises the run from a
+	// fresh journal, so this file is where the reason has to survive. Empty
+	// for every healthy run; see journalWindowErr.
+	JournalError string `json:"journal_error,omitempty"`
 }
 
 // perfColumns is the exact perf.csv column order.

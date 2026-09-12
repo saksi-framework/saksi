@@ -28,6 +28,23 @@ import (
 // verdict at run.end. The environment snapshot (CollectEnv) is in env.go and
 // the docker-stats sampler is in sampler.go — both feed this journal.
 //
+// ONE exception to "fsynced at checkpoint events", and it costs durability:
+// ballots.progress is fsynced by a writer goroutine rather than by the
+// goroutine that stamped it (see stampProgress — the synchronous fsync used to
+// stall ballot submission). A progress event is therefore durable shortly
+// after it is stamped, not at the moment it is stamped, so a hard kill can
+// lose up to progressQueue of them — 64 events, i.e. 64,000 ballots. Every
+// OTHER event, including every event that closes a window, is fsynced before
+// its Stamp returns exactly as before, and a closing event is written only
+// after every progress line handed over before it.
+//
+// What that costs a reader: the last ballots.progress on disk is a LOWER BOUND
+// on what the window had dispatched, so interrupted_at{last_done} and the
+// resume API's Remaining are bounds too — a resume may re-offer ballots the
+// chain already holds. That is already the resume path's contract (the chain's
+// nullifier set, not the journal, decides what is committed), so this widens
+// the over-estimate rather than introducing a new failure mode.
+//
 // Later tasks wire this into the executor; this file only provides the API
 // and tests it.
 
@@ -52,13 +69,15 @@ const progressEvent = "ballots.progress"
 // means 64 is 64,000 ballots of slack.
 const progressQueue = 64
 
-// progressItem is one unit of work for the progress writer: a line to write, a
-// barrier to close once the writer has passed this point, or both. stop tells
-// the writer this is the last item it will handle.
-type progressItem struct {
-	line    map[string]any
-	barrier chan struct{}
-	stop    bool
+// barrier is a "everything handed over before me is on disk" marker for the
+// progress writer. stop tells the writer this is the last thing it will serve.
+//
+// Barriers ride their OWN channel, never the line queue: stampProgress drops
+// the head of the line queue when it is full, and dropping a barrier would
+// leave its waiter parked forever.
+type barrier struct {
+	done chan struct{}
+	stop bool
 }
 
 // Journal is an append-only, one-JSON-object-per-line event log for a single
@@ -78,8 +97,9 @@ type Journal struct {
 	opened time.Time
 	failed error
 
-	progress  chan progressItem
-	done      chan struct{} // closed once the progress writer has retired
+	progress  chan map[string]any // progress lines awaiting their write
+	barriers  chan barrier        // unbuffered: ordering markers and the stop signal
+	done      chan struct{}       // closed once the progress writer has retired
 	coalesced atomic.Int64
 }
 
@@ -114,7 +134,8 @@ func OpenJournal(runDir string, env map[string]any) (*Journal, error) {
 func newJournal(f journalFile, opened time.Time) *Journal {
 	j := &Journal{
 		f: f, opened: opened,
-		progress: make(chan progressItem, progressQueue),
+		progress: make(chan map[string]any, progressQueue),
+		barriers: make(chan barrier),
 		done:     make(chan struct{}),
 	}
 	go j.writeProgress()
@@ -177,13 +198,15 @@ func (j *Journal) Stamp(event string, fields map[string]any) error {
 // gaps with no ballot in flight. Every committed_tps the campaign reported was
 // understated by it.
 //
-// Policy when the queue is full: coalesce to the LATEST progress, never block.
-// Progress is a monotone dispatched-count, so the newest event subsumes an
-// older one and dropping the oldest keeps the sequence ordered and keeps the
-// number a reader actually needs; blocking would put the write back on the
-// submission path, which is the defect this removes. Each coalesce is counted
-// and the running count rides on the next line written ("coalesced"), so a
-// reader sees that a count was skipped rather than a silent gap. At
+// Policy when the queue is full: coalesce towards the LATEST progress, never
+// block. Progress is a monotone dispatched-count, so a newer event subsumes an
+// older one, and dropping from the head keeps the sequence ordered while
+// keeping the number a reader actually needs; blocking would put the write
+// back on the submission path, which is the defect this removes. Every send
+// here is non-blocking, so the newest line is the one kept in the ordinary
+// case and not a guarantee — whichever line is coalesced away is counted, and
+// the running total rides on the next line written ("coalesced_total"), so a
+// reader sees that counts were skipped rather than a silent gap. At
 // progressQueue events of slack it takes the writer falling 64,000 ballots
 // behind to reach this at all.
 func (j *Journal) stampProgress(line map[string]any) {
@@ -193,21 +216,28 @@ func (j *Journal) stampProgress(line map[string]any) {
 	default:
 	}
 	if n := j.coalesced.Load(); n > 0 {
-		line["coalesced"] = n
+		line["coalesced_total"] = n
 	}
 	select {
-	case j.progress <- progressItem{line: line}:
+	case j.progress <- line:
 		return
 	default:
 	}
-	select { // full: drop the oldest queued progress to make room for this one
+	// Full: drop the oldest queued line to make room for this one. Only a
+	// LINE can be popped here — barriers ride j.barriers precisely so this
+	// cannot strand one.
+	select {
 	case <-j.progress:
-		line["coalesced"] = j.coalesced.Add(1)
+		line["coalesced_total"] = j.coalesced.Add(1)
 	default:
 	}
 	select {
-	case j.progress <- progressItem{line: line}:
+	case j.progress <- line:
 	default:
+		// Room was taken between the pop and this send, so this line is the
+		// one coalesced away. With the single dispatcher goroutine bench.Run
+		// documents this cannot happen, but it is counted rather than
+		// assumed away: the count is cumulative and rides the next line.
 		j.coalesced.Add(1)
 	}
 }
@@ -217,15 +247,24 @@ func (j *Journal) stampProgress(line map[string]any) {
 // any error in failed, where Err() finds it.
 func (j *Journal) writeProgress() {
 	defer close(j.done)
-	for it := range j.progress {
-		if it.line != nil {
-			_ = j.writeLine(it.line, true) // the error sticks in failed
+	for {
+		// Lines first, always. A barrier means "every line handed over before
+		// me is written and fsynced", so it is only served once the line
+		// queue has drained — that is the whole ordering guarantee.
+		select {
+		case line := <-j.progress:
+			_ = j.writeLine(line, true) // the error sticks in failed
+			continue
+		default:
 		}
-		if it.barrier != nil {
-			close(it.barrier)
-		}
-		if it.stop {
-			return
+		select {
+		case line := <-j.progress:
+			_ = j.writeLine(line, true)
+		case b := <-j.barriers:
+			close(b.done)
+			if b.stop {
+				return
+			}
 		}
 	}
 }
@@ -236,25 +275,25 @@ func (j *Journal) writeProgress() {
 //
 // Both waits also give up on done, so a Stamp that races a Close can never
 // wedge on a writer that has already retired.
-func (j *Journal) await(it progressItem) {
-	if j.progress == nil {
+func (j *Journal) await(stop bool) {
+	if j.barriers == nil {
 		return
 	}
-	it.barrier = make(chan struct{})
+	b := barrier{done: make(chan struct{}), stop: stop}
 	select {
-	case j.progress <- it:
+	case j.barriers <- b:
 	case <-j.done:
 		return
 	}
 	select {
-	case <-it.barrier:
+	case <-b.done:
 	case <-j.done:
 	}
 }
 
 // flushProgress blocks until every progress event handed over so far is
 // written and fsynced.
-func (j *Journal) flushProgress() { j.await(progressItem{}) }
+func (j *Journal) flushProgress() { j.await(false) }
 
 // Err reports the first write or Sync error the journal hit, including one hit
 // on the progress writer goroutine, where there was no Stamp call left to
@@ -297,7 +336,7 @@ func (j *Journal) Close() error {
 	if j == nil {
 		return nil
 	}
-	j.await(progressItem{stop: true}) // drain and retire the progress writer
+	j.await(true) // drain and retire the progress writer
 	j.mu.Lock()
 	defer j.mu.Unlock()
 	return j.f.Close()
