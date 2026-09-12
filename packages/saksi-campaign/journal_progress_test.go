@@ -512,3 +512,67 @@ func submitMetricsJournalError(t *testing.T, runDir string) string {
 	}
 	return sm.JournalError
 }
+
+// (round 2) A barrier must not overtake a line that was handed over before it,
+// and Close's stop barrier must not retire the writer with a line still
+// queued.
+//
+// The writer drains opportunistically, then blocks on a select over lines and
+// barriers. That drain only proves the queue was empty at that instant: a line
+// handed over afterwards is ready at the same moment as the barrier, and Go
+// picks between two ready cases uniformly. progressDrainHook widens that
+// window so the race is exercised on every iteration instead of once in a
+// blue moon.
+//
+// The second miss is the one that costs a measurement: a line dropped by Close
+// is never written, so its write error never reaches failed, journalWindowErr
+// reads nil and perf.csv records failed:false for a run whose journal broke
+// inside the measured window.
+func TestBarrierNeverOvertakesOrDropsAQueuedLine(t *testing.T) {
+	const iterations = 40
+	prev := progressDrainHook
+	progressDrainHook = func() { time.Sleep(20 * time.Millisecond) }
+	t.Cleanup(func() { progressDrainHook = prev })
+
+	for i := 0; i < iterations; i++ {
+		dir := t.TempDir()
+		j, err := OpenJournal(dir, map[string]any{"go_os": "test"})
+		if err != nil {
+			t.Fatalf("iteration %d: OpenJournal: %v", i, err)
+		}
+
+		// The writer is parked in the widened window, so this line and the
+		// barrier behind it come ready together.
+		_ = j.Stamp(progressEvent, map[string]any{"done": 1000})
+		if err := j.Stamp("segment.end", map[string]any{"index": 0}); err != nil {
+			t.Fatalf("iteration %d: Stamp(segment.end): %v", i, err)
+		}
+		// Same race, against Close's stop barrier this time.
+		_ = j.Stamp(progressEvent, map[string]any{"done": 2000})
+		if err := j.Close(); err != nil {
+			t.Fatalf("iteration %d: Close: %v", i, err)
+		}
+
+		events := journalLines(t, dir)
+		closing := -1
+		seen := map[float64]bool{}
+		for k, ev := range events {
+			switch ev["event"] {
+			case "segment.end":
+				closing = k
+			case progressEvent:
+				done := ev["done"].(float64)
+				seen[done] = true
+				if done == 1000 && closing != -1 {
+					t.Fatalf("iteration %d: done=1000 was written after segment.end: %v", i, events)
+				}
+			}
+		}
+		if closing == -1 {
+			t.Fatalf("iteration %d: no segment.end in journal: %v", i, events)
+		}
+		if !seen[1000] || !seen[2000] {
+			t.Fatalf("iteration %d: a queued progress line was never written (have %v): %v", i, seen, events)
+		}
+	}
+}

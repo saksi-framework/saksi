@@ -88,8 +88,10 @@ type barrier struct {
 // ballots.progress is written by a private writer goroutine instead, because
 // it is the only event stamped from inside the measured submission window —
 // see stampProgress. Its line, fields and fsync are unchanged; only the
-// goroutine that performs them moved. Every other Stamp drains that queue
-// before writing, so the log's order is the order the events happened in.
+// goroutine that performs them moved. Every other Stamp waits on a barrier the
+// writer releases only after it has drained the line queue, so no progress
+// line can be written after the event that closes its window — and none can be
+// left queued when Close retires the writer.
 type Journal struct {
 	mu     sync.Mutex
 	f      journalFile
@@ -257,10 +259,27 @@ func (j *Journal) writeProgress() {
 			continue
 		default:
 		}
+		progressDrainHook()
 		select {
 		case line := <-j.progress:
 			_ = j.writeLine(line, true)
 		case b := <-j.barriers:
+			// Drain again before releasing the barrier. The drain above only
+			// proved the queue was empty AT THAT INSTANT: between it and this
+			// select a line can be handed over while a barrier is offered, and
+			// Go then picks between the two ready cases uniformly. Releasing
+			// the barrier first would let that line be written AFTER the event
+			// the barrier is ordering — or, for Close's stop barrier, dropped
+			// outright, which would also lose its write error and with it the
+			// failed:false that recordJournalError exists to prevent.
+			for drained := false; !drained; {
+				select {
+				case line := <-j.progress:
+					_ = j.writeLine(line, true)
+				default:
+					drained = true
+				}
+			}
 			close(b.done)
 			if b.stop {
 				return
@@ -268,6 +287,12 @@ func (j *Journal) writeProgress() {
 		}
 	}
 }
+
+// progressDrainHook runs between the writer's opportunistic drain and the
+// blocking select that follows it. It does nothing in production; a test
+// replaces it to widen that window by a visible amount, so the line-vs-barrier
+// race there is reliably exercised rather than left to chance.
+var progressDrainHook = func() {}
 
 // await queues it and blocks until the writer goroutine has passed it. Callers
 // are never on the submission path: flushProgress runs on whichever goroutine

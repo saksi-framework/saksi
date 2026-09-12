@@ -311,8 +311,9 @@ silently continued.
 window, so it alone is written by a journal-owned writer goroutine rather than
 by the goroutine that stamped it: its line, fields and fsync are unchanged, but
 the fsync no longer stalls ballot dispatch. Every other event still writes
-synchronously, and every one of them drains the progress queue before writing,
-so no progress line can land after the event that closes its window. If the
+synchronously, waiting on a barrier that the writer releases only once it has
+drained the queued lines, so no progress line can land after the event that
+closes its window and none is left unwritten when the journal closes. If the
 queue ever filled, the journal would coalesce towards the latest count rather
 than wait, and the next progress line carries a `coalesced_total` saying how
 many were folded away.
