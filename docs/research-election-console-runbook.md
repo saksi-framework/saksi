@@ -307,6 +307,16 @@ monotonic reading. Checkpoint events (fsynced): `run.start`, `stage.*`,
 the run with that reason and stops the journal — a truncated journal is never
 silently continued.
 
+`ballots.progress` is the one event stamped from inside the measured submission
+window, so it alone is written by a journal-owned writer goroutine rather than
+by the goroutine that stamped it: its line, fields and fsync are unchanged, but
+the fsync no longer stalls ballot dispatch. Every other event still writes
+synchronously, and every one of them drains the progress queue first, so the
+log's order is still the order the events happened in. If the queue ever
+filled, the journal would coalesce to the latest count rather than wait, and
+the next progress line carries a `coalesced` count saying how many were folded
+away.
+
 Useful events: `stage.generate.*`, `stage.bundle.*`, `stage.ballots.*`,
 `stage.ceremony.*`, `stage.verify.*`, `segment.start`/`segment.end`,
 `ballots.progress {done}`, `interrupted_at {last_done}`, `sample` (one per

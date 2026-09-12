@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -42,16 +43,44 @@ type journalFile interface {
 	Close() error
 }
 
+// progressEvent is the one event stamped from INSIDE the measured submission
+// window, and so the only one written asynchronously — see stampProgress.
+const progressEvent = "ballots.progress"
+
+// progressQueue is how many progress events the writer goroutine may fall
+// behind before stampProgress starts coalescing. One event per 1,000 ballots
+// means 64 is 64,000 ballots of slack.
+const progressQueue = 64
+
+// progressItem is one unit of work for the progress writer: a line to write, a
+// barrier to close once the writer has passed this point, or both. stop tells
+// the writer this is the last item it will handle.
+type progressItem struct {
+	line    map[string]any
+	barrier chan struct{}
+	stop    bool
+}
+
 // Journal is an append-only, one-JSON-object-per-line event log for a single
-// run folder. Every Stamp call takes the mutex and issues exactly one Write;
-// checkpoint events (run.start, stage.*, rep.*, ballots.progress, segment.*,
-// run.end) additionally fsync.
+// run folder. Every Stamp call but ballots.progress takes the mutex and issues
+// exactly one Write; checkpoint events (run.start, stage.*, rep.*,
+// ballots.progress, segment.*, run.end) additionally fsync.
+//
+// ballots.progress is written by a private writer goroutine instead, because
+// it is the only event stamped from inside the measured submission window —
+// see stampProgress. Its line, fields and fsync are unchanged; only the
+// goroutine that performs them moved. Every other Stamp drains that queue
+// before writing, so the log's order is the order the events happened in.
 type Journal struct {
 	mu     sync.Mutex
 	f      journalFile
 	path   string
 	opened time.Time
 	failed error
+
+	progress  chan progressItem
+	done      chan struct{} // closed once the progress writer has retired
+	coalesced atomic.Int64
 }
 
 // OpenJournal creates <runDir>/journal.ndjson and writes the environment
@@ -59,7 +88,7 @@ type Journal struct {
 // immediately.
 func OpenJournal(runDir string, env map[string]any) (*Journal, error) {
 	path := filepath.Join(runDir, JournalFile)
-	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	f, err := openJournalFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("open journal: %w", err)
 	}
@@ -73,7 +102,7 @@ func OpenJournal(runDir string, env map[string]any) (*Journal, error) {
 	line["event"] = "env"
 	line["ts"] = time.Now().UTC().Format(time.RFC3339)
 	if err := j.writeLine(line, true); err != nil {
-		f.Close()
+		_ = j.Close()
 		return nil, err
 	}
 	return j, nil
@@ -83,12 +112,31 @@ func OpenJournal(runDir string, env map[string]any) (*Journal, error) {
 // production code always goes through OpenJournal; tests use this to inject
 // a fake file and a fixed opened time.
 func newJournal(f journalFile, opened time.Time) *Journal {
-	return &Journal{f: f, opened: opened}
+	j := &Journal{
+		f: f, opened: opened,
+		progress: make(chan progressItem, progressQueue),
+		done:     make(chan struct{}),
+	}
+	go j.writeProgress()
+	return j
+}
+
+// openJournalFile opens a journal's underlying file. A var, and the single
+// place the flags live, so a test can substitute a file whose writes stall or
+// fail without a real disk that does either.
+var openJournalFile = func(path string) (journalFile, error) {
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
+		return nil, err
+	}
+	return f, nil
 }
 
 // Stamp appends {"event":event,"ts":...,"mono_ms":<since open>,...fields} and
 // fsyncs if event is a checkpoint. A prior Sync error is returned on every
-// later call, without writing.
+// later call, without writing — except for ballots.progress, which is handed
+// to the writer goroutine and always returns nil; Err() is where its errors
+// surface.
 //
 // A nil Journal accepts and discards every Stamp: a run folder whose journal
 // could not be opened still runs, it just goes unrecorded. Instrumentation
@@ -104,7 +152,120 @@ func (j *Journal) Stamp(event string, fields map[string]any) error {
 	line["event"] = event
 	line["ts"] = time.Now().UTC().Format(time.RFC3339)
 	line["mono_ms"] = time.Since(j.opened).Milliseconds()
+	if event == progressEvent {
+		j.stampProgress(line)
+		// Always nil, and deliberately so: reading failed would take the
+		// journal mutex, which the writer goroutine holds across its fsync
+		// — the exact stall this path exists to avoid. A progress write's
+		// error lands in failed and surfaces at Err() (and so at the next
+		// synchronous Stamp), off the submission path.
+		return nil
+	}
+	// Ordering barrier: everything the progress writer has been handed is on
+	// disk before this line is written, so segment.end / stage.ballots.end /
+	// run.end still follow the progress they close.
+	j.flushProgress()
 	return j.writeLine(line, isCheckpoint(event))
+}
+
+// stampProgress hands line to the writer goroutine WITHOUT ever waiting on it.
+//
+// This is the whole point of the split. bench.Run calls OnProgress on its
+// dispatcher goroutine, so the fsync a checkpoint costs used to stall ballot
+// submission itself: measured on the desktop 2026-09-12 as 12 of 62 reps
+// losing 69 s of submission time (~3 % of the total), visible as multi-second
+// gaps with no ballot in flight. Every committed_tps the campaign reported was
+// understated by it.
+//
+// Policy when the queue is full: coalesce to the LATEST progress, never block.
+// Progress is a monotone dispatched-count, so the newest event subsumes an
+// older one and dropping the oldest keeps the sequence ordered and keeps the
+// number a reader actually needs; blocking would put the write back on the
+// submission path, which is the defect this removes. Each coalesce is counted
+// and the running count rides on the next line written ("coalesced"), so a
+// reader sees that a count was skipped rather than a silent gap. At
+// progressQueue events of slack it takes the writer falling 64,000 ballots
+// behind to reach this at all.
+func (j *Journal) stampProgress(line map[string]any) {
+	select {
+	case <-j.done:
+		return // journal closed: there is nothing left to write to
+	default:
+	}
+	if n := j.coalesced.Load(); n > 0 {
+		line["coalesced"] = n
+	}
+	select {
+	case j.progress <- progressItem{line: line}:
+		return
+	default:
+	}
+	select { // full: drop the oldest queued progress to make room for this one
+	case <-j.progress:
+		line["coalesced"] = j.coalesced.Add(1)
+	default:
+	}
+	select {
+	case j.progress <- progressItem{line: line}:
+	default:
+		j.coalesced.Add(1)
+	}
+}
+
+// writeProgress is the journal's progress writer. It writes each queued line
+// exactly as a synchronous Stamp would — same fields, same fsync — and records
+// any error in failed, where Err() finds it.
+func (j *Journal) writeProgress() {
+	defer close(j.done)
+	for it := range j.progress {
+		if it.line != nil {
+			_ = j.writeLine(it.line, true) // the error sticks in failed
+		}
+		if it.barrier != nil {
+			close(it.barrier)
+		}
+		if it.stop {
+			return
+		}
+	}
+}
+
+// await queues it and blocks until the writer goroutine has passed it. Callers
+// are never on the submission path: flushProgress runs on whichever goroutine
+// stamped a non-progress event, and Close runs at the end of a stage.
+//
+// Both waits also give up on done, so a Stamp that races a Close can never
+// wedge on a writer that has already retired.
+func (j *Journal) await(it progressItem) {
+	if j.progress == nil {
+		return
+	}
+	it.barrier = make(chan struct{})
+	select {
+	case j.progress <- it:
+	case <-j.done:
+		return
+	}
+	select {
+	case <-it.barrier:
+	case <-j.done:
+	}
+}
+
+// flushProgress blocks until every progress event handed over so far is
+// written and fsynced.
+func (j *Journal) flushProgress() { j.await(progressItem{}) }
+
+// Err reports the first write or Sync error the journal hit, including one hit
+// on the progress writer goroutine, where there was no Stamp call left to
+// return it to. Nil-safe, like Stamp.
+func (j *Journal) Err() error {
+	if j == nil {
+		return nil
+	}
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	return j.failed
 }
 
 func (j *Journal) writeLine(line map[string]any, checkpoint bool) error {
@@ -136,6 +297,7 @@ func (j *Journal) Close() error {
 	if j == nil {
 		return nil
 	}
+	j.await(progressItem{stop: true}) // drain and retire the progress writer
 	j.mu.Lock()
 	defer j.mu.Unlock()
 	return j.f.Close()

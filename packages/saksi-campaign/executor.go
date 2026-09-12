@@ -173,13 +173,30 @@ func (e *Executor) journalFor(runID string) *Journal {
 		return nil
 	}
 	path := filepath.Join(dir, JournalFile)
-	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	f, err := openJournalFile(path)
 	if err != nil {
 		return nil
 	}
 	j := newJournal(f, time.Now())
 	j.path = path
 	return j
+}
+
+// journalWindowErr turns a journal failure inside a measured ballot window
+// into a stage error.
+//
+// A journal that could not be OPENED is not a failure — the run still runs, it
+// just goes unrecorded (see Journal.Stamp). A journal that broke MID-WINDOW is
+// different: the window's own record is now incomplete, so the figures it
+// produced cannot be published as if they were recorded. The run fails with
+// the journal's own reason rather than reporting a window it did not write
+// down. This is also the only place a ballots.progress write error can
+// surface, since that write happens off the stamping goroutine.
+func journalWindowErr(j *Journal) error {
+	if err := j.Err(); err != nil {
+		return fmt.Errorf("run journal failed during the ballot window: %w", err)
+	}
+	return nil
 }
 
 // stageEnd is the standard stage.*.end payload: ok, plus the error if not.
@@ -865,6 +882,9 @@ func (e *Executor) submitBallots(ctx context.Context, runID string, c ElectionCo
 	if res.Dropped > 0 {
 		return fmt.Errorf("%d of %d ballots did not commit", res.Dropped, res.Submitted)
 	}
+	if err := journalWindowErr(j); err != nil {
+		return err
+	}
 	e.publish(runID, "ceremony", "info",
 		fmt.Sprintf("%d ballots committed in %s", res.Committed, res.Window.Round(time.Millisecond)))
 	return nil
@@ -1289,6 +1309,9 @@ func (e *Executor) resumeBallots(ctx context.Context, runID string, c ElectionCo
 
 	if dropped > 0 {
 		return fmt.Errorf("%d of %d resubmitted ballots did not commit", dropped, res.Submitted)
+	}
+	if err := journalWindowErr(j); err != nil {
+		return err
 	}
 	e.publish(runID, "submit", "done", fmt.Sprintf(
 		"segment %d committed %d ballots (%d were already on chain)", plan.Segment, res.Committed, replayed))
