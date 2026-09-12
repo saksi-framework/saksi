@@ -173,13 +173,52 @@ func (e *Executor) journalFor(runID string) *Journal {
 		return nil
 	}
 	path := filepath.Join(dir, JournalFile)
-	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	f, err := openJournalFile(path)
 	if err != nil {
 		return nil
 	}
 	j := newJournal(f, time.Now())
 	j.path = path
 	return j
+}
+
+// journalWindowErr turns a journal failure inside a measured ballot window
+// into a stage error.
+//
+// A journal that could not be OPENED is not a failure — the run still runs, it
+// just goes unrecorded (see Journal.Stamp). A journal that broke MID-WINDOW is
+// different: the window's own record is now incomplete, so the figures it
+// produced cannot be published as if they were recorded. The run fails with
+// the journal's own reason rather than reporting a window it did not write
+// down. This is also the only place a ballots.progress write error can
+// surface, since that write happens off the stamping goroutine.
+func journalWindowErr(j *Journal) error {
+	if err := j.Err(); err != nil {
+		return fmt.Errorf("run journal failed during the ballot window: %w", err)
+	}
+	return nil
+}
+
+// recordJournalError persists a mid-window journal failure in
+// submit-metrics.json, where finaliseInput reads the window back from.
+//
+// It cannot be stamped into the journal: the journal is the thing that failed,
+// and a failed journal refuses every later write. Verify finalises the run
+// from a FRESH journal over the same file, so without this the reason would
+// reach the operator (as the stage's returned error) but never run.end or
+// perf.csv's fail_reason — and the repeat driver verifies even after a failed
+// submit, so the run would end recorded as failed:false.
+func recordJournalError(dir string, winErr error) {
+	if winErr == nil {
+		return
+	}
+	path := filepath.Join(dir, submitMetricsFile)
+	var sm submitMetrics
+	if readJSON(path, &sm) != nil {
+		return // no window metrics to annotate; the returned error still fails the stage
+	}
+	sm.JournalError = winErr.Error()
+	_ = writeJSON(path, sm)
 }
 
 // stageEnd is the standard stage.*.end payload: ok, plus the error if not.
@@ -419,6 +458,12 @@ func finaliseInput(dir string, c ElectionConfig, sa StreamAudit, stageErr error,
 	var sm submitMetrics
 	if readJSON(filepath.Join(dir, submitMetricsFile), &sm) != nil {
 		return in
+	}
+	// A journal that broke inside the window is a failed run, and this is the
+	// only place its reason survives to run.end. An explicit stage error still
+	// wins: it is the more proximate diagnosis.
+	if in.StageErr == nil && sm.JournalError != "" {
+		in.StageErr = errors.New(sm.JournalError)
 	}
 	in.Dropped = sm.Dropped
 	// bench.Reconcile is the single definition of "every ballot landed", and
@@ -851,6 +896,9 @@ func (e *Executor) submitBallots(ctx context.Context, runID string, c ElectionCo
 	// instructed.
 	stampWindowEnd(j, end, res.Stopped && !bounded)
 	stampSegmentEnd(j, segmentOf(0, res, res.Committed))
+	// Read at the window's own boundary, once the closing stamps have drained
+	// the progress writer: everything after this point is post-window work.
+	winErr := journalWindowErr(j)
 
 	if readErr != nil {
 		return readErr
@@ -862,8 +910,12 @@ func (e *Executor) submitBallots(ctx context.Context, runID string, c ElectionCo
 	if err := e.writeSubmitMetrics(dir, c, res, samples, count, bounded, startBytes, endBytes, haveBytes && haveEndBytes); err != nil {
 		return err
 	}
+	recordJournalError(dir, winErr)
 	if res.Dropped > 0 {
 		return fmt.Errorf("%d of %d ballots did not commit", res.Dropped, res.Submitted)
+	}
+	if winErr != nil {
+		return winErr
 	}
 	e.publish(runID, "ceremony", "info",
 		fmt.Sprintf("%d ballots committed in %s", res.Committed, res.Window.Round(time.Millisecond)))
@@ -1263,6 +1315,7 @@ func (e *Executor) resumeBallots(ctx context.Context, runID string, c ElectionCo
 	}, res.Stopped)
 	seg := segmentOf(plan.Segment, res, onChain)
 	stampSegmentEnd(j, seg)
+	winErr := journalWindowErr(j) // at the window's boundary, as above
 
 	if readErr != nil {
 		return readErr
@@ -1278,6 +1331,7 @@ func (e *Executor) resumeBallots(ctx context.Context, runID string, c ElectionCo
 		Voters: c.Voters, Positions: c.Positions,
 		Segments: append(plan.segments, seg), Dropped: dropped,
 		Interrupted: res.Stopped, Resumed: true, EByContest: map[string]int64{},
+		StageErr: winErr,
 	}
 	in.ReconcileErr = bench.Reconcile(res.Submitted, onChain, len(pending))
 	in.ReconcileOK = in.ReconcileErr == nil
@@ -1286,9 +1340,13 @@ func (e *Executor) resumeBallots(ctx context.Context, runID string, c ElectionCo
 	if err := rollUpSubmitMetrics(dir, len(committed)-len(pending), res, onChain, dropped); err != nil {
 		e.publish(runID, "submit", "info", "submit metrics not updated: "+err.Error())
 	}
+	recordJournalError(dir, winErr)
 
 	if dropped > 0 {
 		return fmt.Errorf("%d of %d resubmitted ballots did not commit", dropped, res.Submitted)
+	}
+	if winErr != nil {
+		return winErr
 	}
 	e.publish(runID, "submit", "done", fmt.Sprintf(
 		"segment %d committed %d ballots (%d were already on chain)", plan.Segment, res.Committed, replayed))

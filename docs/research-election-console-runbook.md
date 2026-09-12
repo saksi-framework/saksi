@@ -307,6 +307,34 @@ monotonic reading. Checkpoint events (fsynced): `run.start`, `stage.*`,
 the run with that reason and stops the journal — a truncated journal is never
 silently continued.
 
+`ballots.progress` is the one event stamped from inside the measured submission
+window, so it alone is written by a journal-owned writer goroutine rather than
+by the goroutine that stamped it: its line, fields and fsync are unchanged, but
+the fsync no longer stalls ballot dispatch. Every other event still writes
+synchronously, waiting on a barrier that the writer releases only once it has
+drained the queued lines, so no progress line can land after the event that
+closes its window and none is left unwritten when the journal closes. If the
+queue ever filled, the journal would coalesce towards the latest count rather
+than wait, and the next progress line carries a `coalesced_total` saying how
+many were folded away.
+
+Two consequences worth knowing:
+
+- **A progress event is no longer durable at the moment it is stamped.** It is
+  fsynced shortly after, so a hard kill can lose up to 64 of them — 64,000
+  ballots. The last `ballots.progress` on disk is therefore a **lower bound** on
+  what the window had dispatched, and so are `interrupted_at {last_done}` and
+  the resume API's `remaining`: a resume may offer ballots the chain already
+  holds. The chain's nullifier set, not the journal, decides what is committed,
+  so a resume is still correct — it just does slightly more work. Every event
+  that CLOSES a window is still fsynced before its stamp returns, so the
+  interrupted-or-not decision a resume makes is unaffected.
+- **Order within one goroutine, not across goroutines.** A progress line and a
+  `sample` stamped concurrently (the dispatcher and the docker-stats sampler)
+  have no defined order between them and may appear either way round.
+  `mono_ms` is the ordering of record; line order is only guaranteed against
+  the events that close a window.
+
 Useful events: `stage.generate.*`, `stage.bundle.*`, `stage.ballots.*`,
 `stage.ceremony.*`, `stage.verify.*`, `segment.start`/`segment.end`,
 `ballots.progress {done}`, `interrupted_at {last_done}`, `sample` (one per
