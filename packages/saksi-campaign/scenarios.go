@@ -76,7 +76,11 @@ type Scenario struct {
 	AuditGate string
 	// OnChainNote says what the ledger does with this attack when ChainGate is
 	// empty, so a simulated row recorded during a live election cannot be read
-	// as a ledger rejection.
+	// as a ledger rejection. For the DKG and partial-decryption attacks it is
+	// a weakness, not a design choice: the chaincode checks only shape and
+	// presence and never asks who is calling, so any channel client can publish
+	// a transcript or a share first and the real one is then refused as a
+	// duplicate (see the runbook's attack findings).
 	OnChainNote string
 	// MutateBallot is the ballot-stage mutation on single ballots, for the
 	// mid-submission mount: target is a ballot the window has not submitted,
@@ -230,7 +234,7 @@ func Registry() []Scenario {
 			Layer: LayerOffline, Action: "flip a byte in a trustee's Chaum-Pedersen proof response",
 			Expected:    "auditor rejects: decryption.cp_proof (the proof does not verify)",
 			AuditGate:   "decryption.cp_proof",
-			OnChainNote: "on-chain: accepted by design (proof presence only)",
+			OnChainNote: "on-chain: not checked (shape/presence only, no caller authorization)",
 			Mutate: func(dir string) error {
 				return mutateHeader(dir, func(h map[string]any) error {
 					arr, ok := h["partial_decryptions"].([]any)
@@ -253,7 +257,7 @@ func Registry() []Scenario {
 			Layer: LayerOffline, Action: "flip a byte in a trustee's DKG coefficient commitment",
 			Expected:    "auditor rejects: dkg.decode (the commitment is not a valid point)",
 			AuditGate:   "dkg.decode",
-			OnChainNote: "on-chain: accepted by design (PublishDKGTranscript checks shape and consistency, not the commitment points)",
+			OnChainNote: "on-chain: not checked (shape/presence only, no caller authorization)",
 			Mutate: func(dir string) error {
 				return mutateHeader(dir, func(h map[string]any) error {
 					s, ok := h["dkg"].(string)

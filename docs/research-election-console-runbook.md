@@ -497,8 +497,10 @@ behind when it refuses — `tamper-ballot-proof` (`cds`), `reused-nullifier`
 (`nullifier`) and `corrupted-ballot-bytes` (`decode`), mounted at the `ballots`
 pause while the election is open. `tamper-dkg-transcript` and
 `tamper-partial-decryption` would be **accepted** by the chaincode (it checks
-transcript shape and proof presence, not the points or the proof), so they are
-always simulated and their `actual` says so on a live election.
+transcript shape and proof presence, not the points or the proof, and not who
+submits them), so they are always simulated and their `actual` says "on-chain:
+not checked (shape/presence only, no caller authorization); caught by the
+auditor" on a live election.
 `dropped-ballot` is not expressible as one submission; `reordered-ballots`
 stays `SKIPPED`.
 
@@ -507,6 +509,36 @@ One row per scenario. A verdict mounted at a pause is never replaced by an
 staged (often live) row in place, and the re-run is recorded in the journal as
 `attack.rerun.unstaged {scenario, verdict, actual, live, gate_expected,
 gate_observed, kept_mounted_stage}`.
+
+#### Findings: two front-running denial-of-service paths
+
+The chaincode never asks who is calling (no `GetClientIdentity` anywhere), and
+the DKG and partial-decryption gates check shape and presence, not content. Any
+client with write access to the channel can therefore get in first:
+
+- **DKG transcript.** Right after `CreateElection`, an attacker publishes a
+  transcript with the right threshold and commitment count but a tampered
+  commitment. `PublishDKGTranscript` accepts it. The operator's real transcript
+  is then refused as `gate=dkg-duplicate: a DKG transcript is already published
+  for election …`, and the election is unusable: with a non-canonical constant
+  term every `SubmitBallot` fails in `deriveElectionPublicKey` with an error that
+  carries no gate id ("derive election public key: trustee commitment 0 constant
+  term is not a canonical ristretto255 point"); with a substituted valid point
+  the joint key is wrong and every honest ballot fails `gate=cds`.
+- **Partial decryption.** After `CloseElection`, an attacker submits a share
+  under trustee id X for contest C with any 32-byte share and any proof attached.
+  `SubmitPartialDecryption` stores it under (election, C, X). Trustee X's real
+  share is then refused as `gate=partial-duplicate: trustee "X" already submitted
+  a partial decryption for contest "C" …`. The auditor rejects the planted share
+  (`decryption.cp_proof`), and front-running enough trustees leaves fewer than
+  the threshold of valid shares, so no tally for that contest can be verified.
+
+`CreateElection` (squatting an election id) and `CloseElection` (closing an
+election early) have no caller check either. The console does not mount these
+attacks live, because they would poison the election under test; the scenarios
+run simulated and their rows say "on-chain: not checked (shape/presence only, no
+caller authorization)". Adding caller authorization to the chaincode is a
+separate decision and is not part of this change.
 
 `latencies.csv` is `index,segment,ms,ok` with `ok ∈ {commit, drop, replay}`.
 `replay` appears only on resumed runs (see §9) and marks a ballot the chain had

@@ -393,8 +393,8 @@ func TestSecurityRunPausesAtEachDeclaredMoment(t *testing.T) {
 		}
 	}
 	if r := got["tamper-dkg-transcript"]; r.Verdict != "PASS" || r.OnChain || r.Mount.Stage != StageDKG ||
-		!strings.Contains(r.Actual, "accepted by design") {
-		t.Errorf("tamper-dkg-transcript = %+v, want a simulated PASS saying the ledger accepts it by design", r)
+		!strings.HasPrefix(r.Actual, "on-chain: not checked (shape/presence only, no caller authorization); caught by the auditor — ") {
+		t.Errorf("tamper-dkg-transcript = %+v, want a simulated PASS saying the ledger does not check it", r)
 	}
 	if _, ok := got["dropped-ballot"]; ok {
 		t.Error("the close stage was skipped, yet dropped-ballot has a verdict")

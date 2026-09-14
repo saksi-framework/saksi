@@ -158,8 +158,11 @@ when the window resumes. The chaincode's error names its gate (`gate=cds: …`).
 offline or on-chain. `tamper-dkg-transcript` and `tamper-partial-decryption`
 are simulated even on a live network, because the chaincode would *accept*
 them — it checks the transcript's shape and that a proof is present, not the
-points or the proof — and the real election would be poisoned. Their rows say
-so: "on-chain: accepted by design …; caught by the auditor".
+points or the proof, and not who submits them — and the real election would be
+poisoned. Their rows say so: "on-chain: not checked (shape/presence only, no
+caller authorization); caught by the auditor". That gap is a real weakness: any
+channel client can publish a transcript or a share before the real one, which
+is then refused as a duplicate. See the runbook's attack findings.
 
 `reordered-ballots` stays `SKIPPED`: ordering is a ledger property no single
 submission and no stateless audit expresses.

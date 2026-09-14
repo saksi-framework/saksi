@@ -163,8 +163,8 @@ func TestOnlyAttacksWithAnOnChainGateAreLiveCapable(t *testing.T) {
 	}
 	for _, id := range []string{"tamper-partial-decryption", "tamper-dkg-transcript"} {
 		for _, sc := range Registry() {
-			if sc.ID == id && !strings.Contains(sc.OnChainNote, "accepted by design") {
-				t.Errorf("%s: OnChainNote %q must say the ledger accepts it by design", id, sc.OnChainNote)
+			if want := "on-chain: not checked (shape/presence only, no caller authorization)"; sc.ID == id && sc.OnChainNote != want {
+				t.Errorf("%s: OnChainNote = %q, want %q", id, sc.OnChainNote, want)
 			}
 		}
 	}
