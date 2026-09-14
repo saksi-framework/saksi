@@ -1221,3 +1221,67 @@ func TestStudyRoutesAreAdminOnly(t *testing.T) {
 		t.Fatal("a probe started a job")
 	}
 }
+
+// A campaign posted with an attack plan (a single election's config reused)
+// starts with the plan dropped: no repetition runs attacks, and none is refused
+// by the plan-with-skip_attacks rule.
+func TestCampaignDropsAttackPlan(t *testing.T) {
+	fakeHostProbes(t, "", nil)
+	s, _, exec := testServer(t, nil)
+	exec.run = func(context.Context, string, ...string) ([]byte, error) { return nil, errors.New("fake saksi-demo") }
+	c := good()
+	c.AttackPlan = &AttackPlan{Stages: []string{StageBallots, StageClose}}
+	if err := c.Validate(); err != nil {
+		t.Fatalf("the plan must be one a single election accepts: %v", err)
+	}
+
+	rec, id := startCampaign(t, s, map[string]any{"config": c, "warmups": 1, "reps": 1, "burst": 3}, "")
+	if rec.Code != http.StatusAccepted || id == "" {
+		t.Fatalf("a campaign with an attack plan: want 202, got %d %s", rec.Code, rec.Body)
+	}
+	waitJob(t, s, id, time.Minute)
+	var onDisk campaignRecord
+	if err := readJSON(filepath.Join(s.store.Root(), campaignsDir, id, campaignFile), &onDisk); err != nil {
+		t.Fatal(err)
+	}
+	if onDisk.Config.AttackPlan != nil || len(onDisk.Reps) != 3 {
+		t.Fatalf("campaign.json: plan %+v, %d reps (want none, 3)", onDisk.Config.AttackPlan, len(onDisk.Reps))
+	}
+	for _, r := range onDisk.Reps {
+		data, err := os.ReadFile(filepath.Join(s.store.Root(), r.RunID, RunFile))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(string(data), "attack_plan") {
+			t.Errorf("%s (%s) run.json carries an attack plan: %s", r.RunID, r.Kind, data)
+		}
+	}
+}
+
+// A campaign must not share the network with a single-election run that is
+// running a phase or paused at an attack stage.
+func TestPreflightBlocksWhileARunIsBusy(t *testing.T) {
+	fakeHostProbes(t, "", nil)
+	s, _ := gateServer(t, FabricConfig{}, "abc", 1<<62)
+	if !s.tryStart("security-run-1", func() {}) {
+		t.Fatal("tryStart")
+	}
+	s.exec.setPause("security-run-1", &stagePause{view: PauseView{Paused: true, Stage: StageBallots}})
+
+	rep := s.preflight(PreflightInput{Mode: "offline"})
+	f := findings(rep.Warnings)["run_busy"]
+	if f.Severity != severityBlock || f.Forceable || !strings.Contains(f.Message, "security-run-1 (paused at the ballots attack stage)") {
+		t.Fatalf("a busy run must be an unforceable block naming it and its pause: %+v", rep.Warnings)
+	}
+	rec, _ := startCampaign(t, s, map[string]any{"config": good(), "reps": 1, "force": true}, "")
+	if rec.Code != http.StatusConflict || !strings.Contains(rec.Body.String(), "run_busy") {
+		t.Fatalf("a campaign while a run is busy: want 409 run_busy, got %d %s", rec.Code, rec.Body)
+	}
+	noCampaignStarted(t, s)
+
+	s.exec.setPause("security-run-1", nil)
+	s.finish("security-run-1")
+	if rep := s.preflight(PreflightInput{Mode: "offline"}); rep.Blocked() {
+		t.Fatalf("no run busy: %+v", rep.Warnings)
+	}
+}

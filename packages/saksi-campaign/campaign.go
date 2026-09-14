@@ -216,6 +216,9 @@ func (s *Server) handleCampaigns(w http.ResponseWriter, r *http.Request) {
 	c := req.Config
 	c.applyDefaults()
 	c.SkipAttacks = true // measured repetitions never run attacks
+	// A plan is dropped, not refused: it must go before Validate, which
+	// rejects a plan alongside skip_attacks. The burst copy inherits the nil.
+	c.AttackPlan = nil
 	if err := c.Validate(); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
