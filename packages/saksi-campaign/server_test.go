@@ -286,3 +286,83 @@ func TestExportServesTheLedgerDump(t *testing.T) {
 		}
 	}
 }
+
+// The wizard's runs list offers Resume and Verify-only only on a run whose
+// ballot window is interrupted, and the peer-restart fault only on an idle run
+// whose window has not opened. /runs carries those facts, read from each run's
+// journal with the resume route's own check, so the page never guesses.
+func TestRunsListReportsWhereEachRunStands(t *testing.T) {
+	s, h, _ := testServer(t, nil)
+	create := func(mode string, lines ...string) string {
+		c := good()
+		c.Mode = mode
+		id, dir, err := s.store.Create(c, time.Now())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(lines) > 0 {
+			writeJournalLines(t, dir, lines...)
+		}
+		return id
+	}
+	fresh := create("offline")
+	generated := create("offline", `{"event":"run.start"}`)
+	failed := create("offline", `{"event":"run.start"}`, `{"event":"run.end","failed":true,"reason":"verify failed"}`)
+	ended := create("offline", `{"event":"run.start"}`, `{"event":"run.end","failed":false}`)
+	interrupted := create("onchain", `{"event":"run.start"}`, `{"event":"stage.ballots.start","n":10}`,
+		`{"event":"ballots.progress","done":4}`, `{"event":"stage.ballots.interrupted"}`)
+	closed := create("onchain", `{"event":"run.start"}`, `{"event":"stage.ballots.start","n":10}`,
+		`{"event":"stage.ballots.end"}`)
+	// A T3 run after its resume: the window was interrupted, a second segment
+	// found 4946 ballots pending and closed it, and verify-only reconciled.
+	resumed := create("onchain", `{"event":"stage.ballots.start","n":10}`, `{"event":"stage.ballots.interrupted"}`,
+		`{"event":"segment.start","index":1,"pending":4946}`, `{"event":"stage.ballots.end","segment":1}`,
+		`{"event":"interrupted_at","phase":"verify-only"}`, `{"event":"verify_only.reconcile","reconciled":true}`)
+	// The resume closed the election: its ceremony record is on disk.
+	resumedDir, _ := s.store.Dir(resumed)
+	writeFile(t, resumedDir, CeremonyFile, "{}")
+	// Every ballot landed through the resume but the close failed: the resume
+	// route takes it again as a close-only retry.
+	closePending := create("onchain", `{"event":"stage.ballots.start","n":10}`, `{"event":"stage.ballots.interrupted"}`,
+		`{"event":"segment.start","index":1,"pending":6}`, `{"event":"stage.ballots.end","segment":1,"dropped":0}`)
+	s.mu.Lock()
+	s.busy[generated] = func() {}
+	s.mu.Unlock()
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/runs", nil))
+	var views []runView
+	if err := json.Unmarshal(rec.Body.Bytes(), &views); err != nil {
+		t.Fatalf("decode /runs: %v: %s", err, rec.Body)
+	}
+	got := map[string]runView{}
+	for _, v := range views {
+		got[v.RunID] = v
+	}
+	for _, want := range []struct {
+		id, status, reason                                   string
+		busy, started, resumable, wasInterrupted, reconciled bool
+		pending                                              int
+	}{
+		{fresh, "new", "", false, false, false, false, false, -1},
+		{generated, "open", "", true, false, false, false, false, -1},
+		{failed, "failed", "verify failed", false, false, false, false, false, -1},
+		{ended, "ended", "", false, false, false, false, false, -1},
+		{interrupted, "interrupted", "", false, true, true, true, false, -1},
+		{closed, "open", "", false, true, false, false, false, -1},
+		{resumed, "open", "", false, true, false, true, true, 4946},
+		{closePending, "close-pending", "", false, true, true, true, false, 6},
+	} {
+		v := got[want.id]
+		pending := -1
+		if v.ResumePending != nil {
+			pending = *v.ResumePending
+		}
+		if v.Status != want.status || v.Reason != want.reason || v.Busy != want.busy ||
+			v.BallotsStarted != want.started || v.Resumable != want.resumable ||
+			v.WasInterrupted != want.wasInterrupted || v.Reconciled != want.reconciled || pending != want.pending {
+			t.Errorf("%s: got status=%q reason=%q busy=%v started=%v resumable=%v interrupted=%v reconciled=%v pending=%d, want %+v",
+				want.id, v.Status, v.Reason, v.Busy, v.BallotsStarted, v.Resumable, v.WasInterrupted, v.Reconciled, pending, want)
+		}
+	}
+}

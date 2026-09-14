@@ -1,6 +1,7 @@
 package campaign
 
 import (
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -72,6 +73,12 @@ func TestWizardDefinesEveryFunctionItCalls(t *testing.T) {
 		"showIDChip", "startRun", "runCheck", "startSaksi", "startCeremony",
 		"startVerify", "refreshCeremony", "renderTrail", "openStream", "closeStream",
 		"showLoader", "hideLoader", "fileChips", "artifactsFor", "config",
+		"checkAuth", "needSignIn", "showApp", "apiFetch", "errorBody", "renderErr", "setMode",
+		"showSetup", "syncPlan", "schedulePreflight", "runPreflight", "renderPreflight", "syncStart",
+		"watchJob", "watchLadder", "syncReset", "followReset", "startCampaign", "openCampaign",
+		"refreshCampaign", "renderCampaign", "loadCampaigns", "loadRuns", "renderRuns", "runAction",
+		"whenIdle", "renderFaultRuns", "syncFault", "applyPreset", "renderPresets", "onFormChange",
+		"syncHints", "hostCell", "boot", "refreshStudy",
 	} {
 		called := strings.Contains(js, fn+"(")
 		defined := strings.Contains(js, "function "+fn+"(") ||
@@ -91,6 +98,55 @@ func TestWizardDefinesEveryFunctionItCalls(t *testing.T) {
 	} {
 		if !strings.Contains(js, decl) {
 			t.Errorf("wizard.html is missing the declaration %q", decl)
+		}
+	}
+}
+
+// A campaign row's "contended" chip must mean what preflight's host warning
+// means: the page carries the threshold as a literal, pinned here to the Go one.
+func TestWizardContendedThresholdMatchesPreflight(t *testing.T) {
+	page, err := webFS.ReadFile("web/wizard.html")
+	if err != nil {
+		t.Fatalf("read wizard.html: %v", err)
+	}
+	want := fmt.Sprintf("const HOST_WARN_FRACTION = %v;", hostLoadWarnFraction)
+	if !strings.Contains(string(page), want) {
+		t.Errorf("wizard.html must declare %q to match preflight.go's hostLoadWarnFraction", want)
+	}
+}
+
+// The wizard offers the peer-restart fault only on runs the fault route would
+// arm (handleFault, fault.go in PR #46): on-chain, not a campaign repetition,
+// no attack plan, no time-bounded window, ballot window not opened, idle and
+// generated. The page's filter is JavaScript no Go test can run, so each clause
+// is pinned here as text; dropping one would offer a run the route refuses.
+func TestWizardFaultFilterMirrorsTheFaultRoute(t *testing.T) {
+	page, err := webFS.ReadFile("web/wizard.html")
+	if err != nil {
+		t.Fatalf("read wizard.html: %v", err)
+	}
+	js := string(page)
+	start := strings.Index(js, "const faultEligible = ")
+	if start < 0 {
+		t.Fatal("wizard.html no longer declares faultEligible")
+	}
+	end := strings.Index(js[start:], "\n};")
+	if end < 0 {
+		t.Fatal("faultEligible has no end")
+	}
+	body := js[start : start+end]
+	for clause, rule := range map[string]string{
+		`c.mode === "onchain"`: "run mode must be onchain",
+		`!c.rep`:               "a campaign repetition never carries a fault",
+		`!c.attack_plan`:       "a run with an attack plan is refused",
+		`!c.fault_plan`:        "a run already armed",
+		`!(c.window_s > 0)`:    "a time-bounded window is refused",
+		`!r.busy`:              "the route claims the run's lock",
+		`r.status !== "new"`:   "the run needs a journal (generated)",
+		`!r.ballots_started`:   "armed only before stage.ballots.start",
+	} {
+		if !strings.Contains(body, clause) {
+			t.Errorf("faultEligible lost %q (%s)", clause, rule)
 		}
 	}
 }

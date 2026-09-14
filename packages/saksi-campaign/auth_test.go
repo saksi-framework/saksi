@@ -126,6 +126,7 @@ func TestRouteRolesWhenAuthOn(t *testing.T) {
 			{get, "/api/trail"}, {get, "/api/trail/r1"}, {get, "/api/capabilities"},
 			{get, "/api/ceremony/r1"}, {get, "/runs"}, {get, "/board/"}, {get, "/trustee/"},
 			{get, "/admin/"}, {get, "/admin"}, {post, "/api/login"}, {post, "/api/logout"},
+			{get, "/wizard"},
 		}},
 		{"trustee or admin", 401, 0, 0, []probe{{post, "/ceremony/publish"}, {get, "/events"}}},
 		{"trustee, own shares", 401, 0, 403, []probe{{post, "/ceremony/submit"}}},
@@ -133,7 +134,7 @@ func TestRouteRolesWhenAuthOn(t *testing.T) {
 			{post, "/generate"}, {post, "/submit"}, {post, "/verify"}, {post, "/run-all"},
 			{post, "/cancel"}, {post, "/scenarios"}, {post, "/attack"}, {post, "/ceremony/start"},
 			{post, "/api/runs/r1/resume"}, {get, "/api/runs/r1/status"}, {get, "/api/check/r1"},
-			{get, "/api/scenarios/r1"}, {get, "/export/r1/run.json"}, {get, "/wizard"}, {get, "/"},
+			{get, "/api/scenarios/r1"}, {get, "/export/r1/run.json"}, {get, "/api/preflight"}, {get, "/"},
 			{get, "/no-such-page"},
 		}},
 	}
@@ -507,7 +508,7 @@ func TestLogoutInvalidatesSession(t *testing.T) {
 		t.Fatalf("logout must clear the cookie: %+v", cleared)
 	}
 
-	for _, path := range []string{"/api/me", "/wizard"} {
+	for _, path := range []string{"/api/me", "/api/preflight"} {
 		req := httptest.NewRequest(http.MethodGet, path, nil)
 		req.AddCookie(c)
 		rec = httptest.NewRecorder()
@@ -522,7 +523,7 @@ func TestExpiredSessionRejected(t *testing.T) {
 	s, h := authServer(t)
 	now := time.Now()
 	s.auth.now = func() time.Time { return now }
-	req := signIn(t, s, "admin", httptest.NewRequest(http.MethodGet, "/wizard", nil))
+	req := signIn(t, s, "admin", httptest.NewRequest(http.MethodGet, "/api/me", nil))
 
 	now = now.Add(sessionTTL + time.Second)
 	rec := httptest.NewRecorder()
@@ -626,5 +627,51 @@ func TestHashPasswordRejectsEmpty(t *testing.T) {
 		if _, err := HashPassword(strings.NewReader(input)); err == nil {
 			t.Errorf("%q: want an error", input)
 		}
+	}
+}
+
+// /runs is public, but a failed run's reason is raw error text (a stage error
+// can carry Fabric addresses and ports). Anonymous and trustee callers get the
+// coarse state; an admin session, or a console with auth off, also gets why.
+func TestRunsReasonOnlyForAdminsOrAuthOff(t *testing.T) {
+	failedRun := func(t *testing.T, s *Server) string {
+		t.Helper()
+		id, dir, err := s.store.Create(good(), time.Now())
+		if err != nil {
+			t.Fatal(err)
+		}
+		writeJournalLines(t, dir, `{"event":"run.start"}`,
+			`{"event":"run.end","failed":true,"reason":"stage_error: dial tcp 10.0.0.7:7051: connection refused"}`)
+		return id
+	}
+	runsAs := func(t *testing.T, s *Server, h http.Handler, user string) runView {
+		t.Helper()
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, signIn(t, s, user, httptest.NewRequest(http.MethodGet, "/runs", nil)))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("GET /runs as %q: %d %s", user, rec.Code, rec.Body)
+		}
+		var views []runView
+		if err := json.Unmarshal(rec.Body.Bytes(), &views); err != nil || len(views) != 1 {
+			t.Fatalf("GET /runs as %q: %v %s", user, err, rec.Body)
+		}
+		if views[0].Status != "failed" {
+			t.Fatalf("GET /runs as %q: status %q, want failed for everyone", user, views[0].Status)
+		}
+		return views[0]
+	}
+
+	s, h := authServer(t)
+	failedRun(t, s)
+	for user, want := range map[string]bool{"": false, "t1": false, "admin": true} {
+		if got := runsAs(t, s, h, user).Reason != ""; got != want {
+			t.Errorf("auth on, caller %q: reason shown = %v, want %v", user, got, want)
+		}
+	}
+
+	off, hOff, _ := testServer(t, nil)
+	failedRun(t, off)
+	if runsAs(t, off, hOff, "").Reason == "" {
+		t.Error("auth off: the reason must be shown")
 	}
 }

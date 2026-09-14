@@ -102,6 +102,9 @@ var routeAccess = map[string]access{
 	"/api/login":        accessPublic,
 	"/api/logout":       accessPublic,
 	"/api/me":           accessPublic,
+	// The wizard page is static and holds no data; it signs in through
+	// /api/login, and each route it then calls keeps its own role.
+	"/wizard": accessPublic,
 
 	// trustee or admin
 	"/ceremony/publish": accessSignedIn,
@@ -125,7 +128,6 @@ var routeAccess = map[string]access{
 	"/api/check/":     accessAdmin,
 	"/api/scenarios/": accessAdmin,
 	"/export/":        accessAdmin,
-	"/wizard":         accessAdmin,
 	// study campaigns: preflight, the ladder job, campaigns and their exports
 	"/api/preflight":  accessAdmin,
 	"/api/ladder":     accessAdmin,
