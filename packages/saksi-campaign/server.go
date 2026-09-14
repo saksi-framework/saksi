@@ -507,8 +507,9 @@ type runView struct {
 	RunRecord
 	Artifacts []string `json:"artifacts"`
 	// Where the run stands, for the wizard's runs list. Status is "new" (no
-	// journal yet), "open", "ended", "failed" or "interrupted" (a ballot window
-	// the resume route would accept). Busy is a phase holding the run,
+	// journal yet), "open", "ended", "failed", "interrupted" (a ballot window
+	// the resume route would accept) or "close-pending" (a resume landed every
+	// ballot but the close failed; the resume route retries the close). Busy is a phase holding the run,
 	// PausedStage the attack stage it waits at. Reason is run.end's raw failure
 	// text, which can name internal addresses: handleRuns sends it only to an
 	// admin session, or to everyone when auth is off.
@@ -563,8 +564,11 @@ func (s *Server) fillState(v *runView, dir string) {
 	// The resume route's own check, so the page offers Resume exactly when the
 	// route would take it. ponytail: re-reads the journal of on-chain runs; fold
 	// into the scan above if /runs gets slow on a large run store.
-	if _, err := planResume(dir, v.Config); err == nil {
+	if plan, err := planResume(dir, v.Config); err == nil {
 		v.Status, v.Resumable = "interrupted", true
+		if plan.CloseOnly {
+			v.Status = "close-pending" // every ballot landed; only CloseElection is left to retry
+		}
 	}
 }
 

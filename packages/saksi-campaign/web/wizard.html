@@ -2149,7 +2149,7 @@ function runStatus(r) {
   ].filter(Boolean).join(" · ");
   const head = r.busy
     ? `<span class="pill on">${r.paused_stage ? "paused at " + esc(r.paused_stage) : "running"}</span>`
-    : `<span class="pill ${{ ended: "ok", failed: "bad", interrupted: "warn" }[r.status] || ""}">${esc(r.status)}</span>`;
+    : `<span class="pill ${{ ended: "ok", failed: "bad", interrupted: "warn", "close-pending": "warn" }[r.status] || ""}">${esc(r.status)}</span>`;
   return head + (r.reason ? `<div class="small muted">${esc(r.reason)}</div>` : "") +
     (trail ? `<div class="small muted">${esc(trail)}</div>` : "");
 }

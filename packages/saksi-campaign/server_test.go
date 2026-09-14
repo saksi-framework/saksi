@@ -318,6 +318,13 @@ func TestRunsListReportsWhereEachRunStands(t *testing.T) {
 	resumed := create("onchain", `{"event":"stage.ballots.start","n":10}`, `{"event":"stage.ballots.interrupted"}`,
 		`{"event":"segment.start","index":1,"pending":4946}`, `{"event":"stage.ballots.end","segment":1}`,
 		`{"event":"interrupted_at","phase":"verify-only"}`, `{"event":"verify_only.reconcile","reconciled":true}`)
+	// The resume closed the election: its ceremony record is on disk.
+	resumedDir, _ := s.store.Dir(resumed)
+	writeFile(t, resumedDir, CeremonyFile, "{}")
+	// Every ballot landed through the resume but the close failed: the resume
+	// route takes it again as a close-only retry.
+	closePending := create("onchain", `{"event":"stage.ballots.start","n":10}`, `{"event":"stage.ballots.interrupted"}`,
+		`{"event":"segment.start","index":1,"pending":6}`, `{"event":"stage.ballots.end","segment":1,"dropped":0}`)
 	s.mu.Lock()
 	s.busy[generated] = func() {}
 	s.mu.Unlock()
@@ -344,6 +351,7 @@ func TestRunsListReportsWhereEachRunStands(t *testing.T) {
 		{interrupted, "interrupted", "", false, true, true, true, false, -1},
 		{closed, "open", "", false, true, false, false, false, -1},
 		{resumed, "open", "", false, true, false, true, true, 4946},
+		{closePending, "close-pending", "", false, true, true, true, false, 6},
 	} {
 		v := got[want.id]
 		pending := -1
