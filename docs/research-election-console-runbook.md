@@ -885,7 +885,436 @@ run `docker start peer0.org1.example.com` and confirm with
 7. `POST /verify`: `correctness.csv` and `run.end` must show every contest's
    `E = 0` and `ledger_matches_local` `true`.
 
-## 10. Troubleshooting
+## 10. Running the study from the wizard
+
+The whole Chapter 4 study, clicked through `/wizard` on the thesis desktop, in the
+order it is run. Every button and field below is named as the wizard shows it. The
+one-page tick sheet is [`docs/study-checklist.md`](study-checklist.md); the thesis
+evidence it produces is registered in balotachain `docs/CLAIMS.md`.
+
+### 10.1 The machine
+
+The measurements are only comparable if they come from the declared environment
+(balotachain `docs/CLAIMS.md`, Table 3.12): the AMD Ryzen 7 5700G desktop, Windows 11,
+Fabric inside **WSL2 Ubuntu** through **Docker Desktop**'s WSL integration.
+
+1. **Docker's data disk on the NVMe.** Docker Desktop's `docker_data.vhdx` lives on the
+   NVMe; `C:\Users\<you>\AppData\Local\Docker\wsl\disk` is a junction to it. Do not
+   change **Disk image location** in Docker Desktop's settings: it errors on the
+   junction. On the SATA disk both peers stalled 5–10 s on block commit (fsync).
+2. **24 GB for WSL, swap off.** `C:\Users\<you>\.wslconfig`:
+   ```ini
+   [wsl2]
+   memory=24GB
+   swap=0
+   ```
+   A change here takes effect after `wsl --shutdown`, run once **before** the study,
+   never during it.
+3. **No network mount that hangs the boot.** Any NFS or network mount in Ubuntu's
+   `/etc/fstab` must carry `noauto,x-systemd.automount`. Without it the distro hung
+   about 90 s on every start and Docker failed with "getting list of WSL2 integrated
+   distros: context deadline exceeded".
+4. **A repo path without spaces.** `tools/up.sh` refuses one (fabric-samples cannot
+   handle it). The desktop layout is `~/Code/saksi` and `~/Code/fabric-samples`.
+5. **Nothing else heavy on the machine.** Close games, video, builds and anything
+   else that holds CPU, and keep them closed until the study ends. During validation
+   a game held about 7 of the 16 cores and halved MP-10K throughput (about 975 → 450
+   TPS) on identical code; the **Host** preflight row (§10.3) exists because of it.
+6. **No sleep.** From an administrator PowerShell, once:
+   ```powershell
+   powercfg /change standby-timeout-ac 0
+   powercfg /change hibernate-timeout-ac 0
+   ```
+
+Before a session, both of these must answer within seconds:
+
+```powershell
+wsl -d Ubuntu -e true
+wsl -d Ubuntu -e docker info
+```
+
+### 10.2 Bring-up
+
+In a WSL terminal (Windows Terminal → Ubuntu, or `wsl -d Ubuntu`):
+
+```bash
+tmux new -s console          # or, if it exists: tmux attach -t console
+cd ~/Code/saksi
+git log -1 --oneline         # the build this study is measured on: write it down
+./tools/up.sh
+```
+
+`up.sh` installs Fabric if needed, brings the network up, deploys the chaincode,
+builds both binaries and starts the console in the foreground, printing
+"Console starting — on-chain mode ENABLED" and the wizard URL. Detach from tmux with
+`Ctrl-b` then `d`; the console keeps running. Check it from any WSL shell:
+
+```bash
+cd ~/Code/saksi && ./tools/up.sh status
+#   ✓ docker running
+#   ✓ Fabric network up
+#   ✓ console up at http://127.0.0.1:8090 with on-chain ENABLED
+```
+
+Open **`http://127.0.0.1:8090/wizard`** in the Windows browser. Use `127.0.0.1`, not a
+LAN address: the network reset and the peer-restart fault answer `403` to anything
+that does not reach the console over loopback.
+
+**Signing in (only if the console runs with an auth file).** `up.sh` starts the
+console without one, and the wizard header then reads "authentication off". To turn
+login on, hash a password with the binary `up.sh` built, write the users file (§4,
+*Authentication*) and start through the environment variable the console reads:
+
+```bash
+cd ~/Code/saksi
+./target/saksi-campaign hash-password     # type the password, press Enter; copy the hash
+cat > ~/saksi-users.json <<'EOF'
+[{"username": "admin", "role": "admin", "password_bcrypt": "<the hash>"}]
+EOF
+SAKSI_AUTH_FILE=~/saksi-users.json ./tools/up.sh
+```
+
+The wizard then shows **Sign in** with **Username** and **Password**; it needs an admin
+account. The header chip shows the signed-in user and **sign out**.
+
+### 10.3 Preflight
+
+The **Preflight** panel sits under the setup form and re-checks whenever voters,
+positions, mode or **Ballots in flight** change; **Check again** re-runs it. Its chip
+reads **ready**, **N warnings** or **N blocks Start**. A red row disables the start
+button (its tooltip names the codes). Green is required; amber is explained below.
+
+| Row | Finding (severity) | Meaning | What to do |
+| --- | --- | --- | --- |
+| **Fabric** | `fabric_not_configured` (block) | The console was started without Fabric | Stop it (`Ctrl-C` in tmux) and start it with `./tools/up.sh` |
+| **Fabric** | `fabric_unreachable` (block, forceable) | The peer did not answer a 2 s probe | Run `./tools/up.sh status`. If the network is down, stop the console and run `./tools/up.sh` again. **Start anyway** appears for this finding only; use it only when the network is known to be coming up |
+| **Orderer batch** | amber "declared configtx not found" | The console cannot read the declared orderer file | The row must show `BatchTimeout 2s`, `MaxMessageCount 50`, `PreferredMaxBytes 2 MB` and `saksi_configtx saksi`. Start the console with `./tools/up.sh` from the saksi checkout, and never with `SAKSI_CONFIGTX=default` during the study |
+| **Ballots in flight** | `concurrency_low` (warn) | Fewer in flight than `MaxMessageCount`: every block waits the 2 s timeout, so the run measures the timeout | Set **Ballots in flight** to 128 (every thesis preset does) |
+| **Ladder** | `ladder_missing` (block above 1,000 voters); amber "not run" or "stale" | No validation ladder for this build | Press **Run the validation ladder** and wait for "Ladder passed on `<commit>` (4 runs)." Run it again after any rebuild |
+| **Disk** | `disk_short` (block) | The projected ledger (voters × positions × 12,000 bytes, times every run of a campaign) exceeds free space | Free space on the volume the row names, or run fewer repetitions. See the note below |
+| **Host** | `host_cpu`, `host_load` (warn) | Something outside the run holds more than 25 % of the CPU | Close it, wait a minute, **Check again**. **For the study this row is a gate**: do not start a measurement on amber |
+| **Verify threads** | `verify_threads` (warn), `verify_threads_invalid` (block) | The auditor would verify on one thread, or cannot start | Unset `SAKSI_AUDIT_THREADS` and `RAYON_NUM_THREADS` in the tmux shell, then restart the console |
+| **Busy runs** | `run_busy` (block) | A phase is running, or an election is paused at an attack stage | Finish it (decide the pause) or cancel it first |
+
+**The Disk row and the ledger disk.** `up.sh` starts the console without
+`--fabric-peer-volume`, so the **Disk** row measures the run store's volume inside
+WSL, not the Docker disk on the NVMe that holds the ledger (and `perf.csv`'s
+`ledger_bytes_delta` stays empty). Before each on-chain tier, also check that the
+NVMe has room for the projected ledger the row prints.
+
+**Once per build, before the first tier:** run the ladder (it also backs the RQ1
+ladder claim). The ladder result is `~/.saksi/campaign/runs/ladder.json`.
+
+### 10.4 Each tier, in run-table order
+
+Every tier is one row of the thesis run table. The presets under **Thesis run table**
+fill voters, positions, 4 candidates, the paper's 5 trustees at threshold 3, the
+realistic distribution, no senate cut, 128 ballots in flight, the mode, and the
+campaign's warm-ups and repetitions. Predicted hours are balotachain
+`docs/desktop-runs/cost-model.md` §3 ("Predicted h, all reps", fitted on rows 2–4 at
+saksi `ef663d1`); network resets add a few minutes each.
+
+| Row | Preset | Voters × positions | Warm-ups + measured | Mode | Predicted h |
+| --- | --- | --- | --- | --- | --- |
+| 2 | **SP-1K** | 1,000 × 1 | 2 + 10 | on-chain | 0.09 |
+| 2 | **MP-1K** | 1,000 × 3 | 2 + 10 | on-chain | 0.10 |
+| 3 | **SP-10K** | 10,000 × 1 | 2 + 10 | on-chain | 0.16 |
+| 3 | **MP-10K** | 10,000 × 3 | 2 + 10 | on-chain | 0.31 |
+| 4 | **SP-50K** | 50,000 × 1 | 2 + 5 | on-chain | 0.27 |
+| 4 | **MP-50K** | 50,000 × 3 | 2 + 5 | on-chain | 0.70 |
+| 5 | **SP-483K** | 483,000 × 1 | 1 + 3 | on-chain | 1.24 |
+| 6 | **SP-1M** | 1,000,000 × 1 | 1 + 3 | on-chain | 2.53 |
+| 7 | **SP-1.92M** | 1,921,917 × 1 | 1 + 1 | on-chain | 2.42 |
+| 7 | **SP-3.5M** | 3,524,078 × 1 | 1 + 1 | on-chain | 4.39 |
+| 8 | **MP-483K offline** | 483,000 × 3 | 0 + 1 | offline | 0.63 |
+| 8 | **MP-1M offline** | 1,000,000 × 3 | 0 + 1 | offline | 1.30 |
+| 8 | **MP-1.92M offline** | 1,921,917 × 3 | 0 + 1 | offline | 2.49 |
+| 8 | **MP-3.5M offline** | 3,524,078 × 3 | 0 + 1 | offline | 4.55 |
+| 9 | **MP-3.5M on-chain** | 3,524,078 × 3 | 0 + 1 | on-chain | 6.57 |
+
+Rows 2–4 were first measured from the command line on saksi `ef663d1`. Run them again
+here: `cost_model.py` refuses to fit runs from different saksi commits together, so
+every reported row must come from the study's one build. Row 8's hours rest on one
+serial-auditor run and carry no interval. Row 5's open-loop rate sweep and the peak
+burst are campaign options of `POST /api/campaigns` (§9, `sweep`, `window_s`,
+`burst`) with no field in the wizard: the wizard runs row 5's closed-loop repetitions
+only. Capstones (rows 6, 7, 9) and row 8 have extra steps in §10.7.
+
+**Name the study once.** After picking a preset, append one short tag to **Election
+name** (for example `SP-1K w1`) and use the same tag for every tier. Run folders are
+named from it (`sp-1k-w1-<timestamp>-<n>`), which is what lets the refit in §10.9 pick
+exactly this study's runs.
+
+For each tier:
+
+1. **Choose the tier.** Press **Measurement campaign**, then the tier's preset, then
+   add the study tag to **Election name**. Leave every other field as the preset set
+   it.
+2. **Export the previous tier first** (step 6). The reset destroys its ledger.
+3. **Reset network for this tier** (on-chain tiers; row 8 skips it). In the
+   **Infrastructure** panel the heading shows `tools/tier.sh <voters> <positions>`
+   from the form. Type `RESET` in the box and press **Reset network**. The job log
+   follows the script; it takes a few minutes and is killed after 15. It is done when
+   the status reads "done · the console reads the new network (channel height N)".
+   A failure says why under the log (for example "reading the new network: …").
+
+   What it destroys: the Fabric network is torn down and brought back with an empty
+   ledger, so every election on the old network is gone from the chain. Run folders on
+   disk are untouched, and the export is the record. It is refused while any run
+   phase, campaign, ladder or other reset is running.
+4. **Preflight.** Press **Check again**. Every row green, **Host** included (§10.3).
+5. **Run the campaign.** Press **Start campaign →**. The **Measurement campaign** view
+   shows the configuration, **repetitions settled**, and the **Repetitions** table
+   (#, Kind, Run, Status, Committed TPS, p99 ms, Failed, Reason, Host at start, Host
+   at end), refreshed every 3 s, with the driver log under it. Attacks are off for
+   every repetition.
+   - **contended** beside a host sample means that repetition shared the machine
+     (host CPU above 25 %). Its throughput is not comparable. Find the cause, let the
+     campaign finish, export it as evidence, and run the tier again from step 3.
+   - **Failed: yes** with a **Reason** is excluded from every throughput and latency
+     statistic and counted in the failure rate.
+   - When the status reads **done**, read **Summary — measured repetitions
+     (summary.csv)**. The bold rows are `committed_tps`, `latency_p99_ms`,
+     `runs_failed` and `failure_rate`; `n` must equal the measured repetitions.
+6. **Export.** Press **Export bundle (.zip)** (or **export** beside the campaign in the
+   **Campaigns** list). The browser saves `<campaign-id>.zip` to its download folder.
+   It holds, per run, `run.json`, `perf.csv`, `perf-schema.md`, `correctness.csv`,
+   `negative-tests.csv`, `ground-truth-check.json`, `timings.json` and
+   `journal-line1.json`, plus `summary.csv`, `campaign.json` (every repetition with
+   its host samples), `preflight.json` and `MANIFEST.txt` (which files each run is
+   missing). For the thesis, unzip it into balotachain
+   `docs/desktop-runs/<YYYY-MM-DD>-<tier>/`, copy `ladder.json` beside it once per
+   build, and write the tier's note `docs/desktop-runs/<YYYY-MM-DD>-<tier>.md` as the
+   earlier notes do. The full run folders (ballots, latencies, receipts, journals,
+   ledger dumps) stay in WSL under `~/.saksi/campaign/runs/`; the cost-model refit
+   reads them there, so do not delete them.
+
+Then, on the same network, the tier's security run (§10.5) and T3 (§10.6) if this is a
+tier chosen for them, and only then the next tier's reset.
+
+### 10.5 Security run, once per chosen tier
+
+A security run is one election with the attack timeline on. It pauses the lifecycle at
+each ticked stage, mounts that stage's attacks against the election in the state they
+belong to, and scores each against the gate it declares. Run it after the tier's
+campaign, on an on-chain tier (SP-1K is the cheapest). **Its throughput is never used
+for RQ3**: the pauses and the attacks perturb timing, so `perf.csv` has
+`security_run = true`, it reports no sustained TPS and no scaling verdict, and it
+carries no campaign repetition tag, so the refit skips it.
+
+1. Press **Single election**, the tier's preset, and add the study tag to **Election
+   name**. Mode stays **on-chain**.
+2. Leave **Skip all attacks — run the election straight through** unticked and tick
+   the stages. **Security run — throughput perturbed, not for RQ3** appears beside
+   the start button.
+
+   | Stage (tick) | Scenarios | How it is mounted on-chain | Declared gate |
+   | --- | --- | --- | --- |
+   | **Before ballots (DKG)** | `tamper-dkg-transcript` | simulated | auditor `dkg.decode` |
+   | **During ballots (paused at 50 %)** | `tamper-ballot-proof` | real submission | chaincode `cds` |
+   | | `reused-nullifier` | real submission | chaincode `nullifier` |
+   | | `corrupted-ballot-bytes` | real submission | chaincode `decode` |
+   | **After ballots (sealed box)** | `dropped-ballot` | simulated | auditor `stream.completeness` |
+   | | `reordered-ballots` | never mounted | none |
+   | **During tally (ceremony)** | `tamper-partial-decryption` | simulated | auditor `decryption.cp_proof` |
+
+   **pause after** sets where submission stops for the during-ballots stage (default
+   half the ballots). **Each stage waits up to** 300 s for a decision; if nobody
+   decides in time, that stage's attacks run and the election continues.
+3. Press **Generate ballots →**, then **Check the data →**, then **Encrypt →**. At each
+   pause the step shows **Paused at `<stage>`** with the election's state (status,
+   ballots committed, block height), **Run all attacks at this stage**, **Skip this
+   stage**, and a **Run** button per attack. Decide each stage.
+4. **To the trustees →**, **Submit share** on at least three trustee cards, **Publish
+   tally** (the ceremony stage pauses here, on the trustee step), **Verify →**. The
+   result must read **E = 0 · PASS**.
+5. Export from the **Runs** list (Single election mode): `negative-tests.csv`,
+   `perf.csv`, `correctness.csv`, `run.json` and `journal.ndjson` for the run, into
+   balotachain `docs/desktop-runs/<YYYY-MM-DD>-<tier>-security/`.
+
+**Test it against attacks →** on the verify step re-runs the catalogue afterwards as
+simulations. A verdict mounted at a pause is never replaced by one of these: the
+re-run is only journalled (`attack.rerun.unstaged`).
+
+**Reading the verdicts** (the `verdict` column, and the chip the wizard shows):
+
+| Verdict | Chip | Meaning | What to do |
+| --- | --- | --- | --- |
+| `PASS` | rejected by its gate | Refused **by the declared gate**, shown as "declared gate: … · observed gate: …" | Cite it |
+| `INCONCLUSIVE` | INCONCLUSIVE | Refused by a different gate (`actual` reads `rejected by <gate>: …`), by one that names no gate, or never mounted (`actual` starts `not mounted:`) | Not a pass and not in the rejection rate. Read `actual`; if the cause was operational, run the security run again |
+| `FAIL` | NOT REJECTED | Nothing refused it: the ledger accepted it, or the audit passed the mutated copy | A real finding. Record it; do not re-run it away |
+| `SKIPPED` | not run | Never mounted; `reordered-ballots` always, since no gate exists to test | Report it as a gap, never as a pass |
+
+**On-chain limitations to state beside the verdicts** (§7 and §8, *Findings*):
+
+- **No DKG integrity gate on-chain.** The chaincode checks transcript shape, not the
+  points, so `tamper-dkg-transcript` is caught only by the auditor.
+- **Partial-decryption proofs are checked for presence only on-chain.** The
+  Chaum-Pedersen proof is verified by the auditor (`decryption.cp_proof`).
+- **Ballot reordering is not detected**, by the chaincode or by the auditor.
+- **Front-running denial of service.** The chaincode never checks who calls it, so any
+  channel client can publish a tampered DKG transcript or a planted partial decryption
+  first and lock the honest one out (`dkg-duplicate`, `partial-duplicate`). The console
+  does not mount these live.
+
+**Earlier verdicts that were discarded.** Every on-chain attack row from saksi at or
+before `adba922` is discarded, not re-run: any rejection was scored PASS and the
+chaincode's reason never reached the console. The offline rows for
+`corrupted-ballot-bytes` and `tamper-partial-decryption` from those builds are replaced
+by this study's (their mutations hit the wrong field). The offline rows for
+`tamper-dkg-transcript`, `tamper-ballot-proof`, `reused-nullifier` and `dropped-ballot`
+stay valid.
+
+### 10.6 Resilience test (T3): restart the peer mid-submission
+
+T3 stops `peer0.org1.example.com` part-way through a ballot window and records what
+the chain kept and how the run recovers. The run is a security run: its throughput is
+not for RQ3. Run it on a tier's network after that tier's campaign. Keep the wizard
+tab open from step 1 to step 7: the wizard continues only the election it is walking
+(§10.7 has the details).
+
+1. **An eligible run.** Press **Single election**, pick the tier's preset, add the
+   study tag, mode **on-chain**, and tick **Skip all attacks — run the election
+   straight through** (a fault run cannot carry an attack plan). To measure how many
+   ballots an outage of a given length loses, open **Advanced — send rate** and set
+   **Send rate (ballots/s)** now; see the drop rule below.
+2. **Generate.** Press **Generate ballots →** and wait until **Check the data →**
+   is offered. Do not go further yet.
+3. **Arm the fault.** In **Restart the peer mid-submission (T3)**: **Run** offers only
+   eligible runs (on-chain, generated, idle, not a campaign repetition, no attack plan,
+   ballot window not opened) and selects the one on screen. Set **Stop the peer after
+   (share of ballots)** and **Keep it down for (seconds, 5–120)**, type `RESTART`, and
+   press **Arm the fault**. The status reads "Armed on `<run>`: peer0.org1.example.com
+   stops when ballot N of M is dispatched and stays down S s."
+4. **Fire it.** Back on the election: **Check the data →**, then **Encrypt →**. The peer
+   stops at the chosen ballot, comes back after the chosen time, and the phase ends
+   failed with "N of M ballots did not commit". In the **Runs** list the run reads
+   **interrupted**, tagged "security run · fault armed".
+5. **Resume.** Press **Resume** on that run. It submits only the ballots the chain does
+   not hold (a ballot that landed despite its error is recorded as a replay, not a
+   drop), then closes the election. When it ends the note reads "Done: now run
+   Verify-only (required after a fault), then the trustees, publish and Verify." If it
+   did not finish, the reason shows under the list and **Resume** is offered again
+   (status **close-pending** when only the close is left): press it again.
+6. **Verify-only (required).** Press **Verify-only**. It submits nothing: it reconciles
+   the chain's committed count against the run's committed set and walks the chain.
+   The list then shows "verify-only reconciled".
+7. **Finish.** On the election, **To the trustees →** is now enabled: **Submit share**
+   on at least three trustees, **Publish tally**, **Verify →**. The run must end with
+   every contest `E = 0` and `ledger_matches_local` `true`.
+
+Export `run.json`, `perf.csv`, `correctness.csv` and `journal.ndjson` from the **Runs**
+list. The T3 record is in the journal: `fault.start`, `fault.end`, `fault.peer_ready`,
+the window's `stage.ballots.interrupted {dropped}`, the resume's exact
+`segment.start {pending}` (what the chain held before anything was resubmitted), and
+`verify_only.reconcile`. §9's API flow runs verify-only before the resume; the wizard's
+order is the one above, and the handlers accept either.
+
+**The closed-loop drop rule.** With **Send rate** 0 (the default) the workers drain the
+rest of the window as fast as refusals come back, and a refused connection comes back
+at once: **every ballot after the fault point drops within about a second of the
+stop**, whatever **Keep it down for** says. The drop count is then "the rest of the
+window", not "ballots lost over the outage". To measure outage-window loss, set a
+fixed send rate so the remaining ballots are spread across the outage.
+
+**If the console dies while the peer is down**, the peer stays down (`Ctrl-C` in the
+console restarts it; `kill -9`, a crash or closing WSL do not). Recover it by hand:
+
+```bash
+docker start peer0.org1.example.com
+cd ~/Code/saksi && ./tools/up.sh status
+```
+
+### 10.7 Capstones and row 8
+
+**Long runs.** Rows 6, 7 and 9 run for hours, as campaigns like any other tier.
+
+- **Cancel after this repetition** stops a campaign after the repetition in progress,
+  never inside it. A campaign cancelled before its last repetition writes no
+  `summary.csv`; its finished rows stay in the export.
+- **If the console or WSL dies inside a ballot window**, the campaign reads
+  **interrupted** at the next look, and in Single election mode the run reads
+  **interrupted** with **Resume** in the **Runs** list. Resume submits what the chain
+  does not hold and closes the election. A resumed run reports throughput per segment,
+  is marked `sustained: false` and contributes no whole-run TPS: it is a correctness
+  record, not an RQ3 row, so run the tier again for RQ3 if time allows.
+- **The wizard cannot reopen an existing election.** **To the trustees →** is enabled
+  after a resume only for the election the page is walking. A resumed campaign
+  repetition, or any run after the page was reloaded, has no wizard path to its
+  trustees, publish and verify; §9's *Operator flow for a T3 run* (steps 6–7) lists
+  the API calls.
+- **The console's per-phase timeout is 60 minutes** (`--timeout`), and `tools/up.sh`
+  starts it with that default. At the cost model's per-record rates (submit
+  1.243 ms, verify 0.828 ms) the SP-3.5M ballot window needs about 73 minutes, and
+  MP-3.5M on-chain needs about 3.7 hours of ballot window and 2.4 hours of verify. A
+  ballot window cut by the timeout is left **interrupted** and can be resumed; a cut
+  verify cannot. Until `up.sh` can start the console with a longer timeout, SP-3.5M
+  finishes only as a single election walked through a resume, which gives a
+  correctness record and no RQ3 row (as a campaign repetition it cannot be finished
+  from the wizard, see above), and row 9's verify does not finish at all.
+
+<!-- W4b -->
+**Row 8, offline.** Row 8 runs from the wizard as a measurement campaign: press
+**Measurement campaign** and one of **MP-483K offline**, **MP-1M offline**,
+**MP-1.92M offline** or **MP-3.5M offline** (mode offline, 0 warm-ups + 1 measured),
+add the study tag, and **Start campaign →**. An offline run makes no ledger call, so no
+network reset is needed before it. The preflight's disk and memory rows check the
+tier's generator and auditor footprint against this machine; a red row blocks Start,
+and the fix is the one the row states. Export and copy it as in §10.4 step 6.
+<!-- /W4b -->
+
+### 10.8 What not to do during a run
+
+Any of these can end a run, stall it, or silently change what it measures:
+
+- **Sleep or hibernate** the desktop (§10.1 turns both off).
+- **`wsl --shutdown`**, or anything else that stops WSL: it kills the console and the
+  network, and leaves a stopped peer stopped.
+- **Restart Docker Desktop**: it stops the Fabric containers. After a restart the first
+  repetitions also run against cold peers and chaincode containers.
+- **Start other heavy programs**, games above all (§10.1).
+- **Close the WSL terminal that runs tmux**: keep the window open, minimised. Detach
+  from tmux instead.
+- **Pull, rebuild or change the orderer file mid-study.** A new build invalidates the
+  ladder and starts a new regime that `cost_model.py` refuses to pool with the old
+  one; `SAKSI_CONFIGTX=default` measures stock Fabric instead of the declared
+  parameters.
+
+### 10.9 After the study
+
+**Which artifact backs which Chapter 4 claim** (the register, with status and caveats,
+is balotachain `docs/CLAIMS.md`):
+
+| Claim area | Artifact |
+| --- | --- |
+| Environment (Table 3.12), orderer parameters | `journal-line1.json` of every run (`orderer_batch`, Docker limits, commits) and the campaign's `preflight.json` |
+| RQ1: E = 0, ledger matches local | each run's `correctness.csv` (`source=ledger` rows, `ledger_matches_local`), the campaign's `summary.csv` (`runs_failed`) |
+| RQ1: validation ladder | `ladder.json` |
+| RQ2: attacks refused at their gate | the security runs' `negative-tests.csv` (`verdict`, `gate_expected`, `gate_observed`, mount context) and their `attack.*` journal events |
+| RQ2: recovery after a peer restart (T3) | the T3 run's `journal.ndjson` (`fault.*`, `segment.start`, `verify_only.reconcile`) and `correctness.csv` |
+| RQ3: throughput and latency | each campaign's `summary.csv` and per-repetition `perf.csv` (`committed_tps`, `driver_ceiling_tps`, `latency_p99_ms`, `sustained`, `scaling_limit`); `campaign.json` host samples show no repetition was contended |
+| RQ3: cost model | the full run folders in WSL, through `cost_model.py` |
+
+**Refitting the cost model.** `cost_model.py` needs each run's full `journal.ndjson`,
+`gen-timings.json` and `receipts.csv`, which the export bundle does not carry, so it
+reads the run store in WSL. From a balotachain checkout inside WSL, with the study
+tag of §10.4:
+
+```bash
+python3 docs/desktop-runs/cost_model.py \
+    --runs ~/.saksi/campaign/runs \
+    --match '*-w1-*' \
+    --fit-concurrency 128 \
+    --out docs/desktop-runs/cost-model-w1.md
+```
+
+Warm-ups, failed runs, security runs (no repetition tag) and the ladder are skipped by
+the script itself. It refuses to fit when the matched runs span more than one regime
+(auditor threads, orderer parameters, saksi commit) and names them. Write the refit to
+a new file: the current `cost-model.md` holds the predictions committed before rows
+5–9 ran, and its error column is the honesty check.
+
+## 11. Troubleshooting
 
 - **`bind: address already in use`** — another service owns the port; pass a free
   one via `--addr`.
