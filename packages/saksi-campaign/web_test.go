@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -78,7 +79,7 @@ func TestWizardDefinesEveryFunctionItCalls(t *testing.T) {
 		"watchJob", "watchLadder", "syncReset", "followReset", "startCampaign", "openCampaign",
 		"refreshCampaign", "renderCampaign", "loadCampaigns", "loadRuns", "renderRuns", "runAction",
 		"whenIdle", "renderFaultRuns", "syncFault", "applyPreset", "renderPresets", "onFormChange",
-		"syncHints", "hostCell", "boot", "refreshStudy",
+		"syncHints", "hostCell", "boot", "refreshStudy", "openRun", "syncSweepHint", "duration",
 	} {
 		called := strings.Contains(js, fn+"(")
 		defined := strings.Contains(js, "function "+fn+"(") ||
@@ -147,6 +148,29 @@ func TestWizardFaultFilterMirrorsTheFaultRoute(t *testing.T) {
 	} {
 		if !strings.Contains(body, clause) {
 			t.Errorf("faultEligible lost %q (%s)", clause, rule)
+		}
+	}
+}
+
+// Every campaign option the route accepts can be sent from the wizard: a field
+// renamed on one side and not the other would silently drop, say, the sweep
+// from row 5, because the route only refuses unknown keys, not missing ones.
+func TestWizardSendsEveryCampaignOption(t *testing.T) {
+	page, err := webFS.ReadFile("web/wizard.html")
+	if err != nil {
+		t.Fatalf("read wizard.html: %v", err)
+	}
+	js := string(page)
+	start := strings.Index(js, "async function startCampaign()")
+	if start < 0 {
+		t.Fatal("wizard.html no longer defines startCampaign")
+	}
+	body := js[start : start+strings.Index(js[start:], "\n}\n")]
+	opts := reflect.TypeOf(CampaignOptions{})
+	for i := 0; i < opts.NumField(); i++ {
+		name := strings.Split(opts.Field(i).Tag.Get("json"), ",")[0]
+		if !strings.Contains(body, name+":") && !strings.Contains(body, "body."+name+" =") {
+			t.Errorf("startCampaign never sends the campaign option %q", name)
 		}
 	}
 }

@@ -410,6 +410,20 @@
         by the console against its own API, exactly as <code>saksi-campaign --repeat</code> runs it.
         summary.csv summarises the measured repetitions only; a campaign never runs attacks.
       </div>
+      <div class="grid3">
+        <div><label for="sweep">Rate sweep <span class="muted small">— × per step, 0 = off</span></label>
+          <input id="sweep" type="number" min="0" step="0.1" value="0" class="tnum" /></div>
+        <div><label for="windowS">Sweep step window (s)</label>
+          <input id="windowS" type="number" min="1" value="120" class="tnum" /></div>
+        <div><label for="burst">Peak burst <span class="muted small">— voters, 0 = off</span></label>
+          <input id="burst" type="number" min="0" value="0" class="tnum" /></div>
+      </div>
+      <div class="small muted" id="sweepHint" style="margin-top:4px">
+        Both run after the measured repetitions (row 5 uses them). A sweep offers a fixed rate for
+        one window per step and multiplies it each step until committed throughput stops rising or
+        a ballot drops; summary.csv's plateau_tps is the last good step. A burst is one more election
+        of that many voters sent with no rate cap.
+      </div>
     </div>
 
     <div style="margin-top:13px" id="attackBox">
@@ -905,6 +919,28 @@ function applyPreset(p) {
 
 // A campaign's options and a preflight query take whole, non-negative numbers.
 const whole = (id) => Math.max(0, Math.floor(+$(id).value || 0));
+
+// syncSweepHint spells out what a sweep will offer, from repeat.go's rules: the
+// first step offers the send rate (defaultSweepRate, 10/s, when it is 0), each
+// step multiplies it, and at most maxSweepSteps (12) steps run.
+function syncSweepHint() {
+  const f = +$("sweep").value || 0, burst = whole("burst");
+  const parts = [];
+  if (f > 1) {
+    const start = +$("sendRate").value > 0 ? +$("sendRate").value : 10;
+    const top = start * Math.pow(f, 11);
+    const w = Math.max(1, whole("windowS"));
+    parts.push(`The sweep offers ${start.toLocaleString()}/s up to ${Math.round(top).toLocaleString()}/s over at most 12 steps of ${w} s ` +
+      `(the first step is the send rate under Advanced, or 10/s when that is 0). Pick a start and factor whose top step is above the network's throughput, or no plateau is found.`);
+  } else if (f > 0) {
+    parts.push("A sweep factor must be above 1 (each step multiplies the offered rate by it).");
+  }
+  if (burst) parts.push(`Then a burst of ${burst.toLocaleString()} voters with no rate cap.`);
+  $("sweepHint").textContent = parts.length ? parts.join(" ") :
+    "Both run after the measured repetitions (row 5 uses them). A sweep offers a fixed rate for one window per step and multiplies it " +
+    "each step until committed throughput stops rising or a ballot drops; summary.csv's plateau_tps is the last good step. " +
+    "A burst is one more election of that many voters sent with no rate cap.";
+}
 
 // syncHints states the limits the server will enforce, beside the field.
 function syncHints() {
@@ -1737,6 +1773,12 @@ function bytes(n) {
   while (v >= 1024 && i < u.length - 1) { v /= 1024; i++; }
   return v.toFixed(i ? 1 : 0) + " " + u[i];
 }
+// duration renders seconds the way an operator sets --phase-timeout.
+function duration(sec) {
+  if (sec < 90) return `${Math.round(sec)} s`;
+  if (sec < 5400) return `${Math.round(sec / 60)} min`;
+  return `${(sec / 3600).toFixed(1)} h`;
+}
 const fixed = (v, d) => (v == null || !isFinite(v) ? null : Number(v).toFixed(d));
 
 // Each row is a positive fact with the finding codes that can turn it amber or
@@ -1770,8 +1812,11 @@ const PF_ROWS = [
     if (proj != null) text += ` · this run projects ${bytes(proj)} of ${what}`;
     const runs = whole("warmups") + whole("reps");
     if (uiMode === "campaign" && proj != null && runs > 0) {
-      const all = runs * proj;
-      text += ` · the campaign's ${runs} runs project ${bytes(all)}`;
+      // campaign.go campaignDiskBytes: every run, up to 12 sweep steps, and the burst.
+      const sweepRuns = (+$("sweep").value || 0) > 1 ? 12 : 0;
+      const burstShare = whole("voters") > 0 ? whole("burst") / whole("voters") : 0;
+      const all = (runs + sweepRuns + burstShare) * proj;
+      text += ` · the campaign's ${runs} runs${sweepRuns ? " and sweep" : ""}${burstShare ? " and burst" : ""} project ${bytes(all)}`;
       if (d.free_bytes != null && all > d.free_bytes) return { text: text + " — more than is free", amber: true };
     }
     return text;
@@ -1789,6 +1834,13 @@ const PF_ROWS = [
   } },
   { key: "Verify threads", codes: ["verify_threads", "verify_threads_invalid"], fact: (r) =>
     `the auditor verifies on ${r.verify_threads_default} thread${r.verify_threads_default === 1 ? "" : "s"}` },
+  { key: "Phase timeout", codes: ["phase_timeout_short", "phase_timeout_tight"], fact: (r) => {
+    const p = r.phase_timeout || {};
+    if (!p.seconds) return "not reported by this console";
+    const per = `${duration(p.seconds)} per phase (--phase-timeout)`;
+    return p.estimated_s == null ? `${per} · no estimate for this mode`
+      : `${per} · longest phase here: ${p.longest_phase}, about ${duration(p.estimated_s)}`;
+  } },
   { key: "Busy runs", codes: ["run_busy"], hideUnlessFound: true, fact: () => "" },
 ];
 
@@ -1965,6 +2017,10 @@ const CAMPAIGN_LIVE = new Set(["queued", "running"]);
 
 async function startCampaign() {
   const body = { config: config(), warmups: whole("warmups"), reps: whole("reps") };
+  // The route refuses a sweep factor at or below 1 with its reason; 0 means none.
+  const sweep = +$("sweep").value || 0;
+  if (sweep) { body.sweep = sweep; body.window_s = whole("windowS"); }
+  if (whole("burst")) body.burst = whole("burst");
   if (!$("forceBox").hidden && $("force").checked) body.force = true;
   startBusy = true;
   syncStart();
@@ -2176,7 +2232,8 @@ function renderRuns() {
     // on a clean run, where it would stamp interrupted_at on a good record.
     const c2 = r.config || {};
     const acts = r.busy ? "" : [
-      r.resumable ? `<button type="button" class="small primary" data-run-act="resume" data-run="${esc(r.run_id)}">Resume</button>` : "",
+      r.resumable ? `<button type="button" class="small primary" data-run-act="resume" data-run="${esc(r.run_id)}">Resume</button>` :
+        `<button type="button" class="small" data-run-act="open" data-run="${esc(r.run_id)}" title="continue this election in the steps above">Open</button>`,
       caps.fabric && c2.mode === "onchain" && (r.resumable || r.was_interrupted)
         ? `<button type="button" class="small${!r.resumable && !r.reconciled ? " primary" : ""}" data-run-act="verify-only" data-run="${esc(r.run_id)}">Verify-only</button>` : "",
     ].join(" ");
@@ -2192,7 +2249,7 @@ function renderRuns() {
     <th class="num">Voters × pos.</th><th>Status</th><th>Actions</th><th>Exports</th></tr></thead><tbody>${rows}</tbody></table></div>` +
     (runsCache.length > RUNS_SHOWN ? `<div class="small muted" style="margin-top:5px">Newest ${RUNS_SHOWN} of ${runsCache.length} runs.</div>` : "");
   $("rlList").querySelectorAll("[data-run-act]").forEach((b) => {
-    b.onclick = () => runAction(b.dataset.run, b.dataset.runAct, b);
+    b.onclick = () => b.dataset.runAct === "open" ? openRun(b.dataset.run) : runAction(b.dataset.run, b.dataset.runAct, b);
   });
 }
 
@@ -2243,11 +2300,43 @@ async function runAction(id, action, btn) {
       return;
     }
     $("rlNote").textContent += action === "resume"
-      ? " Done: now run Verify-only (required after a fault), then the trustees, publish and Verify."
-      : " Done: continue with the trustees, publish the tally and Verify.";
+      ? " Done: now run Verify-only (required after a fault), then Open the run to continue with the trustees, publish and Verify."
+      : " Done: Open the run to continue with the trustees, publish the tally and Verify.";
     // The run this page is walking: its ceremony is open now.
     if (id === runID) { $("err2").textContent = ""; $("next2").disabled = false; }
   });
+}
+
+// openRun reopens any idle run in the single-election steps, at the step it
+// stopped before: a campaign repetition, a resumed fault run, or a page that was
+// reloaded mid-election. Published and verified goes to the results; closed (the
+// ceremony has started) goes to the trustees, whose step also offers Publish and
+// Verify; anything earlier goes to the data check, whose Continue re-runs
+// Encrypt & record. The console's routes stay the judge of what each step may do.
+async function openRun(id) {
+  const r = runsCache.find((x) => x.run_id === id);
+  if (!r) return;
+  if (uiMode !== "single") setMode("single");
+  stopTimers();
+  stopPauseWatch();
+  closeStream();
+  runID = r.run_id;
+  cfg = r.config || {};
+  $("runChip").textContent = runID;
+  showIDChip();
+  ["err2b", "err2", "err3", "err4"].forEach((e) => { $(e).textContent = ""; });
+  let st = null;
+  if (cfg.mode !== "groundtruth") {
+    try { st = await getJSON(`/api/ceremony/${encodeURIComponent(runID)}`); } catch (_) {}
+  }
+  if (st && st.published && (r.artifacts || []).includes("correctness.csv")) {
+    go(5);
+    await loadResults();
+  } else if (st && (st.published || st.closed_at)) {
+    await startCeremony();
+  } else {
+    await runCheck();
+  }
 }
 
 // whenIdle polls a run's status every 3 s until no phase holds it.
@@ -2288,6 +2377,11 @@ function renderFaultRuns() {
 function syncFault() {
   $("btnFault").disabled = !$("ftRun").value || $("ftConfirm").value !== "RESTART";
 }
+
+["sweep", "windowS", "burst", "sendRate"].forEach((id) => $(id).addEventListener("input", () => {
+  syncSweepHint();
+  if (lastPF) renderPreflight(lastPF);
+}));
 
 $("btnFault").onclick = async () => {
   const id = $("ftRun").value;
