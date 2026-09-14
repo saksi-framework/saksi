@@ -313,6 +313,11 @@ func TestRunsListReportsWhereEachRunStands(t *testing.T) {
 		`{"event":"ballots.progress","done":4}`, `{"event":"stage.ballots.interrupted"}`)
 	closed := create("onchain", `{"event":"run.start"}`, `{"event":"stage.ballots.start","n":10}`,
 		`{"event":"stage.ballots.end"}`)
+	// A T3 run after its resume: the window was interrupted, a second segment
+	// found 4946 ballots pending and closed it, and verify-only reconciled.
+	resumed := create("onchain", `{"event":"stage.ballots.start","n":10}`, `{"event":"stage.ballots.interrupted"}`,
+		`{"event":"segment.start","index":1,"pending":4946}`, `{"event":"stage.ballots.end","segment":1}`,
+		`{"event":"interrupted_at","phase":"verify-only"}`, `{"event":"verify_only.reconcile","reconciled":true}`)
 	s.mu.Lock()
 	s.busy[generated] = func() {}
 	s.mu.Unlock()
@@ -328,21 +333,28 @@ func TestRunsListReportsWhereEachRunStands(t *testing.T) {
 		got[v.RunID] = v
 	}
 	for _, want := range []struct {
-		id, status, reason       string
-		busy, started, resumable bool
+		id, status, reason                                   string
+		busy, started, resumable, wasInterrupted, reconciled bool
+		pending                                              int
 	}{
-		{fresh, "new", "", false, false, false},
-		{generated, "open", "", true, false, false},
-		{failed, "failed", "verify failed", false, false, false},
-		{ended, "ended", "", false, false, false},
-		{interrupted, "interrupted", "", false, true, true},
-		{closed, "open", "", false, true, false},
+		{fresh, "new", "", false, false, false, false, false, -1},
+		{generated, "open", "", true, false, false, false, false, -1},
+		{failed, "failed", "verify failed", false, false, false, false, false, -1},
+		{ended, "ended", "", false, false, false, false, false, -1},
+		{interrupted, "interrupted", "", false, true, true, true, false, -1},
+		{closed, "open", "", false, true, false, false, false, -1},
+		{resumed, "open", "", false, true, false, true, true, 4946},
 	} {
 		v := got[want.id]
+		pending := -1
+		if v.ResumePending != nil {
+			pending = *v.ResumePending
+		}
 		if v.Status != want.status || v.Reason != want.reason || v.Busy != want.busy ||
-			v.BallotsStarted != want.started || v.Resumable != want.resumable {
-			t.Errorf("%s: got status=%q reason=%q busy=%v started=%v resumable=%v, want %+v",
-				want.id, v.Status, v.Reason, v.Busy, v.BallotsStarted, v.Resumable, want)
+			v.BallotsStarted != want.started || v.Resumable != want.resumable ||
+			v.WasInterrupted != want.wasInterrupted || v.Reconciled != want.reconciled || pending != want.pending {
+			t.Errorf("%s: got status=%q reason=%q busy=%v started=%v resumable=%v interrupted=%v reconciled=%v pending=%d, want %+v",
+				want.id, v.Status, v.Reason, v.Busy, v.BallotsStarted, v.Resumable, v.WasInterrupted, v.Reconciled, pending, want)
 		}
 	}
 }

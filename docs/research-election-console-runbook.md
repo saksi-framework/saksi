@@ -731,9 +731,11 @@ and a CLI campaign on the same config therefore produce the same run folders
 and the same `summary.csv`. Every route below is admin-only when auth is on.
 The wizard's campaign mode, preflight panel and runs list drive them. `GET /runs`
 gives each run `status` (`new`, `open`, `ended`, `failed` with `reason`,
-`interrupted`), `busy` (with `paused_stage`), `ballots_started` and
-`resumable` (the resume route's own journal check), which the wizard uses to
-offer Resume, Verify-only and the peer-restart fault only where they apply.
+`interrupted`), `busy` (with `paused_stage`), `ballots_started`, `resumable`
+(the resume route's own journal check), `was_interrupted`, `resume_pending`
+(the latest `segment.start {pending}`) and `reconciled` (a
+`verify_only.reconcile` on record), which the wizard uses to offer Resume,
+Verify-only and the peer-restart fault only where they apply.
 
 | Route | What it does |
 | --- | --- |

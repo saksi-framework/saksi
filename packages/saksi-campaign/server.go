@@ -516,6 +516,12 @@ type runView struct {
 	Reason         string `json:"reason,omitempty"`
 	BallotsStarted bool   `json:"ballots_started"`
 	Resumable      bool   `json:"resumable"`
+	// The T3 trail: a ballot window was interrupted at some point, the latest
+	// resume's exact pending count (segment.start), and a verify-only
+	// reconciliation on record.
+	WasInterrupted bool `json:"was_interrupted"`
+	ResumePending  *int `json:"resume_pending,omitempty"`
+	Reconciled     bool `json:"reconciled"`
 }
 
 // fillState reads where the run in dir stands into v.
@@ -536,6 +542,15 @@ func (s *Server) fillState(v *runView, dir string) {
 		switch jstring(ev, "event") {
 		case "stage.ballots.start":
 			v.BallotsStarted = true
+		case "stage.ballots.interrupted":
+			v.WasInterrupted = true
+		case "segment.start":
+			if p, ok := ev["pending"].(float64); ok {
+				n := int(p)
+				v.ResumePending = &n
+			}
+		case "verify_only.reconcile":
+			v.Reconciled = true
 		case "run.end":
 			v.Status, v.Reason = "ended", ""
 			if jbool(ev, "failed") {
