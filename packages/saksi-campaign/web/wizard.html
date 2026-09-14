@@ -2112,9 +2112,10 @@ const securityRun = (r) => !!(r.config && (r.config.attack_plan || r.config.faul
 
 async function loadRuns() {
   let runs;
+  // Load failures go in the list itself: #rlErr belongs to the run actions,
+  // and this reload runs while their errors arrive.
   try { runs = await getJSON("/runs"); }
-  catch (e) { $("rlErr").textContent = e.message; return; }
-  $("rlErr").textContent = "";
+  catch (e) { $("rlList").innerHTML = `<div class="err">${esc(e.message)}</div>`; return; }
   runsCache = runs.slice().sort((a, b) => String(b.created_at).localeCompare(String(a.created_at)));
   renderRuns();
   renderFaultRuns();
