@@ -126,6 +126,7 @@ func TestRouteRolesWhenAuthOn(t *testing.T) {
 			{get, "/api/trail"}, {get, "/api/trail/r1"}, {get, "/api/capabilities"},
 			{get, "/api/ceremony/r1"}, {get, "/runs"}, {get, "/board/"}, {get, "/trustee/"},
 			{get, "/admin/"}, {get, "/admin"}, {post, "/api/login"}, {post, "/api/logout"},
+			{get, "/wizard"},
 		}},
 		{"trustee or admin", 401, 0, 0, []probe{{post, "/ceremony/publish"}, {get, "/events"}}},
 		{"trustee, own shares", 401, 0, 403, []probe{{post, "/ceremony/submit"}}},
@@ -133,7 +134,7 @@ func TestRouteRolesWhenAuthOn(t *testing.T) {
 			{post, "/generate"}, {post, "/submit"}, {post, "/verify"}, {post, "/run-all"},
 			{post, "/cancel"}, {post, "/scenarios"}, {post, "/attack"}, {post, "/ceremony/start"},
 			{post, "/api/runs/r1/resume"}, {get, "/api/runs/r1/status"}, {get, "/api/check/r1"},
-			{get, "/api/scenarios/r1"}, {get, "/export/r1/run.json"}, {get, "/wizard"}, {get, "/"},
+			{get, "/api/scenarios/r1"}, {get, "/export/r1/run.json"}, {get, "/api/preflight"}, {get, "/"},
 			{get, "/no-such-page"},
 		}},
 	}
@@ -507,7 +508,7 @@ func TestLogoutInvalidatesSession(t *testing.T) {
 		t.Fatalf("logout must clear the cookie: %+v", cleared)
 	}
 
-	for _, path := range []string{"/api/me", "/wizard"} {
+	for _, path := range []string{"/api/me", "/api/preflight"} {
 		req := httptest.NewRequest(http.MethodGet, path, nil)
 		req.AddCookie(c)
 		rec = httptest.NewRecorder()
@@ -522,7 +523,7 @@ func TestExpiredSessionRejected(t *testing.T) {
 	s, h := authServer(t)
 	now := time.Now()
 	s.auth.now = func() time.Time { return now }
-	req := signIn(t, s, "admin", httptest.NewRequest(http.MethodGet, "/wizard", nil))
+	req := signIn(t, s, "admin", httptest.NewRequest(http.MethodGet, "/api/me", nil))
 
 	now = now.Add(sessionTTL + time.Second)
 	rec := httptest.NewRecorder()

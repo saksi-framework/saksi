@@ -506,6 +506,49 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 type runView struct {
 	RunRecord
 	Artifacts []string `json:"artifacts"`
+	// Where the run stands, for the wizard's runs list. Status is "new" (no
+	// journal yet), "open", "ended", "failed" (Reason from run.end) or
+	// "interrupted" (a ballot window the resume route would accept). Busy is a
+	// phase holding the run, PausedStage the attack stage it waits at.
+	Busy           bool   `json:"busy"`
+	PausedStage    string `json:"paused_stage,omitempty"`
+	Status         string `json:"status"`
+	Reason         string `json:"reason,omitempty"`
+	BallotsStarted bool   `json:"ballots_started"`
+	Resumable      bool   `json:"resumable"`
+}
+
+// fillState reads where the run in dir stands into v.
+func (s *Server) fillState(v *runView, dir string) {
+	s.mu.Lock()
+	_, v.Busy = s.busy[v.RunID]
+	s.mu.Unlock()
+	if pv := s.exec.PauseStatus(v.RunID); v.Busy && pv.Paused {
+		v.PausedStage = pv.Stage
+	}
+	events, err := readJournalEvents(dir)
+	if err != nil {
+		v.Status = "new"
+		return
+	}
+	v.Status = "open"
+	for _, ev := range events {
+		switch jstring(ev, "event") {
+		case "stage.ballots.start":
+			v.BallotsStarted = true
+		case "run.end":
+			v.Status, v.Reason = "ended", ""
+			if jbool(ev, "failed") {
+				v.Status, v.Reason = "failed", jstring(ev, "reason")
+			}
+		}
+	}
+	// The resume route's own check, so the page offers Resume exactly when the
+	// route would take it. ponytail: re-reads the journal of on-chain runs; fold
+	// into the scan above if /runs gets slow on a large run store.
+	if _, err := planResume(dir, v.Config); err == nil {
+		v.Status, v.Resumable = "interrupted", true
+	}
 }
 
 func (s *Server) handleRuns(w http.ResponseWriter, r *http.Request) {
@@ -526,7 +569,9 @@ func (s *Server) handleRuns(w http.ResponseWriter, r *http.Request) {
 				arts = append(arts, name)
 			}
 		}
-		views = append(views, runView{RunRecord: rec, Artifacts: arts})
+		v := runView{RunRecord: rec, Artifacts: arts}
+		s.fillState(&v, dir)
+		views = append(views, v)
 	}
 	writeJSONResp(w, http.StatusOK, views)
 }

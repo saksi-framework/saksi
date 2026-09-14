@@ -140,10 +140,10 @@ session; anyone else gets the sealed view.
 
 | Role | Routes |
 | --- | --- |
-| public | `/api/board/`, `/api/verify-code/`, `/trail/`, `/api/trail`, `/api/trail/`, `/api/capabilities`, `/api/ceremony/` (status), `/runs`, the `/board/`, `/trustee/`, `/admin/` apps, `/api/login`, `/api/logout`, `/api/me` |
+| public | `/api/board/`, `/api/verify-code/`, `/trail/`, `/api/trail`, `/api/trail/`, `/api/capabilities`, `/api/ceremony/` (status), `/runs`, the `/board/`, `/trustee/`, `/admin/` apps, the `/wizard` page (it signs in through `/api/login`; the data it shows comes from the routes below), `/api/login`, `/api/logout`, `/api/me` |
 | trustee or admin | `POST /ceremony/publish`, `GET /events` |
 | trustee, own shares only | `POST /ceremony/submit` — `403` unless the body's `trustee_id` is the session's; an admin cannot submit for a trustee |
-| admin | `/generate`, `/submit`, `/verify`, `/run-all`, `/cancel`, `/scenarios`, `/attack`, `/ceremony/start`, `/api/runs/…`, `/api/check/`, `/api/scenarios/`, `/export/` (exports carry the seeded ground truth), `/wizard`, `/api/preflight`, `/api/ladder`, `/api/jobs/`, `/api/campaigns`, `/api/campaigns/…`, `/` (and any unknown path) |
+| admin | `/generate`, `/submit`, `/verify`, `/run-all`, `/cancel`, `/scenarios`, `/attack`, `/ceremony/start`, `/api/runs/…`, `/api/check/`, `/api/scenarios/`, `/export/` (exports carry the seeded ground truth), `/api/preflight`, `/api/ladder`, `/api/jobs/`, `/api/campaigns`, `/api/campaigns/…`, `/` (and any unknown path) |
 
 Stated limits — say so wherever the admin console is shown:
 
@@ -729,7 +729,11 @@ routes the driver calls (`POST /generate`, `GET /api/check/`, `POST /submit`,
 `GET /export/`); anything else answers `403`, auth on or off. A console campaign
 and a CLI campaign on the same config therefore produce the same run folders
 and the same `summary.csv`. Every route below is admin-only when auth is on.
-The wizard buttons for them and the operator walkthrough come later.
+The wizard's campaign mode, preflight panel and runs list drive them. `GET /runs`
+gives each run `status` (`new`, `open`, `ended`, `failed` with `reason`,
+`interrupted`), `busy` (with `paused_stage`), `ballots_started` and
+`resumable` (the resume route's own journal check), which the wizard uses to
+offer Resume, Verify-only and the peer-restart fault only where they apply.
 
 | Route | What it does |
 | --- | --- |

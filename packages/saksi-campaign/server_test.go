@@ -286,3 +286,63 @@ func TestExportServesTheLedgerDump(t *testing.T) {
 		}
 	}
 }
+
+// The wizard's runs list offers Resume and Verify-only only on a run whose
+// ballot window is interrupted, and the peer-restart fault only on an idle run
+// whose window has not opened. /runs carries those facts, read from each run's
+// journal with the resume route's own check, so the page never guesses.
+func TestRunsListReportsWhereEachRunStands(t *testing.T) {
+	s, h, _ := testServer(t, nil)
+	create := func(mode string, lines ...string) string {
+		c := good()
+		c.Mode = mode
+		id, dir, err := s.store.Create(c, time.Now())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(lines) > 0 {
+			writeJournalLines(t, dir, lines...)
+		}
+		return id
+	}
+	fresh := create("offline")
+	generated := create("offline", `{"event":"run.start"}`)
+	failed := create("offline", `{"event":"run.start"}`, `{"event":"run.end","failed":true,"reason":"verify failed"}`)
+	ended := create("offline", `{"event":"run.start"}`, `{"event":"run.end","failed":false}`)
+	interrupted := create("onchain", `{"event":"run.start"}`, `{"event":"stage.ballots.start","n":10}`,
+		`{"event":"ballots.progress","done":4}`, `{"event":"stage.ballots.interrupted"}`)
+	closed := create("onchain", `{"event":"run.start"}`, `{"event":"stage.ballots.start","n":10}`,
+		`{"event":"stage.ballots.end"}`)
+	s.mu.Lock()
+	s.busy[generated] = func() {}
+	s.mu.Unlock()
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/runs", nil))
+	var views []runView
+	if err := json.Unmarshal(rec.Body.Bytes(), &views); err != nil {
+		t.Fatalf("decode /runs: %v: %s", err, rec.Body)
+	}
+	got := map[string]runView{}
+	for _, v := range views {
+		got[v.RunID] = v
+	}
+	for _, want := range []struct {
+		id, status, reason       string
+		busy, started, resumable bool
+	}{
+		{fresh, "new", "", false, false, false},
+		{generated, "open", "", true, false, false},
+		{failed, "failed", "verify failed", false, false, false},
+		{ended, "ended", "", false, false, false},
+		{interrupted, "interrupted", "", false, true, true},
+		{closed, "open", "", false, true, false},
+	} {
+		v := got[want.id]
+		if v.Status != want.status || v.Reason != want.reason || v.Busy != want.busy ||
+			v.BallotsStarted != want.started || v.Resumable != want.resumable {
+			t.Errorf("%s: got status=%q reason=%q busy=%v started=%v resumable=%v, want %+v",
+				want.id, v.Status, v.Reason, v.Busy, v.BallotsStarted, v.Resumable, want)
+		}
+	}
+}
