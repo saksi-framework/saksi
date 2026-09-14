@@ -126,6 +126,12 @@ var routeAccess = map[string]access{
 	"/api/scenarios/": accessAdmin,
 	"/export/":        accessAdmin,
 	"/wizard":         accessAdmin,
+	// study campaigns: preflight, the ladder job, campaigns and their exports
+	"/api/preflight":  accessAdmin,
+	"/api/ladder":     accessAdmin,
+	"/api/jobs/":      accessAdmin,
+	"/api/campaigns":  accessAdmin,
+	"/api/campaigns/": accessAdmin,
 }
 
 // denial returns the HTTP status and reason when sess may not use a route that
@@ -333,7 +339,9 @@ func HashPassword(in io.Reader) (string, error) {
 // the session (if any) into the request context, then applies routeAccess.
 func (s *Server) authorize(mux *routeMux) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if s.auth == nil {
+		// An internal call (internal.go) is the console driving itself; it
+		// takes the auth-off path. Only this package can mark a request so.
+		if s.auth == nil || internalCall(r) {
 			mux.ServeHTTP(w, r)
 			return
 		}
