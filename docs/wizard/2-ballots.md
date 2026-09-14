@@ -53,20 +53,27 @@ Consequences worth stating to a panel:
 
 ## Where the randomness actually is
 
-The *selections* are deterministic. The **cryptography is not** — key material,
-ElGamal blinding factors, and proof nonces all come from `OsRng`. That is
-required for semantic security: encrypting the same vote twice must produce
-different ciphertexts, or the ciphertexts would leak the plaintext by comparison.
+The *selections* are deterministic. The **cryptography is not** — every
+trustee's DKG polynomial (and so the election's secret key), the credential
+issuer's key, ElGamal blinding factors, and proof nonces all come from `OsRng`.
+That is required twice over: encrypting the same vote twice must produce
+different ciphertexts, or the ciphertexts would leak the plaintext by comparison;
+and the election key must be unknown to anyone who reads this source, or anyone
+could decrypt a published ballot.
 
-So two runs with identical parameters produce **identical ground-truth tables and
-completely different ciphertexts**. Both facts are load-bearing, and they are not
-in tension: what must be reproducible is the population, and what must be
-unpredictable is the encryption of it.
+So two runs with identical parameters produce **identical ground-truth tables,
+different election keys, and completely different ciphertexts**. Both facts are
+load-bearing, and they are not in tension: what must be reproducible is the
+population, and what must be unpredictable is the encryption of it.
 
-One practical consequence: the bundle built in step 4 is a *separate* encryption
-of the same plaintext population as the stream written here. Same counts, different
-ciphertexts. This is why step 4 must never silently regenerate a bundle
-mid-ceremony — see [4-encrypt.md](4-encrypt.md).
+> **Runs generated before saksi #50 (merge `1812139`) used fixed DKG dealer
+> polynomials** (`dealer_id × 13 + k + 1`), so their election keys can be derived
+> from the source. Those runs still support correctness, verifiability and
+> performance results, but not ballot secrecy.
+
+The bundle step 4 uses is not a second encryption: it is read from the header
+written here, so the ceremony works on exactly these keys and ciphertexts — see
+[4-encrypt.md](4-encrypt.md).
 
 ## A stated limitation, now narrowed
 
