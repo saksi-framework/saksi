@@ -15,7 +15,7 @@ Study tag: ________  saksi commit (`git log -1 --oneline`): ____________  Date s
 ## Each session (§10.2, §10.3)
 
 - [ ] `wsl -d Ubuntu -e true` and `wsl -d Ubuntu -e docker info` answer within seconds
-- [ ] tmux `console`: `cd ~/Code/saksi && ./tools/up.sh`; `./tools/up.sh status` says on-chain ENABLED
+- [ ] tmux `console`: `cd ~/Code/saksi && SAKSI_PHASE_TIMEOUT=5h ./tools/up.sh`; `./tools/up.sh status` says on-chain ENABLED
 - [ ] Browser at `http://127.0.0.1:8090/wizard` (signed in, if an auth file is used)
 - [ ] Same saksi commit as the line above (no pull, no rebuild mid-study)
 - [ ] **Ladder** row green (once per build: **Run the validation ladder**) · `ladder.json` copied
@@ -45,10 +45,10 @@ unzip to balotachain `docs/desktop-runs/<date>-<tier>/`. Export before the next 
 | 8 | MP-3.5M offline ² | 0 + 1 | — | ☐ | ☐ | ☐ | ☐ | ☐ |
 | 9 | MP-3.5M on-chain ¹ | 0 + 1 | ☐ | ☐ | ☐ | ☐ | ☐ | ☐ |
 
-¹ Longer than the console's 60-minute phase timeout at the predicted rates (§10.7).
-² Offline: no network reset. <!-- W4b --> Disk and memory preflight rows must be green (§10.7). <!-- /W4b -->
+¹ Needs the console started with `SAKSI_PHASE_TIMEOUT=5h`; the **Phase timeout** preflight row must be green (§10.7).
+² Offline: no network reset. Disk and memory preflight rows must be green (§10.7).
 
-Row 5's rate sweep and the peak burst have no wizard field (§10.4).
+Row 5: set **Rate sweep**, **Sweep step window**, **Peak burst** and **Send rate** before **Start campaign →** (§10.4). ☐ Sweep ☐ Burst
 
 ## Security runs (§10.5) — after the tier's campaign, before its reset
 
@@ -72,9 +72,9 @@ Tier: ________  Stop after: ____  Down for: ____ s  Send rate: ____ (0 = closed 
 - [ ] **Generate ballots →** done; stop before **Check the data →**
 - [ ] **Arm the fault** (type `RESTART`); status reads "Armed on …"
 - [ ] **Check the data →**, **Encrypt →**; run ends "N of M ballots did not commit", list shows **interrupted**
-- [ ] **Resume** → "Done: now run Verify-only …" (press **Resume** again if offered)
+- [ ] **Resume** → "Done: now run Verify-only …, then Open the run …" (press **Resume** again if offered)
 - [ ] **Verify-only** → list shows "verify-only reconciled"
-- [ ] **To the trustees →**, **Submit share** ×3, **Publish tally**, **Verify →**: E = 0, ledger matches local
+- [ ] **Open** on the run (lands on the trustees), **Submit share** ×3, **Publish tally**, **Verify →**: E = 0, ledger matches local
 - [ ] Exported `run.json`, `perf.csv`, `correctness.csv`, `journal.ndjson`; copied
 - [ ] Peer up afterwards (`./tools/up.sh status`; `docker start peer0.org1.example.com` if not)
 

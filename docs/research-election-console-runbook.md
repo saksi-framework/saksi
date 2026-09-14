@@ -941,8 +941,13 @@ In a WSL terminal (Windows Terminal → Ubuntu, or `wsl -d Ubuntu`):
 tmux new -s console          # or, if it exists: tmux attach -t console
 cd ~/Code/saksi
 git log -1 --oneline         # the build this study is measured on: write it down
-./tools/up.sh
+SAKSI_PHASE_TIMEOUT=5h ./tools/up.sh
 ```
+
+`SAKSI_PHASE_TIMEOUT` is how long each phase (generate, ballot window, verify) may
+run. The default, 60 minutes, is too short for the capstones (§10.7); 5 hours fits the
+whole run table and costs nothing on the small tiers, so start the study with it and
+keep it for every tier.
 
 `up.sh` installs Fabric if needed, brings the network up, deploys the chaincode,
 builds both binaries and starts the console in the foreground, printing
@@ -971,7 +976,7 @@ cd ~/Code/saksi
 cat > ~/saksi-users.json <<'EOF'
 [{"username": "admin", "role": "admin", "password_bcrypt": "<the hash>"}]
 EOF
-SAKSI_AUTH_FILE=~/saksi-users.json ./tools/up.sh
+SAKSI_AUTH_FILE=~/saksi-users.json SAKSI_PHASE_TIMEOUT=5h ./tools/up.sh
 ```
 
 The wizard then shows **Sign in** with **Username** and **Password**; it needs an admin
@@ -991,7 +996,9 @@ button (its tooltip names the codes). Green is required; amber is explained belo
 | **Orderer batch** | amber "declared configtx not found" | The console cannot read the declared orderer file | The row must show `BatchTimeout 2s`, `MaxMessageCount 50`, `PreferredMaxBytes 2 MB` and `saksi_configtx saksi`. Start the console with `./tools/up.sh` from the saksi checkout, and never with `SAKSI_CONFIGTX=default` during the study |
 | **Ballots in flight** | `concurrency_low` (warn) | Fewer in flight than `MaxMessageCount`: every block waits the 2 s timeout, so the run measures the timeout | Set **Ballots in flight** to 128 (every thesis preset does) |
 | **Ladder** | `ladder_missing` (block above 1,000 voters); amber "not run" or "stale" | No validation ladder for this build | Press **Run the validation ladder** and wait for "Ladder passed on `<commit>` (4 runs)." Run it again after any rebuild |
-| **Disk** | `disk_short` (block) | The projected ledger (voters × positions × 12,000 bytes, times every run of a campaign) exceeds free space | Free space on the volume the row names, or run fewer repetitions. See the note below |
+| **Disk** | `disk_short` (block), `disk_tight` (warn) | The projected ledger (on-chain: voters × positions × 12,000 bytes) or run folder (offline) exceeds free space, counted over every run of a campaign including its sweep steps and burst; amber above 80 % | Free space on the volume the row names, or run fewer repetitions. See the note below |
+| **Memory** | `memory_short` (block), `memory_tight` (warn) | The auditor's projected peak (32 MiB + 150 bytes per ballot record) exceeds what WSL reports available; amber above 80 % | Close programs in WSL or raise `.wslconfig` `memory` |
+| **Phase timeout** | `phase_timeout_short` (block), `phase_timeout_tight` (warn) | The longest phase of this run is estimated above the console's phase timeout, or above 75 % of it | Restart the console with the timeout the message suggests (`SAKSI_PHASE_TIMEOUT=5h ./tools/up.sh`, §10.2) |
 | **Host** | `host_cpu`, `host_load` (warn) | Something outside the run holds more than 25 % of the CPU | Close it, wait a minute, **Check again**. **For the study this row is a gate**: do not start a measurement on amber |
 | **Verify threads** | `verify_threads` (warn), `verify_threads_invalid` (block) | The auditor would verify on one thread, or cannot start | Unset `SAKSI_AUDIT_THREADS` and `RAYON_NUM_THREADS` in the tmux shell, then restart the console |
 | **Busy runs** | `run_busy` (block) | A phase is running, or an election is paused at an attack stage | Finish it (decide the pause) or cancel it first |
@@ -1035,10 +1042,13 @@ saksi `ef663d1`); network resets add a few minutes each.
 Rows 2–4 were first measured from the command line on saksi `ef663d1`. Run them again
 here: `cost_model.py` refuses to fit runs from different saksi commits together, so
 every reported row must come from the study's one build. Row 8's hours rest on one
-serial-auditor run and carry no interval. Row 5's open-loop rate sweep and the peak
-burst are campaign options of `POST /api/campaigns` (§9, `sweep`, `window_s`,
-`burst`) with no field in the wizard: the wizard runs row 5's closed-loop repetitions
-only. Capstones (rows 6, 7, 9) and row 8 have extra steps in §10.7.
+serial-auditor run and carry no interval. Row 5 also runs the open-loop rate sweep and the
+peak burst: under the repetitions, set **Rate sweep** (the factor each step multiplies
+the offered rate by), **Sweep step window** (seconds per step) and **Peak burst**
+(voters). Both run after the measured repetitions. The line under the fields shows the
+rates the sweep will offer: its first step is **Send rate** under **Advanced**, so set
+that and the factor high enough that the top step is above the network's throughput,
+or the sweep never finds its plateau (`plateau_tps` in `summary.csv`). Capstones (rows 6, 7, 9) and row 8 have extra steps in §10.7.
 
 **Name the study once.** After picking a preset, append one short tag to **Election
 name** (for example `SP-1K w1`) and use the same tag for every tier. Run folders are
@@ -1079,15 +1089,16 @@ For each tier:
 6. **Export.** Press **Export bundle (.zip)** (or **export** beside the campaign in the
    **Campaigns** list). The browser saves `<campaign-id>.zip` to its download folder.
    It holds, per run, `run.json`, `perf.csv`, `perf-schema.md`, `correctness.csv`,
-   `negative-tests.csv`, `ground-truth-check.json`, `timings.json` and
-   `journal-line1.json`, plus `summary.csv`, `campaign.json` (every repetition with
-   its host samples), `preflight.json` and `MANIFEST.txt` (which files each run is
-   missing). For the thesis, unzip it into balotachain
+   `negative-tests.csv`, `ground-truth-check.json`, `timings.json`, `journal.ndjson`,
+   `gen-timings.json`, `receipts-lifecycle.csv` (`receipts.csv` without its ballot
+   rows) and `journal-line1.json`, plus `summary.csv`, `campaign.json` (every
+   repetition with its host samples), `preflight.json` and `MANIFEST.txt` (which files
+   each run is missing). For the thesis, unzip it into balotachain
    `docs/desktop-runs/<YYYY-MM-DD>-<tier>/`, copy `ladder.json` beside it once per
    build, and write the tier's note `docs/desktop-runs/<YYYY-MM-DD>-<tier>.md` as the
    earlier notes do. The full run folders (ballots, latencies, receipts, journals,
-   ledger dumps) stay in WSL under `~/.saksi/campaign/runs/`; the cost-model refit
-   reads them there, so do not delete them.
+   ledger dumps) stay in WSL under `~/.saksi/campaign/runs/`. The cost-model refit
+   (§10.9) still reads them there, so do not delete them.
 
 Then, on the same network, the tier's security run (§10.5) and T3 (§10.6) if this is a
 tier chosen for them, and only then the next tier's reset.
@@ -1169,9 +1180,9 @@ stay valid.
 
 T3 stops `peer0.org1.example.com` part-way through a ballot window and records what
 the chain kept and how the run recovers. The run is a security run: its throughput is
-not for RQ3. Run it on a tier's network after that tier's campaign. Keep the wizard
-tab open from step 1 to step 7: the wizard continues only the election it is walking
-(§10.7 has the details).
+not for RQ3. Run it on a tier's network after that tier's campaign. If the page is
+closed or reloaded part-way, **Open** on the run in the **Runs** list brings the
+election back at the step it stopped.
 
 1. **An eligible run.** Press **Single election**, pick the tier's preset, add the
    study tag, mode **on-chain**, and tick **Skip all attacks — run the election
@@ -1193,13 +1204,14 @@ tab open from step 1 to step 7: the wizard continues only the election it is wal
 5. **Resume.** Press **Resume** on that run. It submits only the ballots the chain does
    not hold (a ballot that landed despite its error is recorded as a replay, not a
    drop), then closes the election. When it ends the note reads "Done: now run
-   Verify-only (required after a fault), then the trustees, publish and Verify." If it
+   Verify-only (required after a fault), then Open the run to continue with the
+   trustees, publish and Verify." If it
    did not finish, the reason shows under the list and **Resume** is offered again
    (status **close-pending** when only the close is left): press it again.
 6. **Verify-only (required).** Press **Verify-only**. It submits nothing: it reconciles
    the chain's committed count against the run's committed set and walks the chain.
    The list then shows "verify-only reconciled".
-7. **Finish.** On the election, **To the trustees →** is now enabled: **Submit share**
+7. **Finish.** Press **Open** on the run: it lands on the trustee step. **Submit share**
    on at least three trustees, **Publish tally**, **Verify →**. The run must end with
    every contest `E = 0` and `ledger_matches_local` `true`.
 
@@ -1207,8 +1219,8 @@ Export `run.json`, `perf.csv`, `correctness.csv` and `journal.ndjson` from the *
 list. The T3 record is in the journal: `fault.start`, `fault.end`, `fault.peer_ready`,
 the window's `stage.ballots.interrupted {dropped}`, the resume's exact
 `segment.start {pending}` (what the chain held before anything was resubmitted), and
-`verify_only.reconcile`. §9's API flow runs verify-only before the resume; the wizard's
-order is the one above, and the handlers accept either.
+`verify_only.reconcile`. §9's API flow uses the same order; verify-only is also
+accepted before the resume, where it records the chain as the fault left it.
 
 **The closed-loop drop rule.** With **Send rate** 0 (the default) the workers drain the
 rest of the window as fast as refusals come back, and a refused connection comes back
@@ -1238,22 +1250,19 @@ cd ~/Code/saksi && ./tools/up.sh status
   does not hold and closes the election. A resumed run reports throughput per segment,
   is marked `sustained: false` and contributes no whole-run TPS: it is a correctness
   record, not an RQ3 row, so run the tier again for RQ3 if time allows.
-- **The wizard cannot reopen an existing election.** **To the trustees →** is enabled
-  after a resume only for the election the page is walking. A resumed campaign
-  repetition, or any run after the page was reloaded, has no wizard path to its
-  trustees, publish and verify; §9's *Operator flow for a T3 run* (steps 6–7) lists
-  the API calls.
-- **The console's per-phase timeout is 60 minutes** (`--timeout`), and `tools/up.sh`
-  starts it with that default. At the cost model's per-record rates (submit
-  1.243 ms, verify 0.828 ms) the SP-3.5M ballot window needs about 73 minutes, and
-  MP-3.5M on-chain needs about 3.7 hours of ballot window and 2.4 hours of verify. A
-  ballot window cut by the timeout is left **interrupted** and can be resumed; a cut
-  verify cannot. Until `up.sh` can start the console with a longer timeout, SP-3.5M
-  finishes only as a single election walked through a resume, which gives a
-  correctness record and no RQ3 row (as a campaign repetition it cannot be finished
-  from the wizard, see above), and row 9's verify does not finish at all.
+- **Finishing a resumed run.** A resumed campaign repetition, or any run after the page
+  was reloaded, is finished from the **Runs** list in Single election mode: **Open**
+  lands on the results if the run is verified, on the trustees if its election is
+  closed, and on the data check otherwise.
+- **The phase timeout.** Every phase runs under `--phase-timeout` (env
+  `SAKSI_PHASE_TIMEOUT`, default 60 minutes). At the cost model's per-record rates
+  (submit 1.243 ms, verify 0.828 ms) the SP-3.5M ballot window needs about 73 minutes,
+  and MP-3.5M on-chain needs about 3.7 hours of ballot window and 2.4 hours of verify,
+  so the study starts the console with `SAKSI_PHASE_TIMEOUT=5h` (§10.2). Preflight's
+  **Phase timeout** row shows the timeout and the run's longest estimated phase, and
+  blocks a run that would outlast it. A ballot window cut by the timeout anyway is left
+  **interrupted** and can be resumed; a cut verify cannot.
 
-<!-- W4b -->
 **Row 8, offline.** Row 8 runs from the wizard as a measurement campaign: press
 **Measurement campaign** and one of **MP-483K offline**, **MP-1M offline**,
 **MP-1.92M offline** or **MP-3.5M offline** (mode offline, 0 warm-ups + 1 measured),
@@ -1261,7 +1270,6 @@ add the study tag, and **Start campaign →**. An offline run makes no ledger ca
 network reset is needed before it. The preflight's disk and memory rows check the
 tier's generator and auditor footprint against this machine; a red row blocks Start,
 and the fix is the one the row states. Export and copy it as in §10.4 step 6.
-<!-- /W4b -->
 
 ### 10.8 What not to do during a run
 
@@ -1295,9 +1303,10 @@ is balotachain `docs/CLAIMS.md`):
 | RQ3: throughput and latency | each campaign's `summary.csv` and per-repetition `perf.csv` (`committed_tps`, `driver_ceiling_tps`, `latency_p99_ms`, `sustained`, `scaling_limit`); `campaign.json` host samples show no repetition was contended |
 | RQ3: cost model | the full run folders in WSL, through `cost_model.py` |
 
-**Refitting the cost model.** `cost_model.py` needs each run's full `journal.ndjson`,
-`gen-timings.json` and `receipts.csv`, which the export bundle does not carry, so it
-reads the run store in WSL. From a balotachain checkout inside WSL, with the study
+**Refitting the cost model.** `cost_model.py` needs each run's `journal.ndjson`,
+`gen-timings.json` and lifecycle receipts. The export bundle carries all three (the
+receipts as `receipts-lifecycle.csv`), but `cost_model.py` still reads the run-folder
+layout, so refit from the run store in WSL. From a balotachain checkout inside WSL, with the study
 tag of §10.4:
 
 ```bash
