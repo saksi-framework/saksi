@@ -138,6 +138,7 @@ func NewServer(store *RunStore, exec *Executor, hub *Hub, fabric FabricConfig, a
 	// A fault never fires while anything else uses the network: stopping the
 	// peer under it would wreck those runs.
 	exec.faultGate = s.faultGate
+	exec.phaseTimeout = timeout
 	for _, h := range allowHosts {
 		s.allowHosts[h] = true
 	}

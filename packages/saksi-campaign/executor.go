@@ -98,6 +98,8 @@ type Executor struct {
 
 	// faultGate, when set, refuses to fire runID's armed fault (fault.go).
 	faultGate func(runID string) error
+	// phaseTimeout is the server's per-phase timeout, recorded in journal line 1.
+	phaseTimeout time.Duration
 	// peersDown counts faults between their docker stop and start (RestorePeer).
 	peersDown atomic.Int32
 	// stopMu is held across a fault's docker stop, so RestorePeer never starts
@@ -154,6 +156,9 @@ func (e *Executor) Generate(ctx context.Context, runID string, c ElectionConfig)
 	// The journal is created here, at the run's first stage, and reopened for
 	// appending by every later stage (journalFor).
 	env := CollectEnv(e.demoBin)
+	if e.phaseTimeout > 0 {
+		env["phase_timeout_s"] = e.phaseTimeout.Seconds()
+	}
 	j, jerr := OpenJournal(dir, env)
 	if jerr != nil {
 		e.publish(runID, "generate", "info", "run journal unavailable: "+jerr.Error())

@@ -2,7 +2,7 @@
 // app to configure + run the paper's elections in phases.
 //
 //	saksi-campaign serve [--addr host:port] [--runs dir] [--demo path]
-//	                     [--console path] [--allow-host host[:port]]... [--timeout d]
+//	                     [--console path] [--allow-host host[:port]]... [--phase-timeout d]
 //	                     [--web-dir dir] [--auth-file users.json]
 //	                     [--fabric-peer host:port] [--fabric-gateway-peer name]
 //	                     [--fabric-tls-cert path] [--fabric-msp-id id]
@@ -139,7 +139,17 @@ func serve(args []string) {
 		"directory holding the browser apps to serve: <dir>/board, <dir>/trustee and <dir>/admin (env SAKSI_WEB_DIR)")
 	authFile := fs.String("auth-file", os.Getenv("SAKSI_AUTH_FILE"),
 		"users file (JSON) that turns on login and per-route roles; unset = no auth (env SAKSI_AUTH_FILE)")
-	timeout := fs.Duration("timeout", 60*time.Minute, "per-phase timeout")
+	defTimeout := 60 * time.Minute
+	if v := os.Getenv("SAKSI_PHASE_TIMEOUT"); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil || d <= 0 {
+			fatal("SAKSI_PHASE_TIMEOUT=%q: want a positive duration such as 90m or 4h", v)
+		}
+		defTimeout = d
+	}
+	timeout := fs.Duration("phase-timeout", defTimeout,
+		"how long each phase (generate, ballot submission, verify; /run-all: all three together) may run before it is cancelled (env SAKSI_PHASE_TIMEOUT)")
+	fs.DurationVar(timeout, "timeout", defTimeout, "alias of --phase-timeout")
 	fabricPeer := fs.String("fabric-peer", "localhost:7051", "Fabric gateway peer endpoint (host:port)")
 	fabricGatewayPeer := fs.String("fabric-gateway-peer", "peer0.org1.example.com", "Fabric gateway peer TLS server name")
 	fabricTLSCert := fs.String("fabric-tls-cert", "", "path to the peer TLS CA certificate")
@@ -152,6 +162,9 @@ func serve(args []string) {
 	var allow multiFlag
 	fs.Var(&allow, "allow-host", "additional accepted Host header (repeatable; for LAN)")
 	_ = fs.Parse(args)
+	if *timeout <= 0 {
+		fatal("--phase-timeout must be positive (got %s)", *timeout)
+	}
 
 	fabric := campaign.FabricConfig{
 		PeerEndpoint: *fabricPeer,
@@ -193,6 +206,7 @@ func serve(args []string) {
 	fmt.Printf("Research Election Console\n")
 	fmt.Printf("  serving   http://%s\n", displayHost(*addr))
 	fmt.Printf("  runs      %s\n", *runsDir)
+	fmt.Printf("  phase timeout %s\n", *timeout)
 	fmt.Printf("  saksi-demo %s\n", *demoBin)
 	if *webDir != "" {
 		fmt.Printf("  apps      %s -> http://%s/board/, /trustee/ and /admin/\n", *webDir, displayHost(*addr))
