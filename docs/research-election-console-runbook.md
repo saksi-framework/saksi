@@ -647,6 +647,11 @@ console's verify-only endpoint, which reconciles the chain's committed ballot
 count against the committed set, runs the append-only chain walk
 (`VerifyChain`), and stamps `interrupted_at` in the journal.
 
+The script stops the peer whenever it is run. To stop it at a chosen point of
+the ballot window, with the stop, restart and recovery stamped in the run's
+journal, arm a `peer-restart` fault from the console instead (see
+*Infrastructure API* below).
+
 ### Resuming an interrupted run — `POST /api/runs/{id}/resume`
 
 ```bash
@@ -656,7 +661,8 @@ curl -X POST http://127.0.0.1:8090/api/runs/<run-id>/resume
 Refused with **409** unless the run is `onchain` and its journal's last
 checkpoint is a `ballots.progress` or a `stage.ballots.start` with no matching
 `stage.ballots.end` — the decision is made from the journal alone, no network
-needed.
+needed. It is also refused before anything starts with **400** when the console
+has no Fabric network, and **409** when the run has no readable `bundle.json`.
 
 The committed set is the chain's `ListNullifiers` intersected with the bundle's
 nullifiers, by ballot index; `receipts.csv` is a cross-check, and a receipt
@@ -671,6 +677,45 @@ was in flight when the run died — the row is written `ok=replay` in
 `negative-tests.csv`. A resumed run reports throughput **per segment**, is
 marked `sustained: false` in `run.end`, contributes no whole-run TPS figure, and
 classifies as `scaling_limit: inconclusive`.
+
+When every pending ballot has landed, the resume also commits `CloseElection`
+and opens the ceremony, exactly as `/ceremony/start` would have: the trustees
+then submit (`/ceremony/submit`), the tally is published
+(`/ceremony/publish`), and `/verify` audits the run and the chain's copy of it.
+Without the close, a resumed election stayed open with no route able to close
+it. The close is careful and retryable:
+
+- A resume that was stopped (cancelled, or timed out) before every pending
+  ballot was sent does **not** close: it fails with "the election stays open",
+  its window is stamped interrupted, and the next resume sends the rest.
+- A resume in which ballots still did not land ("N of M resubmitted ballots
+  did not commit") does not close either: its window is stamped
+  `stage.ballots.interrupted` with its `dropped` count, so the next resume
+  retries those ballots and then closes.
+- A resume that landed every ballot but whose `CloseElection` failed fails with
+  "resume again to retry the close". The next resume is planned close-only
+  (`202 {"close_only": true}`): it submits nothing, only commits the close.
+  Close-only is offered when the last window was a resume that ended with no
+  drops, and there is neither a `CloseElection` receipt nor a `ceremony.json`.
+- A close the chain already holds (the chaincode answers "is already closed")
+  counts as done; only the chaincode's exact words for this election
+  (`election "<id>" is already closed`) are taken as that. Each attempt is
+  stamped `resume.close {ok, close_only, already_closed}`.
+
+The `202` body's `remaining` estimates the pending ballots from the interrupted
+window's own record: its ballots minus those it committed, or minus its last
+dispatch checkpoint after a hard kill. Ballots that landed despite an error
+make the first an overcount; after a hard kill, ballots that were in flight
+make the second an undercount. The exact count is `segment.start {pending}`.
+
+One loss is accepted: an attack run cancelled while paused at its ballots
+stage closes on resume without its ballots-stage attacks ever mounted; re-run
+the security run if those verdicts are needed. (A fault run carries no attack
+plan, so this never applies to T3.) Likewise, for an attack run whose plan
+lists the close stage, the close-stage pause runs inside the resume that
+commits the close; if that close is a retry the chain answers "already
+closed", the pause does not run and the close-stage attacks have no rows in
+`negative-tests.csv`.
 
 ### Study API — preflight, ladder job, campaigns, export
 
@@ -717,6 +762,105 @@ another runs answers `409` naming the running job. A campaign lives in
 `<runs>/campaigns/<id>/` as `campaign.json` (config, options, preflight, status,
 rows), `summary.csv` and `log.txt`. If the console stops mid-campaign, the next
 read settles its rows from their run folders and marks it `interrupted`.
+
+### Infrastructure API — network reset and peer-restart fault
+
+Two routes act on the Fabric network itself. Both are destructive by design, so
+both carry the same guards: **admin-only** in the role table, **loopback-only**
+(the request must come from the console machine, even from a signed-in admin
+and even with auth off), a **typed confirmation**, and a refusal while anything
+else is using the network. Neither is reachable from a campaign or ladder job
+(`403`). Refusals answer `{"error": ...}`. Their bodies are read strictly: each
+field name must be spelled exactly (lower case) and given once, so a body such
+as `{"confirm": "nope", "CONFIRM": "RESET"}` is `400`, not a confirmation.
+
+| Route | Guards and behaviour |
+| --- | --- |
+| `POST /api/network/reset` `{voters, positions, confirm: "RESET"}` | `403` off loopback; `400` unless `confirm` is exactly `RESET`, `voters` and `positions` are ≥ 1 and no other field is present; `400` without Fabric; `501` on a host that cannot run the script (Windows, no `bash` on `PATH`, no `tools/tier.sh` under the console binary's git checkout); `409` while a run phase is running or paused at an attack stage (`busy` names them) or while any job (campaign, ladder, another reset) runs. Otherwise `202 {"job": id}`: runs `bash tools/tier.sh <voters> <positions>` from the repo root as a job (`GET /api/jobs/<id>`, kind `network-reset`), every stdout/stderr line in the job log (a line over 1 MiB is cut, and the output after it kept), killed with its whole process group after 15 minutes. After a clean exit the console connects with its own `--fabric-*` settings and reads the channel height, retrying for up to a minute. The result carries `exit_code`, `timed_out`, `duration_ms`, and `chain_height` or `chain_error`; a non-zero exit, a timeout, or a console that cannot read the new network (its certificate paths point into a different fabric-samples than the one `tier.sh` used) fails the job. Every reset, with its full output and exit code, is appended to `<runs>/network-resets.log`. Run folders are never touched, but every election on the old network is gone from the chain: export first |
+| `POST /api/runs/<id>/fault` `{kind: "peer-restart", at, down_s, confirm: "RESTART"}` | `403` off loopback; `400` unless `confirm` is exactly `RESTART`, `kind` is `peer-restart`, `0 < at < 1`, `5 ≤ down_s ≤ 120`, and `at` × the run's ballots leaves at least one ballot on each side; `409` unless the run is on-chain, not a campaign repetition, has no `attack_plan` and no time-bounded window (`window_s`); `400` without Fabric; `409` while a phase runs on it or on any other run, while any job runs, before it is generated, or once its ballot window has started. Otherwise `200 {at_index, ballots, container, ...}`: `fault_plan` is written into the run's `run.json` and `fault.armed` into its journal |
+
+While a reset runs, every run phase (`/generate`, `/ceremony/start`, …), the
+ladder and campaigns answer `409`. The ladder and campaigns also refuse while
+any run phase is running; for a campaign that check is repeated at the moment
+it claims the job slot, so a run started during its preflight is caught too.
+
+A reset runs `tier.sh` in its own process group. Stopping the console (Ctrl-C)
+does not stop it: the script runs to completion on its own. A console started
+again meanwhile no longer knows the reset is running and does not refuse phases
+because of it, so wait for `tools/up.sh status` to report the network up (or
+for the `end:` line in `<runs>/network-resets.log`) before starting anything.
+
+**Arming rule.** A fault is armed on a generated, idle run, before
+`/ceremony/start` (or `/submit`) opens its ballot window; it cannot be armed on
+a window already running, and a posted config (`/generate`, `/run-all`,
+campaigns) carrying `fault_plan` is refused, because those routes do not have
+the loopback and confirmation guards. A run with a fault is a security run:
+`security_run` is `true` in `run.end` and `perf.csv`, and its throughput is not
+for RQ3.
+
+**What the fault does.** When the window hands out ballot `at_index`
+(= `at` × ballots), that worker stops `peer0.org1.example.com` — the only
+container a fault ever touches — before sending it; every other worker keeps
+dispatching. Ballots sent while the peer is down fail and are recorded as
+drops. After `down_s` the peer is started again (also if the phase is
+cancelled meanwhile), and the window waits, up to 3 minutes, until the peer
+answers a ledger query on a fresh connection. Journal events:
+
+| Event | Fields |
+| --- | --- |
+| `fault.window` | the window opened with the fault armed: `at_index`, `down_s` |
+| `fault.start` | the peer was stopped: `at_index`, `ballots_committed`, `block_height` (read just before the stop), `stop_ms`, `ok` |
+| `fault.end` | the peer was started: `down_ms`, `ballots_committed`, `ok` |
+| `fault.peer_ready` | the peer answered: `wait_ms` (on a fresh connection), `window_conn_ready` (the window's own connection answered too, before the 3-minute deadline), `block_height`, `ballots_committed`; `ok` only when both answered |
+| `fault.not_fired` | the window ended before `at_index` was dispatched |
+| `fault.refused` | a job (campaign, ladder, reset) or a phase on another run was using the network when the fault would have fired: the peer was not stopped |
+| `fault.panic` | the restart panicked; the peer was started again (`start_error` if that failed too) |
+
+A window that lost ballots to the fault is stamped
+`stage.ballots.interrupted` (with `fault: "peer-restart"` and its `dropped`
+count), the ceremony stops before `CloseElection`, and the run ends failed.
+
+**What the drop count measures.** With closed-loop dispatch (`send_rate` 0,
+the default) the workers drain the rest of the window as fast as the refusals
+come back, and a refused connection comes back at once: every ballot after
+`at_index` fails within about a second of the stop, whatever `down_s` is. The
+drops are therefore "the rest of the window", not "ballots lost over `down_s`
+seconds". If the question is how many ballots an outage of a given length
+loses, set `send_rate` so the window's remaining ballots are spread across the
+outage.
+
+While a fault has the peer stopped or recovering (from the stop until
+`fault.peer_ready`), no run phase starts on any other run: `/generate`,
+`/ceremony/start`, resume and the rest answer `409` naming the fault's run.
+
+**If the console stops during a fault**, the peer could be left stopped. Ctrl-C
+and SIGTERM start it again before the console exits ("started
+peer0.org1.example.com again" on stderr); if the `docker stop` is still
+running, the start waits for it (up to a minute), and a second Ctrl-C exits at
+once without restoring. A panic in the restart starts the peer too. A console killed any other way (SIGKILL, a crash, closing WSL) cannot:
+run `docker start peer0.org1.example.com` and confirm with
+`tools/up.sh status`.
+
+**Operator flow for a T3 run.**
+
+1. `POST /generate` with an on-chain config (no `attack_plan`), then
+   `GET /api/check/<id>`.
+2. `POST /api/runs/<id>/fault` with `confirm: "RESTART"`, from the console
+   machine.
+3. `POST /ceremony/start`. Poll `GET /api/runs/<id>/status` until `busy` is
+   false: the phase fails with "N of M ballots did not commit" once the peer is
+   back and answering.
+4. `POST /api/runs/<id>/verify-only` (required): records what the chain kept
+   before anything is resubmitted — the reconcile of the chain's count against
+   the committed set, and the chain walk. After the resume that state is gone.
+5. `POST /api/runs/<id>/resume`: submits only what the chain does not hold,
+   classifying ballots that landed despite an error as replays, then closes the
+   election. If it fails after the ballots landed, resume again: the retry
+   only closes.
+6. `POST /ceremony/submit` for at least the threshold of trustees, then
+   `POST /ceremony/publish`.
+7. `POST /verify`: `correctness.csv` and `run.end` must show every contest's
+   `E = 0` and `ledger_matches_local` `true`.
 
 ## 10. Troubleshooting
 

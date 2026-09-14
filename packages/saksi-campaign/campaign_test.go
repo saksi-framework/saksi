@@ -1263,8 +1263,8 @@ func TestCampaignDropsAttackPlan(t *testing.T) {
 func TestPreflightBlocksWhileARunIsBusy(t *testing.T) {
 	fakeHostProbes(t, "", nil)
 	s, _ := gateServer(t, FabricConfig{}, "abc", 1<<62)
-	if !s.tryStart("security-run-1", func() {}) {
-		t.Fatal("tryStart")
+	if why := s.claim("security-run-1", func() {}); why != "" {
+		t.Fatal(why)
 	}
 	s.exec.setPause("security-run-1", &stagePause{view: PauseView{Paused: true, Stage: StageBallots}})
 
@@ -1284,4 +1284,34 @@ func TestPreflightBlocksWhileARunIsBusy(t *testing.T) {
 	if rep := s.preflight(PreflightInput{Mode: "offline"}); rep.Blocked() {
 		t.Fatalf("no run busy: %+v", rep.Warnings)
 	}
+}
+
+// Preflight runs seconds before the job slot is claimed. A run that starts in
+// between must still refuse the campaign: the busy check is repeated together
+// with the claim.
+func TestCampaignRefusesARunThatStartedDuringPreflight(t *testing.T) {
+	fakeHostProbes(t, "", nil)
+	s, _ := gateServer(t, FabricConfig{}, "abc", 1<<62)
+	entered, release := make(chan struct{}), make(chan struct{})
+	var once sync.Once
+	s.freeSpace = func(string) (uint64, error) {
+		once.Do(func() { close(entered); <-release })
+		return 1 << 62, nil
+	}
+	done := make(chan *httptest.ResponseRecorder)
+	go func() {
+		rec, _ := startCampaign(t, s, map[string]any{"config": good(), "reps": 1}, "")
+		done <- rec
+	}()
+	<-entered
+	if why := s.claim("fault-run", func() {}); why != "" {
+		t.Fatal(why)
+	}
+	close(release)
+	rec := <-done
+	if rec.Code != http.StatusConflict || !strings.Contains(rec.Body.String(), "fault-run") {
+		t.Fatalf("a run started during preflight: want 409 naming it, got %d %s", rec.Code, rec.Body)
+	}
+	noCampaignStarted(t, s)
+	s.finish("fault-run")
 }

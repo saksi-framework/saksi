@@ -3,13 +3,11 @@ package campaign
 import (
 	"context"
 	"fmt"
-	"maps"
 	"net"
 	"net/http"
 	"os"
 	"path/filepath"
 	"runtime"
-	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -278,19 +276,12 @@ func (s *Server) preflight(in PreflightInput) PreflightReport {
 	// A phase holds its run's lock for as long as it runs, including while its
 	// lifecycle is paused at an attack stage, so the busy map sees both.
 	s.mu.Lock()
-	busy := slices.Sorted(maps.Keys(s.busy))
+	busy := s.busyRunsLocked("")
 	s.mu.Unlock()
 	if len(busy) > 0 {
-		names := make([]string, len(busy))
-		for i, id := range busy {
-			names[i] = id
-			if pv := s.exec.PauseStatus(id); pv.Paused {
-				names[i] += " (paused at the " + pv.Stage + " attack stage)"
-			}
-		}
 		rep.add(severityBlock, "run_busy",
 			"a phase is running on %s: a campaign would share the network and the machine with it; let it finish or cancel it first",
-			strings.Join(names, ", "))
+			strings.Join(busy, ", "))
 	}
 
 	head, headOK := s.gitHead()

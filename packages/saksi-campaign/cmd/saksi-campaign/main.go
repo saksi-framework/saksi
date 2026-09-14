@@ -31,8 +31,10 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
 	campaign "github.com/saksi-framework/saksi/packages/saksi-campaign"
@@ -205,10 +207,31 @@ func serve(args []string) {
 	} else if *consBin == "" {
 		fmt.Printf("  on-chain  (no driver configured — offline mode only)\n")
 	}
+	go restorePeerOnSignal(exec)
 	if err := http.ListenAndServe(*addr, handler); err != nil {
 		fmt.Fprintf(os.Stderr, "server error: %v\n", err)
 		os.Exit(1)
 	}
+}
+
+// restorePeerOnSignal makes Ctrl-C and SIGTERM start the Fabric peer again when
+// a peer-restart fault has it stopped, instead of leaving it down. A network
+// reset in progress is not touched: tools/tier.sh runs in its own process group
+// and finishes on its own.
+func restorePeerOnSignal(exec *campaign.Executor) {
+	sigs := make(chan os.Signal, 1)
+	signal.Notify(sigs, os.Interrupt, syscall.SIGTERM)
+	sig := <-sigs
+	signal.Stop(sigs) // a second Ctrl-C kills at once, even while the restore waits
+	if restored, err := exec.RestorePeer(); restored {
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "stopping mid-fault: docker start peer0.org1.example.com failed: %v; start it by hand\n", err)
+		} else {
+			fmt.Fprintln(os.Stderr, "stopping mid-fault: started peer0.org1.example.com again")
+		}
+	}
+	fmt.Fprintf(os.Stderr, "console stopped (%v)\n", sig)
+	os.Exit(1)
 }
 
 func defaultRunsDir() string {

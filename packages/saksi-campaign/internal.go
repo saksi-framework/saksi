@@ -43,8 +43,9 @@ func internalCall(r *http.Request) bool {
 // uses. TestInternalRoutesCoverTheDriver fails when the driver gains a call
 // that is not here, or this names one the driver no longer makes.
 //
-// GET on /api/runs/ reaches only the status action: resume and verify-only
-// refuse every method but POST.
+// GET on /api/runs/ reaches only the read-only actions (status, pause): resume,
+// verify-only and fault refuse every method but POST. /api/network/reset is not
+// here at all: the console never resets its own network from a job.
 var internalRoutes = map[string]string{
 	"/generate":         http.MethodPost,
 	"/api/check/":       http.MethodGet,

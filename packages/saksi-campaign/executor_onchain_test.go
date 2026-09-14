@@ -24,11 +24,13 @@ import (
 // fakeLedger is the in-memory stand-in for a Fabric ledger. The ballot window
 // submits concurrently, so every field is guarded by mu.
 type fakeLedger struct {
-	mu      sync.Mutex
-	calls   []string // fn name, in call order
-	failOn  string   // fn name to fail on ("" = never)
-	nextTx  uint64
-	nextBlk uint64
+	mu     sync.Mutex
+	calls  []string // fn name, in call order
+	failOn string   // fn name to fail on ("" = never)
+	// failText replaces the generic "boom" a failOn call fails with.
+	failText string
+	nextTx   uint64
+	nextBlk  uint64
 	// blockSize batches transactions into blocks the way a real orderer does:
 	// blockSize submissions share one block number. 0 = one block per
 	// transaction (the original behaviour).
@@ -80,6 +82,10 @@ type fakeLedger struct {
 	noBatchAfter int
 	// getBallotsBatches records the size of each GetBallots page asked for.
 	getBallotsBatches []int
+
+	// peerDown models a stopped peer: every SubmitBallot and ChainInfo fails,
+	// and nothing is committed, until it is cleared.
+	peerDown bool
 
 	ballots     int             // SubmitBallot attempts, accepted or not
 	accepted    []string        // accepted nullifiers, in accept order
@@ -161,6 +167,9 @@ func (f *fakeLedger) ballotGate(args []string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.ballots++
+	if f.peerDown {
+		return errors.New("rpc error: code = Unavailable desc = connection refused")
+	}
 	if f.FailAt > 0 && f.ballots >= f.FailAt {
 		if f.cancel != nil {
 			f.cancel()
@@ -361,6 +370,9 @@ func (f *fakeLedger) SubmitWithReceipt(fn string, args ...string) ([]byte, clien
 	}
 	txID, blk, ok := f.commit(fn)
 	if !ok {
+		if f.failText != "" {
+			return nil, clientsdk.Receipt{}, errors.New(f.failText)
+		}
 		return nil, clientsdk.Receipt{}, errors.New("boom")
 	}
 	// The real SubmitWithReceipt follows the commit with a qscc lookup.
@@ -423,6 +435,9 @@ func (f *fakeLedger) VerifyChain(from, to uint64, sample []clientsdk.Receipt) (c
 func (f *fakeLedger) ChainInfo() (uint64, []byte, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.peerDown {
+		return 0, nil, errors.New("rpc error: code = Unavailable desc = connection refused")
+	}
 	return f.nextBlk + 1, nil, nil
 }
 

@@ -132,6 +132,10 @@ var routeAccess = map[string]access{
 	"/api/jobs/":      accessAdmin,
 	"/api/campaigns":  accessAdmin,
 	"/api/campaigns/": accessAdmin,
+	// infrastructure: destroys the ledger. The handler also requires loopback
+	// and a typed confirmation. (The peer-restart fault is the "fault" action
+	// under /api/runs/, admin above, with the same two handler guards.)
+	"/api/network/reset": accessAdmin,
 }
 
 // denial returns the HTTP status and reason when sess may not use a route that

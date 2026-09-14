@@ -198,9 +198,10 @@ func (s *Server) handleLadder(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "POST required", http.StatusMethodNotAllowed)
 		return
 	}
-	j, running := s.jobs.start("ladder")
-	if running != nil {
-		busyResponse(w, running)
+	// The ladder runs elections on this host too: not beside a running phase
+	// (a fault run's included), and not during a reset (the slot).
+	j := s.startExclusiveJob(w, "ladder")
+	if j == nil {
 		return
 	}
 	client, base := s.internalClient(j)
