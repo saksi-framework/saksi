@@ -299,7 +299,7 @@ func TestMountContextRoundTripsThroughTheAccumulatedState(t *testing.T) {
 // RunScenarios does at the end of a single-scenario call.
 func exportOnce(t *testing.T, dir string, res ScenarioResult) {
 	t.Helper()
-	merged, err := mergeScenarioResults(dir, []ScenarioResult{res})
+	merged, _, err := mergeScenarioResults(dir, []ScenarioResult{res})
 	if err != nil {
 		t.Fatalf("merge %s: %v", res.Scenario, err)
 	}

@@ -686,3 +686,67 @@ func TestPauseAPI(t *testing.T) {
 		t.Errorf("decision delivered = %+v", d)
 	}
 }
+
+// A step-7 "Run again" (the unstaged catalogue) must not erase a verdict
+// mounted at a pause: negative-tests.csv is the only artifact carrying the live
+// gate evidence. The re-run is journalled instead, and an unstaged result still
+// replaces an unstaged one, and a staged one still replaces a staged one.
+func TestUnstagedRerunNeverReplacesAStagedVerdict(t *testing.T) {
+	store := NewRunStore(t.TempDir())
+	c := good()
+	runID, dir, err := store.Create(c, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	attackRun(t, dir, 3)
+	e := NewExecutor(store, NewHub(), "saksi-demo", "", FabricConfig{})
+	e.run = fakeAuditor(declaredAuditGate)
+
+	committed, height := 5, uint64(9)
+	live := ScenarioResult{Scenario: "tamper-ballot-proof", Stage: StageBallots, Verdict: "PASS", OnChain: true,
+		Actual:       "rejected by chaincode gate cds (the declared gate): proof failed",
+		Mount:        MountContext{Stage: StageBallots, ElectionStatus: "open", BallotsCommitted: &committed, BlockHeight: &height},
+		GateExpected: "cds", GateObserved: "cds"}
+	if err := e.saveScenarioResult(runID, dir, live); err != nil {
+		t.Fatal(err)
+	}
+
+	// The wizard's step 7 posts /scenarios, which runs the catalogue unstaged.
+	if err := e.RunScenarios(context.Background(), runID, []string{"tamper-ballot-proof", "dropped-ballot"}); err != nil {
+		t.Fatal(err)
+	}
+	got := resultsByID(t, dir)
+	if r := got["tamper-ballot-proof"]; !r.OnChain || r.Mount.Stage != StageBallots || r.GateObserved != "cds" {
+		t.Fatalf("the unstaged re-run replaced the live verdict: %+v", r)
+	}
+	if r := got["dropped-ballot"]; r.Mount.Stage != StageUnstaged || r.Verdict != "PASS" {
+		t.Errorf("a scenario with no staged verdict must still take the unstaged one: %+v", r)
+	}
+	rows := readCSVRows(t, dir)
+	liveCol, stage := csvCol(t, rows[0], "live"), csvCol(t, rows[0], "mounted_stage")
+	if rows[1][0] != "tamper-ballot-proof" || rows[1][liveCol] != "true" || rows[1][stage] != StageBallots {
+		t.Errorf("negative-tests.csv lost the live row: %v", rows[1])
+	}
+	reruns := journalEventsOfType(t, dir, "attack.rerun.unstaged")
+	if len(reruns) != 1 || jstring(reruns[0], "scenario") != "tamper-ballot-proof" ||
+		jstring(reruns[0], "verdict") != "PASS" || jstring(reruns[0], "kept_mounted_stage") != StageBallots {
+		t.Fatalf("journal = %v, want one attack.rerun.unstaged for tamper-ballot-proof keeping %s", reruns, StageBallots)
+	}
+
+	// Unstaged over unstaged still updates in place ...
+	if err := e.RunScenarios(context.Background(), runID, []string{"dropped-ballot"}); err != nil {
+		t.Fatal(err)
+	}
+	if n := len(journalEventsOfType(t, dir, "attack.rerun.unstaged")); n != 1 {
+		t.Errorf("an unstaged re-run over an unstaged verdict was held back (%d journal events)", n)
+	}
+	// ... and a verdict from a later pause replaces the earlier staged one.
+	again := live
+	again.Mount.Stage, again.Verdict, again.GateObserved = StageBallots, "INCONCLUSIVE", "election-open"
+	if err := e.saveScenarioResult(runID, dir, again); err != nil {
+		t.Fatal(err)
+	}
+	if r := resultsByID(t, dir)["tamper-ballot-proof"]; r.Verdict != "INCONCLUSIVE" {
+		t.Errorf("a staged verdict did not replace a staged verdict: %+v", r)
+	}
+}

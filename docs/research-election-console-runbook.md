@@ -502,6 +502,12 @@ always simulated and their `actual` says so on a live election.
 `dropped-ballot` is not expressible as one submission; `reordered-ballots`
 stays `SKIPPED`.
 
+One row per scenario. A verdict mounted at a pause is never replaced by an
+`unstaged` one: re-running an attack from step 7 after a security run leaves the
+staged (often live) row in place, and the re-run is recorded in the journal as
+`attack.rerun.unstaged {scenario, verdict, actual, live, gate_expected,
+gate_observed, kept_mounted_stage}`.
+
 `latencies.csv` is `index,segment,ms,ok` with `ok ∈ {commit, drop, replay}`.
 `replay` appears only on resumed runs (see §9) and marks a ballot the chain had
 already committed — a resume artifact, never an attack, and never counted in the

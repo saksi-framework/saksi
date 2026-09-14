@@ -295,10 +295,11 @@ func (e *Executor) RunScenarios(ctx context.Context, runID string, list []string
 
 	// Merge into the accumulated set before exporting: a caller running a
 	// single scenario must not erase the verdicts of the other six.
-	merged, err := mergeScenarioResults(srcDir, results)
+	merged, held, err := mergeScenarioResults(srcDir, results)
 	if err != nil {
 		return err
 	}
+	e.journalHeldBack(runID, merged, held)
 	if err := writeNegativeTestsCSV(filepath.Join(srcDir, NegativeTestsFile), merged); err != nil {
 		return err
 	}
@@ -705,10 +706,18 @@ func readScenarioResults(dir string) ([]ScenarioResult, error) {
 // mergeScenarioResults upserts fresh results into the accumulated set and
 // persists it, returning the whole set ordered by Registry() so the CSV export
 // has a stable row order no matter what sequence produced the verdicts.
-func mergeScenarioResults(dir string, fresh []ScenarioResult) ([]ScenarioResult, error) {
+//
+// One exception to "fresh replaces prior": a result mounted outside any pause
+// (unstaged — the step-7 catalogue, or /attack on its own) never replaces one
+// mounted at a lifecycle pause. The staged row is the evidence of what the
+// gate did to the attack at the moment it belongs to, often a live submission,
+// and negative-tests.csv is the only artifact that carries it; a later
+// simulated re-run must not erase it. Such results are returned in held for
+// the caller to journal instead.
+func mergeScenarioResults(dir string, fresh []ScenarioResult) (merged, held []ScenarioResult, err error) {
 	prior, err := readScenarioResults(dir)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	byID := make(map[string]ScenarioResult, len(prior)+len(fresh))
 	for _, r := range prior {
@@ -717,10 +726,13 @@ func mergeScenarioResults(dir string, fresh []ScenarioResult) ([]ScenarioResult,
 	// Fresh results replace prior ones: re-running a scenario updates its row
 	// rather than appending a second one for the same id.
 	for _, r := range fresh {
+		if p, ok := byID[r.Scenario]; ok && p.staged() && !r.staged() {
+			held = append(held, r)
+			continue
+		}
 		byID[r.Scenario] = r
 	}
 
-	var merged []ScenarioResult
 	for _, sc := range Registry() {
 		if r, ok := byID[sc.ID]; ok {
 			merged = append(merged, r)
@@ -729,12 +741,42 @@ func mergeScenarioResults(dir string, fresh []ScenarioResult) ([]ScenarioResult,
 
 	data, err := json.MarshalIndent(merged, "", "  ")
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if err := os.WriteFile(filepath.Join(dir, ScenarioStateFile), data, 0o644); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	return merged, nil
+	return merged, held, nil
+}
+
+// staged reports a verdict mounted at a lifecycle pause of the attack timeline.
+func (r ScenarioResult) staged() bool {
+	return r.Mount.Stage != "" && r.Mount.Stage != StageUnstaged
+}
+
+// journalHeldBack records each unstaged re-run mergeScenarioResults kept out
+// of negative-tests.csv, so the re-run is on record without displacing the
+// verdict mounted at its pause.
+func (e *Executor) journalHeldBack(runID string, merged, held []ScenarioResult) {
+	if len(held) == 0 {
+		return
+	}
+	kept := make(map[string]string, len(merged))
+	for _, r := range merged {
+		kept[r.Scenario] = r.Mount.Stage
+	}
+	j := e.journalFor(runID)
+	defer j.Close()
+	for _, r := range held {
+		_ = j.Stamp("attack.rerun.unstaged", map[string]any{
+			"scenario": r.Scenario, "verdict": r.Verdict, "actual": r.Actual, "live": r.OnChain,
+			"gate_expected": r.GateExpected, "gate_observed": r.GateObserved,
+			"kept_mounted_stage": kept[r.Scenario],
+		})
+		e.publish(runID, "attack", "info", fmt.Sprintf(
+			"%s: unstaged re-run (%s) recorded in the journal; negative-tests.csv keeps the verdict mounted at %s",
+			r.Scenario, r.Verdict, kept[r.Scenario]))
+	}
 }
 
 func writeNegativeTestsCSV(path string, results []ScenarioResult) error {
@@ -1133,10 +1175,11 @@ func (e *Executor) RunStagedAttack(ctx context.Context, runID string, c Election
 // saveScenarioResult upserts one verdict into the run's accumulated set,
 // rewrites negative-tests.csv from it, and announces it on the attack stream.
 func (e *Executor) saveScenarioResult(runID, srcDir string, res ScenarioResult) error {
-	merged, err := mergeScenarioResults(srcDir, []ScenarioResult{res})
+	merged, held, err := mergeScenarioResults(srcDir, []ScenarioResult{res})
 	if err != nil {
 		return err
 	}
+	e.journalHeldBack(runID, merged, held)
 	if err := writeNegativeTestsCSV(filepath.Join(srcDir, NegativeTestsFile), merged); err != nil {
 		return err
 	}
