@@ -1,16 +1,20 @@
 package campaign
 
 import (
+	"bufio"
 	"encoding/csv"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
 	"os"
+	"path"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -106,14 +110,17 @@ type BoardResponse struct {
 	Sealed bool `json:"sealed"`
 	// Verified is the independent auditor's verdict (correctness.csv, every
 	// contest E = 0). False also means "not audited yet"; Checks says which.
-	Verified      bool           `json:"verified"`
-	Contests      []BoardContest `json:"contests,omitempty"`
-	Integrity     BoardIntegrity `json:"integrity"`
-	Crypto        BoardCrypto    `json:"crypto"`
-	Checks        []Check        `json:"checks"`
-	Artifacts     []string       `json:"artifacts"`
-	Partial       bool           `json:"partial,omitempty"`
-	PartialReason string         `json:"partial_reason,omitempty"`
+	Verified  bool           `json:"verified"`
+	Contests  []BoardContest `json:"contests,omitempty"`
+	Integrity BoardIntegrity `json:"integrity"`
+	Crypto    BoardCrypto    `json:"crypto"`
+	Checks    []Check        `json:"checks"`
+	Artifacts []string       `json:"artifacts"`
+	// Files are the public verification records served at
+	// /api/board/<run>/files/<name>; empty while the board is sealed.
+	Files         []string `json:"files"`
+	Partial       bool     `json:"partial,omitempty"`
+	PartialReason string   `json:"partial_reason,omitempty"`
 }
 
 // --- labels ----------------------------------------------------------------
@@ -320,8 +327,13 @@ func artifactsIn(dir string) []string {
 
 // --- the board -------------------------------------------------------------
 
+// handleBoard serves GET /api/board/<run>, and GET /api/board/<run>/files/<name>
+// for the public copy of a run's verification records (serveBoardFile). Picking
+// the files action from the path suffix is safe here only because both are
+// public: nothing under this subtree may ever need a role.
 func (s *Server) handleBoard(w http.ResponseWriter, r *http.Request) {
-	runID, err := validRun(s, strings.TrimPrefix(r.URL.Path, "/api/board/"))
+	id, file, isFile := strings.Cut(strings.TrimPrefix(r.URL.Path, "/api/board/"), "/files/")
+	runID, err := validRun(s, id)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
@@ -336,7 +348,131 @@ func (s *Server) handleBoard(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
+	if isFile {
+		s.serveBoardFile(w, r, rec, dir, file)
+		return
+	}
 	writeJSONResp(w, http.StatusOK, s.buildBoard(rec, dir))
+}
+
+// publicFiles is what GET /api/board/<run>/files/<name> serves to anyone once
+// the tally is published: the records a reader needs to re-check a run without
+// trusting the console. That is the stream header and the ballots it audited,
+// the chain's own copy of both, the ledger receipts, and the trail. Everything
+// else in the run folder stays behind the admin-only /export/: the seeded
+// ground truth (ground-truth-*.csv, and correctness.csv's ground_truth and E
+// columns), the plaintext ballots (ballots.csv, election.csv), and the
+// operator's records (journal, perf, run.json).
+var publicFiles = []string{
+	headerFile, BallotsFile, "receipts.csv", trailNDJSONFile, trailJSONFile,
+	LedgerDir + "/" + headerFile, LedgerDir + "/" + BallotsFile,
+}
+
+// publicFilesIn lists the public files a run folder holds, in publicFiles order.
+func publicFilesIn(dir string) []string {
+	files := []string{}
+	for _, name := range publicFiles {
+		if _, err := os.Stat(filepath.Join(dir, filepath.FromSlash(name))); err == nil {
+			files = append(files, name)
+		}
+	}
+	return files
+}
+
+// privateHeaderFields are the header.json fields a public copy empties:
+// ground_truth is the seeded plaintext totals, and voter_ids names the
+// synthetic voter behind each ballot index, which the chain never publishes.
+var privateHeaderFields = map[string]bool{"ground_truth": true, "voter_ids": true}
+
+// serveBoardFile serves one of publicFiles. The name must match the list
+// exactly, so no path the caller writes reaches the filesystem. Every file is
+// refused while the board is sealed: header.json carries the tally and the
+// partial decryptions from generation onwards, so serving it early would
+// publish the result before the trustees do.
+func (s *Server) serveBoardFile(w http.ResponseWriter, r *http.Request, rec RunRecord, dir, name string) {
+	if !slices.Contains(publicFiles, name) {
+		http.Error(w, "not a public file of this run", http.StatusNotFound)
+		return
+	}
+	if ceremony, err := s.exec.CeremonyStatus(rec.RunID, rec.Config); err != nil || !ceremony.Published {
+		http.Error(w, "sealed until the tally is published", http.StatusConflict)
+		return
+	}
+	full := filepath.Join(dir, filepath.FromSlash(name))
+	if path.Base(name) != headerFile {
+		http.ServeFile(w, r, full)
+		return
+	}
+	f, err := os.Open(full)
+	if err != nil {
+		http.Error(w, "not found", http.StatusNotFound)
+		return
+	}
+	defer f.Close()
+	w.Header().Set("Content-Type", "application/json")
+	if err := writePublicHeader(w, f); err != nil {
+		// Past the first buffered 4 KiB the status is already sent, so the
+		// client sees a truncated body; the log says why.
+		log.Printf("board: %s public %s: %v", rec.RunID, name, err)
+	}
+}
+
+// writePublicHeader copies a stream header to w with privateHeaderFields
+// written as empty arrays, which keeps the v1 header shape. It streams token by
+// token because at the largest tier voter_ids alone is hundreds of megabytes.
+func writePublicHeader(w io.Writer, r io.Reader) error {
+	dec := json.NewDecoder(r)
+	if t, err := dec.Token(); err != nil || t != json.Delim('{') {
+		return fmt.Errorf("header is not a JSON object")
+	}
+	bw := bufio.NewWriter(w)
+	bw.WriteByte('{')
+	for first := true; dec.More(); first = false {
+		t, err := dec.Token()
+		if err != nil {
+			return err
+		}
+		key, _ := json.Marshal(t)
+		if !first {
+			bw.WriteByte(',')
+		}
+		bw.Write(key)
+		bw.WriteByte(':')
+		if privateHeaderFields[t.(string)] {
+			if err := skipJSONValue(dec); err != nil {
+				return err
+			}
+			bw.WriteString("[]")
+			continue
+		}
+		var v json.RawMessage
+		if err := dec.Decode(&v); err != nil {
+			return err
+		}
+		bw.Write(v)
+	}
+	bw.WriteByte('}')
+	return bw.Flush()
+}
+
+// skipJSONValue consumes the next value from dec without holding it.
+func skipJSONValue(dec *json.Decoder) error {
+	depth := 0
+	for {
+		t, err := dec.Token()
+		if err != nil {
+			return err
+		}
+		switch t {
+		case json.Delim('['), json.Delim('{'):
+			depth++
+		case json.Delim(']'), json.Delim('}'):
+			depth--
+		}
+		if depth == 0 {
+			return nil
+		}
+	}
 }
 
 // buildBoard assembles the board from the run folder, enriching from the ledger
@@ -353,6 +489,7 @@ func (s *Server) buildBoard(rec RunRecord, dir string) BoardResponse {
 		OpenedAt:     rec.CreatedAt,
 		Sealed:       true,
 		Artifacts:    artifactsIn(dir),
+		Files:        []string{},
 		Integrity: BoardIntegrity{
 			Voters: c.Voters, Positions: c.Positions, Candidates: c.Candidates,
 		},
@@ -393,6 +530,9 @@ func (s *Server) buildBoard(rec RunRecord, dir string) BoardResponse {
 		log.Printf("board: %s ceremony status: %v", rec.RunID, cerr)
 	}
 	resp.Sealed = !ceremony.Published
+	if !resp.Sealed {
+		resp.Files = publicFilesIn(dir)
+	}
 	resp.PublishedAt = ceremony.PublishedAt
 	resp.ClosedAt = ceremony.ClosedAt
 	resp.Crypto.TrusteesSubmitted = ceremony.Submitted

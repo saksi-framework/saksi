@@ -122,7 +122,7 @@ func TestRouteRolesWhenAuthOn(t *testing.T) {
 		probes               []probe
 	}{
 		{"public", 0, 0, 0, []probe{
-			{get, "/api/board/r1"}, {get, "/api/verify-code/r1/BC-CAFE-0001"}, {get, "/trail/r1"},
+			{get, "/api/board/r1"}, {get, "/api/board/r1/files/header.json"}, {get, "/api/verify-code/r1/BC-CAFE-0001"}, {get, "/trail/r1"},
 			{get, "/api/trail"}, {get, "/api/trail/r1"}, {get, "/api/capabilities"},
 			{get, "/api/ceremony/r1"}, {get, "/runs"}, {get, "/board/"}, {get, "/trustee/"},
 			{get, "/admin/"}, {get, "/admin"}, {post, "/api/login"}, {post, "/api/logout"},
