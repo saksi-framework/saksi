@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"net"
 	"net/http"
 	"net/url"
@@ -108,6 +109,11 @@ type Server struct {
 	jobs jobBoard
 	// hostCache is the preflight's host sample, reused briefly (preflight.go).
 	hostCache hostSampleCache
+
+	// tierScript locates tools/tier.sh or says why this host cannot run it, and
+	// runScript runs it (reset.go). Tests override both.
+	tierScript func() (string, error)
+	runScript  scriptRunner
 }
 
 // NewServer returns the console HTTP handler. fabric configures the live
@@ -127,6 +133,16 @@ func NewServer(store *RunStore, exec *Executor, hub *Hub, fabric FabricConfig, a
 	s.dial = s.dialChain
 	s.gitHead = s.consoleHead
 	s.freeSpace = freeSpaceOn
+	s.tierScript = consoleTierScript
+	s.runScript = runStreaming
+	// A fault never fires while a job (a campaign, the ladder, a reset) is using
+	// the network: stopping the peer under it would wreck that job's runs.
+	exec.faultGate = func() error {
+		if j := s.jobs.running(); j != nil {
+			return fmt.Errorf("%s %s is running on this network", j.Kind, j.ID)
+		}
+		return nil
+	}
 	for _, h := range allowHosts {
 		s.allowHosts[h] = true
 	}
@@ -164,6 +180,7 @@ func NewServer(store *RunStore, exec *Executor, hub *Hub, fabric FabricConfig, a
 	mux.HandleFunc("/api/jobs/", s.handleJob)
 	mux.HandleFunc("/api/campaigns", s.handleCampaigns)
 	mux.HandleFunc("/api/campaigns/", s.handleCampaign)
+	mux.HandleFunc("/api/network/reset", s.handleNetworkReset)
 	mountWebDir(mux, os.Getenv("SAKSI_WEB_DIR"))
 	s.routes = mux.patterns
 	s.handler = s.guard(s.authorize(mux))
@@ -244,16 +261,33 @@ func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write(data)
 }
 
-// tryStart claims the single-run lock for runID and stores its cancel func.
-// Returns false if a phase is already running on that run.
-func (s *Server) tryStart(runID string, cancel context.CancelFunc) bool {
+// claim takes the single-run lock for runID and stores its cancel func, or
+// returns why it cannot: a phase is already running on that run, or the network
+// is being reset (startExclusiveJob checks the other direction under the same
+// lock, so the two cannot interleave).
+func (s *Server) claim(runID string, cancel context.CancelFunc) string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if _, running := s.busy[runID]; running {
-		return false
+		return "a phase is already running on this run"
+	}
+	if j := s.jobs.running(); j != nil && j.Kind == jobKindReset {
+		return fmt.Sprintf("the network is being reset (job %s): wait for it to finish", j.ID)
 	}
 	s.busy[runID] = cancel
-	return true
+	return ""
+}
+
+// busyRunsLocked names every run with a phase running, noting the stage a
+// paused lifecycle holds at. Caller holds s.mu.
+func (s *Server) busyRunsLocked() []string {
+	ids := slices.Sorted(maps.Keys(s.busy))
+	for i, id := range ids {
+		if pv := s.exec.PauseStatus(id); pv.Paused {
+			ids[i] += " (paused at the " + pv.Stage + " attack stage)"
+		}
+	}
+	return ids
 }
 
 func (s *Server) finish(runID string) {
@@ -266,9 +300,9 @@ func (s *Server) finish(runID string) {
 // releasing the lock when done. Returns 409 if the run is already busy.
 func (s *Server) dispatch(w http.ResponseWriter, runID string, fn func(context.Context)) {
 	ctx, cancel := context.WithTimeout(context.Background(), s.timeout)
-	if !s.tryStart(runID, cancel) {
+	if why := s.claim(runID, cancel); why != "" {
 		cancel()
-		http.Error(w, "a phase is already running on this run", http.StatusConflict)
+		http.Error(w, why, http.StatusConflict)
 		return
 	}
 	go func() {
@@ -894,7 +928,8 @@ func (s *Server) handleCheck(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleRunAction routes /api/runs/{id}/{action}: `status` (GET) reports
-// whether a phase is running, `resume` and `verify-only` (POST) act on the run.
+// whether a phase is running, `resume`, `verify-only` and `fault` (POST) act on
+// the run.
 func (s *Server) handleRunAction(w http.ResponseWriter, r *http.Request) {
 	id, action, ok := strings.Cut(strings.TrimPrefix(r.URL.Path, "/api/runs/"), "/")
 	if !ok {
@@ -910,6 +945,8 @@ func (s *Server) handleRunAction(w http.ResponseWriter, r *http.Request) {
 		s.handleVerifyOnly(w, r, id)
 	case "pause":
 		s.handlePause(w, r, id)
+	case "fault":
+		s.handleFault(w, r, id)
 	default:
 		http.NotFound(w, r)
 	}
@@ -964,7 +1001,8 @@ func (s *Server) handleVerifyOnly(w http.ResponseWriter, r *http.Request, id str
 }
 
 // handleResume serves POST /api/runs/{id}/resume: restart an interrupted
-// ballot window over the ballots the chain does not already hold.
+// ballot window over the ballots the chain does not already hold, then close the
+// election so the ceremony can run (resumeAndClose).
 //
 // The refusal is decided BEFORE anything is dispatched (planResume reads the
 // run's journal, no network), so a run that cannot be resumed gets a 409 with
@@ -1003,9 +1041,9 @@ func (s *Server) handleResume(w http.ResponseWriter, r *http.Request, id string)
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), s.timeout)
-	if !s.tryStart(runID, cancel) {
+	if why := s.claim(runID, cancel); why != "" {
 		cancel()
-		http.Error(w, "a phase is already running on this run", http.StatusConflict)
+		http.Error(w, why, http.StatusConflict)
 		return
 	}
 	go func() {

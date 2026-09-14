@@ -94,6 +94,9 @@ type Executor struct {
 
 	pauseMu sync.Mutex
 	pauses  map[string]*stagePause // runID -> the attack stage its lifecycle is holding at (timeline.go)
+
+	// faultGate, when set, refuses to fire an armed fault (fault.go).
+	faultGate func() error
 }
 
 // NewExecutor wires the production runner. demoBin is the saksi-demo path;
@@ -451,7 +454,7 @@ func finaliseInput(dir string, c ElectionConfig, sa StreamAudit, stageErr error,
 		Voters: c.Voters, Positions: c.Positions,
 		ReconcileOK: true, StageErr: stageErr,
 		EByContest:  make(map[string]int64, len(sa.Contests)),
-		SecurityRun: c.AttackPlan != nil,
+		SecurityRun: c.securityRun(),
 	}
 	for _, ct := range sa.Contests {
 		in.EByContest[ct.Contest] = ct.E
@@ -809,6 +812,13 @@ func (e *Executor) setupOnChain(ctx context.Context, runID string, c ElectionCon
 	if err := e.submitBallots(ctx, runID, c, b, led); err != nil {
 		return err
 	}
+	return e.closeElection(ctx, runID, c, b, led, step)
+}
+
+// closeElection commits CloseElection and holds at the close attack stage if
+// the plan lists it: the end of the ballot phase, from a whole window or a
+// resumed one.
+func (e *Executor) closeElection(ctx context.Context, runID string, c ElectionConfig, b *onChainBundle, led clientsdk.Ledger, step lifecycleStep) error {
 	if err := step(ctx, "CloseElection", "", "CloseElection", b.ElectionID); err != nil {
 		return err
 	}
@@ -893,9 +903,15 @@ func (e *Executor) submitBallots(ctx context.Context, runID string, c ElectionCo
 	var mu sync.Mutex
 	landed := make([]landedTx, 0, count)
 	var readErr error
+	fault := e.newPeerFault(ctx, runID, j, led, e.armedFault(runID, c), count, func() int {
+		mu.Lock()
+		defer mu.Unlock()
+		return len(landed)
+	})
 
 	stopSampler := e.startSampler(ctx, j)
 	submit := func(i int) error {
+		fault.dispatched(i)
 		line, err := reader.At(i)
 		if err != nil {
 			mu.Lock()
@@ -928,6 +944,11 @@ func (e *Executor) submitBallots(ctx context.Context, runID string, c ElectionCo
 	} else {
 		res = runBench(ctx, count, submit, opts)
 	}
+	// Ballots lost to the peer outage leave the window unfinished, not ended:
+	// marked interrupted, which is what lets Resume submit them.
+	if fault.hasFired() && res.Dropped > 0 {
+		res.Stopped = true
+	}
 	samples := stopSampler()
 	bounded := windowWasBounded(ctx, c, res)
 
@@ -938,6 +959,9 @@ func (e *Executor) submitBallots(ctx context.Context, runID string, c ElectionCo
 	}
 	if bounded {
 		end["bounded"] = true
+	}
+	if fault.hasFired() {
+		end["fault"] = FaultPeerRestart
 	}
 	if haveEndBytes {
 		end["ledger_bytes"] = endBytes
@@ -950,6 +974,9 @@ func (e *Executor) submitBallots(ctx context.Context, runID string, c ElectionCo
 	// Read at the window's own boundary, once the closing stamps have drained
 	// the progress writer: everything after this point is post-window work.
 	winErr := journalWindowErr(j)
+	// The outage outlives the window: nothing after this, receipts included,
+	// runs until the peer is back and answering.
+	fault.wait()
 
 	if readErr != nil {
 		return readErr
@@ -1247,7 +1274,29 @@ func (e *Executor) Resume(ctx context.Context, runID string, c ElectionConfig) e
 		return err
 	}
 	defer conn.Close()
-	return e.resumeBallots(ctx, runID, c, conn.Ledger(), conn.Bulletin, path)
+	return e.resumeAndClose(ctx, runID, c, conn.Ledger(), conn.Bulletin, path)
+}
+
+// resumeAndClose finishes what the interrupted phase would have: every ballot
+// the chain lacks, then CloseElection, leaving the ceremony open for the
+// trustees (/ceremony/submit, /ceremony/publish) exactly as /ceremony/start
+// does. Without the close, a resumed election stays open and nothing on the
+// API could ever close it, so its tally could never be published or audited.
+func (e *Executor) resumeAndClose(ctx context.Context, runID string, c ElectionConfig,
+	led clientsdk.Ledger, nl nullifierLister, bundlePath string) error {
+	if err := e.resumeBallots(ctx, runID, c, led, nl, bundlePath); err != nil {
+		return err
+	}
+	b, step, err := e.lifecycle(runID, led, bundlePath, "submit")
+	if err != nil {
+		return err
+	}
+	defer e.closeReceipts(runID)
+	if err := e.closeElection(ctx, runID, c, b, led, step); err != nil {
+		return err
+	}
+	e.publish(runID, "ceremony", "done", "election closed — trustees may now contribute")
+	return e.writeCeremony(runID, c, nil)
 }
 
 // resumeBallots is the resumed ballot window: one more segment, over the
@@ -1382,7 +1431,7 @@ func (e *Executor) resumeBallots(ctx context.Context, runID string, c ElectionCo
 		Voters: c.Voters, Positions: c.Positions,
 		Segments: append(plan.segments, seg), Dropped: dropped,
 		Interrupted: res.Stopped, Resumed: true, EByContest: map[string]int64{},
-		StageErr: winErr, SecurityRun: c.AttackPlan != nil,
+		StageErr: winErr, SecurityRun: c.securityRun(),
 	}
 	in.ReconcileErr = bench.Reconcile(res.Submitted, onChain, len(pending))
 	in.ReconcileOK = in.ReconcileErr == nil

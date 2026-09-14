@@ -81,6 +81,10 @@ type fakeLedger struct {
 	// getBallotsBatches records the size of each GetBallots page asked for.
 	getBallotsBatches []int
 
+	// peerDown models a stopped peer: every SubmitBallot and ChainInfo fails,
+	// and nothing is committed, until it is cleared.
+	peerDown bool
+
 	ballots     int             // SubmitBallot attempts, accepted or not
 	accepted    []string        // accepted nullifiers, in accept order
 	acceptedSet map[string]bool // the same set, for the duplicate gate
@@ -161,6 +165,9 @@ func (f *fakeLedger) ballotGate(args []string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.ballots++
+	if f.peerDown {
+		return errors.New("rpc error: code = Unavailable desc = connection refused")
+	}
 	if f.FailAt > 0 && f.ballots >= f.FailAt {
 		if f.cancel != nil {
 			f.cancel()
@@ -423,6 +430,9 @@ func (f *fakeLedger) VerifyChain(from, to uint64, sample []clientsdk.Receipt) (c
 func (f *fakeLedger) ChainInfo() (uint64, []byte, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.peerDown {
+		return 0, nil, errors.New("rpc error: code = Unavailable desc = connection refused")
+	}
 	return f.nextBlk + 1, nil, nil
 }
 

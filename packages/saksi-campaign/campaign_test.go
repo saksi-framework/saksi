@@ -1263,8 +1263,8 @@ func TestCampaignDropsAttackPlan(t *testing.T) {
 func TestPreflightBlocksWhileARunIsBusy(t *testing.T) {
 	fakeHostProbes(t, "", nil)
 	s, _ := gateServer(t, FabricConfig{}, "abc", 1<<62)
-	if !s.tryStart("security-run-1", func() {}) {
-		t.Fatal("tryStart")
+	if why := s.claim("security-run-1", func() {}); why != "" {
+		t.Fatal(why)
 	}
 	s.exec.setPause("security-run-1", &stagePause{view: PauseView{Paused: true, Stage: StageBallots}})
 

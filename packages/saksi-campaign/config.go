@@ -80,7 +80,15 @@ type ElectionConfig struct {
 	// A security run's throughput is perturbed by design and marked so in
 	// perf.csv (security_run).
 	AttackPlan *AttackPlan `json:"attack_plan,omitempty"`
+	// FaultPlan makes this a security run too: the ballot window stops the
+	// peer part-way through (fault.go). Armed only by POST
+	// /api/runs/<id>/fault, never accepted with a posted config.
+	FaultPlan *FaultPlan `json:"fault_plan,omitempty"`
 }
+
+// securityRun reports that this run was perturbed by design, by attacks or a
+// fault: its throughput is not a measurement.
+func (c ElectionConfig) securityRun() bool { return c.AttackPlan != nil || c.FaultPlan != nil }
 
 // AttackPlan is ElectionConfig.attack_plan.
 type AttackPlan struct {
@@ -209,6 +217,11 @@ func (c ElectionConfig) Validate() error {
 		return fmt.Errorf(
 			"offline mode is capped at %d voters (got %d); use ground-truth mode for larger tiers until the streaming generator lands",
 			OfflineVoterCeiling, c.Voters)
+	}
+	// Every posted config passes through here (/generate, /run-all, campaigns),
+	// and those routes lack the fault route's loopback and confirmation guards.
+	if c.FaultPlan != nil {
+		return fmt.Errorf("fault_plan cannot come with a config: arm it on the generated run with POST /api/runs/<id>/fault")
 	}
 	return c.validateAttackPlan()
 }
