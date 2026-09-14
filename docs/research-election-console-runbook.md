@@ -704,7 +704,7 @@ Preflight findings:
 | block | `fabric_not_configured` | On-chain, and the console was started without Fabric | no |
 | block | `fabric_unreachable` | Fabric is configured, the peer does not answer, and the run is on-chain | yes |
 | block | `ladder_missing` | Above 1,000 voters (not ground truth), for the config or the burst, with no `ladder.json` for this build | no |
-| block | `disk_short` | On-chain, and the projected ledger of the config or the burst exceeds free space | no |
+| block | `disk_short` | On-chain, and the projected ledger exceeds free space: of one run, or, for a campaign, of all its runs together, since no network reset runs between them: (warm-ups + reps) × voters × positions × 12,000, plus 12 × that per-run figure for a sweep (its maximum step count), plus burst × positions × 12,000 | no |
 | block | `verify_threads_invalid` | `SAKSI_AUDIT_THREADS` is set to anything but a positive integer (empty included): the auditor would refuse to run | no |
 | warn | `host_load` | Guest 1-minute load average above 25 % of the CPUs | — |
 | warn | `host_cpu` | Under WSL2, the Windows host's CPU above 25 % | — |

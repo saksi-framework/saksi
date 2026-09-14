@@ -577,14 +577,50 @@ func TestBurstEscapesPreflight(t *testing.T) {
 	// On-chain: the measured reps fit the disk, the burst does not.
 	oc := good()
 	oc.Mode = "onchain"
-	s2, root := gateServer(t, liveFabric(), "abc123", uint64(oc.Voters*oc.Positions*LedgerBytesPerBallot))
+	s2, root := gateServer(t, liveFabric(), "abc123", uint64(2*oc.Voters*oc.Positions*LedgerBytesPerBallot))
 	writeLadder(t, root, "abc123")
 	rec, _ := startCampaign(t, s2, map[string]any{"config": oc, "reps": 2, "burst": 2000}, "")
 	if rec.Code != http.StatusConflict || !strings.Contains(rec.Body.String(), "disk_short") ||
-		!strings.Contains(rec.Body.String(), "burst of 2000 voters") {
+		!strings.Contains(rec.Body.String(), "a 2000-voter burst") {
 		t.Fatalf("want 409 naming the burst's disk block, got %d %s", rec.Code, rec.Body)
 	}
 	noCampaignStarted(t, s2)
+}
+
+// Every run of a campaign lands on the same ledger: warm-ups, measured reps,
+// every sweep step the sweep can run, and the burst. A campaign whose runs each
+// fit but together do not is refused, and force cannot override it.
+func TestCampaignDiskProjectsEveryRun(t *testing.T) {
+	fakeHostProbes(t, "", nil)
+	oc := good() // 10 voters x 1 position
+	oc.Mode = "onchain"
+	perRun := uint64(oc.Voters * oc.Positions * LedgerBytesPerBallot)
+	o := CampaignOptions{Warmups: 1, Reps: 2, Sweep: 2, Burst: 5}
+	want := 3*perRun + maxSweepSteps*perRun + 5*uint64(oc.Positions)*LedgerBytesPerBallot
+	if got, _ := campaignLedgerBytes(oc, o); got != want {
+		t.Fatalf("campaignLedgerBytes = %d, want %d", got, want)
+	}
+	if got, _ := campaignLedgerBytes(oc, CampaignOptions{Reps: 4}); got != 4*perRun {
+		t.Fatalf("no sweep, no burst: %d, want %d", got, 4*perRun)
+	}
+
+	s, _ := gateServer(t, liveFabric(), "abc", want-1)
+	if rep := s.preflight(PreflightInput{Mode: "onchain", Voters: oc.Voters, Positions: oc.Positions}); rep.Blocked() {
+		t.Fatalf("one run fits, so the one-run preflight must not block: %+v", rep.Warnings)
+	}
+	for _, force := range []bool{false, true} {
+		rec, _ := startCampaign(t, s, map[string]any{"config": oc, "warmups": 1, "reps": 2, "sweep": 2, "burst": 5, "force": force}, "")
+		body := rec.Body.String()
+		for _, part := range []string{
+			"disk_short", "cannot override", fmt.Sprintf("projects %d bytes", want), fmt.Sprintf("only %d bytes are free", want-1),
+			"3 warm-up and measured runs", fmt.Sprintf("up to %d sweep steps", maxSweepSteps), "a 5-voter burst",
+		} {
+			if rec.Code != http.StatusConflict || !strings.Contains(body, part) {
+				t.Fatalf("force=%v: want 409 naming %q, got %d %s", force, part, rec.Code, body)
+			}
+		}
+	}
+	noCampaignStarted(t, s)
 }
 
 // force overrides a peer that did not answer the probe, and nothing else.

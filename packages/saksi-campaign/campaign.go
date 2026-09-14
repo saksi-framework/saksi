@@ -254,8 +254,16 @@ func (s *Server) handleCampaigns(w http.ResponseWriter, r *http.Request) {
 			pre.add(severityBlock, "ladder_missing", "the burst of %d voters is above the %d-voter ceiling: %v",
 				burst.Voters, LadderVoterCeiling, err)
 		}
-		if err := s.diskGate(*burst); err != nil {
-			pre.add(severityBlock, "disk_short", "the burst of %d voters: %v", burst.Voters, err)
+	}
+	// Preflight projects one run; the campaign's runs all land on the same
+	// ledger, since nothing resets the network between repetitions. A probe
+	// that failed does not refuse, exactly as the disk gate does.
+	if free := pre.Disk.FreeBytes; c.Mode == "onchain" && free != nil {
+		if need, parts := campaignLedgerBytes(c, o); need > *free {
+			pre.add(severityBlock, "disk_short",
+				"this campaign projects %d bytes of ledger (%s) but only %d bytes are free on %s: "+
+					"no network reset runs between repetitions, so free space or run fewer repetitions",
+				need, parts, *free, pre.Disk.Path)
 		}
 	}
 	if codes := pre.unforceable(); len(codes) > 0 {
@@ -314,6 +322,28 @@ func (s *Server) handleCampaigns(w http.ResponseWriter, r *http.Request) {
 		persistCampaign(dir, rec)
 	})
 	writeJSONResp(w, http.StatusAccepted, map[string]string{"campaign": rec.ID})
+}
+
+// campaignLedgerBytes projects the ledger a whole campaign adds to the peer
+// volume, with the disk gate's per-ballot budget: every warm-up and measured
+// run, every sweep step the sweep can run (maxSweepSteps; each step offers at
+// most the config's voters), and the burst. It returns the total and its
+// breakdown, for the refusal message.
+func campaignLedgerBytes(c ElectionConfig, o CampaignOptions) (uint64, string) {
+	perRun := uint64(c.Voters) * uint64(c.Positions) * LedgerBytesPerBallot
+	runs := uint64(o.Warmups + o.Reps)
+	total := runs * perRun
+	parts := []string{fmt.Sprintf("%d warm-up and measured runs x %d bytes", runs, perRun)}
+	if o.Sweep > 1 {
+		total += maxSweepSteps * perRun
+		parts = append(parts, fmt.Sprintf("up to %d sweep steps x %d bytes", maxSweepSteps, perRun))
+	}
+	if o.Burst > 0 {
+		b := uint64(o.Burst) * uint64(c.Positions) * LedgerBytesPerBallot
+		total += b
+		parts = append(parts, fmt.Sprintf("a %d-voter burst of %d bytes", o.Burst, b))
+	}
+	return total, strings.Join(parts, " + ")
 }
 
 // createCampaign makes the campaign folder, its first campaign.json and log.txt,
