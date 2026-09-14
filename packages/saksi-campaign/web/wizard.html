@@ -2119,6 +2119,7 @@ async function loadRuns() {
   runsCache = runs.slice().sort((a, b) => String(b.created_at).localeCompare(String(a.created_at)));
   renderRuns();
   renderFaultRuns();
+  return runsCache;
 }
 
 function runStatus(r) {
@@ -2199,15 +2200,21 @@ async function runAction(id, action, btn) {
   loadRuns();
   const tick = setInterval(loadRuns, 6000);
   jobTimers.add(tick);
-  whenIdle(id, () => {
+  whenIdle(id, async () => {
     clearInterval(tick);
     jobTimers.delete(tick);
     if (ev) ev.close();
-    loadRuns();
-    if (errors.length) {
+    // Judge the outcome from the run's own record, not only from events: a
+    // phase can end before it publishes anything (no bundle, no Fabric).
+    const run = ((await loadRuns()) || []).find((x) => x.run_id === id) || {};
+    const unfinished = action === "resume" ? run.resumable : !run.reconciled;
+    if (errors.length || unfinished) {
       // A resume that could not close the election is retried with Resume,
       // which reappears in the list when the route would take it again.
-      $("rlNote").textContent += ` It ended with an error${action === "resume" ? "; press Resume again when it is offered" : ""}.`;
+      $("rlNote").textContent += action === "resume"
+        ? ` It did not finish${run.resumable ? ": the ballot window is still interrupted" : ""}` +
+          `${errors.length ? "" : " (the console reported no reason; see its log)"}. Press Resume again when it is offered.`
+        : ` It did not reconcile${errors.length ? "" : " (the console reported no reason; see its log)"}.`;
       return;
     }
     $("rlNote").textContent += action === "resume"
