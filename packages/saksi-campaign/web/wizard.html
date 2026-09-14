@@ -1921,14 +1921,30 @@ $("btnReset").onclick = async () => {
   followReset(res.job);
 };
 
+// followReset watches a reset job to its end, then says what it came to. A
+// reset whose script exited 0 can still fail: the console re-reads the new
+// network afterwards, and a failed read is the job's error (with the result's
+// chain_error). Success is confirmed by the channel height it read.
 function followReset(id) {
   watchJob(id, "rsLog", "rsStatus", (v) => {
     resetBusy = false;
     syncReset();
-    if (v && v.result) {
-      const r = v.result;
-      $("rsStatus").textContent = `${v.id}: ${v.status} · exit ${r.exit_code}` +
-        `${r.timed_out ? " (timed out)" : ""} after ${Math.round((r.duration_ms || 0) / 1000)} s · log ${r.log}`;
+    if (!v) { runPreflight(); return; }
+    const r = v.result || {};
+    const facts = [
+      r.exit_code != null ? `tools/tier.sh exit ${r.exit_code}${r.timed_out ? " (timed out)" : ""}` : "",
+      r.duration_ms != null ? `after ${Math.round(r.duration_ms / 1000)} s` : "",
+      r.log ? `log ${r.log}` : "",
+    ].filter(Boolean).join(" · ");
+    if (v.status === "done") {
+      $("rsErr").textContent = "";
+      $("rsStatus").textContent = `${v.id}: done · ` + (r.chain_height != null
+        ? `the console reads the new network (channel height ${r.chain_height})` : "reset finished") +
+        (facts ? " · " + facts : "");
+    } else {
+      $("rsStatus").textContent = `${v.id}: ${v.status}` + (facts ? " · " + facts : "");
+      $("rsErr").innerHTML = `<b>Reset ${esc(v.status)}</b> ${esc(v.error || "no reason given; see the job log above")}` +
+        (r.chain_error ? `<div style="margin-top:3px">reading the new network: ${esc(r.chain_error)}</div>` : "");
     }
     runPreflight();
     loadRuns();
@@ -2239,10 +2255,11 @@ function whenIdle(id, fn) {
 }
 
 /* ---- peer-restart fault ------------------------------------------------ */
-// The fault route's own refusals, mirrored so only runs it would take are
-// offered: on-chain, generated, idle, not a campaign repetition, no attack
+// Mirrors handleFault's refusals (fault.go, PR #46) so only runs it would arm
+// are offered: on-chain, generated, idle, not a campaign repetition, no attack
 // plan, no time-bounded window, ballot window not opened. The route stays the
 // judge: it also refuses while any job runs or another run is busy.
+// web_test.go TestWizardFaultFilterMirrorsTheFaultRoute pins each clause.
 const faultEligible = (r) => {
   const c = r.config || {};
   return c.mode === "onchain" && !c.rep && !c.attack_plan && !c.fault_plan && !(c.window_s > 0) &&
