@@ -868,13 +868,18 @@ run `docker start peer0.org1.example.com` and confirm with
 3. `POST /ceremony/start`. Poll `GET /api/runs/<id>/status` until `busy` is
    false: the phase fails with "N of M ballots did not commit" once the peer is
    back and answering.
-4. `POST /api/runs/<id>/verify-only` (required): records what the chain kept
-   before anything is resubmitted — the reconcile of the chain's count against
-   the committed set, and the chain walk. After the resume that state is gone.
-5. `POST /api/runs/<id>/resume`: submits only what the chain does not hold,
+4. `POST /api/runs/<id>/resume`: submits only what the chain does not hold,
    classifying ballots that landed despite an error as replays, then closes the
    election. If it fails after the ballots landed, resume again: the retry
-   only closes.
+   only closes. The fault's gap is recorded here, from the chain:
+   `segment.start {pending}` is what the chain did not hold after the fault,
+   and each replay row is a ballot that landed although its submit reported a
+   drop.
+5. `POST /api/runs/<id>/verify-only` (required): the reconcile of the chain's
+   count against the committed set, and the chain walk. This is the order the
+   wizard's T3 steps use. Verify-only is equally valid before step 4 (neither
+   route checks for the other), where it records the chain as the fault left
+   it rather than after the resume.
 6. `POST /ceremony/submit` for at least the threshold of trustees, then
    `POST /ceremony/publish`.
 7. `POST /verify`: `correctness.csv` and `run.end` must show every contest's
