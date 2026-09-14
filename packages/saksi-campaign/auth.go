@@ -339,9 +339,17 @@ func HashPassword(in io.Reader) (string, error) {
 // the session (if any) into the request context, then applies routeAccess.
 func (s *Server) authorize(mux *routeMux) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// An internal call (internal.go) is the console driving itself; it
-		// takes the auth-off path. Only this package can mark a request so.
-		if s.auth == nil || internalCall(r) {
+		// An internal call (internal.go) is the console driving itself: no
+		// session, and only the routes the repeat driver calls, auth on or off.
+		if internalCall(r) {
+			if !internalRouteAllowed(mux, r) {
+				writeJSONResp(w, http.StatusForbidden, map[string]string{"error": "not a route the campaign driver uses"})
+				return
+			}
+			mux.ServeHTTP(w, r)
+			return
+		}
+		if s.auth == nil {
 			mux.ServeHTTP(w, r)
 			return
 		}

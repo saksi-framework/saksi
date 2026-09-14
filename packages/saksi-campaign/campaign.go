@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -41,7 +42,9 @@ type CampaignOptions struct {
 	Force   bool    `json:"force,omitempty"`
 }
 
-// campaignRep is one repetition as its run folder reports it.
+// campaignRep is one repetition as its run folder reports it. Once its status
+// is done or failed the values are final and cached in campaign.json; only an
+// in-progress repetition is read from its run folder.
 type campaignRep struct {
 	Index        int      `json:"index"`
 	Kind         string   `json:"kind"`
@@ -51,6 +54,10 @@ type campaignRep struct {
 	LatencyP99Ms *float64 `json:"latency_p99_ms"`
 	Failed       bool     `json:"failed"`
 	FailReason   string   `json:"fail_reason,omitempty"`
+	// HostStart is sampled before the repetition's /generate, HostEnd after its
+	// verify phase: a repetition that shared the machine shows it afterwards.
+	HostStart *HostSample `json:"host_start,omitempty"`
+	HostEnd   *HostSample `json:"host_end,omitempty"`
 }
 
 // campaignRecord is campaign.json.
@@ -58,6 +65,7 @@ type campaignRecord struct {
 	ID         string          `json:"id"`
 	Status     string          `json:"status"`
 	Error      string          `json:"error,omitempty"`
+	SaveError  string          `json:"save_error,omitempty"`
 	CreatedAt  time.Time       `json:"created_at"`
 	FinishedAt *time.Time      `json:"finished_at,omitempty"`
 	Config     ElectionConfig  `json:"config"`
@@ -74,7 +82,7 @@ func (s *Server) campaignDir(id string) (string, error) {
 }
 
 // saveCampaign writes campaign.json atomically (temp file + rename), so a crash
-// mid-write never leaves a campaign unreadable. Caller holds s.jobs.mu.
+// mid-write never leaves a campaign unreadable.
 func saveCampaign(dir string, rec *campaignRecord) error {
 	data, err := json.MarshalIndent(rec, "", "  ")
 	if err != nil {
@@ -87,9 +95,20 @@ func saveCampaign(dir string, rec *campaignRecord) error {
 	return os.Rename(tmp, filepath.Join(dir, campaignFile))
 }
 
-// loadCampaign reads campaign.json. A campaign whose file says running but
-// that is not this process's active job was running when the console stopped:
-// it is marked interrupted, on disk, rather than left claiming to run.
+// persistCampaign saves rec, and on failure logs it and keeps the reason in
+// save_error, which the next save that succeeds writes out and GET shows while
+// the campaign runs. Caller holds s.jobs.mu.
+func persistCampaign(dir string, rec *campaignRecord) {
+	if err := saveCampaign(dir, rec); err != nil {
+		log.Printf("campaign %s: campaign.json not saved: %v", rec.ID, err)
+		rec.SaveError = fmt.Sprintf("%s: %v", time.Now().UTC().Format(time.RFC3339), err)
+	}
+}
+
+// loadCampaign returns a campaign: the live record when it is this process's
+// running job, campaign.json otherwise. A file that says running but that no
+// job here owns was running when the console stopped: its rows are settled
+// from their run folders and it is marked interrupted, on disk.
 func (s *Server) loadCampaign(id string) (campaignRecord, bool, error) {
 	dir, err := s.campaignDir(id)
 	if err != nil {
@@ -97,26 +116,34 @@ func (s *Server) loadCampaign(id string) (campaignRecord, bool, error) {
 	}
 	s.jobs.mu.Lock()
 	defer s.jobs.mu.Unlock()
+	if a := s.jobs.active; a != nil && a.ID == id && a.campaign != nil {
+		cp := *a.campaign
+		cp.Reps = append([]campaignRep{}, a.campaign.Reps...)
+		return cp, true, nil
+	}
 	var rec campaignRecord
 	if err := readJSON(filepath.Join(dir, campaignFile), &rec); err != nil {
 		return campaignRecord{}, false, fmt.Errorf("unknown campaign %q", id)
 	}
-	active := s.jobs.active != nil && s.jobs.active.ID == id
-	if rec.Status == jobRunning && !active {
+	if rec.Status == jobRunning {
+		s.refreshReps(&rec, false)
 		rec.Status = jobInterrupted
 		rec.Error = "the console stopped while this campaign was running"
-		_ = saveCampaign(dir, &rec)
+		persistCampaign(dir, &rec)
 	}
-	return rec, active, nil
+	return rec, false, nil
 }
 
-// refreshReps fills each repetition from its run folder: perf.csv's row and
-// run.end's verdict, the same two sources Repeat's collect reads. Only the
-// newest repetition of a live campaign can still be running.
+// refreshReps fills every repetition that is not yet final from its run folder:
+// perf.csv's row and run.end's verdict, the same two sources Repeat's collect
+// reads. With active set, the newest repetition may still be running and is
+// left so; every other one is settled.
 func (s *Server) refreshReps(rec *campaignRecord, active bool) {
 	for i := range rec.Reps {
 		rep := &rec.Reps[i]
-		rep.CommittedTPS, rep.LatencyP99Ms, rep.Failed, rep.FailReason = nil, nil, false, ""
+		if rep.Status == jobDone || rep.Status == jobFailed {
+			continue // final, cached
+		}
 		dir, err := s.store.Dir(rep.RunID)
 		if err != nil {
 			rep.Status, rep.Failed, rep.FailReason = jobFailed, true, err.Error()
@@ -132,6 +159,7 @@ func (s *Server) refreshReps(rec *campaignRecord, active bool) {
 			rep.Status = jobRunning
 			continue
 		}
+		rep.CommittedTPS, rep.LatencyP99Ms, rep.Failed, rep.FailReason = nil, nil, false, ""
 		r := repResult{Perf: perf}
 		if v, ok := r.num("committed_tps"); ok {
 			rep.CommittedTPS = &v
@@ -164,15 +192,25 @@ func jbool(m map[string]any, key string) bool {
 
 // handleCampaigns serves GET (list, newest first) and POST (start) on /api/campaigns.
 func (s *Server) handleCampaigns(w http.ResponseWriter, r *http.Request) {
-	if r.Method == http.MethodGet {
+	switch r.Method {
+	case http.MethodGet:
 		s.listCampaigns(w)
+		return
+	case http.MethodPost:
+	default:
+		http.Error(w, "GET or POST required", http.StatusMethodNotAllowed)
 		return
 	}
 	var req struct {
 		Config ElectionConfig `json:"config"`
 		CampaignOptions
 	}
-	if !decodeJSON(w, r, &req) {
+	// Unknown fields are refused: a misspelled "rep" would otherwise run a
+	// campaign with no measured repetitions.
+	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&req); err != nil {
+		http.Error(w, "invalid campaign body: "+err.Error(), http.StatusBadRequest)
 		return
 	}
 	c := req.Config
@@ -190,18 +228,47 @@ func (s *Server) handleCampaigns(w http.ResponseWriter, r *http.Request) {
 	case o.Sweep != 0 && o.Sweep <= 1:
 		http.Error(w, "sweep must be > 1 (the per-step rate multiplier) or 0", http.StatusBadRequest)
 		return
-	case o.Warmups+o.Reps+o.Burst == 0 && o.Sweep == 0:
-		http.Error(w, "nothing to run: set reps, warmups, burst or sweep", http.StatusBadRequest)
+	case o.Reps < 1 && o.Sweep == 0 && o.Burst == 0:
+		http.Error(w, "reps must be >= 1 unless sweep or burst is set", http.StatusBadRequest)
 		return
+	}
+	// The burst is its own election at o.Burst voters, run after the measured
+	// repetitions: checked now, or it fails hours in at its own /generate.
+	var burst *ElectionConfig
+	if o.Burst > 0 {
+		b := c
+		b.Voters, b.SendRate, b.WindowS = o.Burst, 0, 0
+		if err := b.Validate(); err != nil {
+			http.Error(w, fmt.Sprintf("burst of %d voters: %v", o.Burst, err), http.StatusBadRequest)
+			return
+		}
+		burst = &b
 	}
 	if running := s.jobs.running(); running != nil {
 		busyResponse(w, running)
 		return
 	}
 	pre := s.preflight(PreflightInput{Mode: c.Mode, Voters: c.Voters, Positions: c.Positions, Concurrency: c.Concurrency})
+	if burst != nil {
+		if err := s.ladderGate(*burst); err != nil {
+			pre.add(severityBlock, "ladder_missing", "the burst of %d voters is above the %d-voter ceiling: %v",
+				burst.Voters, LadderVoterCeiling, err)
+		}
+		if err := s.diskGate(*burst); err != nil {
+			pre.add(severityBlock, "disk_short", "the burst of %d voters: %v", burst.Voters, err)
+		}
+	}
+	if codes := pre.unforceable(); len(codes) > 0 {
+		writeJSONResp(w, http.StatusConflict, map[string]any{
+			"error": fmt.Sprintf("preflight blocks this campaign, and force cannot override %s: "+
+				"each fails the first /generate or every run", strings.Join(codes, ", ")),
+			"warnings": pre.Warnings,
+		})
+		return
+	}
 	if pre.Blocked() && !o.Force {
 		writeJSONResp(w, http.StatusConflict, map[string]any{
-			"error":    "preflight blocks this campaign; fix the blocking findings or pass force: true",
+			"error":    "preflight blocks this campaign; fix the blocking findings or pass force: true (only fabric_unreachable can be forced)",
 			"warnings": pre.Warnings,
 		})
 		return
@@ -215,18 +282,19 @@ func (s *Server) handleCampaigns(w http.ResponseWriter, r *http.Request) {
 		ID: j.ID, Status: jobRunning, CreatedAt: j.StartedAt,
 		Config: c, Options: o, Preflight: pre, Reps: []campaignRep{},
 	}
-	dir, logFile, err := s.createCampaign(rec)
+	dir, logFile, err := s.createCampaign(j, rec)
 	if err != nil {
 		s.jobs.run(j, func() (json.RawMessage, error) { return nil, err }, func(status, errText string) {
 			if dir != "" { // campaign.json exists: do not leave it claiming to run
 				rec.Status, rec.Error = status, errText
-				_ = saveCampaign(dir, rec)
+				persistCampaign(dir, rec)
 			}
 		})
 		http.Error(w, "cannot create the campaign folder: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
-	j.onRun = func(runID string) { s.recordRep(dir, rec, runID) }
+	j.onRun = func(runID string, start HostSample) { s.recordRep(dir, rec, runID, start) }
+	j.onRepEnd = func(runID string) { s.endRep(dir, rec, runID) }
 	client, base := s.internalClient(j)
 	go s.jobs.run(j, func() (json.RawMessage, error) {
 		defer logFile.Close()
@@ -243,14 +311,15 @@ func (s *Server) handleCampaigns(w http.ResponseWriter, r *http.Request) {
 		now := time.Now().UTC()
 		rec.Status, rec.Error, rec.FinishedAt = status, errText, &now
 		s.refreshReps(rec, false)
-		_ = saveCampaign(dir, rec)
+		persistCampaign(dir, rec)
 	})
 	writeJSONResp(w, http.StatusAccepted, map[string]string{"campaign": rec.ID})
 }
 
-// createCampaign makes the campaign folder, its first campaign.json and log.txt.
-// dir is returned non-empty once campaign.json has been written.
-func (s *Server) createCampaign(rec *campaignRecord) (string, *os.File, error) {
+// createCampaign makes the campaign folder, its first campaign.json and log.txt,
+// and attaches rec to j as the live record. dir is returned non-empty once
+// campaign.json has been written.
+func (s *Server) createCampaign(j *job, rec *campaignRecord) (string, *os.File, error) {
 	dir, err := s.campaignDir(rec.ID)
 	if err != nil {
 		return "", nil, err
@@ -259,6 +328,7 @@ func (s *Server) createCampaign(rec *campaignRecord) (string, *os.File, error) {
 		return "", nil, err
 	}
 	s.jobs.mu.Lock()
+	j.campaign = rec
 	err = saveCampaign(dir, rec)
 	s.jobs.mu.Unlock()
 	if err != nil {
@@ -268,17 +338,47 @@ func (s *Server) createCampaign(rec *campaignRecord) (string, *os.File, error) {
 	return dir, f, err
 }
 
-// recordRep appends the repetition a /generate just created. The run's own
-// run.json carries its rep tag, so the row is read from the run, not guessed.
-func (s *Server) recordRep(dir string, rec *campaignRecord, runID string) {
-	row := campaignRep{RunID: runID, Status: jobRunning}
+// recordRep appends the repetition a /generate just created, with the host
+// sample taken before it. The run's own run.json carries its rep tag, so the
+// row is read from the run, not guessed. Every earlier repetition is over by
+// now, so their values are settled and cached first.
+func (s *Server) recordRep(dir string, rec *campaignRecord, runID string, start HostSample) {
+	row := campaignRep{RunID: runID, Status: jobRunning, HostStart: &start}
 	if run, err := s.record(runID); err == nil && run.Config.Rep != nil {
 		row.Index, row.Kind = run.Config.Rep.Index, run.Config.Rep.Kind
 	}
 	s.jobs.mu.Lock()
 	defer s.jobs.mu.Unlock()
+	s.refreshReps(rec, false)
 	rec.Reps = append(rec.Reps, row)
-	_ = saveCampaign(dir, rec)
+	persistCampaign(dir, rec)
+}
+
+// endRep takes a finished repetition's closing host sample and settles its row.
+func (s *Server) endRep(dir string, rec *campaignRecord, runID string) {
+	s.jobs.mu.Lock()
+	i := pendingRepIndex(rec.Reps, runID)
+	s.jobs.mu.Unlock()
+	if i < 0 {
+		return
+	}
+	end := sampleHost() // outside the lock: under WSL it shells out
+	s.jobs.mu.Lock()
+	defer s.jobs.mu.Unlock()
+	rec.Reps[i].HostEnd = &end
+	s.refreshReps(rec, false)
+	persistCampaign(dir, rec)
+}
+
+// pendingRepIndex is the index of the row for runID still waiting for its
+// closing sample, or -1.
+func pendingRepIndex(reps []campaignRep, runID string) int {
+	for i, r := range reps {
+		if r.RunID == runID && r.HostEnd == nil {
+			return i
+		}
+	}
+	return -1
 }
 
 func (s *Server) listCampaigns(w http.ResponseWriter) {
@@ -292,7 +392,8 @@ func (s *Server) listCampaigns(w http.ResponseWriter) {
 		if !e.IsDir() {
 			continue
 		}
-		if rec, _, err := s.loadCampaign(e.Name()); err == nil {
+		if rec, active, err := s.loadCampaign(e.Name()); err == nil {
+			s.refreshReps(&rec, active)
 			out = append(out, rec)
 		}
 	}

@@ -15,13 +15,14 @@ import (
 	"runtime"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
 
 // --- helpers -----------------------------------------------------------------
 
-// enableTestAuth turns auth on for s with the auth tests' three fixture users.
+// enableTestAuth turns auth on for s with an admin and one trustee.
 func enableTestAuth(t *testing.T, s *Server) {
 	t.Helper()
 	users := []User{
@@ -38,11 +39,12 @@ func enableTestAuth(t *testing.T, s *Server) {
 	}
 }
 
-// fakeHostProbes replaces the load-average reader and the Fabric dial for one test.
+// fakeHostProbes replaces the load-average reader and the Fabric dial for one
+// test, and makes the host look like plain Linux (no WSL host CPU sample).
 func fakeHostProbes(t *testing.T, loadavg string, dialErr error) {
 	t.Helper()
-	oldLoad, oldDial := readLoadAvg, dialFabric
-	t.Cleanup(func() { readLoadAvg, dialFabric = oldLoad, oldDial })
+	oldLoad, oldDial, oldRel, oldCmd := readLoadAvg, dialFabric, readOSRelease, hostCPUCommand
+	t.Cleanup(func() { readLoadAvg, dialFabric, readOSRelease, hostCPUCommand = oldLoad, oldDial, oldRel, oldCmd })
 	readLoadAvg = func() ([]byte, error) {
 		if loadavg == "" {
 			return nil, os.ErrNotExist
@@ -50,6 +52,31 @@ func fakeHostProbes(t *testing.T, loadavg string, dialErr error) {
 		return []byte(loadavg), nil
 	}
 	dialFabric = func(string, time.Duration) error { return dialErr }
+	readOSRelease = func() ([]byte, error) { return []byte("6.8.0-45-generic\n"), nil }
+	hostCPUCommand = func(context.Context) ([]byte, error) { return nil, errors.New("not WSL") }
+}
+
+// fakeWSLHost makes the host look like WSL2 whose Windows CPU sample prints out
+// (or fails with err). Returns the number of times the command ran.
+func fakeWSLHost(t *testing.T, out string, err error) *int {
+	t.Helper()
+	oldRel, oldCmd := readOSRelease, hostCPUCommand
+	t.Cleanup(func() { readOSRelease, hostCPUCommand = oldRel, oldCmd })
+	calls := new(int)
+	readOSRelease = func() ([]byte, error) { return []byte("5.15.167.4-microsoft-standard-WSL2\n"), nil }
+	hostCPUCommand = func(context.Context) ([]byte, error) {
+		*calls++
+		return []byte(out), err
+	}
+	return calls
+}
+
+func findings(ws []PreflightWarning) map[string]PreflightWarning {
+	m := map[string]PreflightWarning{}
+	for _, w := range ws {
+		m[w.Code] = w
+	}
+	return m
 }
 
 func codes(ws []PreflightWarning) map[string]string {
@@ -100,6 +127,17 @@ func startCampaign(t *testing.T, s *Server, body any, sessionUser string) (*http
 	return rec, out.Campaign
 }
 
+// noCampaignStarted fails when a refused start left a folder or a job behind.
+func noCampaignStarted(t *testing.T, s *Server) {
+	t.Helper()
+	if entries, _ := os.ReadDir(filepath.Join(s.store.Root(), campaignsDir)); len(entries) != 0 {
+		t.Fatal("a refused campaign must leave nothing on disk")
+	}
+	if s.jobs.running() != nil {
+		t.Fatal("a refused campaign must not start a job")
+	}
+}
+
 // --- internal transport --------------------------------------------------------
 
 // No header, query, cookie or address an outside caller controls can make a
@@ -109,7 +147,7 @@ func TestInternalCallerCannotBeForged(t *testing.T) {
 	srv := httptest.NewServer(s)
 	t.Cleanup(srv.Close)
 
-	req, _ := http.NewRequest(http.MethodGet, srv.URL+"/api/preflight?internal=1&internal_call=true", nil)
+	req, _ := http.NewRequest(http.MethodPost, srv.URL+"/generate?internal=1&internal_call=true", strings.NewReader("{}"))
 	for _, h := range []string{"X-Internal", "X-Internal-Call", "X-Saksi-Internal", "Internal-Call-Key"} {
 		req.Header.Set(h, "true")
 	}
@@ -131,8 +169,9 @@ func TestInternalCallerCannotBeForged(t *testing.T) {
 	}
 }
 
-// The in-process client reaches admin routes, and the trustee-only share route,
-// with auth on and with auth off, through guard()'s Host check.
+// The in-process client reaches the driver's routes, the trustee-only share
+// route included, with auth on and off, through guard()'s Host check, and
+// nothing else.
 func TestInternalTransportWorksWithAuthOnAndOff(t *testing.T) {
 	for _, authOn := range []bool{false, true} {
 		t.Run(fmt.Sprintf("auth=%v", authOn), func(t *testing.T) {
@@ -148,40 +187,127 @@ func TestInternalTransportWorksWithAuthOnAndOff(t *testing.T) {
 				}
 			}
 			client, base := s.internalClient(nil)
-
-			resp, err := client.Get(base + "/api/preflight?mode=offline")
-			if err != nil || resp.StatusCode != http.StatusOK {
-				t.Fatalf("GET /api/preflight in-process: %v %v", err, resp)
+			do := func(method, path string, body any) *http.Response {
+				t.Helper()
+				var rd io.Reader
+				if body != nil {
+					b, _ := json.Marshal(body)
+					rd = bytes.NewReader(b)
+				}
+				req, _ := http.NewRequest(method, base+path, rd)
+				resp, err := client.Do(req)
+				if err != nil {
+					t.Fatalf("%s %s in-process: %v", method, path, err)
+				}
+				t.Cleanup(func() { resp.Body.Close() })
+				return resp
 			}
-			resp.Body.Close()
 
-			b, _ := json.Marshal(good())
-			resp, err = client.Post(base+"/generate", "application/json", bytes.NewReader(b))
-			if err != nil || resp.StatusCode != http.StatusAccepted {
-				t.Fatalf("POST /generate in-process: %v %v", err, resp)
+			resp := do(http.MethodPost, "/generate", good())
+			if resp.StatusCode != http.StatusAccepted {
+				t.Fatalf("POST /generate in-process: %d", resp.StatusCode)
 			}
 			var gen struct {
 				RunID string `json:"run_id"`
 			}
 			_ = json.NewDecoder(resp.Body).Decode(&gen)
-			resp.Body.Close()
 
-			sb, _ := json.Marshal(map[string]string{"run_id": gen.RunID, "trustee_id": "2"})
-			resp, err = client.Post(base+"/ceremony/submit", "application/json", bytes.NewReader(sb))
-			if err != nil {
-				t.Fatal(err)
+			if resp := do(http.MethodGet, "/api/runs/"+gen.RunID+"/status", nil); resp.StatusCode != http.StatusOK {
+				t.Fatalf("GET status in-process: %d", resp.StatusCode)
 			}
-			resp.Body.Close()
-			if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
-				t.Fatalf("the driver's trustee-share call was refused by auth: %d", resp.StatusCode)
+			if resp := do(http.MethodPost, "/ceremony/submit", map[string]string{"run_id": gen.RunID, "trustee_id": "2"}); resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+				t.Fatalf("the driver's trustee-share call was refused: %d", resp.StatusCode)
+			}
+			for _, p := range []struct{ method, path string }{
+				{http.MethodGet, "/api/preflight"}, {http.MethodPost, "/api/ladder"},
+				{http.MethodGet, "/api/campaigns"}, {http.MethodPost, "/api/runs/" + gen.RunID + "/resume"},
+				{http.MethodPost, "/api/runs/" + gen.RunID + "/verify-only"}, {http.MethodGet, "/wizard"},
+				{http.MethodPost, "/attack"}, {http.MethodGet, "/generate"}, {http.MethodPost, "/export/" + gen.RunID + "/run.json"},
+			} {
+				if resp := do(p.method, p.path, nil); resp.StatusCode != http.StatusForbidden {
+					t.Errorf("internal %s %s: want 403, got %d", p.method, p.path, resp.StatusCode)
+				}
 			}
 		})
 	}
 }
 
+// recordingTransport records every request before forwarding it.
+type recordingTransport struct {
+	mu    sync.Mutex
+	calls [][2]string // method, path
+}
+
+func (rt *recordingTransport) RoundTrip(r *http.Request) (*http.Response, error) {
+	rt.mu.Lock()
+	rt.calls = append(rt.calls, [2]string{r.Method, r.URL.Path})
+	rt.mu.Unlock()
+	return http.DefaultTransport.RoundTrip(r)
+}
+
+// Every request Repeat (warm-ups, measured reps, a sweep, a burst, local and
+// on-chain) and RunLadder make must resolve to an allowed internal route, and
+// every allowed route must be one they make. A driver call added to repeat.go
+// without an allowlist entry fails here instead of as a 403 mid-campaign.
+func TestInternalRoutesCoverTheDriver(t *testing.T) {
+	fake := newFakeConsole()
+	fake.perf = func(string, RepTag) map[string]string {
+		return map[string]string{"mode": "offline", "dropped": "0", "committed_tps": "5.000", "latency_p99_ms": "100.000"}
+	}
+	fake.end = func(string, RepTag) map[string]any { return map[string]any{"failed": false} }
+	base := fake.start(t)
+	rt := &recordingTransport{}
+	client := &http.Client{Transport: rt}
+
+	for _, mode := range []string{"offline", "onchain"} {
+		o := testRepeatOpts(t, base)
+		o.Client, o.Config.Mode = client, mode
+		o.Warmups, o.Reps, o.Burst, o.Sweep, o.Window = 1, 1, 3, 2, time.Second
+		if err := Repeat(context.Background(), o); err != nil {
+			t.Fatalf("Repeat %s: %v", mode, err)
+		}
+	}
+	if err := RunLadder(context.Background(), LadderOpts{
+		BaseURL: base, Client: client, DataDir: t.TempDir(), Log: io.Discard, Poll: time.Millisecond,
+		Head: func() (string, bool) { return "abc", true },
+	}); err != nil {
+		t.Fatalf("RunLadder: %v", err)
+	}
+
+	s, _, _ := testServer(t, nil)
+	mux := http.NewServeMux()
+	for _, p := range s.routes {
+		mux.HandleFunc(p, func(http.ResponseWriter, *http.Request) {})
+	}
+	used := map[string]bool{}
+	for _, c := range rt.calls {
+		_, pattern := mux.Handler(httptest.NewRequest(c[0], c[1], nil))
+		if internalRoutes[pattern] != c[0] {
+			t.Errorf("the driver calls %s %s (route %q), which internalRoutes does not allow", c[0], c[1], pattern)
+		}
+		used[pattern] = true
+	}
+	for p := range internalRoutes {
+		if !used[p] {
+			t.Errorf("internalRoutes allows %q, which the driver never calls", p)
+		}
+	}
+}
+
+// A handler panic reached through the internal transport is an error for the
+// job that hit it, not a crashed console.
+func TestInternalTransportRecoversHandlerPanic(t *testing.T) {
+	s, _, _ := testServer(t, nil)
+	s.handler = http.HandlerFunc(func(http.ResponseWriter, *http.Request) { panic("boom") })
+	client, base := s.internalClient(nil)
+	if _, err := client.Get(base + "/api/runs/x/status"); err == nil || !strings.Contains(err.Error(), "panicked") {
+		t.Fatalf("want a handler-panicked error, got %v", err)
+	}
+}
+
 // --- preflight -----------------------------------------------------------------
 
-func TestPreflightFabricReachability(t *testing.T) {
+func TestPreflightFabric(t *testing.T) {
 	s, _ := gateServer(t, liveFabric(), "abc", 1<<62)
 
 	fakeHostProbes(t, "", errors.New("connection refused"))
@@ -189,8 +315,9 @@ func TestPreflightFabricReachability(t *testing.T) {
 	if rep.Fabric.Reachable == nil || *rep.Fabric.Reachable {
 		t.Fatalf("reachable = %v, want false", rep.Fabric.Reachable)
 	}
-	if codes(rep.Warnings)["fabric_unreachable"] != severityBlock || !rep.Blocked() {
-		t.Fatalf("an unreachable peer must block an on-chain run: %+v", rep.Warnings)
+	f := findings(rep.Warnings)["fabric_unreachable"]
+	if f.Severity != severityBlock || !f.Forceable {
+		t.Fatalf("an unreachable peer must be a forceable block for an on-chain run: %+v", rep.Warnings)
 	}
 	if _, ok := codes(s.preflight(PreflightInput{Mode: "offline"}).Warnings)["fabric_unreachable"]; ok {
 		t.Fatal("an offline run needs no peer")
@@ -203,8 +330,15 @@ func TestPreflightFabricReachability(t *testing.T) {
 	}
 
 	off, _ := gateServer(t, FabricConfig{}, "abc", 1<<62)
-	if rep := off.preflight(PreflightInput{Mode: "onchain"}); rep.Fabric.Enabled || rep.Fabric.Reachable != nil {
+	rep = off.preflight(PreflightInput{Mode: "onchain"})
+	if rep.Fabric.Enabled || rep.Fabric.Reachable != nil {
 		t.Fatalf("no Fabric configured: enabled=%v reachable=%v", rep.Fabric.Enabled, rep.Fabric.Reachable)
+	}
+	if f := findings(rep.Warnings)["fabric_not_configured"]; f.Severity != severityBlock || f.Forceable {
+		t.Fatalf("on-chain with no Fabric must be an unforceable block: %+v", rep.Warnings)
+	}
+	if off.preflight(PreflightInput{Mode: "offline"}).Blocked() {
+		t.Fatal("an offline run needs no Fabric")
 	}
 }
 
@@ -214,8 +348,8 @@ func TestPreflightLadder(t *testing.T) {
 	big := PreflightInput{Mode: "offline", Voters: 2000, Positions: 3}
 
 	rep := s.preflight(big)
-	if codes(rep.Warnings)["ladder_missing"] != severityBlock || rep.Ladder.OK {
-		t.Fatalf("no ladder.json above the ceiling must block: ok=%v %+v", rep.Ladder.OK, rep.Warnings)
+	if f := findings(rep.Warnings)["ladder_missing"]; f.Severity != severityBlock || f.Forceable || rep.Ladder.OK {
+		t.Fatalf("no ladder.json above the ceiling must be an unforceable block: ok=%v %+v", rep.Ladder.OK, rep.Warnings)
 	}
 	if rep := s.preflight(PreflightInput{Mode: "offline", Voters: LadderVoterCeiling}); rep.Blocked() {
 		t.Fatalf("a tier at the ceiling needs no ladder: %+v", rep.Warnings)
@@ -238,17 +372,17 @@ func TestPreflightDisk(t *testing.T) {
 	need := uint64(100 * 3 * LedgerBytesPerBallot)
 	in := PreflightInput{Mode: "onchain", Voters: 100, Positions: 3}
 
-	s, root := gateServer(t, FabricConfig{}, "abc", need-1)
+	s, root := gateServer(t, liveFabric(), "abc", need-1)
 	rep := s.preflight(in)
-	if codes(rep.Warnings)["disk_short"] != severityBlock {
-		t.Fatalf("projected ledger above free space must block: %+v", rep.Warnings)
+	if f := findings(rep.Warnings)["disk_short"]; f.Severity != severityBlock || f.Forceable {
+		t.Fatalf("projected ledger above free space must be an unforceable block: %+v", rep.Warnings)
 	}
 	if rep.Disk.ProjectedLedgerBytes == nil || *rep.Disk.ProjectedLedgerBytes != need ||
 		rep.Disk.FreeBytes == nil || *rep.Disk.FreeBytes != need-1 || rep.Disk.Path != root {
 		t.Fatalf("disk report = %+v", rep.Disk)
 	}
 
-	s2, _ := gateServer(t, FabricConfig{}, "abc", need)
+	s2, _ := gateServer(t, liveFabric(), "abc", need)
 	if rep := s2.preflight(in); rep.Blocked() {
 		t.Fatalf("exactly enough is enough: %+v", rep.Warnings)
 	}
@@ -263,7 +397,7 @@ func TestPreflightHostLoad(t *testing.T) {
 
 	fakeHostProbes(t, fmt.Sprintf("%.2f %.2f 1.00 2/300 12345\n", cpus*0.5, cpus*0.4), nil)
 	rep := s.preflight(PreflightInput{Mode: "offline"})
-	if rep.Host.Load1 == nil || rep.Host.Load5 == nil || rep.Host.CPUs != runtime.NumCPU() {
+	if rep.Host.GuestLoad1 == nil || rep.Host.GuestLoad5 == nil || rep.Host.CPUs != runtime.NumCPU() || rep.Host.HostCPUPct != nil {
 		t.Fatalf("host = %+v", rep.Host)
 	}
 	if codes(rep.Warnings)["host_load"] != severityWarn || rep.Blocked() {
@@ -276,8 +410,44 @@ func TestPreflightHostLoad(t *testing.T) {
 	}
 
 	fakeHostProbes(t, "", nil) // no /proc/loadavg: Windows
-	if rep := s.preflight(PreflightInput{Mode: "offline"}); rep.Host.Load1 != nil || rep.Host.Load5 != nil {
-		t.Fatalf("no loadavg must report null, got %v", rep.Host.Load1)
+	if rep := s.preflight(PreflightInput{Mode: "offline"}); rep.Host.GuestLoad1 != nil || rep.Host.GuestLoad5 != nil {
+		t.Fatalf("no loadavg must report null, got %v", rep.Host.GuestLoad1)
+	}
+}
+
+// Inside WSL2 the guest's loadavg cannot see a Windows program eating cores;
+// the Windows host's CPU is sampled through interop and warned on separately.
+func TestPreflightHostCPUOnWSL(t *testing.T) {
+	s, _ := gateServer(t, FabricConfig{}, "abc", 1<<62)
+	fakeHostProbes(t, "0.50 0.40 0.30 1/100 1", nil)
+
+	calls := fakeWSLHost(t, "37.5\r\n", nil)
+	rep := s.preflight(PreflightInput{Mode: "offline"})
+	if rep.Host.HostCPUPct == nil || *rep.Host.HostCPUPct != 37.5 || rep.Host.GuestLoad1 == nil || *rep.Host.GuestLoad1 != 0.5 || *calls != 1 {
+		t.Fatalf("host = %+v (calls %d)", rep.Host, *calls)
+	}
+	if f := findings(rep.Warnings)["host_cpu"]; f.Severity != severityWarn {
+		t.Fatalf("host CPU at 37.5%% must warn: %+v", rep.Warnings)
+	}
+
+	fakeWSLHost(t, "12,5", nil) // comma-decimal locale
+	rep = s.preflight(PreflightInput{Mode: "offline"})
+	if rep.Host.HostCPUPct == nil || *rep.Host.HostCPUPct != 12.5 {
+		t.Fatalf("comma decimal: %v", rep.Host.HostCPUPct)
+	}
+	if _, ok := codes(rep.Warnings)["host_cpu"]; ok {
+		t.Fatal("host CPU at 12.5% must not warn")
+	}
+
+	fakeWSLHost(t, "", errors.New("powershell.exe: not found"))
+	if rep := s.preflight(PreflightInput{Mode: "offline"}); rep.Host.HostCPUPct != nil {
+		t.Fatalf("a failed sample must be null, got %v", *rep.Host.HostCPUPct)
+	}
+
+	calls = fakeWSLHost(t, "90", nil)
+	readOSRelease = func() ([]byte, error) { return []byte("6.8.0-45-generic\n"), nil }
+	if rep := s.preflight(PreflightInput{Mode: "offline"}); rep.Host.HostCPUPct != nil || *calls != 0 {
+		t.Fatalf("outside WSL there is no host sample: %v (calls %d)", rep.Host.HostCPUPct, *calls)
 	}
 }
 
@@ -315,17 +485,30 @@ func TestPreflightConcurrencyAgainstMaxMessageCount(t *testing.T) {
 	}
 }
 
+// SAKSI_AUDIT_THREADS is parsed as the auditor parses it: set to anything but a
+// positive integer (empty included) and the auditor refuses to run.
 func TestPreflightVerifyThreads(t *testing.T) {
 	fakeHostProbes(t, "", nil)
 	s, _ := gateServer(t, FabricConfig{}, "abc", 1<<62)
 
-	t.Setenv("SAKSI_AUDIT_THREADS", "1")
+	for _, bad := range []string{"", "0", "-2", "four", "2.5", "++8"} {
+		t.Setenv(auditThreadsEnv, bad)
+		rep := s.preflight(PreflightInput{Mode: "offline"})
+		if f := findings(rep.Warnings)["verify_threads_invalid"]; f.Severity != severityBlock || f.Forceable {
+			t.Errorf("%s=%q must be an unforceable block: %+v", auditThreadsEnv, bad, rep.Warnings)
+		}
+	}
+	t.Setenv(auditThreadsEnv, "+8")
+	if rep := s.preflight(PreflightInput{Mode: "offline"}); rep.VerifyThreadsDefault != 8 || rep.Blocked() {
+		t.Fatalf("+8: %d %+v", rep.VerifyThreadsDefault, rep.Warnings)
+	}
+	t.Setenv(auditThreadsEnv, " 1 ")
 	rep := s.preflight(PreflightInput{Mode: "offline"})
-	if rep.VerifyThreadsDefault != 1 || codes(rep.Warnings)["verify_threads"] != severityWarn {
+	if rep.VerifyThreadsDefault != 1 || codes(rep.Warnings)["verify_threads"] != severityWarn || rep.Blocked() {
 		t.Fatalf("one verify thread must warn: %d %+v", rep.VerifyThreadsDefault, rep.Warnings)
 	}
 
-	t.Setenv("SAKSI_AUDIT_THREADS", "")
+	os.Unsetenv(auditThreadsEnv) // t.Setenv above restores it after the test
 	t.Setenv("RAYON_NUM_THREADS", "")
 	if got := s.preflight(PreflightInput{Mode: "offline"}).VerifyThreadsDefault; got != runtime.NumCPU() {
 		t.Fatalf("default verify threads = %d, want every core (%d)", got, runtime.NumCPU())
@@ -352,36 +535,99 @@ func TestPreflightRouteRejectsBadNumbers(t *testing.T) {
 
 // --- campaigns and jobs ---------------------------------------------------------
 
-// A blocking-preflight campaign is refused with the findings unless forced.
-func TestCampaignRefusedOnBlockUnlessForced(t *testing.T) {
+func TestCampaignBodyValidation(t *testing.T) {
 	fakeHostProbes(t, "", nil)
 	s, _ := gateServer(t, FabricConfig{}, "abc", 1<<62)
-	c := good()
-	c.Voters = 2000 // above the ladder ceiling, no ladder.json
-
-	rec, _ := startCampaign(t, s, map[string]any{"config": c, "reps": 1}, "")
-	if rec.Code != http.StatusConflict || !strings.Contains(rec.Body.String(), "ladder_missing") {
-		t.Fatalf("want 409 with the ladder finding, got %d %s", rec.Code, rec.Body)
+	for _, tc := range []struct {
+		name string
+		body map[string]any
+		want string
+	}{
+		{"misspelled reps", map[string]any{"config": good(), "rep": 3}, "unknown field"},
+		{"warm-ups only", map[string]any{"config": good(), "warmups": 2}, "reps must be >= 1"},
+		{"nothing", map[string]any{"config": good()}, "reps must be >= 1"},
+		{"sweep of 1", map[string]any{"config": good(), "reps": 1, "sweep": 1}, "sweep must be"},
+		{"negative burst", map[string]any{"config": good(), "reps": 1, "burst": -1}, ">= 0"},
+		{"burst over the offline ceiling", map[string]any{"config": good(), "reps": 1, "burst": OfflineVoterCeiling + 1},
+			fmt.Sprintf("burst of %d voters", OfflineVoterCeiling+1)},
+	} {
+		rec, _ := startCampaign(t, s, tc.body, "")
+		if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), tc.want) {
+			t.Errorf("%s: want 400 %q, got %d %s", tc.name, tc.want, rec.Code, rec.Body)
+		}
 	}
-	if entries, _ := os.ReadDir(filepath.Join(s.store.Root(), campaignsDir)); len(entries) != 0 {
-		t.Fatal("a refused campaign must leave nothing on disk")
-	}
+	noCampaignStarted(t, s)
+}
 
-	rec, id := startCampaign(t, s, map[string]any{"config": c, "reps": 1, "force": true}, "")
+// The burst is its own election at `burst` voters, after the measured reps: its
+// ladder and disk refusals must come at start, not hours in at its /generate.
+func TestBurstEscapesPreflight(t *testing.T) {
+	fakeHostProbes(t, "", nil)
+	s, _ := gateServer(t, FabricConfig{}, "abc123", 1<<62)
+	for _, force := range []bool{false, true} {
+		rec, _ := startCampaign(t, s, map[string]any{"config": good(), "reps": 2, "burst": 2000, "force": force}, "")
+		body := rec.Body.String()
+		if rec.Code != http.StatusConflict || !strings.Contains(body, "ladder_missing") ||
+			!strings.Contains(body, "burst of 2000 voters") || !strings.Contains(body, "cannot override") {
+			t.Fatalf("force=%v: want 409 naming the burst's ladder block, got %d %s", force, rec.Code, body)
+		}
+	}
+	noCampaignStarted(t, s)
+
+	// On-chain: the measured reps fit the disk, the burst does not.
+	oc := good()
+	oc.Mode = "onchain"
+	s2, root := gateServer(t, liveFabric(), "abc123", uint64(oc.Voters*oc.Positions*LedgerBytesPerBallot))
+	writeLadder(t, root, "abc123")
+	rec, _ := startCampaign(t, s2, map[string]any{"config": oc, "reps": 2, "burst": 2000}, "")
+	if rec.Code != http.StatusConflict || !strings.Contains(rec.Body.String(), "disk_short") ||
+		!strings.Contains(rec.Body.String(), "burst of 2000 voters") {
+		t.Fatalf("want 409 naming the burst's disk block, got %d %s", rec.Code, rec.Body)
+	}
+	noCampaignStarted(t, s2)
+}
+
+// force overrides a peer that did not answer the probe, and nothing else.
+func TestCampaignForceOverridesOnlyFabricUnreachable(t *testing.T) {
+	fakeHostProbes(t, "", nil)
+	s, _ := gateServer(t, FabricConfig{}, "abc", 1<<62)
+	big := good()
+	big.Voters = 2000 // above the ladder ceiling, no ladder.json
+	rec, _ := startCampaign(t, s, map[string]any{"config": big, "reps": 1, "force": true}, "")
+	if rec.Code != http.StatusConflict || !strings.Contains(rec.Body.String(), "ladder_missing") ||
+		!strings.Contains(rec.Body.String(), "cannot override ladder_missing") {
+		t.Fatalf("a forced ladder block: want 409 that says it cannot be forced, got %d %s", rec.Code, rec.Body)
+	}
+	noCampaignStarted(t, s)
+
+	fakeHostProbes(t, "", errors.New("connection refused"))
+	s2, _ := gateServer(t, liveFabric(), "abc", 1<<62)
+	oc := good()
+	oc.Mode = "onchain"
+	rec, _ = startCampaign(t, s2, map[string]any{"config": oc, "reps": 1}, "")
+	if rec.Code != http.StatusConflict || !strings.Contains(rec.Body.String(), "fabric_unreachable") {
+		t.Fatalf("unreachable peer without force: want 409, got %d %s", rec.Code, rec.Body)
+	}
+	noCampaignStarted(t, s2)
+	rec, id := startCampaign(t, s2, map[string]any{"config": oc, "reps": 1, "force": true}, "")
 	if rec.Code != http.StatusAccepted || id == "" {
 		t.Fatalf("forced: want 202, got %d %s", rec.Code, rec.Body)
 	}
-	waitJob(t, s, id, time.Minute)
-	_, body := getCampaign(t, s, id)
-	pre, _ := body["preflight"].(map[string]any)
-	if ws, _ := pre["warnings"].([]any); len(ws) == 0 {
-		t.Fatalf("the forced campaign must keep its preflight snapshot: %v", body["preflight"])
+	waitJob(t, s2, id, time.Minute)
+	var onDisk campaignRecord
+	if err := readJSON(filepath.Join(s2.store.Root(), campaignsDir, id, campaignFile), &onDisk); err != nil {
+		t.Fatal(err)
+	}
+	if f := findings(onDisk.Preflight.Warnings)["fabric_unreachable"]; !f.Forceable {
+		t.Fatalf("the forced campaign must keep its preflight snapshot: %+v", onDisk.Preflight.Warnings)
 	}
 }
 
-// One job console-wide; cancel stops after the current repetition; no attacks.
+// One job console-wide; cancel stops after the current repetition; no attacks;
+// every repetition carries its host samples.
 func TestCampaignExclusivityAndCancel(t *testing.T) {
-	fakeHostProbes(t, "", nil)
+	fakeHostProbes(t, "1.00 0.50 0.25 1/100 1", nil)
+	fakeWSLHost(t, "42", nil)
 	s, _, exec := testServer(t, nil)
 	release := make(chan struct{})
 	exec.run = func(ctx context.Context, _ string, _ ...string) ([]byte, error) {
@@ -430,16 +676,23 @@ func TestCampaignExclusivityAndCancel(t *testing.T) {
 	if v := waitJob(t, s, id, time.Minute); v.Status != jobCancelled || v.Kind != "campaign" || len(v.Log) == 0 {
 		t.Fatalf("job = %+v", v)
 	}
-	code, body := getCampaign(t, s, id)
-	reps, _ := body["reps"].([]any)
-	if code != http.StatusOK || body["status"] != jobCancelled || len(reps) != 1 {
-		t.Fatalf("cancelled campaign: %d status=%v reps=%d", code, body["status"], len(reps))
+	var onDisk campaignRecord
+	if err := readJSON(filepath.Join(s.store.Root(), campaignsDir, id, campaignFile), &onDisk); err != nil {
+		t.Fatal(err)
 	}
-	if cfg, _ := body["config"].(map[string]any); cfg["skip_attacks"] != true {
-		t.Fatalf("a campaign must force skip_attacks: %v", cfg)
+	if onDisk.Status != jobCancelled || len(onDisk.Reps) != 1 {
+		t.Fatalf("cancelled campaign on disk: status=%s reps=%d", onDisk.Status, len(onDisk.Reps))
 	}
-	runID, _ := reps[0].(map[string]any)["run_id"].(string)
-	if run, err := s.record(runID); err != nil || !run.Config.SkipAttacks || run.Config.Rep == nil || run.Config.Rep.Kind != "warmup" {
+	row := onDisk.Reps[0]
+	if row.Status != jobFailed || row.HostStart == nil || row.HostEnd == nil ||
+		row.HostStart.HostCPUPct == nil || *row.HostStart.HostCPUPct != 42 ||
+		row.HostEnd.GuestLoad1 == nil || *row.HostEnd.GuestLoad1 != 1 {
+		t.Fatalf("repetition row = %+v (start %+v end %+v)", row, row.HostStart, row.HostEnd)
+	}
+	if !onDisk.Config.SkipAttacks {
+		t.Fatal("a campaign must force skip_attacks")
+	}
+	if run, err := s.record(row.RunID); err != nil || !run.Config.SkipAttacks || run.Config.Rep == nil || run.Config.Rep.Kind != "warmup" {
 		t.Fatalf("repetition run.json: %+v %v", run.Config, err)
 	}
 
@@ -454,36 +707,51 @@ func TestCampaignExclusivityAndCancel(t *testing.T) {
 }
 
 // A campaign whose file says running, read by a console that is not running
-// it, was interrupted by a restart.
+// it, was interrupted by a restart: its rows are settled from their run
+// folders first, and once settled they are cached, not re-read.
 func TestCampaignMarkedInterruptedAfterRestart(t *testing.T) {
 	s, _ := gateServer(t, FabricConfig{}, "abc", 1<<62)
+	runID, runDir, err := s.store.Create(good(), time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, runDir, PerfCSV, "run_id,committed_tps,latency_p99_ms\n"+runID+",12.5,80\n")
+	writeFile(t, runDir, JournalFile, `{"event":"env"}`+"\n"+`{"event":"run.end","failed":false}`+"\n")
+
 	dir := filepath.Join(s.store.Root(), campaignsDir, "campaign-20260914-120000-1")
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	rec := &campaignRecord{ID: filepath.Base(dir), Status: jobRunning, CreatedAt: time.Now().UTC(), Config: good()}
+	rec := &campaignRecord{ID: filepath.Base(dir), Status: jobRunning, CreatedAt: time.Now().UTC(), Config: good(),
+		Reps: []campaignRep{{Index: 1, Kind: "measured", RunID: runID, Status: jobRunning}}}
 	if err := saveCampaign(dir, rec); err != nil {
 		t.Fatal(err)
 	}
 
 	code, body := getCampaign(t, s, rec.ID)
-	if code != http.StatusOK || body["status"] != jobInterrupted {
-		t.Fatalf("want interrupted, got %d %v", code, body["status"])
+	reps, _ := body["reps"].([]any)
+	if code != http.StatusOK || body["status"] != jobInterrupted || len(reps) != 1 {
+		t.Fatalf("want interrupted with 1 row, got %d %v", code, body)
+	}
+	if row := reps[0].(map[string]any); row["status"] != jobDone || row["committed_tps"] != 12.5 {
+		t.Fatalf("row must be settled from its run folder: %v", row)
 	}
 	var onDisk campaignRecord
-	if err := readJSON(filepath.Join(dir, campaignFile), &onDisk); err != nil || onDisk.Status != jobInterrupted {
-		t.Fatalf("interrupted must be persisted: %v %v", onDisk.Status, err)
+	if err := readJSON(filepath.Join(dir, campaignFile), &onDisk); err != nil || onDisk.Status != jobInterrupted ||
+		onDisk.Reps[0].Status != jobDone || *onDisk.Reps[0].CommittedTPS != 12.5 {
+		t.Fatalf("interrupted state and settled rows must be persisted: %+v %v", onDisk, err)
 	}
 
+	writeFile(t, runDir, PerfCSV, "run_id,committed_tps,latency_p99_ms\n"+runID+",99,80\n")
 	list := httptest.NewRecorder()
 	s.ServeHTTP(list, httptest.NewRequest(http.MethodGet, "/api/campaigns", nil))
-	if !strings.Contains(list.Body.String(), `"status":"interrupted"`) {
-		t.Fatalf("list: %s", list.Body)
+	if !strings.Contains(list.Body.String(), `"status":"interrupted"`) || !strings.Contains(list.Body.String(), `"committed_tps":12.5`) {
+		t.Fatalf("list must show the settled, cached row: %s", list.Body)
 	}
 }
 
 // The bundle holds each run's thesis files under <run-id>/, journal line 1,
-// and the campaign's summary, record and preflight.
+// the campaign's summary, record and preflight, and a manifest of what is there.
 func TestCampaignExportBundle(t *testing.T) {
 	s, _ := gateServer(t, FabricConfig{}, "abc", 1<<62)
 	var reps []campaignRep
@@ -532,7 +800,7 @@ func TestCampaignExportBundle(t *testing.T) {
 		names = append(names, n)
 	}
 	slices.Sort(names)
-	want := []string{campaignFile, preflightBundleFile, SummaryCSV}
+	want := []string{campaignFile, preflightBundleFile, SummaryCSV, manifestFile}
 	for i, r := range reps {
 		want = append(want, r.RunID+"/"+RunFile, r.RunID+"/"+PerfCSV, r.RunID+"/"+CorrectnessFile, r.RunID+"/"+journalLine1File)
 		if i == 1 {
@@ -551,6 +819,55 @@ func TestCampaignExportBundle(t *testing.T) {
 	}
 	if !strings.Contains(files[preflightBundleFile], `"voters": 10`) {
 		t.Fatalf("preflight.json: %s", files[preflightBundleFile])
+	}
+	manifest := files[manifestFile]
+	for _, line := range []string{
+		reps[0].RunID + " (warmup 1, done)",
+		"included: run.json, perf.csv, correctness.csv, journal-line1.json",
+		"missing:  perf-schema.md, negative-tests.csv, ground-truth-check.json, timings.json",
+		"missing:  perf-schema.md, ground-truth-check.json, timings.json",
+		"included: summary.csv, campaign.json, preflight.json",
+	} {
+		if !strings.Contains(manifest, line) {
+			t.Errorf("MANIFEST.txt lacks %q:\n%s", line, manifest)
+		}
+	}
+}
+
+// A file that exists but cannot be read aborts the response rather than
+// finishing a valid-looking zip without it.
+func TestCampaignExportAbortsOnReadError(t *testing.T) {
+	s, _ := gateServer(t, FabricConfig{}, "abc", 1<<62)
+	runID, dir, err := s.store.Create(good(), time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(dir, TimingsFile), 0o755); err != nil { // opens, cannot be read
+		t.Fatal(err)
+	}
+	id := "campaign-20260914-140000-1"
+	cdir := filepath.Join(s.store.Root(), campaignsDir, id)
+	if err := os.MkdirAll(cdir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := saveCampaign(cdir, &campaignRecord{ID: id, Status: jobDone, Reps: []campaignRep{{RunID: runID, Status: jobDone}}}); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if p := recover(); p != http.ErrAbortHandler {
+			t.Fatalf("want panic(http.ErrAbortHandler), got %v", p)
+		}
+	}()
+	s.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/api/campaigns/"+id+"/export", nil))
+	t.Fatal("the export completed despite an unreadable file")
+}
+
+// A campaign.json that cannot be written is logged and kept as save_error.
+func TestPersistCampaignRecordsSaveError(t *testing.T) {
+	rec := &campaignRecord{ID: "campaign-x"}
+	persistCampaign(filepath.Join(t.TempDir(), "no-such-dir"), rec)
+	if rec.SaveError == "" {
+		t.Fatal("a failed save must set save_error")
 	}
 }
 
@@ -623,8 +940,8 @@ func TestCampaignAgainstRealDemo(t *testing.T) {
 	}
 	for i, want := range []RepTag{{1, "warmup"}, {1, "measured"}, {2, "measured"}} {
 		r := body.Reps[i]
-		if r.Index != want.Index || r.Kind != want.Kind || r.Status != jobDone || r.Failed {
-			t.Errorf("rep %d = %+v, want %+v done", i, r, want)
+		if r.Index != want.Index || r.Kind != want.Kind || r.Status != jobDone || r.Failed || r.HostStart == nil || r.HostEnd == nil {
+			t.Errorf("rep %d = %+v, want %+v done with host samples", i, r, want)
 		}
 	}
 	summary := map[string]map[string]string{}
@@ -654,7 +971,7 @@ func TestCampaignAgainstRealDemo(t *testing.T) {
 			}
 		}
 	}
-	if !names[SummaryCSV] || !names[campaignFile] || !names[preflightBundleFile] {
+	if !names[SummaryCSV] || !names[campaignFile] || !names[preflightBundleFile] || !names[manifestFile] {
 		t.Errorf("bundle is missing campaign files: %v", names)
 	}
 }

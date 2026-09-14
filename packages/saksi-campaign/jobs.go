@@ -32,7 +32,8 @@ const (
 const jobLogLines = 200
 
 // job is one ladder or campaign run. Every field is guarded by jobBoard.mu,
-// except onRun, which is set before the job's goroutine starts and never again.
+// except the hooks, which are set before the job's goroutine starts and never
+// again.
 type job struct {
 	ID         string
 	Kind       string // "ladder" | "campaign"
@@ -43,7 +44,10 @@ type job struct {
 	Result     json.RawMessage
 	log        []string
 	cancel     bool
-	onRun      func(runID string) // campaigns: record each run the job creates
+	campaign   *campaignRecord // campaigns: the live record, saved as campaign.json
+
+	onRun    func(runID string, start HostSample) // campaigns: a repetition's run was created
+	onRepEnd func(runID string)                   // campaigns: a repetition's run is over
 }
 
 // jobBoard is the console-wide job slot. The zero value is ready.
