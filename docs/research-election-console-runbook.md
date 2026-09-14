@@ -220,8 +220,8 @@ address can drive it — and with it the login is demo-grade (see §4). Pick one
 ## 6. Using the console
 
 1. **Configure**: election name; add/remove trustees (with names); threshold `t`;
-   positions/candidates; voters (scale presets — offline caps at 10,000; use
-   ground-truth mode for larger tiers until the streaming generator lands);
+   positions/candidates; voters (scale presets — offline takes every tier up to
+   MP-3.5M's 10,572,234 ballot records when preflight finds the disk and memory);
    distribution; mode (offline / on-chain / groundtruth). Two advanced fields
    drive the on-chain ballot window: **concurrency** (in-flight submissions,
    default 8) and **send rate** (dispatches per second; 0 = unthrottled).
@@ -747,7 +747,7 @@ Verify-only and the peer-restart fault only where they apply.
 
 | Route | What it does |
 | --- | --- |
-| `GET /api/preflight[?mode=&voters=&positions=&concurrency=]` | One report: `fabric` (enabled, `reachable` by a 2 s TCP dial, peer, channel), `orderer_batch` (declared `configtx.yaml`), `ladder` (`ok`, `ladder_commit`, `console_commit`), `disk` (`free_bytes` on the disk guard's volume, `projected_ledger_bytes` = voters × positions × 12,000), `host` (`guest_load1`, `guest_load5` from `/proc/loadavg`; under WSL2 also `host_cpu_pct`, the Windows host's `% Processor Time` sampled through `powershell.exe` `Get-Counter` (three 1 s samples, the last two averaged so PowerShell's own startup is excluded; about 3.7 s, 5 s timeout), because the guest's load average cannot see Windows programs; each null when unreadable; `cpus`; the host sample is reused for 10 s, with one sample in flight at a time), `verify_threads_default`, `concurrency_min_advised` (= `MaxMessageCount`), and `warnings[]` of `{severity, code, message, forceable}`. `mode` defaults to `onchain` |
+| `GET /api/preflight[?mode=&voters=&positions=&candidates=&concurrency=]` | One report: `fabric` (enabled, `reachable` by a 2 s TCP dial, peer, channel), `orderer_batch` (declared `configtx.yaml`), `ladder` (`ok`, `ladder_commit`, `console_commit`), `disk` (`free_bytes` on the disk guard's volume: the peer volume on-chain when configured, else the runs volume; on-chain `projected_ledger_bytes` = voters × positions × 12,000; offline `projected_run_bytes` = voters × positions × (1,848 + 1,402 × candidates), measured from whole console runs), `memory` (`available_bytes` = `/proc/meminfo` `MemAvailable`, null where it does not exist, such as Windows; `projected_audit_bytes` = 32 MiB + voters × positions × 150, the auditor's measured peak, for offline and on-chain runs), `host` (`guest_load1`, `guest_load5` from `/proc/loadavg`; under WSL2 also `host_cpu_pct`, the Windows host's `% Processor Time` sampled through `powershell.exe` `Get-Counter` (three 1 s samples, the last two averaged so PowerShell's own startup is excluded; about 3.7 s, 5 s timeout), because the guest's load average cannot see Windows programs; each null when unreadable; `cpus`; the host sample is reused for 10 s, with one sample in flight at a time), `verify_threads_default`, `concurrency_min_advised` (= `MaxMessageCount`), and `warnings[]` of `{severity, code, message, forceable}`. `mode` defaults to `onchain` |
 | `POST /api/ladder` | Runs the validation ladder as a job → `202 {"job": id}`. Writes `ladder.json` on a pass, exactly as `tools/ladder.sh` does |
 | `GET /api/jobs/<id>` | `{kind, status: queued\|running\|done\|failed\|cancelled, started_at, finished_at, error, log: [last 200 lines], result}`. A ladder's `result` is its `ladder.json` |
 | `POST /api/campaigns` `{config, warmups, reps, sweep?, window_s?, burst?, force?}` | Starts a campaign → `202 {"campaign": id}`. Unknown fields are `400`; `reps` must be ≥ 1 unless `sweep` or `burst` is set. Forces `skip_attacks: true` and drops any `attack_plan` (a campaign never runs attacks). Runs preflight on the config, and checks the burst (an election at `burst` voters) against validation, the ladder gate and the disk guard. A `block` answers `409 {error, warnings}`; `force: true` overrides only `fabric_unreachable` |
@@ -764,12 +764,15 @@ Preflight findings:
 | block | `fabric_not_configured` | On-chain, and the console was started without Fabric | no |
 | block | `fabric_unreachable` | Fabric is configured, the peer does not answer, and the run is on-chain | yes |
 | block | `ladder_missing` | Above 1,000 voters (not ground truth), for the config or the burst, with no `ladder.json` for this build | no |
-| block | `disk_short` | On-chain, and the projected ledger exceeds free space: of one run, or, for a campaign, of all its runs together, since no network reset runs between them: (warm-ups + reps) × voters × positions × 12,000, plus 12 × that per-run figure for a sweep (its maximum step count), plus burst × positions × 12,000 | no |
+| block | `disk_short` | The projected ledger (on-chain) or run folder (offline) exceeds free space: of one run, or, for a campaign, of all its runs together, since no network reset runs between them and every run folder is kept: (warm-ups + reps) × the per-run projection, plus 12 × it for a sweep (its maximum step count), plus the burst's own. `/generate` refuses the single run the same way | no |
+| block | `memory_short` | The audit's projected memory exceeds `MemAvailable` (never on a host without `/proc/meminfo`). `/generate` refuses the same way | no |
 | block | `verify_threads_invalid` | `SAKSI_AUDIT_THREADS` is set to anything but a positive integer (empty included): the auditor would refuse to run | no |
 | warn | `host_load` | Guest 1-minute load average above 25 % of the CPUs | — |
 | warn | `host_cpu` | Under WSL2, the Windows host's CPU above 25 % | — |
 | warn | `concurrency_low` | On-chain, ballots in flight below the orderer's `MaxMessageCount` | — |
 | warn | `verify_threads` | The auditor would verify on one thread | — |
+| warn | `disk_tight` | The run's projected disk is above 80 % of free space | — |
+| warn | `memory_tight` | The audit's projected memory is above 80 % of `MemAvailable` | — |
 
 One job runs at a time, console-wide: starting a ladder or campaign while
 another runs answers `409` naming the running job. A campaign lives in

@@ -51,6 +51,26 @@ var forceableBlocks = map[string]bool{"fabric_unreachable": true}
 // readLoadAvg reads /proc/loadavg. Absent (Windows, macOS) means no load figure.
 var readLoadAvg = func() ([]byte, error) { return os.ReadFile("/proc/loadavg") }
 
+// readMeminfo reads /proc/meminfo. Absent (Windows, macOS) means no memory figure.
+var readMeminfo = func() ([]byte, error) { return os.ReadFile("/proc/meminfo") }
+
+// memAvailable is /proc/meminfo's MemAvailable in bytes: what the kernel says a
+// new process can have without swapping.
+func memAvailable() (uint64, bool) {
+	data, err := readMeminfo()
+	if err != nil {
+		return 0, false
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		f := strings.Fields(line)
+		if len(f) >= 2 && f[0] == "MemAvailable:" {
+			kb, err := strconv.ParseUint(f[1], 10, 64)
+			return kb * 1024, err == nil
+		}
+	}
+	return 0, false
+}
+
 // readOSRelease reads the kernel release; WSL2's contains "microsoft".
 var readOSRelease = func() ([]byte, error) { return os.ReadFile("/proc/sys/kernel/osrelease") }
 
@@ -165,6 +185,7 @@ type PreflightInput struct {
 	Mode        string `json:"mode"`
 	Voters      int    `json:"voters,omitempty"`
 	Positions   int    `json:"positions,omitempty"`
+	Candidates  int    `json:"candidates,omitempty"`
 	Concurrency int    `json:"concurrency,omitempty"`
 }
 
@@ -195,10 +216,19 @@ type PreflightReport struct {
 		ConsoleCommit string `json:"console_commit"`
 	} `json:"ladder"`
 	Disk struct {
-		Path                 string  `json:"path"`
-		FreeBytes            *uint64 `json:"free_bytes"`
+		Path      string  `json:"path"`
+		FreeBytes *uint64 `json:"free_bytes"`
+		// ProjectedLedgerBytes is an on-chain run's ledger, ProjectedRunBytes an
+		// offline run's folder; the other is null.
 		ProjectedLedgerBytes *uint64 `json:"projected_ledger_bytes"`
+		ProjectedRunBytes    *uint64 `json:"projected_run_bytes"`
 	} `json:"disk"`
+	// Memory is the auditor's projected peak against MemAvailable, which is null
+	// where /proc/meminfo does not exist (Windows).
+	Memory struct {
+		AvailableBytes      *uint64 `json:"available_bytes"`
+		ProjectedAuditBytes *uint64 `json:"projected_audit_bytes"`
+	} `json:"memory"`
 	Host struct {
 		HostSample
 		CPUs int `json:"cpus"`
@@ -240,7 +270,7 @@ func (p PreflightReport) unforceable() []string {
 func (s *Server) preflight(in PreflightInput) PreflightReport {
 	rep := PreflightReport{At: time.Now().UTC(), Run: in, Warnings: []PreflightWarning{}}
 	onchain := in.Mode == "onchain"
-	c := ElectionConfig{Mode: in.Mode, Voters: in.Voters, Positions: in.Positions}
+	c := ElectionConfig{Mode: in.Mode, Voters: in.Voters, Positions: in.Positions, Candidates: in.Candidates}
 
 	rep.Fabric.Enabled = s.fabric.Enabled()
 	rep.Fabric.Peer, rep.Fabric.Channel = s.fabric.PeerEndpoint, s.fabric.Channel
@@ -296,21 +326,38 @@ func (s *Server) preflight(in PreflightInput) PreflightReport {
 			in.Voters, LadderVoterCeiling, err)
 	}
 
-	// The same volume and formula the disk gate uses, so the report and the
-	// refusal at /generate cannot disagree.
-	rep.Disk.Path = s.fabric.PeerVolume
-	if rep.Disk.Path == "" {
-		rep.Disk.Path = s.store.Root()
-	}
-	if free, err := s.freeSpace(rep.Disk.Path); err == nil {
+	// The same volumes and formulas the admission gates use, so the report and
+	// the refusal at /generate cannot disagree.
+	rep.Disk.Path = s.diskPath(in.Mode)
+	free, freeErr := s.freeSpace(rep.Disk.Path)
+	if freeErr == nil {
 		rep.Disk.FreeBytes = &free
 	}
-	if in.Voters > 0 && in.Positions > 0 {
-		need := uint64(in.Voters) * uint64(in.Positions) * LedgerBytesPerBallot
-		rep.Disk.ProjectedLedgerBytes = &need
+	if need, what := diskProjection(c); need > 0 {
+		if onchain {
+			rep.Disk.ProjectedLedgerBytes = &need
+		} else {
+			rep.Disk.ProjectedRunBytes = &need
+		}
+		if err := s.diskGate(c); err != nil {
+			rep.add(severityBlock, "disk_short", "%v", err)
+		} else if freeErr == nil && float64(need) > resourceWarnFraction*float64(free) {
+			rep.add(severityWarn, "disk_tight", "this run projects %d bytes of %s, over %.0f%% of the %d bytes free on %s",
+				need, what, resourceWarnFraction*100, free, rep.Disk.Path)
+		}
 	}
-	if err := s.diskGate(c); err != nil {
-		rep.add(severityBlock, "disk_short", "%v", err)
+	avail, haveMem := memAvailable()
+	if haveMem {
+		rep.Memory.AvailableBytes = &avail
+	}
+	if need := auditMemory(c); need > 0 {
+		rep.Memory.ProjectedAuditBytes = &need
+		if err := s.memoryGate(c); err != nil {
+			rep.add(severityBlock, "memory_short", "%v", err)
+		} else if haveMem && float64(need) > resourceWarnFraction*float64(avail) {
+			rep.add(severityWarn, "memory_tight", "this run's audit projects %d bytes of memory, over %.0f%% of the %d bytes available",
+				need, resourceWarnFraction*100, avail)
+		}
 	}
 
 	rep.Host.HostSample = s.hostCache.get()
@@ -365,7 +412,7 @@ func auditThreadsDefault() (int, error) {
 	return runtime.NumCPU(), nil
 }
 
-// handlePreflight serves GET /api/preflight[?mode=&voters=&positions=&concurrency=].
+// handlePreflight serves GET /api/preflight[?mode=&voters=&positions=&candidates=&concurrency=].
 // mode defaults to onchain: the study's measured runs are on-chain.
 func (s *Server) handlePreflight(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
@@ -377,7 +424,7 @@ func (s *Server) handlePreflight(w http.ResponseWriter, r *http.Request) {
 	if in.Mode == "" {
 		in.Mode = "onchain"
 	}
-	for name, dst := range map[string]*int{"voters": &in.Voters, "positions": &in.Positions, "concurrency": &in.Concurrency} {
+	for name, dst := range map[string]*int{"voters": &in.Voters, "positions": &in.Positions, "candidates": &in.Candidates, "concurrency": &in.Concurrency} {
 		raw := q.Get(name)
 		if raw == "" {
 			continue

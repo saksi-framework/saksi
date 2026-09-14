@@ -19,11 +19,13 @@ import (
 // MaxTrustees is the UI/validation cap on trustee count.
 const MaxTrustees = 15
 
-// OfflineVoterCeiling caps offline-mode voters. Offline generation is not
-// parallelized, so the 50k/483k/1M tiers need ground-truth mode until the
-// streaming generator lands; a researcher clicking a huge offline tier gets a
-// clear error, not a run that never finishes.
-const OfflineVoterCeiling = 10000
+// OfflineRecordCeiling is a sanity bound on an offline run's ballot records
+// (voters x positions): the largest thesis tier, 3,524,078 voters x 3
+// positions. It is not a resource guard. The generator and the auditor both
+// stream, so what an offline tier can really afford is the disk and memory of
+// this machine, and preflight and /generate check those (diskGate,
+// memoryGate); this only refuses a config no study row asks for.
+const OfflineRecordCeiling = 3_524_078 * 3
 
 // Trustee is one DKG trustee's display identity.
 type Trustee struct {
@@ -162,8 +164,7 @@ func (c ElectionConfig) Seats(p int) int {
 // ModeGroundTruth generates ONLY the Stage-4 plaintext ground-truth tables
 // (paper Appendix A) — no DKG, no credentials, no encryption, no proofs, and
 // nothing submitted on-chain. Because it runs no cryptography, it is not
-// subject to OfflineVoterCeiling, which is what makes the capstone tiers
-// (1,921,917 and 3,524,078 voters) reachable from the console.
+// subject to OfflineRecordCeiling or the offline resource guards.
 const ModeGroundTruth = "groundtruth"
 
 // Validate returns the first invariant violation, or nil. This is the single
@@ -213,10 +214,11 @@ func (c ElectionConfig) Validate() error {
 	default:
 		return fmt.Errorf("mode must be 'offline', 'onchain', or %q (got %q)", ModeGroundTruth, c.Mode)
 	}
-	if c.Mode == "offline" && c.Voters > OfflineVoterCeiling {
+	// Divided, not multiplied: a posted voters x positions can overflow int.
+	if c.Mode == "offline" && c.Voters > OfflineRecordCeiling/c.Positions {
 		return fmt.Errorf(
-			"offline mode is capped at %d voters (got %d); use ground-truth mode for larger tiers until the streaming generator lands",
-			OfflineVoterCeiling, c.Voters)
+			"offline mode is bounded at %d ballot records, the largest thesis tier (3,524,078 voters x 3 positions); got %d voters x %d positions",
+			OfflineRecordCeiling, c.Voters, c.Positions)
 	}
 	// Every posted config passes through here (/generate, /run-all, campaigns),
 	// and those routes lack the fault route's loopback and confirmation guards.

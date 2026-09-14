@@ -700,8 +700,8 @@ func TestCampaignBodyValidation(t *testing.T) {
 		{"nothing", map[string]any{"config": good()}, "reps must be >= 1"},
 		{"sweep of 1", map[string]any{"config": good(), "reps": 1, "sweep": 1}, "sweep must be"},
 		{"negative burst", map[string]any{"config": good(), "reps": 1, "burst": -1}, ">= 0"},
-		{"burst over the offline ceiling", map[string]any{"config": good(), "reps": 1, "burst": OfflineVoterCeiling + 1},
-			fmt.Sprintf("burst of %d voters", OfflineVoterCeiling+1)},
+		{"burst over the offline bound", map[string]any{"config": good(), "reps": 1, "burst": OfflineRecordCeiling + 1},
+			fmt.Sprintf("burst of %d voters", OfflineRecordCeiling+1)},
 	} {
 		rec, _ := startCampaign(t, s, tc.body, "")
 		if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), tc.want) {
@@ -749,10 +749,10 @@ func TestCampaignDiskProjectsEveryRun(t *testing.T) {
 	perRun := uint64(oc.Voters * oc.Positions * LedgerBytesPerBallot)
 	o := CampaignOptions{Warmups: 1, Reps: 2, Sweep: 2, Burst: 5}
 	want := 3*perRun + maxSweepSteps*perRun + 5*uint64(oc.Positions)*LedgerBytesPerBallot
-	if got, _ := campaignLedgerBytes(oc, o); got != want {
-		t.Fatalf("campaignLedgerBytes = %d, want %d", got, want)
+	if got, _ := campaignDiskBytes(oc, o); got != want {
+		t.Fatalf("campaignDiskBytes = %d, want %d", got, want)
 	}
-	if got, _ := campaignLedgerBytes(oc, CampaignOptions{Reps: 4}); got != 4*perRun {
+	if got, _ := campaignDiskBytes(oc, CampaignOptions{Reps: 4}); got != 4*perRun {
 		t.Fatalf("no sweep, no burst: %d, want %d", got, 4*perRun)
 	}
 

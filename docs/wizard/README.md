@@ -56,7 +56,8 @@ than hidden. See [5-trustees.md](5-trustees.md) and [7-attacks.md](7-attacks.md)
 Set in step 1; it changes which later steps apply.
 
 - **offline** — everything runs locally, no ledger. This is the presentation
-  path. Capped at 10,000 voters.
+  path. Bounded at 10,572,234 ballot records (MP-3.5M); preflight checks the
+  disk and memory a tier needs.
 - **onchain** — the same, plus the lifecycle is committed to Hyperledger Fabric
   with real ledger receipts. Needs a reachable peer.
 - **groundtruth** — generates the plaintext population *only*, no cryptography.

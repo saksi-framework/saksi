@@ -73,11 +73,11 @@ sent until step 2 — this step is local until then.
 ≥ 1; distribution one of `uniform` / `skewed` / `realistic`; senate seats within
 `0..candidates-1`; mode one of `offline` / `onchain` / `groundtruth`.
 
-**The offline ceiling.** `OfflineVoterCeiling` (10,000) applies **only** when
-`Mode == "offline"`, because the cost that justifies it — a credential, DKG
-share, ElGamal encryption and CDS proof per voter per candidate — does not exist
-on the `groundtruth` path. That scoping is what makes the 3,524,078-voter tier
-reachable.
+**The offline bound.** `OfflineRecordCeiling` (10,572,234 ballot records, the
+MP-3.5M tier) applies **only** when `Mode == "offline"`, and it is a sanity
+bound: the streaming generator and auditor make disk and memory the real limit,
+which preflight and `/generate` check (`disk_short`, `memory_short`). The
+`groundtruth` path runs no cryptography and has no bound.
 
 **Choose `realistic`.** `uniform` divides the electorate evenly and therefore
 ties at rank one; `skewed` gives a front-runner but leaves the losers level, so

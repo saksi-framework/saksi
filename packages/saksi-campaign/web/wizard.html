@@ -727,7 +727,8 @@ const RUN_TABLE = [
   ["MP-3.5M on-chain", 3524078, 3, 0, 1],
 ].map(([label, voters, positions, warmups, reps, mode = "onchain"]) => ({ label, voters, positions, warmups, reps, mode }));
 const PAPER_TRUSTEES = ["COMELEC", "Civil Society Watch", "University IT", "Academe Observer", "Bar Association"];
-const OFFLINE_CEILING = 10000;
+// config.go OfflineRecordCeiling: the largest thesis tier, MP-3.5M.
+const OFFLINE_RECORD_BOUND = 3524078 * 3;
 // preflight.go hostLoadWarnFraction: a host sample above this share of the
 // machine is "contended". web_test.go pins the two together.
 const HOST_WARN_FRACTION = 0.25;
@@ -907,11 +908,11 @@ const whole = (id) => Math.max(0, Math.floor(+$(id).value || 0));
 
 // syncHints states the limits the server will enforce, beside the field.
 function syncHints() {
-  const over = $("mode").value === "offline" && +$("voters").value > OFFLINE_CEILING;
+  const over = $("mode").value === "offline" && whole("voters") * whole("positions") > OFFLINE_RECORD_BOUND;
   $("votersHint").hidden = !over;
   $("votersHint").textContent = over
-    ? `This console refuses offline runs above ${OFFLINE_CEILING.toLocaleString()} voters (OfflineVoterCeiling, until ` +
-      "the streaming generator lands): use on-chain or ground-truth mode, or run row 8 from the command line." : "";
+    ? `This console refuses offline runs above ${OFFLINE_RECORD_BOUND.toLocaleString()} ballot records ` +
+      "(voters × positions, the largest thesis tier). Below that, preflight checks this machine's disk and memory for the run." : "";
   const adv = lastPF && lastPF.concurrency_min_advised;
   const el = $("concHint");
   if (adv == null) {
@@ -1708,7 +1709,7 @@ async function runPreflight() {
   clearTimeout(pfTimer);
   const seq = ++pfSeq;
   const q = new URLSearchParams({ mode: $("mode").value, voters: whole("voters"),
-    positions: whole("positions"), concurrency: whole("concurrency") });
+    positions: whole("positions"), candidates: whole("candidates"), concurrency: whole("concurrency") });
   $("pfAt").textContent = "checking…";
   let rep;
   try { rep = await getJSON("/api/preflight?" + q); }
@@ -1761,17 +1762,24 @@ const PF_ROWS = [
                                 : `not run for this build (${short(l.console_commit)})`;
     return { text: why + " · needed above 1,000 voters", amber: true };
   } },
-  { key: "Disk", codes: ["disk_short"], fact: (r) => {
+  { key: "Disk", codes: ["disk_short", "disk_tight"], fact: (r) => {
     const d = r.disk || {};
     let text = `${bytes(d.free_bytes)} free on ${d.path}`;
-    if (d.projected_ledger_bytes != null) text += ` · this run projects ${bytes(d.projected_ledger_bytes)} of ledger`;
+    const [proj, what] = d.projected_ledger_bytes != null ? [d.projected_ledger_bytes, "ledger"]
+      : d.projected_run_bytes != null ? [d.projected_run_bytes, "run folder"] : [null, ""];
+    if (proj != null) text += ` · this run projects ${bytes(proj)} of ${what}`;
     const runs = whole("warmups") + whole("reps");
-    if (uiMode === "campaign" && r.run.mode === "onchain" && d.projected_ledger_bytes != null && runs > 0) {
-      const all = runs * d.projected_ledger_bytes;
+    if (uiMode === "campaign" && proj != null && runs > 0) {
+      const all = runs * proj;
       text += ` · the campaign's ${runs} runs project ${bytes(all)}`;
       if (d.free_bytes != null && all > d.free_bytes) return { text: text + " — more than is free", amber: true };
     }
     return text;
+  } },
+  { key: "Memory", codes: ["memory_short", "memory_tight"], fact: (r) => {
+    const m = r.memory || {};
+    const avail = m.available_bytes == null ? "available memory not readable on this host" : `${bytes(m.available_bytes)} available`;
+    return m.projected_audit_bytes == null ? avail : `${avail} · the audit projects ${bytes(m.projected_audit_bytes)}`;
   } },
   { key: "Host", codes: ["host_load", "host_cpu"], fact: (r) => {
     const h = r.host || {};

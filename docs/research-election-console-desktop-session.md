@@ -72,9 +72,10 @@ offline (no network) or on-chain (live Fabric).
   offline. On-chain `Submit` + perf numbers need a live Fabric network. The
   `reordered-ballots` scenario never runs anywhere: ordering is not checked
   on-chain or by the stateless auditor, so there is no gate to test.
-- **Offline scale ceiling**: the console caps offline voters at 10,000 (offline
-  generation isn't parallelized). Bigger tiers (50k/483k/1M) are on-chain/perf
-  mode only.
+- **Offline scale**: offline runs are bounded at 10,572,234 ballot records (the
+  MP-3.5M tier). The generator and auditor stream, so the real limit is disk
+  (1,848 + 1,402 × candidates bytes per record) and memory (32 MiB + 150 bytes
+  per record for the audit), which preflight and `/generate` check.
 - **Run folder** (under `--runs`, one per run): `run.json`, `header.json`,
   `ballots.ndjson`, `correctness.csv` (Verify), `negative-tests.csv` (Scenarios),
   `scenarios/<id>/` (mutated copies). All exportable from the UI.

@@ -56,10 +56,10 @@ func TestGenerateRejectsInvalidConfig(t *testing.T) {
 	}
 }
 
-func TestOfflineCeilingRejectedAt400(t *testing.T) {
+func TestOfflineBoundRejectedAt400(t *testing.T) {
 	_, h, _ := testServer(t, nil)
 	big := good()
-	big.Voters = OfflineVoterCeiling + 1 // offline
+	big.Voters = OfflineRecordCeiling + 1 // offline, 1 position
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, postJSON("/generate", big))
 	if rec.Code != http.StatusBadRequest {

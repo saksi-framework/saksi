@@ -231,7 +231,6 @@ const $ = (id) => document.getElementById(id);
 // Paper tier ladder: precinct → barangay → municipal → city → provincial, then
 // the two committed capstone tiers (Zamboanga Peninsula, full ZAMBASULTA).
 const PRESETS = [1, 10, 100, 1000, 10000, 50000, 483000, 1000000, 1921917, 3524078];
-const OFFLINE_CEILING = 10000;
 // Data files: study CSVs first (prominent), then raw artifacts.
 const FILE_ORDER = ["election.csv", "ballots.csv", "correctness.csv", "negative-tests.csv",
                     "ground-truth-ballots.csv", "ground-truth-summary.csv", "perf.csv",
@@ -332,13 +331,10 @@ function syncN() { $("nDisplay").value = document.querySelectorAll('[data-truste
 
 function renderPresets() {
   const box = $("presets"); box.innerHTML = "";
-  const offline = $("mode").value === "offline";
+  // Every tier runs in every mode. An offline run is bounded only by this
+  // machine's disk and memory, which the server checks when it is created.
   PRESETS.forEach((n) => {
     const b = document.createElement("button"); b.type = "button"; b.className = "tnum"; b.textContent = n.toLocaleString();
-    // Ground-truth mode runs no crypto, so the offline ceiling does not apply —
-    // the capstone tiers are reachable there.
-    const blocked = offline && n > OFFLINE_CEILING;
-    b.disabled = blocked; if (blocked) b.title = "on-chain or ground-truth mode only";
     b.onclick = () => { $("voters").value = n; };
     box.append(b);
   });
