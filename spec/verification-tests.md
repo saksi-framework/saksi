@@ -24,7 +24,7 @@ balotachain: fabric CI job = full on-chain lifecycle (saksi-demo.sh)
 | Invalid ballots rejected | negative catalog below (chaincode `SubmitBallot` gate) |
 | Duplicate votes rejected | `per_position_double_vote_is_caught`, chaincode `TestSubmitBallotRejectsDoubleVote` |
 | All accepted ballots counted | **Reconcile** (`committed == submitted == N`): SDK `TestCountCommittedBallots*` + console `reconcileCommitted` |
-| Independently verifiable from the public record | `saksi-auditor` runs on public artifacts only (I1 formal test, planned); tamper detection `malicious_bb_node_*`, `wrong_tally_is_caught`, `ledger_digest` |
+| Independently verifiable from the public record | `saksi-auditor` runs on public artifacts only (I1 formal test, planned); tamper detection `malicious_bb_node_dropping_*`, `wrong_tally_is_caught` (ballot reordering is not detected; see the verifier's scope below) |
 | All cryptographic proofs verify | `ballot.cds_proof`, credential-signature, Chaum-Pedersen partial-decryption findings (auditor `happy_path_audit_passes`, `multi_position_audit_passes`) |
 
 ## Negative catalog (panel #20/#24) — 11 cases → the gate that rejects each
@@ -44,7 +44,7 @@ balotachain: fabric CI job = full on-chain lifecycle (saksi-demo.sh)
 | 11 | unauthorized identity | `wrong_issuer_pk_is_caught` (credential from a non-issuer key) |
 | — | corrupted data (bad hex/bytes) | chaincode `TestSubmitBallotRejectsBadHex`, `...RejectsWrongVersion` |
 
-## Verifier's scope (panel #28) — the 10 checks, all from the public record
+## Verifier's scope (panel #28) — the 10 checks, 9 run from the public record (ledger ordering is not checked)
 
 The `saksi-auditor` `audit()` report (public artifacts only — no secret shares):
 
@@ -59,7 +59,7 @@ The `saksi-auditor` `audit()` report (public artifacts only — no secret shares
 | trustee decryption proofs | `decryption.chaum_pedersen` per partial |
 | 3-of-5 threshold | `decryption.threshold` |
 | announced tally == decrypted aggregate | `tally.homomorphic_sum` (decode == published) |
-| append-only ledger consistency | `ledger_digest` (order-dependent hash chain; `malicious_bb_node_reordering_*`) |
+| append-only ledger consistency (ordering) | **not checked** — no finding; `ledger_digest` exists but no verifier runs it. Reordering is not detected — the tally is order-independent, so reordering cannot change the result; ordering integrity is not claimed (`malicious_bb_node_reordering_ballots_is_not_detected_and_leaves_the_tally_unchanged`) |
 
 ## Three-tier test plan (panel #19/#23)
 
