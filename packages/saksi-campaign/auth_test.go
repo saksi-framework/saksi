@@ -629,3 +629,49 @@ func TestHashPasswordRejectsEmpty(t *testing.T) {
 		}
 	}
 }
+
+// /runs is public, but a failed run's reason is raw error text (a stage error
+// can carry Fabric addresses and ports). Anonymous and trustee callers get the
+// coarse state; an admin session, or a console with auth off, also gets why.
+func TestRunsReasonOnlyForAdminsOrAuthOff(t *testing.T) {
+	failedRun := func(t *testing.T, s *Server) string {
+		t.Helper()
+		id, dir, err := s.store.Create(good(), time.Now())
+		if err != nil {
+			t.Fatal(err)
+		}
+		writeJournalLines(t, dir, `{"event":"run.start"}`,
+			`{"event":"run.end","failed":true,"reason":"stage_error: dial tcp 10.0.0.7:7051: connection refused"}`)
+		return id
+	}
+	runsAs := func(t *testing.T, s *Server, h http.Handler, user string) runView {
+		t.Helper()
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, signIn(t, s, user, httptest.NewRequest(http.MethodGet, "/runs", nil)))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("GET /runs as %q: %d %s", user, rec.Code, rec.Body)
+		}
+		var views []runView
+		if err := json.Unmarshal(rec.Body.Bytes(), &views); err != nil || len(views) != 1 {
+			t.Fatalf("GET /runs as %q: %v %s", user, err, rec.Body)
+		}
+		if views[0].Status != "failed" {
+			t.Fatalf("GET /runs as %q: status %q, want failed for everyone", user, views[0].Status)
+		}
+		return views[0]
+	}
+
+	s, h := authServer(t)
+	failedRun(t, s)
+	for user, want := range map[string]bool{"": false, "t1": false, "admin": true} {
+		if got := runsAs(t, s, h, user).Reason != ""; got != want {
+			t.Errorf("auth on, caller %q: reason shown = %v, want %v", user, got, want)
+		}
+	}
+
+	off, hOff, _ := testServer(t, nil)
+	failedRun(t, off)
+	if runsAs(t, off, hOff, "").Reason == "" {
+		t.Error("auth off: the reason must be shown")
+	}
+}

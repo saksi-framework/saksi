@@ -730,8 +730,9 @@ routes the driver calls (`POST /generate`, `GET /api/check/`, `POST /submit`,
 and a CLI campaign on the same config therefore produce the same run folders
 and the same `summary.csv`. Every route below is admin-only when auth is on.
 The wizard's campaign mode, preflight panel and runs list drive them. `GET /runs`
-gives each run `status` (`new`, `open`, `ended`, `failed` with `reason`,
-`interrupted`), `busy` (with `paused_stage`), `ballots_started`, `resumable`
+gives each run `status` (`new`, `open`, `ended`, `failed`, `interrupted`;
+a failed run's raw `reason` only to an admin session, or to everyone when auth
+is off, since it can name internal addresses), `busy` (with `paused_stage`), `ballots_started`, `resumable`
 (the resume route's own journal check), `was_interrupted`, `resume_pending`
 (the latest `segment.start {pending}`) and `reconciled` (a
 `verify_only.reconcile` on record), which the wizard uses to offer Resume,

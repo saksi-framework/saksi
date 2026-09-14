@@ -507,9 +507,11 @@ type runView struct {
 	RunRecord
 	Artifacts []string `json:"artifacts"`
 	// Where the run stands, for the wizard's runs list. Status is "new" (no
-	// journal yet), "open", "ended", "failed" (Reason from run.end) or
-	// "interrupted" (a ballot window the resume route would accept). Busy is a
-	// phase holding the run, PausedStage the attack stage it waits at.
+	// journal yet), "open", "ended", "failed" or "interrupted" (a ballot window
+	// the resume route would accept). Busy is a phase holding the run,
+	// PausedStage the attack stage it waits at. Reason is run.end's raw failure
+	// text, which can name internal addresses: handleRuns sends it only to an
+	// admin session, or to everyone when auth is off.
 	Busy           bool   `json:"busy"`
 	PausedStage    string `json:"paused_stage,omitempty"`
 	Status         string `json:"status"`
@@ -572,6 +574,11 @@ func (s *Server) handleRuns(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+	// /runs is public; the failure reason is operator detail.
+	showReason := s.auth == nil
+	if sess := sessionFrom(r); sess != nil && sess.Role == RoleAdmin {
+		showReason = true
+	}
 	views := make([]runView, 0, len(recs))
 	for _, rec := range recs {
 		dir, err := s.store.Dir(rec.RunID)
@@ -586,6 +593,9 @@ func (s *Server) handleRuns(w http.ResponseWriter, r *http.Request) {
 		}
 		v := runView{RunRecord: rec, Artifacts: arts}
 		s.fillState(&v, dir)
+		if !showReason {
+			v.Reason = ""
+		}
 		views = append(views, v)
 	}
 	writeJSONResp(w, http.StatusOK, views)
