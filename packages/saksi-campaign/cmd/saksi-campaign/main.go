@@ -3,7 +3,7 @@
 //
 //	saksi-campaign serve [--addr host:port] [--runs dir] [--demo path]
 //	                     [--console path] [--allow-host host[:port]]... [--timeout d]
-//	                     [--web-dir dir]
+//	                     [--web-dir dir] [--auth-file users.json]
 //	                     [--fabric-peer host:port] [--fabric-gateway-peer name]
 //	                     [--fabric-tls-cert path] [--fabric-msp-id id]
 //	                     [--fabric-cert path] [--fabric-key path]
@@ -16,6 +16,11 @@
 //	                        [--sweep 1.5] [--window 120s] [--burst N]
 //	                        [--base-url http://127.0.0.1:8090] [--out summary.csv]
 //	saksi-campaign --ladder [--base-url URL] [--runs dir]
+//
+// And it makes the password hashes for a --auth-file users file, reading the
+// password from stdin so it never lands in shell history:
+//
+//	saksi-campaign hash-password < password.txt
 package main
 
 import (
@@ -52,10 +57,18 @@ func main() {
 		repeat(os.Args[2:])
 	case "--ladder":
 		ladder(os.Args[2:])
+	case "hash-password":
+		fmt.Fprintln(os.Stderr, "reading one password line from stdin")
+		h, err := campaign.HashPassword(os.Stdin)
+		if err != nil {
+			fatal("hash-password: %v", err)
+		}
+		fmt.Println(h)
 	default:
 		fmt.Fprintln(os.Stderr, "usage: saksi-campaign serve [flags]")
 		fmt.Fprintln(os.Stderr, "       saksi-campaign --repeat --config run.json [flags]")
 		fmt.Fprintln(os.Stderr, "       saksi-campaign --ladder [flags]")
+		fmt.Fprintln(os.Stderr, "       saksi-campaign hash-password < password")
 		os.Exit(2)
 	}
 }
@@ -121,7 +134,9 @@ func serve(args []string) {
 	demoBin := fs.String("demo", "saksi-demo", "path to the saksi-demo binary")
 	consBin := fs.String("console", "", "path to the on-chain console driver (optional)")
 	webDir := fs.String("web-dir", os.Getenv("SAKSI_WEB_DIR"),
-		"directory holding the browser apps to serve: <dir>/board and <dir>/trustee (env SAKSI_WEB_DIR)")
+		"directory holding the browser apps to serve: <dir>/board, <dir>/trustee and <dir>/admin (env SAKSI_WEB_DIR)")
+	authFile := fs.String("auth-file", os.Getenv("SAKSI_AUTH_FILE"),
+		"users file (JSON) that turns on login and per-route roles; unset = no auth (env SAKSI_AUTH_FILE)")
 	timeout := fs.Duration("timeout", 60*time.Minute, "per-phase timeout")
 	fabricPeer := fs.String("fabric-peer", "localhost:7051", "Fabric gateway peer endpoint (host:port)")
 	fabricGatewayPeer := fs.String("fabric-gateway-peer", "peer0.org1.example.com", "Fabric gateway peer TLS server name")
@@ -167,13 +182,23 @@ func serve(args []string) {
 	hub := campaign.NewHub()
 	exec := campaign.NewExecutor(store, hub, *demoBin, *consBin, fabric)
 	handler := campaign.NewServer(store, exec, hub, fabric, allowedHosts(*addr, allow), *timeout)
+	if *authFile != "" {
+		if err := handler.EnableAuth(*authFile); err != nil {
+			fatal("--auth-file %s: %v", *authFile, err)
+		}
+	}
 
 	fmt.Printf("Research Election Console\n")
 	fmt.Printf("  serving   http://%s\n", displayHost(*addr))
 	fmt.Printf("  runs      %s\n", *runsDir)
 	fmt.Printf("  saksi-demo %s\n", *demoBin)
 	if *webDir != "" {
-		fmt.Printf("  apps      %s -> http://%s/board/ and /trustee/\n", *webDir, displayHost(*addr))
+		fmt.Printf("  apps      %s -> http://%s/board/, /trustee/ and /admin/\n", *webDir, displayHost(*addr))
+	}
+	if *authFile != "" {
+		fmt.Printf("  auth      on, users from %s\n", *authFile)
+	} else {
+		fmt.Printf("  auth      off (no --auth-file)\n")
 	}
 	if fabric.Enabled() {
 		fmt.Printf("  on-chain  fabric gateway %s (channel %s)\n", fabric.PeerEndpoint, fabric.Channel)

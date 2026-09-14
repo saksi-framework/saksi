@@ -406,9 +406,9 @@ func TestTrackingCodeRoundTrips(t *testing.T) {
 
 // --- static apps + ceremony view -------------------------------------------
 
-func TestWebDirServesBoardAndTrustee(t *testing.T) {
+func TestWebDirServesBoardTrusteeAndAdmin(t *testing.T) {
 	dir := t.TempDir()
-	for _, app := range []string{"board", "trustee"} {
+	for _, app := range []string{"board", "trustee", "admin"} {
 		if err := os.MkdirAll(filepath.Join(dir, app), 0o755); err != nil {
 			t.Fatal(err)
 		}
@@ -417,7 +417,7 @@ func TestWebDirServesBoardAndTrustee(t *testing.T) {
 	t.Setenv("SAKSI_WEB_DIR", dir)
 	_, h, _ := testServer(t, nil)
 
-	for _, app := range []string{"board", "trustee"} {
+	for _, app := range []string{"board", "trustee", "admin"} {
 		rec := httptest.NewRecorder()
 		h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/"+app+"/", nil))
 		if rec.Code != http.StatusOK {
