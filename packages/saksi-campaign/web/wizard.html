@@ -1249,6 +1249,7 @@ async function startVerify() {
   openStream(runID, async (e) => {
     if (e.phase === "verify" && (e.level === "done" || e.level === "error")) {
       hideLoader(4);
+      loadRuns();
       await loadResults();
     }
   });
