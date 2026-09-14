@@ -3,6 +3,16 @@
 Guidance for AI assistants (and humans) picking up work on the Saksi framework.
 Read this first, then [`docs/ROADMAP.md`](docs/ROADMAP.md) for the full build plan.
 
+**Current state and project context live in the balotachain repo** (clone it beside this
+one): [`docs/context/README.md`](https://github.com/saksi-framework/balotachain/blob/main/docs/context/README.md)
+(standing rules, what needs the user's approval, Claude Code memory notes with a restore
+script, the `/ban-init` skill) and
+[`docs/updates/2026-09-15-state-and-next-steps.md`](https://github.com/saksi-framework/balotachain/blob/main/docs/updates/2026-09-15-state-and-next-steps.md)
+(where both repos stand and what is next). The sections below are older build notes. For
+running the study, the current operator guide is
+[`docs/research-election-console-runbook.md`](docs/research-election-console-runbook.md) §10
+and [`docs/study-checklist.md`](docs/study-checklist.md).
+
 ## What Saksi is
 
 Saksi is a reusable, open-source cryptographic framework for **end-to-end
