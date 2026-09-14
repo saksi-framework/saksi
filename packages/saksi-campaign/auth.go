@@ -126,6 +126,12 @@ var routeAccess = map[string]access{
 	"/api/scenarios/": accessAdmin,
 	"/export/":        accessAdmin,
 	"/wizard":         accessAdmin,
+	// study campaigns: preflight, the ladder job, campaigns and their exports
+	"/api/preflight":  accessAdmin,
+	"/api/ladder":     accessAdmin,
+	"/api/jobs/":      accessAdmin,
+	"/api/campaigns":  accessAdmin,
+	"/api/campaigns/": accessAdmin,
 }
 
 // denial returns the HTTP status and reason when sess may not use a route that
@@ -333,6 +339,16 @@ func HashPassword(in io.Reader) (string, error) {
 // the session (if any) into the request context, then applies routeAccess.
 func (s *Server) authorize(mux *routeMux) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// An internal call (internal.go) is the console driving itself: no
+		// session, and only the routes the repeat driver calls, auth on or off.
+		if internalCall(r) {
+			if !internalRouteAllowed(mux, r) {
+				writeJSONResp(w, http.StatusForbidden, map[string]string{"error": "not a route the campaign driver uses"})
+				return
+			}
+			mux.ServeHTTP(w, r)
+			return
+		}
 		if s.auth == nil {
 			mux.ServeHTTP(w, r)
 			return

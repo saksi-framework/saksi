@@ -108,7 +108,8 @@ Flags:
 **Off unless you pass `--auth-file`.** Without it the console is open to anyone
 who can reach the address, exactly as before. `--repeat`, `tools/ladder.sh` and
 the other `tools/*.sh` scripts do not log in, so run measurement campaigns
-against a console started without it.
+against a console started without it — or start them from the console itself
+(`POST /api/ladder`, `POST /api/campaigns`, §9), which needs only an admin session.
 
 1. Hash each password. It is read from stdin (never argv), one line, and echoed:
    ```bash
@@ -142,7 +143,7 @@ session; anyone else gets the sealed view.
 | public | `/api/board/`, `/api/verify-code/`, `/trail/`, `/api/trail`, `/api/trail/`, `/api/capabilities`, `/api/ceremony/` (status), `/runs`, the `/board/`, `/trustee/`, `/admin/` apps, `/api/login`, `/api/logout`, `/api/me` |
 | trustee or admin | `POST /ceremony/publish`, `GET /events` |
 | trustee, own shares only | `POST /ceremony/submit` — `403` unless the body's `trustee_id` is the session's; an admin cannot submit for a trustee |
-| admin | `/generate`, `/submit`, `/verify`, `/run-all`, `/cancel`, `/scenarios`, `/attack`, `/ceremony/start`, `/api/runs/…`, `/api/check/`, `/api/scenarios/`, `/export/` (exports carry the seeded ground truth), `/wizard`, `/` (and any unknown path) |
+| admin | `/generate`, `/submit`, `/verify`, `/run-all`, `/cancel`, `/scenarios`, `/attack`, `/ceremony/start`, `/api/runs/…`, `/api/check/`, `/api/scenarios/`, `/export/` (exports carry the seeded ground truth), `/wizard`, `/api/preflight`, `/api/ladder`, `/api/jobs/`, `/api/campaigns`, `/api/campaigns/…`, `/` (and any unknown path) |
 
 Stated limits — say so wherever the admin console is shown:
 
@@ -670,6 +671,52 @@ was in flight when the run died — the row is written `ok=replay` in
 `negative-tests.csv`. A resumed run reports throughput **per segment**, is
 marked `sustained: false` in `run.end`, contributes no whole-run TPS figure, and
 classifies as `scaling_limit: inconclusive`.
+
+### Study API — preflight, ladder job, campaigns, export
+
+The console can run the ladder and `--repeat` campaigns itself. It reuses
+`RunLadder` and `Repeat` unchanged, driving its own API in-process: no socket,
+no credential. The requests carry a context marker only the console can set,
+still pass the Host/Origin guard, have no session, and may reach only the
+routes the driver calls (`POST /generate`, `GET /api/check/`, `POST /submit`,
+`POST /ceremony/start`, `GET /api/ceremony/`, `POST /ceremony/submit`,
+`POST /ceremony/publish`, `POST /verify`, `GET /api/runs/…/status`,
+`GET /export/`); anything else answers `403`, auth on or off. A console campaign
+and a CLI campaign on the same config therefore produce the same run folders
+and the same `summary.csv`. Every route below is admin-only when auth is on.
+The wizard buttons for them and the operator walkthrough come later.
+
+| Route | What it does |
+| --- | --- |
+| `GET /api/preflight[?mode=&voters=&positions=&concurrency=]` | One report: `fabric` (enabled, `reachable` by a 2 s TCP dial, peer, channel), `orderer_batch` (declared `configtx.yaml`), `ladder` (`ok`, `ladder_commit`, `console_commit`), `disk` (`free_bytes` on the disk guard's volume, `projected_ledger_bytes` = voters × positions × 12,000), `host` (`guest_load1`, `guest_load5` from `/proc/loadavg`; under WSL2 also `host_cpu_pct`, the Windows host's `% Processor Time` sampled through `powershell.exe` `Get-Counter` (three 1 s samples, the last two averaged so PowerShell's own startup is excluded; about 3.7 s, 5 s timeout), because the guest's load average cannot see Windows programs; each null when unreadable; `cpus`; the host sample is reused for 10 s, with one sample in flight at a time), `verify_threads_default`, `concurrency_min_advised` (= `MaxMessageCount`), and `warnings[]` of `{severity, code, message, forceable}`. `mode` defaults to `onchain` |
+| `POST /api/ladder` | Runs the validation ladder as a job → `202 {"job": id}`. Writes `ladder.json` on a pass, exactly as `tools/ladder.sh` does |
+| `GET /api/jobs/<id>` | `{kind, status: queued\|running\|done\|failed\|cancelled, started_at, finished_at, error, log: [last 200 lines], result}`. A ladder's `result` is its `ladder.json` |
+| `POST /api/campaigns` `{config, warmups, reps, sweep?, window_s?, burst?, force?}` | Starts a campaign → `202 {"campaign": id}`. Unknown fields are `400`; `reps` must be ≥ 1 unless `sweep` or `burst` is set. Forces `skip_attacks: true` and drops any `attack_plan` (a campaign never runs attacks). Runs preflight on the config, and checks the burst (an election at `burst` voters) against validation, the ladder gate and the disk guard. A `block` answers `409 {error, warnings}`; `force: true` overrides only `fabric_unreachable` |
+| `GET /api/campaigns` | Every campaign, newest first |
+| `GET /api/campaigns/<id>` | Status (`running`, `done`, `failed`, `cancelled`, `interrupted`), `save_error` if a `campaign.json` write failed, the preflight snapshot, a row per repetition (`index`, `kind`, `run_id`, `status`, `committed_tps`, `latency_p99_ms`, `failed`, `fail_reason` from the run's `perf.csv` and `run.end`; `host_start` sampled before its `/generate` and `host_end` after its verify phase), and `summary` (the parsed `summary.csv`) once written. A finished repetition's values are cached; only the one in progress is read live |
+| `POST /api/campaigns/<id>/cancel` | Stops the campaign after the current repetition (`cancelled`, no `summary.csv`). Cancelling during the last repetition, with no sweep or burst after it, has nothing left to stop: the campaign ends `done` with its `summary.csv` |
+| `GET /api/campaigns/<id>/export` | A streamed zip: `<run-id>/run.json`, `perf.csv`, `perf-schema.md`, `correctness.csv`, `negative-tests.csv`, `ground-truth-check.json`, `timings.json` (each when present) and `<run-id>/journal-line1.json` for every run, plus `summary.csv`, `campaign.json`, `preflight.json` and `MANIFEST.txt` (per run, the files included and missing). A file that exists but cannot be read aborts the download instead of finishing a zip without it |
+
+Preflight findings:
+
+| Severity | Code | When | Forceable |
+| --- | --- | --- | --- |
+| block | `run_busy` | A phase is running on a run, or its lifecycle is paused at an attack stage (named in the message) | no |
+| block | `fabric_not_configured` | On-chain, and the console was started without Fabric | no |
+| block | `fabric_unreachable` | Fabric is configured, the peer does not answer, and the run is on-chain | yes |
+| block | `ladder_missing` | Above 1,000 voters (not ground truth), for the config or the burst, with no `ladder.json` for this build | no |
+| block | `disk_short` | On-chain, and the projected ledger exceeds free space: of one run, or, for a campaign, of all its runs together, since no network reset runs between them: (warm-ups + reps) × voters × positions × 12,000, plus 12 × that per-run figure for a sweep (its maximum step count), plus burst × positions × 12,000 | no |
+| block | `verify_threads_invalid` | `SAKSI_AUDIT_THREADS` is set to anything but a positive integer (empty included): the auditor would refuse to run | no |
+| warn | `host_load` | Guest 1-minute load average above 25 % of the CPUs | — |
+| warn | `host_cpu` | Under WSL2, the Windows host's CPU above 25 % | — |
+| warn | `concurrency_low` | On-chain, ballots in flight below the orderer's `MaxMessageCount` | — |
+| warn | `verify_threads` | The auditor would verify on one thread | — |
+
+One job runs at a time, console-wide: starting a ladder or campaign while
+another runs answers `409` naming the running job. A campaign lives in
+`<runs>/campaigns/<id>/` as `campaign.json` (config, options, preflight, status,
+rows), `summary.csv` and `log.txt`. If the console stops mid-campaign, the next
+read settles its rows from their run folders and marks it `interrupted`.
 
 ## 10. Troubleshooting
 

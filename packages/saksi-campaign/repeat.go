@@ -89,6 +89,10 @@ type RepeatOpts struct {
 	Log io.Writer
 	// Poll is how often the driver checks whether a phase has finished.
 	Poll time.Duration
+	// Client, when set, carries every request instead of a plain network
+	// client. The console's own campaign jobs set it to an in-process
+	// transport (internal.go); the CLI leaves it nil.
+	Client *http.Client
 }
 
 // repResult is one repetition's outcome as the API reported it.
@@ -173,12 +177,15 @@ func newRepeatDriver(o RepeatOpts) (*repeatDriver, error) {
 	}
 	d := &repeatDriver{
 		base:   strings.TrimSuffix(o.BaseURL, "/"),
-		http:   &http.Client{Timeout: 0}, // phases are polled, not waited on
+		http:   o.Client,
 		log:    o.Log,
 		poll:   o.Poll,
 		window: o.Window,
 		factor: o.Sweep,
 		out:    o.Out,
+	}
+	if d.http == nil {
+		d.http = &http.Client{Timeout: 0} // phases are polled, not waited on
 	}
 	if d.log == nil {
 		d.log = os.Stdout
@@ -672,6 +679,12 @@ type LadderOpts struct {
 	DataDir string
 	Log     io.Writer
 	Poll    time.Duration
+	// Client is RepeatOpts.Client for the ladder's repetitions.
+	Client *http.Client
+	// Head resolves the commit ladder.json is pinned to (default: this
+	// binary's own git HEAD). The console passes the resolver its own ladder
+	// gate compares against, so the two cannot disagree.
+	Head func() (string, bool)
 }
 
 // LadderConfig is one ladder tier's election: three positions, four candidates,
@@ -698,7 +711,7 @@ func LadderConfig(voters int) ElectionConfig {
 // predicate, is where E != 0 on any contest shows up. A single failing tier
 // leaves no ladder.json, so the large-tier gate stays shut.
 func RunLadder(ctx context.Context, o LadderOpts) error {
-	d, err := newRepeatDriver(RepeatOpts{BaseURL: o.BaseURL, Log: o.Log, Poll: o.Poll})
+	d, err := newRepeatDriver(RepeatOpts{BaseURL: o.BaseURL, Log: o.Log, Poll: o.Poll, Client: o.Client})
 	if err != nil {
 		return err
 	}
@@ -721,7 +734,10 @@ func RunLadder(ctx context.Context, o LadderOpts) error {
 		runs = append(runs, r.RunID)
 	}
 
-	head, ok := consoleGitHead()
+	if o.Head == nil {
+		o.Head = consoleGitHead
+	}
+	head, ok := o.Head()
 	if !ok {
 		return fmt.Errorf("the ladder passed but this build's commit could not be resolved, " +
 			"so the result cannot be pinned to it; run from a git checkout")

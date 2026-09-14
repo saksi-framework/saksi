@@ -103,6 +103,11 @@ type Server struct {
 	auth *authState
 	// routes is every pattern registered on the mux, for the role-table test.
 	routes []string
+
+	// jobs is the console-wide ladder/campaign job slot (jobs.go).
+	jobs jobBoard
+	// hostCache is the preflight's host sample, reused briefly (preflight.go).
+	hostCache hostSampleCache
 }
 
 // NewServer returns the console HTTP handler. fabric configures the live
@@ -154,6 +159,11 @@ func NewServer(store *RunStore, exec *Executor, hub *Hub, fabric FabricConfig, a
 	mux.HandleFunc("/api/login", s.handleLogin)
 	mux.HandleFunc("/api/logout", s.handleLogout)
 	mux.HandleFunc("/api/me", s.handleMe)
+	mux.HandleFunc("/api/preflight", s.handlePreflight)
+	mux.HandleFunc("/api/ladder", s.handleLadder)
+	mux.HandleFunc("/api/jobs/", s.handleJob)
+	mux.HandleFunc("/api/campaigns", s.handleCampaigns)
+	mux.HandleFunc("/api/campaigns/", s.handleCampaign)
 	mountWebDir(mux, os.Getenv("SAKSI_WEB_DIR"))
 	s.routes = mux.patterns
 	s.handler = s.guard(s.authorize(mux))

@@ -331,10 +331,11 @@
       <summary class="small muted" style="cursor:pointer">Advanced — on-chain submission load</summary>
       <div class="grid2" style="margin-top:9px">
         <div><label for="concurrency">Ballots in flight</label>
-          <input id="concurrency" type="number" min="1" value="8" class="tnum" />
+          <input id="concurrency" type="number" min="1" value="128" class="tnum" />
           <div class="small muted" style="margin-top:4px">
-            How many ballot submissions are open at once. 1 measures this console's own
-            round-trip, not the network's throughput.
+            How many ballot submissions are open at once. Keep it at least the orderer's
+            MaxMessageCount (50 in the declared config), or every block waits the 2 s
+            batch timeout and the run measures the timeout, not the network.
           </div></div>
         <div><label for="sendRate">Send rate (ballots/s)</label>
           <input id="sendRate" type="number" min="0" step="any" value="0" class="tnum" />
