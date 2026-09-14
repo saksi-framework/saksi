@@ -27,7 +27,9 @@ This text is served from the scenario registry in Go, not written into the page,
 so what the audience reads cannot drift away from the code that performs the
 mutation.
 
-After running: the verdict. **PASS means the attack was rejected.**
+After running: the verdict. **PASS means the attack was rejected by the gate it
+declares** — the auditor check named in `gate_expected`. A rejection by any
+other check is `INCONCLUSIVE`, shown amber, and left out of the rejection rate.
 
 ## What runs
 
@@ -43,7 +45,9 @@ The original run is never modified; each attack works on its own copy.
 ### The positive control
 
 The first audit — of the **unmutated** copy — must pass before the mutation is
-applied. If it does not, the scenario fails outright.
+applied. If it does not, the scenario is `INCONCLUSIVE` (`not mounted: positive
+control did not pass`): nothing was tested, so it is neither a pass nor a
+failure of the gate.
 
 This is what makes the result attributable. Without it, a rejection after
 mutation could be caused by some unrelated pre-existing fault in the run, and the
@@ -121,39 +125,52 @@ Each attack therefore also appears at its own lifecycle stage, in an
 The stage is a field on `Scenario` (`scenarios.go`), beside `Action` and
 `Expected`, so the page never hardcodes which attack happens when.
 
+### When the attacks run: the timeline
+
+A single election with an `attack_plan` is a **security run**. Its lifecycle
+**pauses** at each stage the plan ticks, and the stage's panel waits for
+**Run**, **Run all attacks at this stage** or **Skip this stage**. If nobody
+decides before the stage's timeout (`timeout_s`, default 300 s), every attack
+at that stage runs and the election continues.
+
+| Stage | Where the lifecycle holds |
+|---|---|
+| `dkg` | after `CreateElection`, before the real `PublishDKGTranscript` |
+| `ballots` | `ballots_at` × N ballots dispatched and committed; the rest not yet sent |
+| `close` | after `CloseElection` |
+| `ceremony` | trustees have acted; the tally is not yet published |
+
+This is what makes a verdict about the gate it names. Mounted after the
+election closed, a tampered ballot is refused by the closed-election gate
+before the proof check ever runs; that is recorded as `INCONCLUSIVE`, never as
+a pass. A security run's throughput is marked perturbed (`perf.csv`
+`security_run`).
+
 ### Simulated versus real
 
-This is the distinction to be precise about, because only one of them is
-evidence about the deployed system.
+**Real (on-chain).** Only attacks with an on-chain gate that leaves no state
+behind are submitted to the live election, at the `ballots` pause: a tampered
+copy of the first ballot not yet sent (`tamper-ballot-proof`, gate `cds`;
+`corrupted-ballot-bytes`, gate `decode`), and that ballot carrying the
+nullifier of one already committed (`reused-nullifier`, gate `nullifier`). The
+refused copy leaves nothing on the ledger, and the real ballot is submitted
+when the window resumes. The chaincode's error names its gate (`gate=cds: …`).
 
-**Offline — simulated.** The attack mutates a copy of the run and re-audits it.
-Labelled `simulated` in the UI and recorded as `on_chain=false` in
-`negative-tests.csv`.
+**Simulated.** Everything else mutates a copy of the run and re-audits it,
+offline or on-chain. `tamper-dkg-transcript` and `tamper-partial-decryption`
+are simulated even on a live network, because the chaincode would *accept*
+them — it checks the transcript's shape and that a proof is present, not the
+points or the proof — and the real election would be poisoned. Their rows say
+so: "on-chain: accepted by design …; caught by the auditor".
 
-**On-chain — real.** The tampered artifact is submitted to the peer and the
-**chaincode refuses it at endorsement**, mid-election. `SubmitBallot` verifies
-the CDS proof on-chain and fails with *"contest %q CDS well-formedness proof
-failed"*; a replayed nullifier fails with *"nullifier already spent … (double
-vote)"*. That error text is what the panel displays, and the row is recorded as
-`on_chain=true`.
-
-The verdict inverts on the live path: **an error is PASS**, and a successful
-commit is `FAIL`, because a tampered artifact the ledger accepted is a genuine
-finding. The real election is never at risk — the chaincode declines the write,
-and that refusal is the demonstration.
-
-`close`-stage attacks stay simulated in both modes: they describe something
-missing or reordered across the whole ballot set, which no single submission can
-express. `Scenario.LiveCapable()` encodes that, and a test asserts it.
+`reordered-ballots` stays `SKIPPED`: ordering is a ledger property no single
+submission and no stateless audit expresses.
 
 ### Skipping
 
-Attacks are opt-in — nothing runs until a **Run** button is pressed. Beyond
-that:
-
-- **Skip** on any stage panel hides that stage and moves on.
-- **Skip attacks** in step 1 hides every inline panel for a clean end-to-end
-  run.
+- **Skip this stage** on a paused panel continues without running the rest.
+- Unticking a stage in step 1 removes that pause; **Skip attacks** removes the
+  whole timeline for a clean end-to-end run (no pauses, not a security run).
 
 Skipping is not recorded as a pass. A stage that was never run simply has no
 verdict.
@@ -163,5 +180,8 @@ verdict.
 A verdict earned inline is upserted into `scenarios.json` by
 `mergeScenarioResults`, so step 7 shows it as already decided rather than
 re-running it, and `negative-tests.csv` stays complete however the verdicts were
-obtained. The CSV carries `stage` and `on_chain` columns so the manuscript can
-distinguish a simulated rejection from a real one.
+obtained. The CSV carries the mount context (`mounted_stage`,
+`election_status`, `ballots_committed`, `block_height`, `live`) and the gates
+(`gate_expected`, `gate_observed`) so the manuscript can tell a simulated
+rejection from a real one, and a rejection by the gate under test from one by
+another.
