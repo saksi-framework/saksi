@@ -123,14 +123,19 @@ against a console started without it.
    ]
    ```
    The console refuses to start on an unknown role, a trustee without
-   `trustee_id`, an admin with one, a duplicate username, or a value that is not a
-   bcrypt hash.
+   `trustee_id`, a `trustee_id` that is not digits without a leading zero, an
+   admin with one, a duplicate username or `trustee_id`, a username over 256
+   bytes, or a value that is not a cost-12 bcrypt hash (what `hash-password`
+   makes).
 3. Start it: `./saksi-campaign serve --auth-file users.json ...`
 
 The apps sign in with `POST /api/login` (a 12-hour `saksi_session` cookie),
-`POST /api/logout` and `GET /api/me`. Five failed logins from one address lock
-that address out for 30 s. No session → `401 {"error":"login required"}`; wrong
-role → `403 {"error":"..."}`.
+`POST /api/logout` and `GET /api/me`. Five failed logins for one username from
+one address lock that username out, from that address, for 30 s; fifty failures
+from one address across any usernames lock the whole address out for 30 s. No
+session → `401 {"error":"login required"}`; wrong role → `403 {"error":"..."}`.
+The trail's unsealed operator view (`/api/trail/<id>?operator=1`) needs an admin
+session; anyone else gets the sealed view.
 
 | Role | Routes |
 | --- | --- |
@@ -144,8 +149,11 @@ Stated limits — say so wherever the admin console is shown:
 - Demo-grade: users in a file, sessions in memory (a restart logs everyone out),
   no TLS termination (the cookie is `Secure` only when served over TLS), no audit
   log of logins. Keep the loopback bind; reach it remotely through an SSH tunnel.
-- Everyone behind one address (all tunnel users arrive as loopback) shares the
-  lockout counter.
+- Anyone on loopback (every tunnel user arrives as loopback) can lock one named
+  account for 30 s with 5 guesses, or all of loopback with 50.
+- Cookies are not isolated by port: any other HTTP service on 127.0.0.1 (for
+  example the Vite dev server) receives `saksi_session`. Cross-port POSTs are
+  still refused by the console's Origin check.
 - The admin app's voter-roll and credential steps do not issue real voter
   credentials; the thesis's voter-side claims still come from the harness.
 - `/events` needs a session, so the public board cannot subscribe to progress;
