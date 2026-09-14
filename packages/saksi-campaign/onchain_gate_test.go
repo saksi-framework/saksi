@@ -136,14 +136,36 @@ func TestStagesPartitionTheCatalogue(t *testing.T) {
 	}
 }
 
-// close-stage attacks describe something missing or reordered across the whole
-// ballot set, which no single submission can express. Claiming otherwise would
-// send them down the live path and produce a misleading result.
-func TestOnlySubmittableStagesAreLiveCapable(t *testing.T) {
+// An attack goes to the live ledger only when an on-chain gate exists to refuse
+// it. The chaincode does not verify a partial decryption's proof or a DKG
+// commitment point, so those submitted live would be ACCEPTED into the real
+// election; close-stage attacks describe something missing or reordered across
+// the whole ballot set, which no single submission expresses. All of those run
+// simulated, and say why on a live election.
+func TestOnlyAttacksWithAnOnChainGateAreLiveCapable(t *testing.T) {
+	live := map[string]string{
+		"tamper-ballot-proof": "cds", "reused-nullifier": "nullifier", "corrupted-ballot-bytes": "decode",
+	}
 	for _, sc := range Registry() {
-		want := sc.Stage != StageClose
-		if sc.LiveCapable() != want {
-			t.Errorf("%s (stage %s): LiveCapable=%v, want %v", sc.ID, sc.Stage, sc.LiveCapable(), want)
+		gate, want := live[sc.ID]
+		if sc.LiveCapable() != want || sc.ChainGate != gate {
+			t.Errorf("%s: LiveCapable=%v ChainGate=%q, want %v %q", sc.ID, sc.LiveCapable(), sc.ChainGate, want, gate)
+		}
+		if want && (sc.Stage != StageBallots || sc.MutateBallot == nil) {
+			t.Errorf("%s is live but cannot be mounted mid-submission", sc.ID)
+		}
+		if !want && sc.Layer != LayerChaincode && sc.OnChainNote == "" {
+			t.Errorf("%s runs simulated on a live election but does not say what the ledger does with it", sc.ID)
+		}
+		if sc.Layer != LayerChaincode && sc.AuditGate == "" {
+			t.Errorf("%s declares no auditor gate, so a simulated PASS could name no check", sc.ID)
+		}
+	}
+	for _, id := range []string{"tamper-partial-decryption", "tamper-dkg-transcript"} {
+		for _, sc := range Registry() {
+			if sc.ID == id && !strings.Contains(sc.OnChainNote, "accepted by design") {
+				t.Errorf("%s: OnChainNote %q must say the ledger accepts it by design", id, sc.OnChainNote)
+			}
 		}
 	}
 }

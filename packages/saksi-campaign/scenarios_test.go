@@ -116,13 +116,22 @@ func TestScenariosRejectTheirMutations(t *testing.T) {
 	// Look columns up by name: hardcoding indices means a schema change reads
 	// the wrong field instead of failing honestly.
 	layerCol, verdictCol := csvCol(t, rows[0], "layer"), csvCol(t, rows[0], "verdict")
+	expCol, obsCol := csvCol(t, rows[0], "gate_expected"), csvCol(t, rows[0], "gate_observed")
+	actualCol := csvCol(t, rows[0], "actual")
 	offlineCount := 0
 	for _, cols := range rows[1:] {
+		t.Logf("%s: %s expected=%s observed=%s", cols[0], cols[verdictCol], cols[expCol], cols[obsCol])
 		if cols[layerCol] == "offline" {
 			offlineCount++
+			// PASS here is the REAL auditor naming the declared check among its
+			// failures — the proof each scenario's AuditGate is the gate that
+			// actually catches its mutation.
 			if v := cols[verdictCol]; v != "PASS" {
-				t.Fatalf("offline scenario %q must PASS (be rejected), got %q — a gate that should have rejected did not",
-					cols[0], v)
+				t.Fatalf("offline scenario %q must PASS (be rejected by %s), got %q: %s",
+					cols[0], cols[expCol], v, cols[actualCol])
+			}
+			if cols[expCol] == "" || !strings.Contains(";"+cols[obsCol]+";", ";"+cols[expCol]+";") {
+				t.Fatalf("%s: expected gate %q not among the observed %q", cols[0], cols[expCol], cols[obsCol])
 			}
 		}
 	}
@@ -149,14 +158,6 @@ func TestBallotLineRoundTrip(t *testing.T) {
 	lines, err := readBallotLines(dir)
 	if err != nil || len(lines) != 3 || lines[1] != "bb" {
 		t.Fatalf("round-trip failed: %v %v", err, lines)
-	}
-}
-
-func TestFlipHexStringChangesValue(t *testing.T) {
-	for _, s := range []string{"", "0a", "ff", "deadbeef0"} {
-		if flipHexString(s) == s {
-			t.Fatalf("flipHexString(%q) did not change the value", s)
-		}
 	}
 }
 
@@ -194,10 +195,14 @@ func csvCol(t *testing.T, header []string, name string) int {
 // needing saksi-demo on PATH.
 func TestNegativeTestsCSVRowsMatchTheirHeader(t *testing.T) {
 	dir := t.TempDir()
+	committed, height := 5, uint64(42)
 	exportOnce(t, dir, ScenarioResult{
 		Scenario: "dropped-ballot", Stage: StageClose, Layer: LayerOffline.String(),
 		Action: "act", Expected: "exp", Actual: "actual", Verdict: "PASS",
-		Property: "prop", OnChain: false,
+		Property: "prop", OnChain: true,
+		Mount: MountContext{Stage: StageBallots, ElectionStatus: "open",
+			BallotsCommitted: &committed, BlockHeight: &height},
+		GateExpected: "cds", GateObserved: "cds",
 	})
 	rows := readCSVRows(t, dir)
 	if len(rows) != 3 {
@@ -206,11 +211,64 @@ func TestNegativeTestsCSVRowsMatchTheirHeader(t *testing.T) {
 	for col, want := range map[string]string{
 		"scenario": "dropped-ballot", "stage": StageClose, "layer": "offline",
 		"action": "act", "expected": "exp", "actual": "actual",
-		"verdict": "PASS", "property": "prop", "on_chain": "false",
+		"verdict": "PASS", "property": "prop", "on_chain": "true",
 		"attempted": "1", "rejected": "1", "rate": "1.00",
+		"mounted_stage": StageBallots, "election_status": "open", "ballots_committed": "5",
+		"block_height": "42", "live": "true", "gate_expected": "cds", "gate_observed": "cds",
 	} {
 		if got := rows[1][csvCol(t, rows[0], col)]; got != want {
 			t.Errorf("column %q = %q, want %q — header and row writer are out of step", col, got, want)
+		}
+	}
+	for i, row := range rows {
+		if len(row) != len(rows[0]) {
+			t.Errorf("row %d has %d cells, header has %d", i, len(row), len(rows[0]))
+		}
+	}
+}
+
+// The mount context survives the round trip through scenarios.json, the state
+// the CSV is rebuilt from: a later, unrelated verdict must not wipe it, and an
+// empty context stays empty rather than becoming zeros.
+func TestMountContextRoundTripsThroughTheAccumulatedState(t *testing.T) {
+	dir := t.TempDir()
+	committed, height := 3, uint64(17)
+	exportOnce(t, dir, ScenarioResult{Scenario: "reused-nullifier", Verdict: "PASS", OnChain: true,
+		Mount:        MountContext{Stage: StageBallots, ElectionStatus: "open", BallotsCommitted: &committed, BlockHeight: &height},
+		GateExpected: "nullifier", GateObserved: "nullifier"})
+	exportOnce(t, dir, ScenarioResult{Scenario: "dropped-ballot", Verdict: "INCONCLUSIVE",
+		Mount: MountContext{Stage: StageUnstaged}, GateExpected: "stream.completeness", GateObserved: "tally.homomorphic_sum"})
+
+	got, err := readScenarioResults(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("results = %d, want 2", len(got))
+	}
+	r := got[0]
+	if r.Mount.Stage != StageBallots || r.Mount.ElectionStatus != "open" ||
+		r.Mount.BallotsCommitted == nil || *r.Mount.BallotsCommitted != 3 ||
+		r.Mount.BlockHeight == nil || *r.Mount.BlockHeight != 17 || r.GateObserved != "nullifier" {
+		t.Errorf("reused-nullifier lost its mount context: %+v", r)
+	}
+	if got[1].Mount.BallotsCommitted != nil || got[1].Mount.BlockHeight != nil {
+		t.Errorf("an unstaged simulation gained a ledger state it never had: %+v", got[1].Mount)
+	}
+
+	rows := readCSVRows(t, dir)
+	stage, bc, verdict := csvCol(t, rows[0], "mounted_stage"), csvCol(t, rows[0], "ballots_committed"), csvCol(t, rows[0], "verdict")
+	if rows[2][stage] != StageUnstaged || rows[2][bc] != "" || rows[2][verdict] != "INCONCLUSIVE" {
+		t.Errorf("dropped-ballot row = %v", rows[2])
+	}
+
+	list, err := ScenarioListings(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, l := range list {
+		if l.ID == "reused-nullifier" && (l.GateExpected != "nullifier" || l.MountedStage != StageBallots || l.ChainGate != "nullifier") {
+			t.Errorf("listing lost the gates or mount: %+v", l)
 		}
 	}
 }
@@ -324,10 +382,11 @@ func TestNegativeTestsCSVRejectionRates(t *testing.T) {
 	exportOnce(t, dir, ScenarioResult{Scenario: "tamper-ballot-proof", Verdict: "PASS", OnChain: true})
 	exportOnce(t, dir, ScenarioResult{Scenario: "reused-nullifier", Verdict: "FAIL"})
 	exportOnce(t, dir, ScenarioResult{Scenario: "dropped-ballot", Verdict: "SKIPPED"})
+	exportOnce(t, dir, ScenarioResult{Scenario: "corrupted-ballot-bytes", Verdict: "INCONCLUSIVE"})
 
 	rows := readCSVRows(t, dir)
-	if len(rows) != 5 { // header + 3 + summary
-		t.Fatalf("csv rows = %d, want header + 3 + summary: %v", len(rows), rows)
+	if len(rows) != 6 { // header + 4 + summary
+		t.Fatalf("csv rows = %d, want header + 4 + summary: %v", len(rows), rows)
 	}
 	scenarioCol := csvCol(t, rows[0], "scenario")
 	attempted, rejected, rate := csvCol(t, rows[0], "attempted"), csvCol(t, rows[0], "rejected"), csvCol(t, rows[0], "rate")
@@ -336,7 +395,9 @@ func TestNegativeTestsCSVRejectionRates(t *testing.T) {
 		"tamper-ballot-proof": {"1", "1", "1.00"},
 		"reused-nullifier":    {"1", "0", "0.00"},
 		"dropped-ballot":      {"0", "0", ""}, // never mounted — no rate to report
-		"summary":             {"2", "1", "0.50"},
+		// Refused, but not by its declared gate: not a trial of that gate.
+		"corrupted-ballot-bytes": {"0", "0", ""},
+		"summary":                {"2", "1", "0.50"},
 	}
 	for _, cols := range rows[1:] {
 		w, ok := want[cols[scenarioCol]]

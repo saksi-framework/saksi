@@ -47,6 +47,16 @@ type StreamAudit struct {
 	// verbatim into timings.json. Absent from pre-v2 audit documents, which
 	// decode as zeros.
 	TimingsMs TimingsMs `json:"timings_ms"`
+	// FailedChecks names every auditor check that failed, by its stable id —
+	// what lets a simulated attack's verdict say WHICH gate rejected it.
+	// Absent from auditors built before it existed, which decode as none.
+	FailedChecks []FailedCheck `json:"failed_checks"`
+}
+
+// FailedCheck is one failed auditor check (saksi-auditor demo.rs FailedCheck).
+type FailedCheck struct {
+	Check  string `json:"check"`
+	Detail string `json:"detail"`
 }
 
 // Runner shells an external command and returns its stdout. Injected so tests
@@ -81,6 +91,9 @@ type Executor struct {
 
 	receiptsMu sync.Mutex
 	receipts   map[string]*receiptsWriter // runID -> its open receiptsWriter (see openReceiptsFor/closeReceipts)
+
+	pauseMu sync.Mutex
+	pauses  map[string]*stagePause // runID -> the attack stage its lifecycle is holding at (timeline.go)
 }
 
 // NewExecutor wires the production runner. demoBin is the saksi-demo path;
@@ -769,13 +782,32 @@ func (e *Executor) setupOnChain(ctx context.Context, runID string, c ElectionCon
 	if err := step(ctx, "CreateElection", "", "CreateElection", b.Params); err != nil {
 		return err
 	}
+	// A security run's pauses (timeline.go). Without an attack plan listing the
+	// stage nothing here runs — not even the height read. The ballots stage
+	// pauses inside submitBallots.
+	if c.AttackPlan.has(StageDKG) {
+		none := 0
+		e.pauseForAttacks(ctx, runID, c, StageDKG,
+			MountContext{ElectionStatus: "open", BallotsCommitted: &none, BlockHeight: chainHeight(led)},
+			true, e.simulatedMount(ctx, runID, true))
+	}
 	if err := step(ctx, "PublishDKGTranscript", "", "PublishDKGTranscript", b.DKG); err != nil {
 		return err
 	}
 	if err := e.submitBallots(ctx, runID, c, b, led); err != nil {
 		return err
 	}
-	return step(ctx, "CloseElection", "", "CloseElection", b.ElectionID)
+	if err := step(ctx, "CloseElection", "", "CloseElection", b.ElectionID); err != nil {
+		return err
+	}
+	if !c.AttackPlan.has(StageClose) {
+		return nil
+	}
+	dir, _ := e.store.Dir(runID)
+	e.pauseForAttacks(ctx, runID, c, StageClose,
+		MountContext{ElectionStatus: "closed", BallotsCommitted: committedFromMetrics(dir), BlockHeight: chainHeight(led)},
+		true, e.simulatedMount(ctx, runID, true))
+	return ctx.Err()
 }
 
 // landedTx is one ballot as the timed window left it: which index it was, and
@@ -851,7 +883,7 @@ func (e *Executor) submitBallots(ctx context.Context, runID string, c ElectionCo
 	var readErr error
 
 	stopSampler := e.startSampler(ctx, j)
-	res := bench.Run(ctx, count, func(i int) error {
+	submit := func(i int) error {
 		line, err := reader.At(i)
 		if err != nil {
 			mu.Lock()
@@ -869,14 +901,21 @@ func (e *Executor) submitBallots(ctx context.Context, runID string, c ElectionCo
 		landed = append(landed, landedTx{index: i, txID: txID, block: block})
 		mu.Unlock()
 		return nil
-	}, bench.RunOpts{
+	}
+	opts := bench.RunOpts{
 		Concurrency: concurrency,
 		SendRate:    c.SendRate,
 		MaxDuration: c.Window(),
 		OnProgress: func(done int) {
 			_ = j.Stamp("ballots.progress", map[string]any{"done": done})
 		},
-	})
+	}
+	var res bench.RunResult
+	if at := c.AttackPlan.pauseIndex(count); at > 0 {
+		res = e.pausedWindow(ctx, runID, c, led, count, at, submit, opts)
+	} else {
+		res = runBench(ctx, count, submit, opts)
+	}
 	samples := stopSampler()
 	bounded := windowWasBounded(ctx, c, res)
 

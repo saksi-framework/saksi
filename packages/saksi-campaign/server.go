@@ -889,6 +889,8 @@ func (s *Server) handleRunAction(w http.ResponseWriter, r *http.Request) {
 		s.handleResume(w, r, id)
 	case "verify-only":
 		s.handleVerifyOnly(w, r, id)
+	case "pause":
+		s.handlePause(w, r, id)
 	default:
 		http.NotFound(w, r)
 	}
