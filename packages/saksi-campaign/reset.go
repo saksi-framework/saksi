@@ -2,6 +2,7 @@ package campaign
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -12,6 +13,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strconv"
 	"time"
 )
@@ -54,12 +56,7 @@ func runStreaming(ctx context.Context, dir string, out io.Writer, name string, a
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		sc := bufio.NewScanner(pr)
-		sc.Buffer(make([]byte, 64*1024), 1<<20)
-		for sc.Scan() {
-			_, _ = out.Write(append(sc.Bytes(), '\n'))
-		}
-		_, _ = io.Copy(io.Discard, pr) // an over-long line must not stall the child
+		copyLines(out, pr)
 	}()
 	err := cmd.Run()
 	_ = pw.Close()
@@ -75,6 +72,82 @@ func runStreaming(ctx context.Context, dir string, out io.Writer, name string, a
 		return -1, err
 	}
 	return 0, nil
+}
+
+// maxScriptLine is the longest output line kept whole; the rest of a longer
+// line is cut, and reading carries on with the next one.
+const maxScriptLine = 1 << 20
+
+// copyLines writes r to out one line per Write, cutting any line longer than
+// maxScriptLine rather than giving up on the output after it.
+func copyLines(out io.Writer, r io.Reader) {
+	br := bufio.NewReaderSize(r, 64*1024)
+	var line []byte
+	cut := false
+	flush := func() {
+		if cut {
+			line = append(line, " [line cut at 1 MiB]"...)
+		}
+		_, _ = out.Write(append(line, '\n'))
+		line, cut = line[:0], false
+	}
+	for {
+		chunk, more, err := br.ReadLine()
+		if err != nil {
+			if len(line) > 0 || cut {
+				flush()
+			}
+			return
+		}
+		if room := maxScriptLine - len(line); len(chunk) > room {
+			chunk, cut = chunk[:room], true
+		}
+		line = append(line, chunk...)
+		if !more {
+			flush()
+		}
+	}
+}
+
+// decodeExactKeys decodes a JSON object body into v, accepting only the keys in
+// allowed, each spelled exactly and given at most once. encoding/json matches
+// keys case-insensitively and lets a later duplicate win, which would let
+// {"confirm":"nope","CONFIRM":"RESET"} confirm.
+func decodeExactKeys(w http.ResponseWriter, r *http.Request, v any, allowed ...string) error {
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 1<<16))
+	if err != nil {
+		return err
+	}
+	dec := json.NewDecoder(bytes.NewReader(body))
+	if t, err := dec.Token(); err != nil || t != json.Delim('{') {
+		return errors.New("the body must be a JSON object")
+	}
+	seen := make(map[string]bool, len(allowed))
+	for dec.More() {
+		t, err := dec.Token()
+		if err != nil {
+			return err
+		}
+		key, _ := t.(string)
+		switch {
+		case !slices.Contains(allowed, key):
+			return fmt.Errorf("unknown field %q: the fields are %v, spelled exactly", key, allowed)
+		case seen[key]:
+			return fmt.Errorf("field %q is given more than once", key)
+		}
+		seen[key] = true
+		var value json.RawMessage
+		if err := dec.Decode(&value); err != nil {
+			return err
+		}
+	}
+	if _, err := dec.Token(); err != nil {
+		return err
+	}
+	if _, err := dec.Token(); err != io.EOF {
+		return errors.New("unexpected data after the JSON object")
+	}
+	return json.Unmarshal(body, v)
 }
 
 // locateTierScript finds tools/tier.sh under the console's repo root, or says
@@ -115,7 +188,7 @@ func consoleTierScript() (string, error) {
 // what is busy, and returns nil.
 func (s *Server) startExclusiveJob(w http.ResponseWriter, kind string) *job {
 	s.mu.Lock()
-	busy := s.busyRunsLocked()
+	busy := s.busyRunsLocked("")
 	var j *job
 	running := s.jobs.running()
 	if running == nil && len(busy) == 0 {
@@ -157,9 +230,7 @@ func (s *Server) handleNetworkReset(w http.ResponseWriter, r *http.Request) {
 		Positions int    `json:"positions"`
 		Confirm   string `json:"confirm"`
 	}
-	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<16))
-	dec.DisallowUnknownFields()
-	if err := dec.Decode(&req); err != nil {
+	if err := decodeExactKeys(w, r, &req, "voters", "positions", "confirm"); err != nil {
 		refuse(http.StatusBadRequest, "invalid reset body: %v", err)
 		return
 	}
@@ -194,12 +265,6 @@ func (s *Server) handleNetworkReset(w http.ResponseWriter, r *http.Request) {
 // runReset is the reset job's body: tools/tier.sh under networkResetTimeout,
 // every output line into the job log and the console log.
 func (s *Server) runReset(j *job, script string, voters, positions int, from string) (json.RawMessage, error) {
-	// The cached /api/trail connection carries the old network's TLS CA and
-	// client identity, which cryptogen has just regenerated under the same
-	// paths. Dropped whatever the outcome; the next request reconnects and
-	// re-reads the files (FabricConfig.Connect reads them on every call).
-	defer s.dropChainConn()
-
 	logPath := filepath.Join(s.store.Root(), networkResetLog)
 	logFile, err := os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
 	if err != nil {
@@ -213,8 +278,15 @@ func (s *Server) runReset(j *job, script string, voters, positions int, from str
 
 	ctx, cancel := context.WithTimeout(context.Background(), networkResetTimeout)
 	defer cancel()
-	code, runErr := s.runScript(ctx, filepath.Dir(filepath.Dir(script)), io.MultiWriter(jobLog{&s.jobs, j}, logFile),
+	sink := io.MultiWriter(jobLog{&s.jobs, j}, logFile)
+	code, runErr := s.runScript(ctx, filepath.Dir(filepath.Dir(script)), sink,
 		"bash", script, strconv.Itoa(voters), strconv.Itoa(positions))
+	// The cached /api/trail connection carries the old network's TLS CA and
+	// client identity, which cryptogen has just regenerated under the same
+	// paths. Dropped whatever the outcome; the next connection re-reads the
+	// files (FabricConfig.Connect reads them on every call).
+	s.dropChainConn()
+	result := map[string]any{"voters": voters, "positions": positions, "log": logPath}
 
 	timedOut := errors.Is(runErr, context.DeadlineExceeded)
 	switch {
@@ -224,6 +296,16 @@ func (s *Server) runReset(j *job, script string, voters, positions int, from str
 		err = fmt.Errorf("tools/tier.sh could not run: %w", runErr)
 	case code != 0:
 		err = fmt.Errorf("tools/tier.sh exited with code %d (see the job log): the network is in an unknown state", code)
+	default:
+		height, chainErr := s.readNewChain()
+		if chainErr != nil {
+			result["chain_error"] = chainErr.Error()
+			err = fmt.Errorf("tools/tier.sh succeeded but this console cannot read the new network (%v): check that its "+
+				"--fabric-tls-cert, --fabric-cert and --fabric-key point into the fabric-samples tools/tier.sh used", chainErr)
+		} else {
+			result["chain_height"] = height
+			fmt.Fprintf(sink, "console reads the new network: channel height %d\n", height)
+		}
 	}
 	outcome := "ok"
 	if err != nil {
@@ -231,11 +313,33 @@ func (s *Server) runReset(j *job, script string, voters, positions int, from str
 	}
 	fmt.Fprintf(logFile, "%s reset %s end: exit %d after %s: %s\n",
 		time.Now().UTC().Format(time.RFC3339), j.ID, code, time.Since(start).Round(time.Second), outcome)
-	result, _ := json.Marshal(map[string]any{
-		"exit_code": code, "timed_out": timedOut, "duration_ms": time.Since(start).Milliseconds(),
-		"voters": voters, "positions": positions, "log": logPath,
-	})
-	return result, err
+	result["exit_code"], result["timed_out"], result["duration_ms"] = code, timedOut, time.Since(start).Milliseconds()
+	data, _ := json.Marshal(result)
+	return data, err
+}
+
+// resetCheckTimeout bounds how long a finished reset retries reading the new
+// network; resetCheckPoll is the wait between tries. Vars so tests are quick.
+var resetCheckTimeout, resetCheckPoll = time.Minute, 2 * time.Second
+
+// readNewChain connects with the console's own Fabric settings and reads the
+// channel height, retrying while the new peer settles.
+func (s *Server) readNewChain() (uint64, error) {
+	deadline := time.Now().Add(resetCheckTimeout)
+	for {
+		_, led, err := s.dial()
+		if err == nil {
+			var h uint64
+			if h, _, err = led.ChainInfo(); err == nil {
+				return h, nil
+			}
+			s.dropChainConn() // a connection that cannot read is not kept
+		}
+		if time.Now().After(deadline) {
+			return 0, err
+		}
+		time.Sleep(resetCheckPoll)
+	}
 }
 
 // dropChainConn closes and forgets the cached /api/trail connection.

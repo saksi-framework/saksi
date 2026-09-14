@@ -284,9 +284,10 @@ func (s *Server) handleCampaigns(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
-	j, running := s.jobs.start("campaign")
-	if running != nil {
-		busyResponse(w, running)
+	// Preflight ran seconds ago and a single run may have started since: the
+	// busy check and the claim happen together here, under s.mu.
+	j := s.startExclusiveJob(w, "campaign")
+	if j == nil {
 		return
 	}
 	rec := &campaignRecord{

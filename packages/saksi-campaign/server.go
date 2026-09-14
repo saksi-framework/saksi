@@ -135,14 +135,9 @@ func NewServer(store *RunStore, exec *Executor, hub *Hub, fabric FabricConfig, a
 	s.freeSpace = freeSpaceOn
 	s.tierScript = consoleTierScript
 	s.runScript = runStreaming
-	// A fault never fires while a job (a campaign, the ladder, a reset) is using
-	// the network: stopping the peer under it would wreck that job's runs.
-	exec.faultGate = func() error {
-		if j := s.jobs.running(); j != nil {
-			return fmt.Errorf("%s %s is running on this network", j.Kind, j.ID)
-		}
-		return nil
-	}
+	// A fault never fires while anything else uses the network: stopping the
+	// peer under it would wreck those runs.
+	exec.faultGate = s.faultGate
 	for _, h := range allowHosts {
 		s.allowHosts[h] = true
 	}
@@ -278,16 +273,20 @@ func (s *Server) claim(runID string, cancel context.CancelFunc) string {
 	return ""
 }
 
-// busyRunsLocked names every run with a phase running, noting the stage a
-// paused lifecycle holds at. Caller holds s.mu.
-func (s *Server) busyRunsLocked() []string {
-	ids := slices.Sorted(maps.Keys(s.busy))
-	for i, id := range ids {
-		if pv := s.exec.PauseStatus(id); pv.Paused {
-			ids[i] += " (paused at the " + pv.Stage + " attack stage)"
+// busyRunsLocked names every run but except with a phase running, noting the
+// stage a paused lifecycle holds at. Caller holds s.mu.
+func (s *Server) busyRunsLocked(except string) []string {
+	var names []string
+	for _, id := range slices.Sorted(maps.Keys(s.busy)) {
+		if id == except {
+			continue
 		}
+		if pv := s.exec.PauseStatus(id); pv.Paused {
+			id += " (paused at the " + pv.Stage + " attack stage)"
+		}
+		names = append(names, id)
 	}
-	return ids
+	return names
 }
 
 func (s *Server) finish(runID string) {

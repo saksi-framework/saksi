@@ -276,7 +276,7 @@ func (s *Server) preflight(in PreflightInput) PreflightReport {
 	// A phase holds its run's lock for as long as it runs, including while its
 	// lifecycle is paused at an attack stage, so the busy map sees both.
 	s.mu.Lock()
-	busy := s.busyRunsLocked()
+	busy := s.busyRunsLocked("")
 	s.mu.Unlock()
 	if len(busy) > 0 {
 		rep.add(severityBlock, "run_busy",

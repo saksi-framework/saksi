@@ -514,8 +514,9 @@ type FinaliseInput struct {
 	// Set only when LedgerAudit is "ok"; a mismatch is a finding, NOT a
 	// failed run — it is a result the instrument exists to report.
 	LedgerMatchesLocal *bool
-	// SecurityRun reports that the run had an attack plan: its lifecycle paused
-	// to mount attacks, so its throughput is perturbed by design. It never
+	// SecurityRun reports that the run had an attack plan (its lifecycle paused
+	// to mount attacks) or an armed fault (the peer was stopped mid-window), so
+	// its throughput is perturbed by design. It never
 	// yields a sustained TPS or a scaling verdict.
 	SecurityRun bool
 }

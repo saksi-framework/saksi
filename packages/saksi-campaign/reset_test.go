@@ -20,8 +20,11 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
+
+	clientsdk "github.com/saksi-framework/saksi/packages/saksi-bulletin/client-sdk"
 )
 
 // enabledFabric passes FabricConfig.Enabled without pointing at anything real.
@@ -42,6 +45,7 @@ func resetServer(t *testing.T, run func(ctx context.Context, out io.Writer) (int
 	t.Helper()
 	s, _ := gateServer(t, enabledFabric(), "abc", 1<<62)
 	s.tierScript = func() (string, error) { return filepath.Join("/repo", "tools", "tier.sh"), nil }
+	s.dial = func() (chainReader, clientsdk.Ledger, error) { return nil, &fakeLedger{}, nil }
 	calls := &[]scriptCall{}
 	var mu sync.Mutex
 	s.runScript = func(ctx context.Context, dir string, out io.Writer, name string, args ...string) (int, error) {
@@ -86,6 +90,10 @@ func TestResetRefusals(t *testing.T) {
 		{"padded confirm", map[string]any{"voters": 1000, "positions": 1, "confirm": "RESET "}, loopback, http.StatusBadRequest, "exactly \\\"RESET\\\""},
 		{"no voters", map[string]any{"positions": 1, "confirm": "RESET"}, loopback, http.StatusBadRequest, "voters"},
 		{"unknown field", map[string]any{"voters": 1, "positions": 1, "confirm": "RESET", "force": true}, loopback, http.StatusBadRequest, "force"},
+		{"confirm in another case", json.RawMessage(`{"voters":1,"positions":1,"Confirm":"RESET"}`), loopback, http.StatusBadRequest, "Confirm"},
+		{"case-folded duplicate wins", json.RawMessage(`{"voters":1,"positions":1,"confirm":"nope","CONFIRM":"RESET"}`), loopback, http.StatusBadRequest, "CONFIRM"},
+		{"exact duplicate", json.RawMessage(`{"voters":1,"positions":1,"confirm":"nope","confirm":"RESET"}`), loopback, http.StatusBadRequest, "more than once"},
+		{"not an object", json.RawMessage(`["RESET"]`), loopback, http.StatusBadRequest, "JSON object"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -296,7 +304,11 @@ func TestResetJobRecordsOutputAndExitCode(t *testing.T) {
 			if v.Status != tc.status || v.Kind != jobKindReset {
 				t.Fatalf("job = %+v, want %s", v, tc.status)
 			}
-			if strings.Join(v.Log, "|") != "tier: 1000 voters x 1 positions|network down" {
+			wantLog := "tier: 1000 voters x 1 positions|network down"
+			if tc.code == 0 {
+				wantLog += "|console reads the new network: channel height 1"
+			}
+			if strings.Join(v.Log, "|") != wantLog {
 				t.Fatalf("job log = %q", v.Log)
 			}
 			var res map[string]any
@@ -326,6 +338,33 @@ func TestResetJobRecordsOutputAndExitCode(t *testing.T) {
 	}
 }
 
+// tier.sh can exit 0 and still leave a network this console cannot read (its
+// --fabric-* paths pointing into another fabric-samples): the job says so.
+func TestResetFailsWhenTheConsoleCannotReadTheNewNetwork(t *testing.T) {
+	old, oldPoll := resetCheckTimeout, resetCheckPoll
+	t.Cleanup(func() { resetCheckTimeout, resetCheckPoll = old, oldPoll })
+	resetCheckTimeout, resetCheckPoll = 30*time.Millisecond, time.Millisecond
+	s, _ := resetServer(t, func(context.Context, io.Writer) (int, error) { return 0, nil })
+	var dials atomic.Int32
+	s.dial = func() (chainReader, clientsdk.Ledger, error) {
+		dials.Add(1)
+		return nil, nil, errors.New("read TLS cert: no such file")
+	}
+	rec := postReset(t, s, goodReset, loopback, "")
+	var out struct{ Job string }
+	_ = json.Unmarshal(rec.Body.Bytes(), &out)
+	v := waitJob(t, s, out.Job, time.Minute)
+	var res map[string]any
+	_ = json.Unmarshal(v.Result, &res)
+	if v.Status != jobFailed || !strings.Contains(v.Error, "cannot read the new network") ||
+		!strings.Contains(fmt.Sprint(res["chain_error"]), "TLS cert") || res["exit_code"] != float64(0) {
+		t.Fatalf("job = %+v result %v", v, res)
+	}
+	if dials.Load() < 2 {
+		t.Fatalf("the check must retry while the peer settles, dialled %d times", dials.Load())
+	}
+}
+
 // TestResetScriptHelper is not a test: runStreaming's tests run the test binary
 // as the script, choosing its behaviour by environment.
 func TestResetScriptHelper(t *testing.T) {
@@ -334,6 +373,10 @@ func TestResetScriptHelper(t *testing.T) {
 		fmt.Println("helper: stdout")
 		fmt.Fprintln(os.Stderr, "helper: stderr")
 		os.Exit(3)
+	case "longline":
+		fmt.Println(strings.Repeat("x", 2<<20))
+		fmt.Println("helper: after the long line")
+		os.Exit(0)
 	case "hang":
 		fmt.Println("helper: up")
 		time.Sleep(2 * time.Minute)
@@ -352,6 +395,17 @@ func TestRunStreamingCapturesOutputExitCodeAndKillsOnTimeout(t *testing.T) {
 	}
 	if !strings.Contains(out.String(), "helper: stdout\n") || !strings.Contains(out.String(), "helper: stderr\n") {
 		t.Fatalf("both streams must reach the log, got %q", out.String())
+	}
+
+	t.Setenv("SAKSI_RESET_HELPER", "longline")
+	out.Reset()
+	if code, err := runStreaming(context.Background(), "", &out, os.Args[0], helper...); err != nil || code != 0 {
+		t.Fatalf("longline: code %d err %v", code, err)
+	}
+	lines := strings.Split(out.String(), "\n")
+	if len(lines) < 2 || len(lines[0]) > maxScriptLine+64 || !strings.Contains(lines[0], "[line cut at 1 MiB]") ||
+		!strings.Contains(out.String(), "helper: after the long line") {
+		t.Fatalf("a 2 MiB line must be cut and the output after it kept (first line %d bytes)", len(lines[0]))
 	}
 
 	t.Setenv("SAKSI_RESET_HELPER", "hang")
@@ -429,6 +483,9 @@ func TestResetReloadsTheFabricIdentity(t *testing.T) {
 	fab := enabledFabric()
 	fab.TLSCert, fab.Cert, fab.Key = filepath.Join(msp, "ca.crt"), filepath.Join(msp, "cert.pem"), filepath.Join(msp, "key.pem")
 
+	old, oldPoll := resetCheckTimeout, resetCheckPoll
+	t.Cleanup(func() { resetCheckTimeout, resetCheckPoll = old, oldPoll })
+	resetCheckTimeout, resetCheckPoll = 10*time.Millisecond, time.Millisecond
 	store := NewRunStore(t.TempDir())
 	hub := NewHub()
 	s := NewServer(store, NewExecutor(store, hub, "saksi-demo", "", fab), hub, fab, nil, time.Minute)
@@ -452,7 +509,9 @@ func TestResetReloadsTheFabricIdentity(t *testing.T) {
 	rec := postReset(t, s, goodReset, loopback, "")
 	var out struct{ Job string }
 	_ = json.Unmarshal(rec.Body.Bytes(), &out)
-	if v := waitJob(t, s, out.Job, time.Minute); v.Status != jobDone {
+	// No peer listens here, so the post-reset chain read fails; the identity
+	// the console connects with is what this test is about.
+	if v := waitJob(t, s, out.Job, time.Minute); v.Status != jobFailed || !strings.Contains(v.Error, "cannot read the new network") {
 		t.Fatalf("reset: %+v", v)
 	}
 	got := credentials()

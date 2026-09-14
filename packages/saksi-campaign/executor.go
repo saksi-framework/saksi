@@ -16,6 +16,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	clientsdk "github.com/saksi-framework/saksi/packages/saksi-bulletin/client-sdk"
@@ -95,8 +96,10 @@ type Executor struct {
 	pauseMu sync.Mutex
 	pauses  map[string]*stagePause // runID -> the attack stage its lifecycle is holding at (timeline.go)
 
-	// faultGate, when set, refuses to fire an armed fault (fault.go).
-	faultGate func() error
+	// faultGate, when set, refuses to fire runID's armed fault (fault.go).
+	faultGate func(runID string) error
+	// peersDown counts faults between their docker stop and start (RestorePeer).
+	peersDown atomic.Int32
 }
 
 // NewExecutor wires the production runner. demoBin is the saksi-demo path;
@@ -1282,19 +1285,52 @@ func (e *Executor) Resume(ctx context.Context, runID string, c ElectionConfig) e
 // trustees (/ceremony/submit, /ceremony/publish) exactly as /ceremony/start
 // does. Without the close, a resumed election stays open and nothing on the
 // API could ever close it, so its tally could never be published or audited.
+//
+// The close is retryable: a resume whose ballots all landed but whose close
+// failed is planned again as close-only (planResume), and a close the chain
+// already holds counts as done.
+//
+// One loss is accepted: an attack run cancelled at its ballots pause closes
+// here without its ballots-stage attacks ever mounted. (A fault run carries no
+// attack plan.)
 func (e *Executor) resumeAndClose(ctx context.Context, runID string, c ElectionConfig,
 	led clientsdk.Ledger, nl nullifierLister, bundlePath string) error {
-	if err := e.resumeBallots(ctx, runID, c, led, nl, bundlePath); err != nil {
+	dir, err := e.store.Dir(runID)
+	if err != nil {
 		return err
+	}
+	plan, err := planResume(dir, c)
+	if err != nil {
+		return err
+	}
+	if !plan.CloseOnly {
+		if err := e.resumeBallots(ctx, runID, c, led, nl, bundlePath); err != nil {
+			return err
+		}
+		// A resume stopped part-way has ballots it never sent: closing now would
+		// shut them out. Its window is stamped interrupted, so resuming again
+		// sends them and then closes.
+		if err := ctx.Err(); err != nil {
+			return fmt.Errorf("the resume was stopped before every pending ballot was sent, so the election stays open: resume again (%w)", err)
+		}
 	}
 	b, step, err := e.lifecycle(runID, led, bundlePath, "submit")
 	if err != nil {
 		return err
 	}
 	defer e.closeReceipts(runID)
+	j := e.journalFor(runID)
+	defer j.Close()
+	already := false
 	if err := e.closeElection(ctx, runID, c, b, led, step); err != nil {
-		return err
+		if !strings.Contains(clientsdk.ErrorText(err), "is already closed") {
+			_ = j.Stamp("resume.close", map[string]any{"ok": false, "close_only": plan.CloseOnly, "error": err.Error()})
+			return fmt.Errorf("every ballot is on the chain but CloseElection failed: resume again to retry the close: %w", err)
+		}
+		// A close that reached the chain while its answer did not reach us.
+		already = true
 	}
+	_ = j.Stamp("resume.close", map[string]any{"ok": true, "close_only": plan.CloseOnly, "already_closed": already})
 	e.publish(runID, "ceremony", "done", "election closed — trustees may now contribute")
 	return e.writeCeremony(runID, c, nil)
 }
@@ -1314,6 +1350,9 @@ func (e *Executor) resumeBallots(ctx context.Context, runID string, c ElectionCo
 	plan, err := planResume(dir, c)
 	if err != nil {
 		return err
+	}
+	if plan.CloseOnly {
+		return errors.New("this run's ballot window is not interrupted: there is nothing to resume")
 	}
 
 	j := e.journalFor(runID)
@@ -1612,10 +1651,16 @@ type resumePlan struct {
 	// Segment is the segment number the resume will write. Segment 0 is the
 	// original window; every resume increments.
 	Segment int `json:"segment"`
-	// Remaining is how many ballots the interrupted window had not dispatched,
-	// as its last checkpoint saw it. The exact figure needs the chain (see
-	// committedByIndex); this is the cheap number the API answers with.
+	// Remaining estimates the ballots the interrupted window left pending: its
+	// ballots minus those it committed when it stamped its end, or minus its
+	// last dispatch checkpoint when it stamped none (a hard kill). The exact
+	// figure needs the chain (see committedByIndex) and is stamped as
+	// segment.start {pending}; ballots that landed despite an error make this
+	// an upper bound.
 	Remaining int `json:"remaining"`
+	// CloseOnly: every ballot landed through an earlier resume, but the
+	// election was never closed. The resume only commits CloseElection.
+	CloseOnly bool `json:"close_only,omitempty"`
 
 	lastDone int
 	stamped  bool      // interrupted_at was already recorded
@@ -1635,21 +1680,22 @@ func planResume(dir string, c ElectionConfig) (resumePlan, error) {
 	if err != nil {
 		return p, fmt.Errorf("this run has no readable journal, so there is no checkpoint to resume from: %w", err)
 	}
-	open := false
-	n := 0
+	open, resumed := false, false
+	n, committed, endDropped := 0, -1, 0
 	p.Segment = 1 // journals recorded before segment.start existed still resume into a new segment
 	for _, ev := range events {
 		switch jstring(ev, "event") {
 		case "stage.ballots.start":
-			open, n = true, jint(ev, "n")
+			open, n, committed = true, jint(ev, "n"), -1
 		case "ballots.progress":
 			open, p.lastDone = true, jint(ev, "done")
 		case "stage.ballots.interrupted":
-			open = true
+			open, committed = true, jint(ev, "committed")
 		case "stage.ballots.end":
-			open = false
+			open, endDropped = false, jint(ev, "dropped")
 		case "segment.start":
 			p.Segment = jint(ev, "index") + 1
+			resumed = resumed || jint(ev, "index") >= 1
 		case "segment.end":
 			p.segments = append(p.segments, segmentFromEvent(ev))
 		case "interrupted_at":
@@ -1657,12 +1703,21 @@ func planResume(dir string, c ElectionConfig) (resumePlan, error) {
 		}
 	}
 	if !open {
+		// A resume that landed every ballot and then failed to close leaves the
+		// window ended and the election open: only the close is left to retry.
+		if resumed && endDropped == 0 && !closeRecorded(dir) {
+			return resumePlan{CloseOnly: true}, nil
+		}
 		return resumePlan{}, errors.New("this run's ballot window is not interrupted: there is nothing to resume")
 	}
 	if p.Segment < 1 {
 		p.Segment = 1
 	}
-	if p.Remaining = n - p.lastDone; p.Remaining < 0 {
+	done := p.lastDone
+	if committed >= 0 {
+		done = committed
+	}
+	if p.Remaining = n - done; p.Remaining < 0 {
 		p.Remaining = 0
 	}
 	// A hard kill (the console died inside the window) stamps no segment.end,
@@ -1676,6 +1731,21 @@ func planResume(dir string, c ElectionConfig) (resumePlan, error) {
 		p.segments = []Segment{{Index: 0}}
 	}
 	return p, nil
+}
+
+// closeRecorded reports whether this console has recorded the election closed:
+// a CloseElection receipt, or the ceremony file the close writes.
+func closeRecorded(dir string) bool {
+	if _, err := os.Stat(filepath.Join(dir, CeremonyFile)); err == nil {
+		return true
+	}
+	events, _ := readReceipts(dir) // a torn last row still leaves the rest readable
+	for _, ev := range events {
+		if ev.Event == "CloseElection" {
+			return true
+		}
+	}
+	return false
 }
 
 // readJournalEvents decodes journal.ndjson into one map per event. A torn last
