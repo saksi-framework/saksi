@@ -94,7 +94,11 @@ func (t *internalTransport) RoundTrip(req *http.Request) (*http.Response, error)
 	}
 
 	r := req.Clone(context.WithValue(req.Context(), internalCallKey{}, true))
-	r.Host = t.host
+	// What a real server hands a handler: a non-nil body and a client address.
+	r.Host, r.RemoteAddr = t.host, "127.0.0.1:0"
+	if r.Body == nil {
+		r.Body = http.NoBody
+	}
 	rec := httptest.NewRecorder()
 	if err := serveRecovering(t.s, rec, r); err != nil {
 		return nil, err

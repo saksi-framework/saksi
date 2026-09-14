@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -249,6 +250,10 @@ func (rt *recordingTransport) RoundTrip(r *http.Request) (*http.Response, error)
 // on-chain) and RunLadder make must resolve to an allowed internal route, and
 // every allowed route must be one they make. A driver call added to repeat.go
 // without an allowlist entry fails here instead of as a 403 mid-campaign.
+//
+// The fake answers every call successfully, so this covers the driver's
+// success-path calls. TestInternalRoutesCoverTheDriverOnErrors covers the
+// calls it makes after a step fails.
 func TestInternalRoutesCoverTheDriver(t *testing.T) {
 	fake := newFakeConsole()
 	fake.perf = func(string, RepTag) map[string]string {
@@ -274,23 +279,102 @@ func TestInternalRoutesCoverTheDriver(t *testing.T) {
 		t.Fatalf("RunLadder: %v", err)
 	}
 
-	s, _, _ := testServer(t, nil)
-	mux := http.NewServeMux()
-	for _, p := range s.routes {
-		mux.HandleFunc(p, func(http.ResponseWriter, *http.Request) {})
-	}
+	pattern := consolePatterns(t)
 	used := map[string]bool{}
 	for _, c := range rt.calls {
-		_, pattern := mux.Handler(httptest.NewRequest(c[0], c[1], nil))
-		if internalRoutes[pattern] != c[0] {
-			t.Errorf("the driver calls %s %s (route %q), which internalRoutes does not allow", c[0], c[1], pattern)
+		p := pattern(c[0], c[1])
+		if internalRoutes[p] != c[0] {
+			t.Errorf("the driver calls %s %s (route %q), which internalRoutes does not allow", c[0], c[1], p)
 		}
-		used[pattern] = true
+		used[p] = true
 	}
 	for p := range internalRoutes {
 		if !used[p] {
 			t.Errorf("internalRoutes allows %q, which the driver never calls", p)
 		}
+	}
+}
+
+// consolePatterns resolves a request to the console route it reaches, from the
+// routes NewServer really registers.
+func consolePatterns(t *testing.T) func(method, path string) string {
+	t.Helper()
+	s, _, _ := testServer(t, nil)
+	mux := http.NewServeMux()
+	for _, p := range s.routes {
+		mux.HandleFunc(p, func(http.ResponseWriter, *http.Request) {})
+	}
+	return func(method, path string) string {
+		_, pattern := mux.Handler(httptest.NewRequest(method, path, nil))
+		return pattern
+	}
+}
+
+// failOnce answers the first request to one console route with a 500 and
+// hands every other request to the fake console.
+type failOnce struct {
+	pattern func(method, path string) string
+	target  string
+	next    http.Handler
+	mu      sync.Mutex
+	done    bool
+}
+
+func (f *failOnce) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	f.mu.Lock()
+	hit := !f.done && f.pattern(r.Method, r.URL.Path) == f.target
+	f.done = f.done || hit
+	f.mu.Unlock()
+	if hit {
+		http.Error(w, "injected failure", http.StatusInternalServerError)
+		return
+	}
+	f.next.ServeHTTP(w, r)
+}
+
+// The driver's error branches: each allowed route fails once, in turn, and
+// every call the driver makes afterwards must still be an allowed route.
+func TestInternalRoutesCoverTheDriverOnErrors(t *testing.T) {
+	fake := newFakeConsole()
+	fake.perf = func(string, RepTag) map[string]string {
+		return map[string]string{"mode": "offline", "dropped": "0", "committed_tps": "5.000", "latency_p99_ms": "100.000"}
+	}
+	fake.end = func(string, RepTag) map[string]any { return map[string]any{"failed": false} }
+	pattern := consolePatterns(t)
+	for _, target := range slices.Sorted(maps.Keys(internalRoutes)) {
+		for _, mode := range []string{"offline", "onchain"} {
+			srv := httptest.NewServer(&failOnce{pattern: pattern, target: target, next: fake})
+			rt := &recordingTransport{}
+			o := testRepeatOpts(t, srv.URL)
+			o.Client, o.Config.Mode = &http.Client{Transport: rt}, mode
+			o.Warmups, o.Reps = 1, 1
+			_ = Repeat(context.Background(), o) // a failed step may end the campaign: that is the branch under test
+			srv.Close()
+			for _, c := range rt.calls {
+				if p := pattern(c[0], c[1]); internalRoutes[p] != c[0] {
+					t.Errorf("%s failing once (%s): the driver then calls %s %s (route %q), which internalRoutes does not allow",
+						target, mode, c[0], c[1], p)
+				}
+			}
+		}
+	}
+}
+
+// An internal request reaches its handler as a served one would: a non-nil
+// body and a loopback client address.
+func TestInternalTransportRequestLooksServed(t *testing.T) {
+	s, _, _ := testServer(t, nil)
+	var body io.ReadCloser
+	var remote string
+	s.handler = http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) { body, remote = r.Body, r.RemoteAddr })
+	client, base := s.internalClient(nil)
+	resp, err := client.Get(base + "/api/runs/x/status")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if body != http.NoBody || !isLoopback(remote) {
+		t.Fatalf("handler saw body %v, remote %q; want http.NoBody and a loopback address", body, remote)
 	}
 }
 
@@ -405,32 +489,43 @@ func TestPreflightHostLoad(t *testing.T) {
 	}
 
 	fakeHostProbes(t, fmt.Sprintf("%.2f 0.00 0.00 1/300 1\n", cpus*0.1), nil)
+	s.hostCache.reset()
 	if _, ok := codes(s.preflight(PreflightInput{Mode: "offline"}).Warnings)["host_load"]; ok {
 		t.Fatal("load at 10% of CPUs must not warn")
 	}
 
 	fakeHostProbes(t, "", nil) // no /proc/loadavg: Windows
+	s.hostCache.reset()
 	if rep := s.preflight(PreflightInput{Mode: "offline"}); rep.Host.GuestLoad1 != nil || rep.Host.GuestLoad5 != nil {
 		t.Fatalf("no loadavg must report null, got %v", rep.Host.GuestLoad1)
 	}
 }
 
+// reset drops the cached sample, so a test can change its fakes between calls.
+func (c *hostSampleCache) reset() {
+	c.mu.Lock()
+	c.at = time.Time{}
+	c.mu.Unlock()
+}
+
 // Inside WSL2 the guest's loadavg cannot see a Windows program eating cores;
 // the Windows host's CPU is sampled through interop and warned on separately.
+// The fake output is the Get-Counter form's: an invariant-culture average.
 func TestPreflightHostCPUOnWSL(t *testing.T) {
 	s, _ := gateServer(t, FabricConfig{}, "abc", 1<<62)
 	fakeHostProbes(t, "0.50 0.40 0.30 1/100 1", nil)
 
-	calls := fakeWSLHost(t, "37.5\r\n", nil)
+	calls := fakeWSLHost(t, "29.430375364287\r\n", nil)
 	rep := s.preflight(PreflightInput{Mode: "offline"})
-	if rep.Host.HostCPUPct == nil || *rep.Host.HostCPUPct != 37.5 || rep.Host.GuestLoad1 == nil || *rep.Host.GuestLoad1 != 0.5 || *calls != 1 {
+	if rep.Host.HostCPUPct == nil || *rep.Host.HostCPUPct != 29.430375364287 || rep.Host.GuestLoad1 == nil || *rep.Host.GuestLoad1 != 0.5 || *calls != 1 {
 		t.Fatalf("host = %+v (calls %d)", rep.Host, *calls)
 	}
 	if f := findings(rep.Warnings)["host_cpu"]; f.Severity != severityWarn {
-		t.Fatalf("host CPU at 37.5%% must warn: %+v", rep.Warnings)
+		t.Fatalf("host CPU at 29.4%% must warn: %+v", rep.Warnings)
 	}
 
-	fakeWSLHost(t, "12,5", nil) // comma-decimal locale
+	fakeWSLHost(t, "12,5", nil) // a comma-decimal culture, should one ever print
+	s.hostCache.reset()
 	rep = s.preflight(PreflightInput{Mode: "offline"})
 	if rep.Host.HostCPUPct == nil || *rep.Host.HostCPUPct != 12.5 {
 		t.Fatalf("comma decimal: %v", rep.Host.HostCPUPct)
@@ -440,14 +535,71 @@ func TestPreflightHostCPUOnWSL(t *testing.T) {
 	}
 
 	fakeWSLHost(t, "", errors.New("powershell.exe: not found"))
+	s.hostCache.reset()
 	if rep := s.preflight(PreflightInput{Mode: "offline"}); rep.Host.HostCPUPct != nil {
 		t.Fatalf("a failed sample must be null, got %v", *rep.Host.HostCPUPct)
 	}
 
 	calls = fakeWSLHost(t, "90", nil)
 	readOSRelease = func() ([]byte, error) { return []byte("6.8.0-45-generic\n"), nil }
+	s.hostCache.reset()
 	if rep := s.preflight(PreflightInput{Mode: "offline"}); rep.Host.HostCPUPct != nil || *calls != 0 {
 		t.Fatalf("outside WSL there is no host sample: %v (calls %d)", rep.Host.HostCPUPct, *calls)
+	}
+}
+
+// Preflight reuses its host sample for preflightHostTTL, and concurrent
+// callers share one sample in flight: a page looping GET /api/preflight
+// cannot spawn a powershell.exe per request. Repetition samples stay live.
+func TestPreflightHostSampleCached(t *testing.T) {
+	s, _ := gateServer(t, FabricConfig{}, "abc", 1<<62)
+	fakeHostProbes(t, "", nil)
+	var mu sync.Mutex
+	calls := 0
+	readOSRelease = func() ([]byte, error) { return []byte("5.15.167.4-microsoft-standard-WSL2\n"), nil }
+	hostCPUCommand = func(context.Context) ([]byte, error) {
+		time.Sleep(100 * time.Millisecond) // long enough for the callers to overlap
+		mu.Lock()
+		calls++
+		mu.Unlock()
+		return []byte("20"), nil
+	}
+	count := func() int {
+		mu.Lock()
+		defer mu.Unlock()
+		return calls
+	}
+
+	var wg sync.WaitGroup
+	for range 5 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if rep := s.preflight(PreflightInput{Mode: "offline"}); rep.Host.HostCPUPct == nil || *rep.Host.HostCPUPct != 20 {
+				t.Errorf("a waiting caller must get the shared sample: %+v", rep.Host)
+			}
+		}()
+	}
+	wg.Wait()
+	if n := count(); n != 1 {
+		t.Fatalf("5 concurrent preflights spawned %d samples, want 1", n)
+	}
+	s.preflight(PreflightInput{Mode: "offline"})
+	if n := count(); n != 1 {
+		t.Fatalf("a preflight within %s must reuse the sample; %d samples", preflightHostTTL, n)
+	}
+
+	s.hostCache.mu.Lock()
+	s.hostCache.at = time.Now().Add(-preflightHostTTL - time.Second)
+	s.hostCache.mu.Unlock()
+	s.preflight(PreflightInput{Mode: "offline"})
+	if n := count(); n != 2 {
+		t.Fatalf("an expired sample must be taken again; %d samples", n)
+	}
+
+	sampleHost() // a repetition's sample: never cached
+	if n := count(); n != 3 {
+		t.Fatalf("sampleHost must sample live; %d samples", n)
 	}
 }
 

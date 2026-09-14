@@ -10,6 +10,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -55,11 +56,60 @@ var readOSRelease = func() ([]byte, error) { return os.ReadFile("/proc/sys/kerne
 
 // hostCPUCommand samples the Windows host's CPU through WSL interop. Inside
 // WSL2 /proc/loadavg sees only the guest VM, so a Windows program eating half
-// the cores is invisible without it. LoadPercentage is each processor's load
-// over the last second, averaged across processors.
+// the cores is invisible without it.
+//
+// Three one-second % Processor Time samples, averaging the last two: the first
+// covers PowerShell's own startup, which inflated a single-shot reading
+// (Win32_Processor LoadPercentage read 43 cold and 34 warm against a true
+// 11-13). The value prints in the invariant culture; about 3.7 s in all.
 var hostCPUCommand = func(ctx context.Context) ([]byte, error) {
 	return cmdRunner(ctx, "powershell.exe", "-NoProfile", "-NonInteractive", "-Command",
-		"(Get-CimInstance Win32_Processor | Measure-Object -Property LoadPercentage -Average).Average")
+		`$v = (Get-Counter '\Processor(_Total)\% Processor Time' -SampleInterval 1 -MaxSamples 3).CounterSamples.CookedValue; `+
+			`(($v[1] + $v[2]) / 2).ToString([cultureinfo]::InvariantCulture)`)
+}
+
+// preflightHostTTL is how long a preflight reuses its host sample. Under WSL
+// every sample spawns powershell.exe for seconds, and with auth off any page in
+// the operator's browser can loop GET /api/preflight.
+const preflightHostTTL = 10 * time.Second
+
+// hostSampleCache holds the preflight's last host sample, with at most one
+// sample in flight: concurrent callers wait for it instead of each spawning
+// their own. Repetition samples (campaign rows) never go through it.
+type hostSampleCache struct {
+	mu      sync.Mutex
+	at      time.Time
+	sample  HostSample
+	pending chan struct{} // closed when the in-flight sample lands
+}
+
+func (c *hostSampleCache) get() HostSample {
+	c.mu.Lock()
+	for {
+		if !c.at.IsZero() && time.Since(c.at) < preflightHostTTL {
+			s := c.sample
+			c.mu.Unlock()
+			return s
+		}
+		if c.pending == nil {
+			break
+		}
+		p := c.pending
+		c.mu.Unlock()
+		<-p
+		c.mu.Lock()
+	}
+	p := make(chan struct{})
+	c.pending = p
+	c.mu.Unlock()
+
+	s := sampleHost()
+
+	c.mu.Lock()
+	c.sample, c.at, c.pending = s, time.Now(), nil
+	c.mu.Unlock()
+	close(p)
+	return s
 }
 
 // dialFabric is the cheap reachability probe: a TCP connect, nothing more.
@@ -252,7 +302,7 @@ func (s *Server) preflight(in PreflightInput) PreflightReport {
 		rep.add(severityBlock, "disk_short", "%v", err)
 	}
 
-	rep.Host.HostSample = sampleHost()
+	rep.Host.HostSample = s.hostCache.get()
 	rep.Host.CPUs = runtime.NumCPU()
 	if l := rep.Host.GuestLoad1; l != nil && *l > hostLoadWarnFraction*float64(rep.Host.CPUs) {
 		rep.add(severityWarn, "host_load",

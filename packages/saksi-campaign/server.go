@@ -106,6 +106,8 @@ type Server struct {
 
 	// jobs is the console-wide ladder/campaign job slot (jobs.go).
 	jobs jobBoard
+	// hostCache is the preflight's host sample, reused briefly (preflight.go).
+	hostCache hostSampleCache
 }
 
 // NewServer returns the console HTTP handler. fabric configures the live
