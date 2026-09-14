@@ -3,6 +3,7 @@
 use std::collections::BTreeSet;
 
 use curve25519_dalek::{ristretto::RistrettoPoint, scalar::Scalar, traits::Identity};
+use rand_core::{CryptoRng, RngCore};
 use saksi_protocol::{
     DKGComplaint as ProtocolDKGComplaint, DKGTranscript as ProtocolDKGTranscript,
     TrusteeCommitment as ProtocolTrusteeCommitment, WIRE_VERSION,
@@ -64,6 +65,22 @@ impl Dealer {
             trustee_id,
             coefficients,
         }
+    }
+
+    /// A dealer whose polynomial of degree `threshold - 1` is drawn uniformly
+    /// from `rng`. The constant term is this dealer's contribution to the joint
+    /// secret key, so every coefficient must come from a CSPRNG: fixed
+    /// coefficients would let anyone who reads the code derive the election's
+    /// secret key and decrypt every ballot.
+    pub fn random(
+        trustee_id: usize,
+        threshold: usize,
+        rng: &mut (impl RngCore + CryptoRng),
+    ) -> Self {
+        Self::new(
+            trustee_id,
+            (0..threshold).map(|_| Scalar::random(rng)).collect(),
+        )
     }
 
     pub fn commitments(&self) -> DealerCommitments {
@@ -387,6 +404,35 @@ mod tests {
         let decrypted =
             combine_partial_decryptions(&ciphertext, &partials).expect("partials combine");
 
+        assert_eq!(decrypted, plaintext);
+        assert!(output.complaints.is_empty());
+    }
+
+    #[test]
+    fn random_dealers_are_fresh_and_their_key_decrypts_at_threshold() {
+        let config = DkgConfig::default_3_of_5();
+        let mut rng = rand_core::OsRng;
+        let dealers: Vec<Dealer> = (1..=config.trustees)
+            .map(|id| Dealer::random(id, config.threshold, &mut rng))
+            .collect();
+        assert_ne!(
+            dealers[0].coefficients,
+            Dealer::random(1, config.threshold, &mut rng).coefficients,
+            "two draws for the same trustee gave the same polynomial"
+        );
+
+        let output = run_in_memory(config, &dealers).expect("dkg completes");
+        let plaintext = Plaintext::from_small_integer(1);
+        let ciphertext = encrypt(&output.public_key, plaintext, Scalar::from(77u64));
+        let partials: Vec<_> = output
+            .trustee_shares
+            .iter()
+            .skip(1)
+            .take(config.threshold)
+            .map(|share| partial_decrypt(share, &ciphertext))
+            .collect();
+        let decrypted =
+            combine_partial_decryptions(&ciphertext, &partials).expect("partials combine");
         assert_eq!(decrypted, plaintext);
         assert!(output.complaints.is_empty());
     }

@@ -100,6 +100,16 @@ impl ElectionFixture {
     }
 }
 
+/// One dealer per trustee, each with a uniformly random polynomial
+/// ([`Dealer::random`]). The generator's elections are published, so their
+/// secret key must not be derivable from this source: a fixed polynomial would
+/// let anyone decrypt every generated ballot.
+fn random_dealers(config: DkgConfig, rng: &mut OsRng) -> Vec<Dealer> {
+    (1..=config.trustees)
+        .map(|dealer_id| Dealer::random(dealer_id, config.threshold, rng))
+        .collect()
+}
+
 /// Build the standard happy-path fixture used by every test.
 ///
 /// Layout:
@@ -126,17 +136,7 @@ pub(crate) fn happy_path_fixture() -> ElectionFixture {
     // -- DKG --------------------------------------------------------------
 
     let config = DkgConfig::default_3_of_5();
-    // Deterministic-ish dealers: same shape used in saksi-crypto's tests.
-    let dealers: Vec<Dealer> = (1..=config.trustees)
-        .map(|dealer_id| {
-            Dealer::new(
-                dealer_id,
-                (0..config.threshold)
-                    .map(|coefficient| Scalar::from((dealer_id * 13 + coefficient + 1) as u64))
-                    .collect(),
-            )
-        })
-        .collect();
+    let dealers = random_dealers(config, &mut rng);
     let dkg_output = run_in_memory(config, &dealers).expect("DKG completes");
     let dkg_transcript = dkg_output.to_protocol_transcript(parameters.election_id.clone());
     let election_public_key = dkg_output.public_key;
@@ -744,19 +744,10 @@ pub(crate) fn gen_prologue(params: &GenParams) -> GenPrologue {
         threshold: params.threshold as u32,
     };
 
-    // -- DKG (t-of-n; deterministic dealers as happy_path) -----------------
+    // -- DKG (t-of-n; every dealer polynomial drawn from OsRng) --------------
 
     let config = DkgConfig::new(params.threshold, params.trustees).expect("valid t-of-n");
-    let dealers: Vec<Dealer> = (1..=config.trustees)
-        .map(|dealer_id| {
-            Dealer::new(
-                dealer_id,
-                (0..config.threshold)
-                    .map(|coefficient| Scalar::from((dealer_id * 13 + coefficient + 1) as u64))
-                    .collect(),
-            )
-        })
-        .collect();
+    let dealers = random_dealers(config, &mut rng);
     let dkg_output = run_in_memory(config, &dealers).expect("DKG completes");
     let dkg_transcript = dkg_output.to_protocol_transcript(parameters.election_id.clone());
 
@@ -1074,6 +1065,50 @@ pub(crate) fn joint_public_key_from_transcript(transcript: &DKGTranscript) -> Pu
         joint += saksi_crypto::group::point_from_compressed(bytes).unwrap();
     }
     elgamal::PublicKey::from_point(joint)
+}
+
+#[cfg(test)]
+mod dkg_randomness_tests {
+    use super::*;
+
+    /// The generator's election key must not be derivable from this source: two
+    /// elections with identical parameters get unrelated DKG transcripts, and
+    /// neither is the fixed-polynomial transcript the generator used to publish.
+    #[test]
+    fn every_generated_election_gets_a_fresh_dkg() {
+        let params = GenParams::simple(2, 1, 2, SelectionProfile::Uniform);
+        let a = gen_prologue(&params);
+        let b = gen_prologue(&params);
+        assert_ne!(
+            a.dkg_transcript, b.dkg_transcript,
+            "two elections shared a DKG"
+        );
+
+        let config = DkgConfig::new(params.threshold, params.trustees).expect("valid t-of-n");
+        let fixed: Vec<Dealer> = (1..=config.trustees)
+            .map(|dealer_id| {
+                Dealer::new(
+                    dealer_id,
+                    (0..config.threshold)
+                        .map(|k| Scalar::from((dealer_id * 13 + k + 1) as u64))
+                        .collect(),
+                )
+            })
+            .collect();
+        let old = run_in_memory(config, &fixed)
+            .expect("DKG completes")
+            .to_protocol_transcript(params.election_id.clone());
+        assert_ne!(
+            a.dkg_transcript, old,
+            "the generator is back on fixed dealer polynomials"
+        );
+
+        assert_ne!(
+            happy_path_fixture().dkg_transcript,
+            happy_path_fixture().dkg_transcript,
+            "the published happy-path bundle reused a DKG"
+        );
+    }
 }
 
 #[cfg(test)]
