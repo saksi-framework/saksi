@@ -108,7 +108,8 @@ Flags:
 **Off unless you pass `--auth-file`.** Without it the console is open to anyone
 who can reach the address, exactly as before. `--repeat`, `tools/ladder.sh` and
 the other `tools/*.sh` scripts do not log in, so run measurement campaigns
-against a console started without it.
+against a console started without it — or start them from the console itself
+(`POST /api/ladder`, `POST /api/campaigns`, §9), which needs only an admin session.
 
 1. Hash each password. It is read from stdin (never argv), one line, and echoed:
    ```bash
@@ -142,7 +143,7 @@ session; anyone else gets the sealed view.
 | public | `/api/board/`, `/api/verify-code/`, `/trail/`, `/api/trail`, `/api/trail/`, `/api/capabilities`, `/api/ceremony/` (status), `/runs`, the `/board/`, `/trustee/`, `/admin/` apps, `/api/login`, `/api/logout`, `/api/me` |
 | trustee or admin | `POST /ceremony/publish`, `GET /events` |
 | trustee, own shares only | `POST /ceremony/submit` — `403` unless the body's `trustee_id` is the session's; an admin cannot submit for a trustee |
-| admin | `/generate`, `/submit`, `/verify`, `/run-all`, `/cancel`, `/scenarios`, `/attack`, `/ceremony/start`, `/api/runs/…`, `/api/check/`, `/api/scenarios/`, `/export/` (exports carry the seeded ground truth), `/wizard`, `/` (and any unknown path) |
+| admin | `/generate`, `/submit`, `/verify`, `/run-all`, `/cancel`, `/scenarios`, `/attack`, `/ceremony/start`, `/api/runs/…`, `/api/check/`, `/api/scenarios/`, `/export/` (exports carry the seeded ground truth), `/wizard`, `/api/preflight`, `/api/ladder`, `/api/jobs/`, `/api/campaigns`, `/api/campaigns/…`, `/` (and any unknown path) |
 
 Stated limits — say so wherever the admin console is shown:
 
@@ -670,6 +671,44 @@ was in flight when the run died — the row is written `ok=replay` in
 `negative-tests.csv`. A resumed run reports throughput **per segment**, is
 marked `sustained: false` in `run.end`, contributes no whole-run TPS figure, and
 classifies as `scaling_limit: inconclusive`.
+
+### Study API — preflight, ladder job, campaigns, export
+
+The console can run the ladder and `--repeat` campaigns itself. It reuses
+`RunLadder` and `Repeat` unchanged, driving its own API in-process (no socket,
+no credential: the requests carry a context marker only the console can set,
+and still pass the Host/Origin guard), so a console campaign and a CLI campaign
+on the same config produce the same run folders and the same `summary.csv`.
+Every route is admin-only when auth is on. The wizard buttons for them and the
+operator walkthrough come later.
+
+| Route | What it does |
+| --- | --- |
+| `GET /api/preflight[?mode=&voters=&positions=&concurrency=]` | One report: `fabric` (enabled, `reachable` by a 2 s TCP dial, peer, channel), `orderer_batch` (declared `configtx.yaml`), `ladder` (`ok`, `ladder_commit`, `console_commit`), `disk` (`free_bytes` on the disk guard's volume, `projected_ledger_bytes` = voters × positions × 12,000), `host` (`load1`, `load5` from `/proc/loadavg`, null where there is none; `cpus`), `verify_threads_default`, `concurrency_min_advised` (= `MaxMessageCount`), and `warnings[]` of `{severity, code, message}`. `mode` defaults to `onchain` |
+| `POST /api/ladder` | Runs the validation ladder as a job → `202 {"job": id}`. Writes `ladder.json` on a pass, exactly as `tools/ladder.sh` does |
+| `GET /api/jobs/<id>` | `{kind, status: queued\|running\|done\|failed\|cancelled, started_at, finished_at, error, log: [last 200 lines], result}`. A ladder's `result` is its `ladder.json` |
+| `POST /api/campaigns` `{config, warmups, reps, sweep?, window_s?, burst?, force?}` | Starts a campaign → `202 {"campaign": id}`. Forces `skip_attacks: true`. Runs preflight on the config first: a `block` finding answers `409 {error, warnings}` unless `force: true` |
+| `GET /api/campaigns` | Every campaign, newest first |
+| `GET /api/campaigns/<id>` | Status (`running`, `done`, `failed`, `cancelled`, `interrupted`), the preflight snapshot, a row per repetition (`index`, `kind`, `run_id`, `status`, `committed_tps`, `latency_p99_ms`, `failed`, `fail_reason`, read from each run's `perf.csv` and `run.end`), and `summary` (the parsed `summary.csv`) once written |
+| `POST /api/campaigns/<id>/cancel` | Stops the campaign after the current repetition; `summary.csv` is not written for a cancelled campaign |
+| `GET /api/campaigns/<id>/export` | A streamed zip: `<run-id>/run.json`, `perf.csv`, `perf-schema.md`, `correctness.csv`, `negative-tests.csv`, `ground-truth-check.json`, `timings.json` (each when present) and `<run-id>/journal-line1.json` for every run, plus `summary.csv`, `campaign.json` and `preflight.json` |
+
+Preflight findings:
+
+| Severity | Code | When |
+| --- | --- | --- |
+| block | `fabric_unreachable` | Fabric is configured, the peer does not answer, and the run is on-chain |
+| block | `ladder_missing` | Above 1,000 voters (not ground truth) with no `ladder.json` for this build |
+| block | `disk_short` | On-chain, and the projected ledger exceeds free space |
+| warn | `host_load` | 1-minute load average above 25 % of the CPUs |
+| warn | `concurrency_low` | On-chain, ballots in flight below the orderer's `MaxMessageCount` |
+| warn | `verify_threads` | The auditor would verify on one thread |
+
+One job runs at a time, console-wide: starting a ladder or campaign while
+another runs answers `409` naming the running job. A campaign lives in
+`<runs>/campaigns/<id>/` as `campaign.json` (config, options, preflight, status,
+rows), `summary.csv` and `log.txt`. If the console stops mid-campaign, the next
+read marks it `interrupted`; its finished repetitions stay in their run folders.
 
 ## 10. Troubleshooting
 
