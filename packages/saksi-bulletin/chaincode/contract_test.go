@@ -259,7 +259,7 @@ func TestSubmitBallotRejectsDoubleVote(t *testing.T) {
 	if err == nil {
 		t.Fatal("second SubmitBallot with the same nullifier should fail")
 	}
-	if !strings.Contains(err.Error(), "double vote") {
+	if !strings.Contains(err.Error(), "gate=nullifier: nullifier already spent") {
 		t.Fatalf("expected a double-vote error, got: %v", err)
 	}
 }
@@ -275,7 +275,7 @@ func TestSubmitBallotRejectsTamperedCDSProof(t *testing.T) {
 	// Flip a byte in the first branch's response scalar.
 	ballot.WellFormednessProofs[0].Branches[0].Response[0] ^= 0x01
 	err := sc.SubmitBallot(ctx, mustMarshal(t, ballot))
-	if err == nil || !strings.Contains(err.Error(), "well-formedness proof failed") {
+	if err == nil || !strings.Contains(err.Error(), "gate=cds: ") {
 		t.Fatalf("expected a CDS-proof failure, got: %v", err)
 	}
 }
@@ -297,7 +297,7 @@ func TestSubmitBallotRejectsMissingDKG(t *testing.T) {
 		t.Fatalf("CreateElection: %v", err)
 	}
 	err := sc.SubmitBallot(ctx, mustMarshal(t, validCDSBallot(t)))
-	if err == nil || !strings.Contains(err.Error(), "no published DKG transcript") {
+	if err == nil || !strings.Contains(err.Error(), "gate=dkg-missing: ") {
 		t.Fatalf("expected a missing-DKG error, got: %v", err)
 	}
 }
@@ -312,7 +312,7 @@ func TestSubmitBallotRejectsContestCountMismatch(t *testing.T) {
 	// Drop the well-formedness proof so counts disagree (1 ciphertext, 0 proofs).
 	ballot.WellFormednessProofs = nil
 	err := sc.SubmitBallot(ctx, mustMarshal(t, ballot))
-	if err == nil || !strings.Contains(err.Error(), "ciphertexts") {
+	if err == nil || !strings.Contains(err.Error(), "gate=shape: ") {
 		t.Fatalf("expected a ciphertext/proof-count error, got: %v", err)
 	}
 }
@@ -368,8 +368,13 @@ func TestGetBallotMissingIsError(t *testing.T) {
 
 func TestSubmitBallotRejectsBadHex(t *testing.T) {
 	sc := &SmartContract{}
-	if err := sc.SubmitBallot(newContext(), "nothex!!"); err == nil {
-		t.Fatal("SubmitBallot should reject non-hex input")
+	if err := sc.SubmitBallot(newContext(), "nothex!!"); err == nil || !strings.HasPrefix(err.Error(), "gate=decode: ") {
+		t.Fatalf("SubmitBallot should reject non-hex input at the decode gate, got: %v", err)
+	}
+	// Valid hex that is not a protobuf Ballot (field 1 with the reserved wire
+	// type 7) is refused at the same gate.
+	if err := sc.SubmitBallot(newContext(), "0f01"); err == nil || !strings.HasPrefix(err.Error(), "gate=decode: decode ballot") {
+		t.Fatalf("SubmitBallot should reject an undecodable ballot at the decode gate, got: %v", err)
 	}
 }
 
@@ -599,7 +604,7 @@ func TestPublishDKGTranscriptRejectsDuplicate(t *testing.T) {
 		t.Fatalf("first publish: %v", err)
 	}
 	err := sc.PublishDKGTranscript(ctx, transcriptHex)
-	if err == nil || !strings.Contains(err.Error(), "already published") {
+	if err == nil || !strings.Contains(err.Error(), "gate=dkg-duplicate: ") {
 		t.Fatalf("expected a duplicate-transcript error, got: %v", err)
 	}
 }
@@ -611,7 +616,7 @@ func TestPublishDKGTranscriptRejectsThresholdMismatch(t *testing.T) {
 	bad := validDKGTranscript()
 	bad.Threshold = 4
 	err := sc.PublishDKGTranscript(ctx, mustMarshalDKG(t, bad))
-	if err == nil || !strings.Contains(err.Error(), "threshold") {
+	if err == nil || !strings.Contains(err.Error(), "gate=dkg-consistency: ") {
 		t.Fatalf("expected a threshold-mismatch error, got: %v", err)
 	}
 }
@@ -649,7 +654,7 @@ func TestGetDKGTranscriptMissingIsError(t *testing.T) {
 func TestSubmitBallotRejectsUnknownElection(t *testing.T) {
 	sc := &SmartContract{}
 	err := sc.SubmitBallot(newContext(), validBallotHex(t, defaultNullifier()))
-	if err == nil || !strings.Contains(err.Error(), "does not exist") {
+	if err == nil || !strings.Contains(err.Error(), "gate=election-exists: ") {
 		t.Fatalf("expected an unknown-election error, got: %v", err)
 	}
 }
@@ -662,7 +667,7 @@ func TestSubmitBallotRejectsBadCredentialSignature(t *testing.T) {
 	// Flip a byte in the signature scalar s (bytes 32..64 of the proof prefix).
 	ballot.CredentialPresentation.PresentationProof[40] ^= 0x01
 	err := sc.SubmitBallot(ctx, mustMarshal(t, ballot))
-	if err == nil || !strings.Contains(err.Error(), "credential signature") {
+	if err == nil || !strings.Contains(err.Error(), "gate=credential: credential signature") {
 		t.Fatalf("expected a credential-signature error, got: %v", err)
 	}
 }
@@ -675,7 +680,7 @@ func TestSubmitBallotRejectsClosedElection(t *testing.T) {
 		t.Fatalf("CloseElection: %v", err)
 	}
 	err := sc.SubmitBallot(ctx, validBallotHex(t, defaultNullifier()))
-	if err == nil || !strings.Contains(err.Error(), "not open") {
+	if err == nil || !strings.Contains(err.Error(), "gate=election-open: ") {
 		t.Fatalf("expected a not-open error, got: %v", err)
 	}
 }
@@ -772,14 +777,14 @@ func TestSubmitPartialDecryptionRejectsOpenElection(t *testing.T) {
 	ctx := newContext()
 	withElection(t, sc, ctx) // still open
 	err := sc.SubmitPartialDecryption(ctx, "election-2026", mustMarshalPartial(t, validPartialDecryption()))
-	if err == nil || !strings.Contains(err.Error(), "not closed") {
+	if err == nil || !strings.Contains(err.Error(), "gate=election-closed: ") {
 		t.Fatalf("expected a not-closed error, got: %v", err)
 	}
 }
 
 func TestSubmitPartialDecryptionRejectsUnknownElection(t *testing.T) {
 	err := (&SmartContract{}).SubmitPartialDecryption(newContext(), "election-2026", mustMarshalPartial(t, validPartialDecryption()))
-	if err == nil || !strings.Contains(err.Error(), "does not exist") {
+	if err == nil || !strings.Contains(err.Error(), "gate=election-exists: ") {
 		t.Fatalf("expected an unknown-election error, got: %v", err)
 	}
 }
@@ -811,7 +816,7 @@ func TestSubmitPartialDecryptionRejectsDuplicate(t *testing.T) {
 		t.Fatalf("first submit: %v", err)
 	}
 	err := sc.SubmitPartialDecryption(ctx, "election-2026", partialHex)
-	if err == nil || !strings.Contains(err.Error(), "already submitted") {
+	if err == nil || !strings.Contains(err.Error(), "gate=partial-duplicate: ") {
 		t.Fatalf("expected a duplicate-share error, got: %v", err)
 	}
 }
@@ -829,7 +834,7 @@ func TestSubmitPartialDecryptionRejectsMalformedShareOrMissingProof(t *testing.T
 
 	noProof := validPartialDecryption()
 	noProof.Proof = nil
-	if err := sc.SubmitPartialDecryption(ctx, "election-2026", mustMarshalPartial(t, noProof)); err == nil || !strings.Contains(err.Error(), "proof") {
+	if err := sc.SubmitPartialDecryption(ctx, "election-2026", mustMarshalPartial(t, noProof)); err == nil || !strings.Contains(err.Error(), "gate=cp-presence: ") {
 		t.Fatalf("expected a missing-proof error, got: %v", err)
 	}
 }
