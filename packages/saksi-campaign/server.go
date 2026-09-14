@@ -97,6 +97,11 @@ type Server struct {
 	// dial resolves the chain reader + ledger for /api/trail. Defaults to
 	// dialChain (lazy-connect via fabric); tests override it to inject fakes.
 	dial func() (chainReader, clientsdk.Ledger, error)
+
+	// auth is nil unless EnableAuth was called; nil means every route is open.
+	auth *authState
+	// routes is every pattern registered on the mux, for the role-table test.
+	routes []string
 }
 
 // NewServer returns the console HTTP handler. fabric configures the live
@@ -119,7 +124,7 @@ func NewServer(store *RunStore, exec *Executor, hub *Hub, fabric FabricConfig, a
 	for _, h := range allowHosts {
 		s.allowHosts[h] = true
 	}
-	mux := http.NewServeMux()
+	mux := &routeMux{ServeMux: http.NewServeMux()}
 	mux.HandleFunc("/", s.handleIndex)
 	mux.HandleFunc("/generate", s.handleGenerate)
 	mux.HandleFunc("/submit", s.handleSubmit)
@@ -145,25 +150,30 @@ func NewServer(store *RunStore, exec *Executor, hub *Hub, fabric FabricConfig, a
 	mux.HandleFunc("/attack", s.handleStagedAttack)
 	mux.HandleFunc("/api/board/", s.handleBoard)
 	mux.HandleFunc("/api/verify-code/", s.handleVerifyCode)
+	mux.HandleFunc("/api/login", s.handleLogin)
+	mux.HandleFunc("/api/logout", s.handleLogout)
+	mux.HandleFunc("/api/me", s.handleMe)
 	mountWebDir(mux, os.Getenv("SAKSI_WEB_DIR"))
-	s.handler = s.guard(mux)
+	s.routes = mux.patterns
+	s.handler = s.guard(s.authorize(mux))
 	return s
 }
 
-// mountWebDir serves the two browser apps the console can host: the public
-// bulletin board at /board/ and the trustee console at /trustee/, read from
-// <dir>/board and <dir>/trustee. Same origin as the API, so guard()'s
-// cross-origin POST defense keeps protecting the ceremony endpoints.
+// mountWebDir serves the browser apps the console can host: the public
+// bulletin board at /board/, the trustee console at /trustee/ and the admin
+// console at /admin/, read from <dir>/board, <dir>/trustee and <dir>/admin.
+// Same origin as the API, so guard()'s cross-origin POST defense keeps
+// protecting the ceremony endpoints, and the session cookie reaches the API.
 //
-// Both apps select their election with a query parameter rather than a route,
+// The apps select their election with a query parameter rather than a route,
 // so http.FileServer's own index.html handling is the whole router and no SPA
 // fallback is needed. An empty dir registers nothing and the console behaves
 // exactly as it did before.
-func mountWebDir(mux *http.ServeMux, dir string) {
+func mountWebDir(mux *routeMux, dir string) {
 	if strings.TrimSpace(dir) == "" {
 		return
 	}
-	for _, app := range []string{"board", "trustee"} {
+	for _, app := range []string{"board", "trustee", "admin"} {
 		prefix := "/" + app + "/"
 		mux.Handle(prefix, http.StripPrefix(prefix,
 			http.FileServer(http.Dir(filepath.Join(dir, app)))))
@@ -662,6 +672,14 @@ func (s *Server) handleCeremonySubmit(w http.ResponseWriter, r *http.Request) {
 		Trustee string `json:"trustee_id"`
 	}
 	if !decodeJSON(w, r, &body) {
+		return
+	}
+	// With auth on, authorize() admitted only a trustee session; the shares
+	// submitted must be that trustee's own. The one role check that needs the
+	// parsed body, so it cannot live in the route table.
+	if sess := sessionFrom(r); sess != nil && sess.TrusteeID != body.Trustee {
+		writeJSONResp(w, http.StatusForbidden, map[string]string{"error": fmt.Sprintf(
+			"signed in as trustee %q: a trustee may submit only their own shares", sess.TrusteeID)})
 		return
 	}
 	runID, err := validRun(s, body.RunID)
