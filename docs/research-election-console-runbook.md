@@ -101,6 +101,55 @@ Flags:
 - `--console` on-chain driver path (optional; leave unset for offline).
 - `--allow-host host[:port]` extra accepted Host header (for LAN — see below).
 - `--timeout` per-phase timeout (default `60m`).
+- `--auth-file` users file that turns on login (env `SAKSI_AUTH_FILE`; see below).
+
+### Authentication
+
+**Off unless you pass `--auth-file`.** Without it the console is open to anyone
+who can reach the address, exactly as before. `--repeat`, `tools/ladder.sh` and
+the other `tools/*.sh` scripts do not log in, so run measurement campaigns
+against a console started without it.
+
+1. Hash each password. It is read from stdin (never argv), one line, and echoed:
+   ```bash
+   ./saksi-campaign hash-password      # type the password, press Enter
+   ```
+2. Write the users file, one object per user. `trustee_id` is the trustee's wire
+   id (`"1"`..`"n"`, in the order of the election's trustee list), trustees only:
+   ```json
+   [
+     {"username": "admin",   "role": "admin",   "password_bcrypt": "$2a$12$..."},
+     {"username": "comelec", "role": "trustee", "trustee_id": "1", "password_bcrypt": "$2a$12$..."}
+   ]
+   ```
+   The console refuses to start on an unknown role, a trustee without
+   `trustee_id`, an admin with one, a duplicate username, or a value that is not a
+   bcrypt hash.
+3. Start it: `./saksi-campaign serve --auth-file users.json ...`
+
+The apps sign in with `POST /api/login` (a 12-hour `saksi_session` cookie),
+`POST /api/logout` and `GET /api/me`. Five failed logins from one address lock
+that address out for 30 s. No session → `401 {"error":"login required"}`; wrong
+role → `403 {"error":"..."}`.
+
+| Role | Routes |
+| --- | --- |
+| public | `/api/board/`, `/api/verify-code/`, `/trail/`, `/api/trail`, `/api/trail/`, `/api/capabilities`, `/api/ceremony/` (status), `/runs`, the `/board/`, `/trustee/`, `/admin/` apps, `/api/login`, `/api/logout`, `/api/me` |
+| trustee or admin | `POST /ceremony/publish`, `GET /events` |
+| trustee, own shares only | `POST /ceremony/submit` — `403` unless the body's `trustee_id` is the session's; an admin cannot submit for a trustee |
+| admin | `/generate`, `/submit`, `/verify`, `/run-all`, `/cancel`, `/scenarios`, `/attack`, `/ceremony/start`, `/api/runs/…`, `/api/check/`, `/api/scenarios/`, `/export/` (exports carry the seeded ground truth), `/wizard`, `/` (and any unknown path) |
+
+Stated limits — say so wherever the admin console is shown:
+
+- Demo-grade: users in a file, sessions in memory (a restart logs everyone out),
+  no TLS termination (the cookie is `Secure` only when served over TLS), no audit
+  log of logins. Keep the loopback bind; reach it remotely through an SSH tunnel.
+- Everyone behind one address (all tunnel users arrive as loopback) shares the
+  lockout counter.
+- The admin app's voter-roll and credential steps do not issue real voter
+  credentials; the thesis's voter-side claims still come from the harness.
+- `/events` needs a session, so the public board cannot subscribe to progress;
+  it polls `/api/board` instead.
 
 ### Orderer batch parameters
 
@@ -145,7 +194,8 @@ declared file is in force.
 
 ## 5. Reaching it from another device
 
-The server has **no login** — anyone who can reach the address can drive it. Pick one:
+Without `--auth-file` the server has **no login** — anyone who can reach the
+address can drive it — and with it the login is demo-grade (see §4). Pick one:
 
 - **SSH tunnel (most private):** keep the loopback bind and, from your other
   device: `ssh -L 8090:127.0.0.1:8090 <user>@<run-host>` then open
@@ -175,10 +225,11 @@ The server has **no login** — anyone who can reach the address can drive it. P
 
 ## 6b. Serving the browser apps (`--web-dir`)
 
-The console can host two standalone browser apps alongside the wizard: the
-**public bulletin board** at `/board/` and the **trustee console** at
-`/trustee/`. They live in the sibling **balotachain** repo
-(`apps/auditor`, `apps/trustee`) and are served as built static bundles — the
+The console can host three standalone browser apps alongside the wizard: the
+**public bulletin board** at `/board/`, the **trustee console** at `/trustee/`
+and the **admin console** at `/admin/` (served from `<dir>/admin` once
+balotachain builds it). They live in the sibling **balotachain** repo
+(`apps/auditor`, `apps/trustee`, `apps/admin`) and are served as built static bundles — the
 console does not build them.
 
 ```bash
@@ -193,7 +244,7 @@ saksi-campaign serve --demo ../../target/release/saksi-demo \
 ```
 
 `--web-dir` also reads the environment variable `SAKSI_WEB_DIR` (the flag wins).
-Unset, the two routes are simply not registered and the console behaves exactly
+Unset, the app routes are simply not registered and the console behaves exactly
 as it did before.
 
 Both apps select their election with a query parameter:
