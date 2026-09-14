@@ -251,7 +251,8 @@ func (s *Server) handleCampaigns(w http.ResponseWriter, r *http.Request) {
 		busyResponse(w, running)
 		return
 	}
-	pre := s.preflight(PreflightInput{Mode: c.Mode, Voters: c.Voters, Positions: c.Positions, Concurrency: c.Concurrency})
+	pre := s.preflight(PreflightInput{Mode: c.Mode, Voters: c.Voters, Positions: c.Positions,
+		Candidates: c.Candidates, Concurrency: c.Concurrency})
 	if burst != nil {
 		if err := s.ladderGate(*burst); err != nil {
 			pre.add(severityBlock, "ladder_missing", "the burst of %d voters is above the %d-voter ceiling: %v",
@@ -259,14 +260,19 @@ func (s *Server) handleCampaigns(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	// Preflight projects one run; the campaign's runs all land on the same
-	// ledger, since nothing resets the network between repetitions. A probe
-	// that failed does not refuse, exactly as the disk gate does.
-	if free := pre.Disk.FreeBytes; c.Mode == "onchain" && free != nil {
-		if need, parts := campaignLedgerBytes(c, o); need > *free {
+	// ledger, since nothing resets the network between repetitions, and an
+	// offline campaign keeps every run folder. A probe that failed does not
+	// refuse, exactly as the disk gate does.
+	if free := pre.Disk.FreeBytes; free != nil {
+		if need, parts := campaignDiskBytes(c, o); need > *free {
+			what, why := "ledger", "no network reset runs between repetitions"
+			if c.Mode == "offline" {
+				what, why = "run folders", "every repetition keeps its run folder"
+			}
 			pre.add(severityBlock, "disk_short",
-				"this campaign projects %d bytes of ledger (%s) but only %d bytes are free on %s: "+
-					"no network reset runs between repetitions, so free space or run fewer repetitions",
-				need, parts, *free, pre.Disk.Path)
+				"this campaign projects %d bytes of %s (%s) but only %d bytes are free on %s: "+
+					"%s, so free space or run fewer repetitions",
+				need, what, parts, *free, pre.Disk.Path, why)
 		}
 	}
 	if codes := pre.unforceable(); len(codes) > 0 {
@@ -328,13 +334,13 @@ func (s *Server) handleCampaigns(w http.ResponseWriter, r *http.Request) {
 	writeJSONResp(w, http.StatusAccepted, map[string]string{"campaign": rec.ID})
 }
 
-// campaignLedgerBytes projects the ledger a whole campaign adds to the peer
-// volume, with the disk gate's per-ballot budget: every warm-up and measured
-// run, every sweep step the sweep can run (maxSweepSteps; each step offers at
-// most the config's voters), and the burst. It returns the total and its
-// breakdown, for the refusal message.
-func campaignLedgerBytes(c ElectionConfig, o CampaignOptions) (uint64, string) {
-	perRun := uint64(c.Voters) * uint64(c.Positions) * LedgerBytesPerBallot
+// campaignDiskBytes projects the disk a whole campaign fills, with the disk
+// gate's per-run projection (the ledger on-chain, the run folder offline):
+// every warm-up and measured run, every sweep step the sweep can run
+// (maxSweepSteps; each step offers at most the config's voters), and the
+// burst. It returns the total and its breakdown, for the refusal message.
+func campaignDiskBytes(c ElectionConfig, o CampaignOptions) (uint64, string) {
+	perRun, _ := diskProjection(c)
 	runs := uint64(o.Warmups + o.Reps)
 	total := runs * perRun
 	parts := []string{fmt.Sprintf("%d warm-up and measured runs x %d bytes", runs, perRun)}
@@ -343,7 +349,9 @@ func campaignLedgerBytes(c ElectionConfig, o CampaignOptions) (uint64, string) {
 		parts = append(parts, fmt.Sprintf("up to %d sweep steps x %d bytes", maxSweepSteps, perRun))
 	}
 	if o.Burst > 0 {
-		b := uint64(o.Burst) * uint64(c.Positions) * LedgerBytesPerBallot
+		burst := c
+		burst.Voters = o.Burst
+		b, _ := diskProjection(burst)
 		total += b
 		parts = append(parts, fmt.Sprintf("a %d-voter burst of %d bytes", o.Burst, b))
 	}

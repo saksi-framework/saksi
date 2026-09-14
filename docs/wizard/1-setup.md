@@ -94,21 +94,23 @@ It rejects: an empty election or trustee name, a trustee count outside
 voters below 1, a distribution that is not `uniform`, `skewed`, or `realistic`, a senate-seat
 count outside `0..candidates-1`, and a mode that is not one of the three.
 
-### The 10,000-voter offline ceiling
+### The offline record bound
 
 ```go
-if c.Mode == "offline" && c.Voters > OfflineVoterCeiling { ... }
+if c.Mode == "offline" && c.Voters > OfflineRecordCeiling/c.Positions { ... }
 ```
 
-Offline runs are capped at 10,000 voters because the full cryptographic path —
-credential issuance, DKG, an ElGamal encryption and a CDS proof per candidate per
-voter — is genuinely expensive, and a runaway run would hang the console rather
-than fail.
+Offline runs are bounded at 10,572,234 ballot records (voters × positions), the
+largest thesis tier (MP-3.5M). This is a sanity bound, not a resource guard: the
+generator and the auditor both stream, so what an offline tier can really afford
+is this machine's disk and memory. Preflight (and `/generate`) check those: the
+run folder at 1,848 + 1,402 × candidates bytes per ballot record against free
+space on the runs volume, and the auditor at 32 MiB + 150 bytes per record
+against `MemAvailable`. Each blocks above its resource and warns above 80 % of it.
 
-The cap is scoped to `offline` on purpose. **`groundtruth` mode has no ceiling**,
-because it runs no cryptography at all: the cost that justifies the cap does not
-exist on that path. That is what lets the 3,524,078-voter capstone tier generate
-in well under a second.
+The bound is scoped to `offline`. **`groundtruth` mode has none**, because it
+runs no cryptography at all. That is what lets the 3,524,078-voter capstone tier
+generate in well under a second.
 
 ## What this step does not do
 

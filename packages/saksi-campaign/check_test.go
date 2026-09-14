@@ -75,6 +75,11 @@ func TestCheckPassesOnConsistentData(t *testing.T) {
 	if rep.Rows != 4 {
 		t.Fatalf("audited %d rows, want 4", rep.Rows)
 	}
+	for _, c := range rep.Checks {
+		if c.Name == "Voter ids unique and sequential" && !strings.HasPrefix(c.Detail, "V-000001 through V-000004,") {
+			t.Errorf("both ends of the id range are zero-padded, got %q", c.Detail)
+		}
+	}
 	if rep.BallotsSHA256 == "" || rep.SummarySHA256 == "" {
 		t.Fatal("both tables must be fingerprinted")
 	}

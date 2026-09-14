@@ -138,6 +138,7 @@ func NewServer(store *RunStore, exec *Executor, hub *Hub, fabric FabricConfig, a
 	// A fault never fires while anything else uses the network: stopping the
 	// peer under it would wreck those runs.
 	exec.faultGate = s.faultGate
+	exec.phaseTimeout = timeout
 	for _, h := range allowHosts {
 		s.allowHosts[h] = true
 	}
@@ -176,6 +177,11 @@ func NewServer(store *RunStore, exec *Executor, hub *Hub, fabric FabricConfig, a
 	mux.HandleFunc("/api/campaigns", s.handleCampaigns)
 	mux.HandleFunc("/api/campaigns/", s.handleCampaign)
 	mux.HandleFunc("/api/network/reset", s.handleNetworkReset)
+	// Browsers ask for a favicon on every page; without this route the request
+	// falls through to "/" and, with auth on, logs a 401 on the public board.
+	mux.HandleFunc("/favicon.ico", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	})
 	mountWebDir(mux, os.Getenv("SAKSI_WEB_DIR"))
 	s.routes = mux.patterns
 	s.handler = s.guard(s.authorize(mux))
@@ -1168,6 +1174,35 @@ const errLadderNotRun = "validation ladder has not been run for this build; run 
 // (one voter x one position), used by the disk guard's projection.
 const LedgerBytesPerBallot = 12000
 
+// OfflineRunBytesPerRecord + OfflineRunBytesPerCandidate x candidates is the
+// run folder an offline run leaves per ballot record (one voter x one
+// position): ballots.ndjson (hex protobuf) and ballots.csv (the same ballot as
+// JSON) are ~97 % of it, header.json's voter id and ground-truth-ballots.csv
+// the rest. Measured from whole console runs (generate, check, the ceremony,
+// verify) at 500 and 1,000 voters x 3 positions: the per-record slope was
+// 4,652, 7,456 and 13,064 bytes at 2, 4 and 8 candidates, which is exactly
+// 1,848 + 1,402 x candidates. The run id is inside every ballot, so a long
+// election name adds a few bytes per record; the 80 % warning absorbs that.
+const (
+	OfflineRunBytesPerRecord    = 1848
+	OfflineRunBytesPerCandidate = 1402
+)
+
+// AuditorBaseBytes + AuditorBytesPerRecord x records is the auditor's peak
+// resident memory over a run: the whole-stream nullifier map
+// (HashMap<[u8; 32], usize>) and header.json's voter_ids (one string per
+// record, read with the header), everything else being per chunk. Measured as
+// audit-stream's peak private bytes: 37.5 MiB at 50,000 records and 58.8 MiB at
+// 200,000 (4 candidates), a 149-byte slope over a ~30 MiB base.
+const (
+	AuditorBaseBytes      = 32 << 20
+	AuditorBytesPerRecord = 150
+)
+
+// resourceWarnFraction: preflight warns when a projection passes this share of
+// the resource it is checked against (the gates block only above all of it).
+const resourceWarnFraction = 0.8
+
 // ladderRecord is <runs-root>/ladder.json: which build the ladder passed on,
 // when, and the runs that prove it.
 type ladderRecord struct {
@@ -1176,12 +1211,12 @@ type ladderRecord struct {
 	Runs   []string  `json:"runs"`
 }
 
-// admit applies both gates to a config before any run folder is created — a
+// admit applies the gates to a config before any run folder is created — a
 // tier that cannot produce a trustworthy measurement should cost nothing but
 // the error message. Every path that creates a run goes through here, so a
 // second entry point cannot quietly skip them.
 func (s *Server) admit(w http.ResponseWriter, c ElectionConfig) bool {
-	for _, gate := range []func(ElectionConfig) error{s.ladderGate, s.diskGate} {
+	for _, gate := range []func(ElectionConfig) error{s.ladderGate, s.diskGate, s.memoryGate} {
 		if err := gate(c); err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return false
@@ -1218,31 +1253,80 @@ func (s *Server) ladderGate(c ElectionConfig) error {
 	return nil
 }
 
-// diskGate refuses an on-chain tier whose projected ledger will not fit. The
-// message carries the numbers, because "not enough disk" without them tells an
-// operator nothing about which knob to turn.
+// diskProjection is the disk a run will fill and what it is: an on-chain run's
+// ledger on the peer volume, or an offline run's folder on the runs volume.
+// Zero when the mode writes nothing that scales (ground truth) or the config
+// does not say how much.
+func diskProjection(c ElectionConfig) (uint64, string) {
+	records := uint64(c.Voters) * uint64(c.Positions)
+	switch c.Mode {
+	case "onchain":
+		return records * LedgerBytesPerBallot, fmt.Sprintf(
+			"ledger (%d voters x %d positions x %d bytes per ballot)", c.Voters, c.Positions, LedgerBytesPerBallot)
+	case "offline":
+		if c.Candidates < 1 {
+			return 0, ""
+		}
+		per := uint64(OfflineRunBytesPerRecord + OfflineRunBytesPerCandidate*c.Candidates)
+		return records * per, fmt.Sprintf(
+			"run folder (%d voters x %d positions x %d bytes per ballot record at %d candidates)",
+			c.Voters, c.Positions, per, c.Candidates)
+	}
+	return 0, ""
+}
+
+// diskPath is the volume diskProjection's bytes land on.
+func (s *Server) diskPath(mode string) string {
+	if mode == "onchain" && s.fabric.PeerVolume != "" {
+		return s.fabric.PeerVolume
+	}
+	return s.store.Root()
+}
+
+// diskGate refuses a tier whose projected ledger (on-chain) or run folder
+// (offline) will not fit. The message carries the numbers, because "not enough
+// disk" without them tells an operator nothing about which knob to turn.
 //
 // A probe that fails does NOT refuse: an unreadable volume is an
 // instrumentation loss, and instrumentation must never be the thing that
 // blocks a run.
 func (s *Server) diskGate(c ElectionConfig) error {
-	if c.Mode != "onchain" {
+	need, what := diskProjection(c)
+	if need == 0 {
 		return nil
 	}
-	path := s.fabric.PeerVolume
-	if path == "" {
-		path = s.store.Root()
-	}
+	path := s.diskPath(c.Mode)
 	free, err := s.freeSpace(path)
-	if err != nil {
+	if err != nil || need <= free {
 		return nil
 	}
-	need := uint64(c.Voters) * uint64(c.Positions) * LedgerBytesPerBallot
-	if need <= free {
+	return fmt.Errorf("this run projects %d bytes of %s but only %d bytes are free on %s: free space or run a smaller tier",
+		need, what, free, path)
+}
+
+// auditMemory is the auditor's projected peak memory for c, or 0 for a mode
+// that never runs it.
+func auditMemory(c ElectionConfig) uint64 {
+	if c.Mode != "offline" && c.Mode != "onchain" {
+		return 0
+	}
+	records := uint64(c.Voters) * uint64(c.Positions)
+	if records == 0 {
+		return 0
+	}
+	return AuditorBaseBytes + records*AuditorBytesPerRecord
+}
+
+// memoryGate refuses a tier whose audit would not fit in the memory available
+// now. Like diskGate, a host that cannot report it (Windows: no
+// /proc/meminfo) is not refused.
+func (s *Server) memoryGate(c ElectionConfig) error {
+	need := auditMemory(c)
+	avail, ok := memAvailable()
+	if need == 0 || !ok || need <= avail {
 		return nil
 	}
-	return fmt.Errorf(
-		"this run projects %d bytes of ledger (%d voters x %d positions x %d bytes per ballot) "+
-			"but only %d bytes are free on %s: free space or run a smaller tier",
-		need, c.Voters, c.Positions, LedgerBytesPerBallot, free, path)
+	return fmt.Errorf("this run's audit projects %d bytes of memory (%d MiB + %d voters x %d positions x %d bytes per record) "+
+		"but only %d bytes are available: close other programs or run a smaller tier",
+		need, AuditorBaseBytes>>20, c.Voters, c.Positions, AuditorBytesPerRecord, avail)
 }

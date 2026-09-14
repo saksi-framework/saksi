@@ -700,8 +700,8 @@ func TestCampaignBodyValidation(t *testing.T) {
 		{"nothing", map[string]any{"config": good()}, "reps must be >= 1"},
 		{"sweep of 1", map[string]any{"config": good(), "reps": 1, "sweep": 1}, "sweep must be"},
 		{"negative burst", map[string]any{"config": good(), "reps": 1, "burst": -1}, ">= 0"},
-		{"burst over the offline ceiling", map[string]any{"config": good(), "reps": 1, "burst": OfflineVoterCeiling + 1},
-			fmt.Sprintf("burst of %d voters", OfflineVoterCeiling+1)},
+		{"burst over the offline bound", map[string]any{"config": good(), "reps": 1, "burst": OfflineRecordCeiling + 1},
+			fmt.Sprintf("burst of %d voters", OfflineRecordCeiling+1)},
 	} {
 		rec, _ := startCampaign(t, s, tc.body, "")
 		if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), tc.want) {
@@ -749,10 +749,10 @@ func TestCampaignDiskProjectsEveryRun(t *testing.T) {
 	perRun := uint64(oc.Voters * oc.Positions * LedgerBytesPerBallot)
 	o := CampaignOptions{Warmups: 1, Reps: 2, Sweep: 2, Burst: 5}
 	want := 3*perRun + maxSweepSteps*perRun + 5*uint64(oc.Positions)*LedgerBytesPerBallot
-	if got, _ := campaignLedgerBytes(oc, o); got != want {
-		t.Fatalf("campaignLedgerBytes = %d, want %d", got, want)
+	if got, _ := campaignDiskBytes(oc, o); got != want {
+		t.Fatalf("campaignDiskBytes = %d, want %d", got, want)
 	}
-	if got, _ := campaignLedgerBytes(oc, CampaignOptions{Reps: 4}); got != 4*perRun {
+	if got, _ := campaignDiskBytes(oc, CampaignOptions{Reps: 4}); got != 4*perRun {
 		t.Fatalf("no sweep, no burst: %d, want %d", got, 4*perRun)
 	}
 
@@ -953,6 +953,12 @@ func TestCampaignExportBundle(t *testing.T) {
 		writeFile(t, dir, JournalFile, `{"event":"env","go_os":"linux"}`+"\n"+`{"event":"run.end","failed":false}`+"\n")
 		if i == 1 {
 			writeFile(t, dir, NegativeTestsFile, "scenario,verdict\n")
+			writeFile(t, dir, GenTimingsFile, `{"wall_ms":12}`)
+			writeFile(t, dir, "receipts.csv", receiptsCSVHeader+"\n"+
+				"CreateElection,e,tx1,1,aa,bb,cc,2026-09-14T13:00:00Z\n"+
+				"SubmitBallot,0,tx2,2,aa,bb,cc,2026-09-14T13:00:01Z\n"+
+				"CloseElection,e,tx3,3,aa,bb,cc,2026-09-14T13:00:02Z\n"+
+				"SubmitBallot,1,tx4,4,aa")
 		}
 		reps = append(reps, campaignRep{Index: 1, Kind: kind, RunID: runID})
 	}
@@ -990,9 +996,10 @@ func TestCampaignExportBundle(t *testing.T) {
 	slices.Sort(names)
 	want := []string{campaignFile, preflightBundleFile, SummaryCSV, manifestFile}
 	for i, r := range reps {
-		want = append(want, r.RunID+"/"+RunFile, r.RunID+"/"+PerfCSV, r.RunID+"/"+CorrectnessFile, r.RunID+"/"+journalLine1File)
+		want = append(want, r.RunID+"/"+RunFile, r.RunID+"/"+PerfCSV, r.RunID+"/"+CorrectnessFile, r.RunID+"/"+journalLine1File,
+			r.RunID+"/"+JournalFile)
 		if i == 1 {
-			want = append(want, r.RunID+"/"+NegativeTestsFile)
+			want = append(want, r.RunID+"/"+NegativeTestsFile, r.RunID+"/"+GenTimingsFile, r.RunID+"/"+receiptsLifecycleFile)
 		}
 	}
 	slices.Sort(want)
@@ -1001,6 +1008,16 @@ func TestCampaignExportBundle(t *testing.T) {
 	}
 	if got := files[reps[0].RunID+"/"+journalLine1File]; got != `{"event":"env","go_os":"linux"}` {
 		t.Fatalf("journal-line1.json = %q", got)
+	}
+	if got := files[reps[0].RunID+"/"+JournalFile]; !strings.Contains(got, `"run.end"`) {
+		t.Fatalf("journal.ndjson must be the whole journal, got %q", got)
+	}
+	// The ballots are dropped, and so is the partial last row a crash leaves.
+	wantLife := receiptsCSVHeader + "\n" +
+		"CreateElection,e,tx1,1,aa,bb,cc,2026-09-14T13:00:00Z\n" +
+		"CloseElection,e,tx3,3,aa,bb,cc,2026-09-14T13:00:02Z\n"
+	if got := files[reps[1].RunID+"/"+receiptsLifecycleFile]; got != wantLife {
+		t.Fatalf("receipts-lifecycle.csv:\n got %q\nwant %q", got, wantLife)
 	}
 	if !strings.Contains(files[campaignFile], `"committed_tps": 12.5`) {
 		t.Fatalf("campaign.json in the bundle must carry the refreshed rows: %s", files[campaignFile])
@@ -1011,9 +1028,11 @@ func TestCampaignExportBundle(t *testing.T) {
 	manifest := files[manifestFile]
 	for _, line := range []string{
 		reps[0].RunID + " (warmup 1, done)",
-		"included: run.json, perf.csv, correctness.csv, journal-line1.json",
-		"missing:  perf-schema.md, negative-tests.csv, ground-truth-check.json, timings.json",
-		"missing:  perf-schema.md, ground-truth-check.json, timings.json",
+		"included: run.json, perf.csv, correctness.csv, journal.ndjson, journal-line1.json\n",
+		"missing:  perf-schema.md, negative-tests.csv, ground-truth-check.json, timings.json, gen-timings.json, receipts-lifecycle.csv\n",
+		"included: run.json, perf.csv, correctness.csv, negative-tests.csv, journal.ndjson, gen-timings.json, journal-line1.json, " +
+			"receipts-lifecycle.csv (receipts.csv ends in a partial row, dropped)\n",
+		"missing:  perf-schema.md, ground-truth-check.json, timings.json\n",
 		"included: summary.csv, campaign.json, preflight.json",
 	} {
 		if !strings.Contains(manifest, line) {

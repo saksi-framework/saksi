@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -533,5 +534,82 @@ func TestCeremonyTimestampsSurviveAReload(t *testing.T) {
 	// so it must not drift to the publish time.
 	if st.PublishedAt.Before(*st.ClosedAt) {
 		t.Error("published_at must not precede closed_at")
+	}
+}
+
+func getPath(h http.Handler, path string) *httptest.ResponseRecorder {
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, path, nil))
+	return rec
+}
+
+// The public verification files: the allowlist only, nothing while sealed, and
+// a header with the seeded ground truth and the voter ids emptied.
+func TestBoardFilesArePublicRecordsOnly(t *testing.T) {
+	s, h, exec := testServer(t, nil)
+	runID, dir := seedRun(t, s, nil)
+	const header = `{"election_id":"e","tally":"abcd","ground_truth":[7,0],"voter_ids":["V-1","V-2"],"n":2}`
+	writeFile(t, dir, "header.json", header)
+	writeFile(t, dir, BallotsFile, "0a01\n0a02\n")
+	if err := os.MkdirAll(filepath.Join(dir, LedgerDir), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, dir, LedgerDir+"/"+BallotsFile, "0a02\n0a01\n")
+	writeFile(t, dir, GroundTruthSummaryCSV, "secret")
+	writeCorrectness(t, dir, "president/cand0,7,7,0,true,7,,,,,")
+	base := "/api/board/" + runID + "/files/"
+
+	if rec := getPath(h, base+"header.json"); rec.Code != http.StatusConflict {
+		t.Fatalf("sealed header.json: want 409, got %d: %s", rec.Code, rec.Body)
+	}
+	if _, board := getBoard(t, h, runID); len(board.Files) != 0 {
+		t.Fatalf("a sealed board lists no files, got %v", board.Files)
+	}
+	if err := exec.markPublished(runID, good()); err != nil {
+		t.Fatal(err)
+	}
+
+	rec := getPath(h, base+"header.json")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("header.json: want 200, got %d: %s", rec.Code, rec.Body)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("public header is not JSON: %v (%s)", err, rec.Body)
+	}
+	for _, k := range []string{"ground_truth", "voter_ids"} {
+		if v, ok := got[k].([]any); !ok || len(v) != 0 {
+			t.Errorf("%s must be an empty array, got %v", k, got[k])
+		}
+	}
+	if got["tally"] != "abcd" || got["n"] != float64(2) {
+		t.Errorf("public fields must pass through unchanged, got %v", got)
+	}
+	if rec := getPath(h, base+"ledger/ballots.ndjson"); rec.Code != http.StatusOK || rec.Body.String() != "0a02\n0a01\n" {
+		t.Errorf("ledger/ballots.ndjson: got %d %q", rec.Code, rec.Body)
+	}
+	_, board := getBoard(t, h, runID)
+	if want := []string{"header.json", BallotsFile, LedgerDir + "/" + BallotsFile}; !slices.Equal(board.Files, want) {
+		t.Errorf("files = %v, want %v", board.Files, want)
+	}
+
+	for _, name := range []string{
+		GroundTruthSummaryCSV, CorrectnessFile, BallotsCSV, ElectionCSV, JournalFile, PerfCSV, RunFile,
+		"../" + RunFile, "ledger/../" + GroundTruthSummaryCSV, "..%2f" + RunFile, "%2e%2e/" + RunFile, "ledger", "",
+	} {
+		rec := getPath(h, base+name)
+		if rec.Code == http.StatusOK || strings.Contains(rec.Body.String(), "secret") ||
+			strings.Contains(rec.Body.String(), "ground_truth") {
+			t.Errorf("%q must not be served, got %d: %s", name, rec.Code, rec.Body)
+		}
+	}
+}
+
+// A header that is not a JSON object is an error, never a partial copy that
+// passes for one.
+func TestWritePublicHeaderRejectsNonObject(t *testing.T) {
+	var b strings.Builder
+	if err := writePublicHeader(&b, strings.NewReader(`["ground_truth"]`)); err == nil {
+		t.Fatal("want an error for a non-object header")
 	}
 }

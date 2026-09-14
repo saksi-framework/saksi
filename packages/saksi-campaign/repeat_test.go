@@ -345,7 +345,7 @@ func postConfig(t *testing.T, s *Server, c ElectionConfig) *httptest.ResponseRec
 // actually passed on.
 func TestLadderGate(t *testing.T) {
 	big := good()
-	big.Voters = 2000 // offline, over LadderVoterCeiling, under OfflineVoterCeiling
+	big.Voters = 2000 // offline, over LadderVoterCeiling
 
 	t.Run("refused with no ladder.json", func(t *testing.T) {
 		s, _ := gateServer(t, FabricConfig{}, "abc123", 1<<62)

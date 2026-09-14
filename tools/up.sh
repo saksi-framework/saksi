@@ -24,6 +24,8 @@ CONSOLE_DIR="${ROOT}/packages/saksi-campaign"
 CHANNEL="${SAKSI_CHANNEL:-saksi}"
 ADDR="${SAKSI_ADDR:-127.0.0.1:8090}"
 RUNS_DIR="${SAKSI_RUNS:-${HOME}/.saksi/campaign/runs}"
+# How long each console phase may run; the capstone tiers need hours.
+PHASE_TIMEOUT="${SAKSI_PHASE_TIMEOUT:-60m}"
 FABRIC_VERSION="${FABRIC_VERSION:-2.5.15}"
 # Default beside the repo, matching network.sh's own default.
 FABRIC_SAMPLES="${FABRIC_SAMPLES:-$(cd "${ROOT}/.." && pwd)/fabric-samples}"
@@ -157,6 +159,7 @@ cmd_up() {
 		--addr "${ADDR}" \
 		--demo "${DEMO_BIN}" \
 		--runs "${RUNS_DIR}" \
+		--phase-timeout "${PHASE_TIMEOUT}" \
 		--fabric-channel "${CHANNEL}" \
 		--fabric-tls-cert "${TLS_CERT}" \
 		--fabric-cert "${CERT}" \

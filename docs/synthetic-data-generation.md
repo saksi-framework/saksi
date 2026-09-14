@@ -384,22 +384,18 @@ saksi-demo gen --stream ./run --chunk 5000 \
 
 ### From the console
 
-Pick **ground truth only** as the mode. Because that path runs no cryptography,
-the 10,000-voter offline ceiling does not apply to it and the capstone presets
-(1,921,917 and 3,524,078) are selectable:
+Pick **ground truth only** as the mode. That path runs no cryptography, so no
+offline bound or resource guard applies to it and the capstone presets
+(1,921,917 and 3,524,078) are selectable. Offline mode takes them too, up to the
+MP-3.5M tier's 10,572,234 ballot records, when preflight finds the disk and
+memory for the run:
 
 ```go
 // packages/saksi-campaign/config.go
-//
-// OfflineVoterCeiling caps offline-mode voters. Offline generation is not
-// parallelized, so the 50k/483k/1M tiers are on-chain/perf mode only […]
-const OfflineVoterCeiling = 10000
+const OfflineRecordCeiling = 3_524_078 * 3
 
-// The check is scoped to offline, so ground-truth runs are unaffected:
-if c.Mode == "offline" && c.Voters > OfflineVoterCeiling {
-    return fmt.Errorf(
-        "offline mode is capped at %d voters (got %d); select on-chain/perf mode for larger tiers",
-        OfflineVoterCeiling, c.Voters)
+if c.Mode == "offline" && c.Voters > OfflineRecordCeiling/c.Positions {
+    return fmt.Errorf("offline mode is bounded at %d ballot records, ...", OfflineRecordCeiling, ...)
 }
 ```
 

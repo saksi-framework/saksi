@@ -218,7 +218,7 @@ func recountBallots(path string, c ElectionConfig) ([][]int, int, []Check) {
 		fmt.Sprintf("%d columns: voter, scale, complexity, and one per position", len(header)))}
 	if ordered {
 		checks = append(checks, pass("Voter ids unique and sequential",
-			"V-000001 through V-"+strconv.Itoa(rows)+", no duplicates or gaps"))
+			fmt.Sprintf("V-%06d through V-%06d, no duplicates or gaps", 1, rows)))
 	} else {
 		checks = append(checks, fail("Voter ids unique and sequential", firstBad))
 	}

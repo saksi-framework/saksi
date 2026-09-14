@@ -100,7 +100,7 @@ Flags:
 - `--runs` run-folder store root (default `~/.saksi/campaign/runs`).
 - `--console` on-chain driver path (optional; leave unset for offline).
 - `--allow-host host[:port]` extra accepted Host header (for LAN — see below).
-- `--timeout` per-phase timeout (default `60m`).
+- `--phase-timeout` (env `SAKSI_PHASE_TIMEOUT`, alias `--timeout`, default `60m`): how long each phase (generate, ballot submission, verify) may run before it is cancelled; `/run-all` runs all three under one. `tools/up.sh` passes `SAKSI_PHASE_TIMEOUT` through. Journal line 1 records it as `phase_timeout_s`, and preflight blocks a run whose longest phase is estimated above it (`phase_timeout_short`) and warns above 75 % (`phase_timeout_tight`), from 0.18 ms per ballot record to generate, 1.24 ms to submit and 0.83 ms to verify on-chain (0.16 ms offline). At the default, SP-3.5M on-chain (about 73 minutes of submission) is blocked: start the console with `SAKSI_PHASE_TIMEOUT=4h ./tools/up.sh` for the capstones.
 - `--auth-file` users file that turns on login (env `SAKSI_AUTH_FILE`; see below).
 
 ### Authentication
@@ -220,8 +220,8 @@ address can drive it — and with it the login is demo-grade (see §4). Pick one
 ## 6. Using the console
 
 1. **Configure**: election name; add/remove trustees (with names); threshold `t`;
-   positions/candidates; voters (scale presets — offline caps at 10,000; use
-   ground-truth mode for larger tiers until the streaming generator lands);
+   positions/candidates; voters (scale presets — offline takes every tier up to
+   MP-3.5M's 10,572,234 ballot records when preflight finds the disk and memory);
    distribution; mode (offline / on-chain / groundtruth). Two advanced fields
    drive the on-chain ballot window: **concurrency** (in-flight submissions,
    default 8) and **send rate** (dispatches per second; 0 = unthrottled).
@@ -279,6 +279,7 @@ loopback bind. Do not expose it to an untrusted network.
 | Endpoint | Body |
 |---|---|
 | `GET /api/board/<run>` | `BoardResponse` — ranked contests with seats/elected/ties, ballot accounting, cryptographic digests, the check list, and the artifact list. **Offline-first**: it reads the run folder and only *enriches* from the ledger, so unlike `/api/trail/<id>` it never 502s without a network |
+| `GET /api/board/<run>/files/<name>` | The public copy of a run's verification records, listed in the board's `files` field: `header.json`, `ballots.ndjson`, `receipts.csv`, `trail.ndjson` (or `trail.json`), `ledger/header.json` and `ledger/ballots.ndjson`. **409 until the tally is published**, because `header.json` carries the tally from generation onwards. Both headers are served with `ground_truth` and `voter_ids` emptied, so `saksi-demo audit-stream` on the public copy runs every check except accuracy: its only failed check is `tally.accuracy` ("ground truth has 0 entries … accuracy check skipped"), and each contest's `decoded` should equal its `published_tally`. Every other file (ground truth, `correctness.csv`, `ballots.csv`, `election.csv`, the journal, perf, `run.json`) stays behind admin-only `/export/` |
 | `GET /api/verify-code/<run>/<code>` | `VerifyCodeResponse` — the ballot record whose nullifier starts with the code's eight hex characters. `409` if the prefix is ambiguous, `400` if the code is not hex |
 | `GET /api/ceremony/<run>` | `CeremonyView` — `CeremonyState` (unchanged, same JSON paths the wizard reads) plus the run's decryption context and an audit-log timeline |
 
@@ -592,9 +593,15 @@ generate → check → submit → ceremony → verify. `summary.csv` is written 
 the **measured** repetitions only: per numeric `perf.csv` column, one row of
 `min,median,mean,p95,p99,stddev,n`, plus `runs_measured`, `runs_failed`,
 `failure_rate` and `failed_reasons`. A run that failed — per `run.end`'s
-`failed` flag: a stage error, any drop, a reconcile mismatch, a non-zero `E`, or
-an interruption — is excluded from every throughput and latency statistic and
-counted in the failure rate instead.
+`failed` flag: a stage error, an on-chain run that put no ballot on the chain
+(`nothing_submitted`), any drop, a reconcile mismatch, a non-zero `E`, or an
+interruption — is excluded from every throughput and latency statistic and
+counted in the failure rate instead. A submit or ceremony-start stage that
+fails (a bundle or Fabric connect error, a lifecycle step, an unreadable ballot
+stream) is stamped `stage.submit.end` / `stage.ceremony.end` with `ok: false`,
+and the next verify records it as `stage_error: submit: …` or
+`stage_error: ceremony: …`; a later successful start, or a resume that closes
+the election, supersedes it.
 
 `--sweep k` runs time-bounded windows (`--window`, default 120 s) at a target
 send rate multiplied by `k` each step, sizing each step's concurrency from the
@@ -741,14 +748,14 @@ Verify-only and the peer-restart fault only where they apply.
 
 | Route | What it does |
 | --- | --- |
-| `GET /api/preflight[?mode=&voters=&positions=&concurrency=]` | One report: `fabric` (enabled, `reachable` by a 2 s TCP dial, peer, channel), `orderer_batch` (declared `configtx.yaml`), `ladder` (`ok`, `ladder_commit`, `console_commit`), `disk` (`free_bytes` on the disk guard's volume, `projected_ledger_bytes` = voters × positions × 12,000), `host` (`guest_load1`, `guest_load5` from `/proc/loadavg`; under WSL2 also `host_cpu_pct`, the Windows host's `% Processor Time` sampled through `powershell.exe` `Get-Counter` (three 1 s samples, the last two averaged so PowerShell's own startup is excluded; about 3.7 s, 5 s timeout), because the guest's load average cannot see Windows programs; each null when unreadable; `cpus`; the host sample is reused for 10 s, with one sample in flight at a time), `verify_threads_default`, `concurrency_min_advised` (= `MaxMessageCount`), and `warnings[]` of `{severity, code, message, forceable}`. `mode` defaults to `onchain` |
+| `GET /api/preflight[?mode=&voters=&positions=&candidates=&concurrency=]` | One report: `fabric` (enabled, `reachable` by a 2 s TCP dial, peer, channel), `orderer_batch` (declared `configtx.yaml`), `ladder` (`ok`, `ladder_commit`, `console_commit`), `disk` (`free_bytes` on the disk guard's volume: the peer volume on-chain when configured, else the runs volume; on-chain `projected_ledger_bytes` = voters × positions × 12,000; offline `projected_run_bytes` = voters × positions × (1,848 + 1,402 × candidates), measured from whole console runs), `memory` (`available_bytes` = `/proc/meminfo` `MemAvailable`, null where it does not exist, such as Windows; `projected_audit_bytes` = 32 MiB + voters × positions × 150, the auditor's measured peak, for offline and on-chain runs), `host` (`guest_load1`, `guest_load5` from `/proc/loadavg`; under WSL2 also `host_cpu_pct`, the Windows host's `% Processor Time` sampled through `powershell.exe` `Get-Counter` (three 1 s samples, the last two averaged so PowerShell's own startup is excluded; about 3.7 s, 5 s timeout), because the guest's load average cannot see Windows programs; each null when unreadable; `cpus`; the host sample is reused for 10 s, with one sample in flight at a time), `phase_timeout` (`seconds`, `longest_phase`, `estimated_s`; see `--phase-timeout`), `verify_threads_default`, `concurrency_min_advised` (= `MaxMessageCount`), and `warnings[]` of `{severity, code, message, forceable}`. `mode` defaults to `onchain` |
 | `POST /api/ladder` | Runs the validation ladder as a job → `202 {"job": id}`. Writes `ladder.json` on a pass, exactly as `tools/ladder.sh` does |
 | `GET /api/jobs/<id>` | `{kind, status: queued\|running\|done\|failed\|cancelled, started_at, finished_at, error, log: [last 200 lines], result}`. A ladder's `result` is its `ladder.json` |
 | `POST /api/campaigns` `{config, warmups, reps, sweep?, window_s?, burst?, force?}` | Starts a campaign → `202 {"campaign": id}`. Unknown fields are `400`; `reps` must be ≥ 1 unless `sweep` or `burst` is set. Forces `skip_attacks: true` and drops any `attack_plan` (a campaign never runs attacks). Runs preflight on the config, and checks the burst (an election at `burst` voters) against validation, the ladder gate and the disk guard. A `block` answers `409 {error, warnings}`; `force: true` overrides only `fabric_unreachable` |
 | `GET /api/campaigns` | Every campaign, newest first |
 | `GET /api/campaigns/<id>` | Status (`running`, `done`, `failed`, `cancelled`, `interrupted`), `save_error` if a `campaign.json` write failed, the preflight snapshot, a row per repetition (`index`, `kind`, `run_id`, `status`, `committed_tps`, `latency_p99_ms`, `failed`, `fail_reason` from the run's `perf.csv` and `run.end`; `host_start` sampled before its `/generate` and `host_end` after its verify phase), and `summary` (the parsed `summary.csv`) once written. A finished repetition's values are cached; only the one in progress is read live |
 | `POST /api/campaigns/<id>/cancel` | Stops the campaign after the current repetition (`cancelled`, no `summary.csv`). Cancelling during the last repetition, with no sweep or burst after it, has nothing left to stop: the campaign ends `done` with its `summary.csv` |
-| `GET /api/campaigns/<id>/export` | A streamed zip: `<run-id>/run.json`, `perf.csv`, `perf-schema.md`, `correctness.csv`, `negative-tests.csv`, `ground-truth-check.json`, `timings.json` (each when present) and `<run-id>/journal-line1.json` for every run, plus `summary.csv`, `campaign.json`, `preflight.json` and `MANIFEST.txt` (per run, the files included and missing). A file that exists but cannot be read aborts the download instead of finishing a zip without it |
+| `GET /api/campaigns/<id>/export` | A streamed zip: `<run-id>/run.json`, `perf.csv`, `perf-schema.md`, `correctness.csv`, `negative-tests.csv`, `ground-truth-check.json`, `timings.json`, `journal.ndjson`, `gen-timings.json` (each when present), `<run-id>/journal-line1.json`, and `<run-id>/receipts-lifecycle.csv` (`receipts.csv` without its `SubmitBallot` rows; a partial last row left by a crash is dropped and the manifest says so) for every run, so the bundle is what `cost_model.py` reads, plus `summary.csv`, `campaign.json`, `preflight.json` and `MANIFEST.txt` (per run, the files included and missing). A file that exists but cannot be read aborts the download instead of finishing a zip without it |
 
 Preflight findings:
 
@@ -758,12 +765,15 @@ Preflight findings:
 | block | `fabric_not_configured` | On-chain, and the console was started without Fabric | no |
 | block | `fabric_unreachable` | Fabric is configured, the peer does not answer, and the run is on-chain | yes |
 | block | `ladder_missing` | Above 1,000 voters (not ground truth), for the config or the burst, with no `ladder.json` for this build | no |
-| block | `disk_short` | On-chain, and the projected ledger exceeds free space: of one run, or, for a campaign, of all its runs together, since no network reset runs between them: (warm-ups + reps) × voters × positions × 12,000, plus 12 × that per-run figure for a sweep (its maximum step count), plus burst × positions × 12,000 | no |
+| block | `disk_short` | The projected ledger (on-chain) or run folder (offline) exceeds free space: of one run, or, for a campaign, of all its runs together, since no network reset runs between them and every run folder is kept: (warm-ups + reps) × the per-run projection, plus 12 × it for a sweep (its maximum step count), plus the burst's own. `/generate` refuses the single run the same way | no |
+| block | `memory_short` | The audit's projected memory exceeds `MemAvailable` (never on a host without `/proc/meminfo`). `/generate` refuses the same way | no |
 | block | `verify_threads_invalid` | `SAKSI_AUDIT_THREADS` is set to anything but a positive integer (empty included): the auditor would refuse to run | no |
 | warn | `host_load` | Guest 1-minute load average above 25 % of the CPUs | — |
 | warn | `host_cpu` | Under WSL2, the Windows host's CPU above 25 % | — |
 | warn | `concurrency_low` | On-chain, ballots in flight below the orderer's `MaxMessageCount` | — |
 | warn | `verify_threads` | The auditor would verify on one thread | — |
+| warn | `disk_tight` | The run's projected disk is above 80 % of free space | — |
+| warn | `memory_tight` | The audit's projected memory is above 80 % of `MemAvailable` | — |
 
 One job runs at a time, console-wide: starting a ladder or campaign while
 another runs answers `409` naming the running job. A campaign lives in
@@ -858,13 +868,18 @@ run `docker start peer0.org1.example.com` and confirm with
 3. `POST /ceremony/start`. Poll `GET /api/runs/<id>/status` until `busy` is
    false: the phase fails with "N of M ballots did not commit" once the peer is
    back and answering.
-4. `POST /api/runs/<id>/verify-only` (required): records what the chain kept
-   before anything is resubmitted — the reconcile of the chain's count against
-   the committed set, and the chain walk. After the resume that state is gone.
-5. `POST /api/runs/<id>/resume`: submits only what the chain does not hold,
+4. `POST /api/runs/<id>/resume`: submits only what the chain does not hold,
    classifying ballots that landed despite an error as replays, then closes the
    election. If it fails after the ballots landed, resume again: the retry
-   only closes.
+   only closes. The fault's gap is recorded here, from the chain:
+   `segment.start {pending}` is what the chain did not hold after the fault,
+   and each replay row is a ballot that landed although its submit reported a
+   drop.
+5. `POST /api/runs/<id>/verify-only` (required): the reconcile of the chain's
+   count against the committed set, and the chain walk. This is the order the
+   wizard's T3 steps use. Verify-only is equally valid before step 4 (neither
+   route checks for the other), where it records the chain as the fault left
+   it rather than after the resume.
 6. `POST /ceremony/submit` for at least the threshold of trustees, then
    `POST /ceremony/publish`.
 7. `POST /verify`: `correctness.csv` and `run.end` must show every contest's

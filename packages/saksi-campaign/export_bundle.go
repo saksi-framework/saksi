@@ -4,6 +4,7 @@ import (
 	"archive/zip"
 	"bufio"
 	"bytes"
+	"encoding/csv"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -24,6 +25,7 @@ import (
 // bundleRunFiles are copied from each run folder when present, as <run-id>/<file>.
 var bundleRunFiles = []string{
 	RunFile, PerfCSV, PerfSchemaFile, CorrectnessFile, NegativeTestsFile, CheckFile, TimingsFile,
+	JournalFile, GenTimingsFile,
 }
 
 const (
@@ -33,6 +35,10 @@ const (
 	preflightBundleFile = "preflight.json"
 	// manifestFile lists, per run, the files included and the ones missing.
 	manifestFile = "MANIFEST.txt"
+	// receiptsLifecycleFile is receipts.csv without its SubmitBallot rows: the
+	// lifecycle transactions the cost model times the orderer from, without a
+	// row per ballot.
+	receiptsLifecycleFile = "receipts-lifecycle.csv"
 )
 
 // streamCampaignBundle writes the zip. A file that is absent is recorded as
@@ -80,6 +86,13 @@ func (s *Server) streamCampaignBundle(w http.ResponseWriter, rec campaignRecord)
 			must(zipBytes(zw, rep.RunID+"/"+journalLine1File, line))
 		}
 		tally(line != nil, journalLine1File, &have, &missing)
+		ok, truncated, err := zipLifecycleReceipts(zw, rep.RunID+"/"+receiptsLifecycleFile, filepath.Join(dir, "receipts.csv"))
+		must(err)
+		name := receiptsLifecycleFile
+		if truncated {
+			name += " (receipts.csv ends in a partial row, dropped)"
+		}
+		tally(ok, name, &have, &missing)
 		list(fmt.Sprintf("%s (%s %d, %s)", rep.RunID, rep.Kind, rep.Index, rep.Status), have, missing)
 	}
 
@@ -120,6 +133,50 @@ func zipFile(zw *zip.Writer, name, path string) (bool, error) {
 	}
 	_, err = io.Copy(dst, f)
 	return err == nil, err
+}
+
+// zipLifecycleReceipts streams path (a receipts.csv) into the zip as name,
+// keeping the header and every row that is not a SubmitBallot. It reports false
+// with no error when there is no receipts.csv, and truncated when the file ends
+// in a partial row (a crash mid-append), which is left out.
+func zipLifecycleReceipts(zw *zip.Writer, name, path string) (ok, truncated bool, err error) {
+	f, err := os.Open(path)
+	if errors.Is(err, fs.ErrNotExist) {
+		return false, false, nil
+	}
+	if err != nil {
+		return false, false, err
+	}
+	defer f.Close()
+	dst, err := zw.Create(name)
+	if err != nil {
+		return false, false, err
+	}
+	r := csv.NewReader(bufio.NewReader(f))
+	r.FieldsPerRecord = -1 // a short last row is truncation, reported below
+	r.ReuseRecord = true
+	cw := csv.NewWriter(dst)
+	for header := true; ; header = false {
+		row, err := r.Read()
+		if err == io.EOF {
+			break
+		}
+		var perr *csv.ParseError
+		if errors.As(err, &perr) || (err == nil && !header && len(row) < receiptsCSVFields) {
+			truncated = true
+			break
+		}
+		if err != nil {
+			return false, false, err
+		}
+		if header || row[0] != "SubmitBallot" {
+			if err := cw.Write(row); err != nil {
+				return false, false, err
+			}
+		}
+	}
+	cw.Flush()
+	return true, truncated, cw.Error()
 }
 
 func zipBytes(zw *zip.Writer, name string, data []byte) error {

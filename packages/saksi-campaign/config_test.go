@@ -2,6 +2,7 @@ package campaign
 
 import (
 	"fmt"
+	"strings"
 	"testing"
 )
 
@@ -86,26 +87,44 @@ func TestValidateRejectsBadMode(t *testing.T) {
 	}
 }
 
-func TestValidateEnforcesOfflineCeiling(t *testing.T) {
+// Offline takes every thesis tier up to row 8's MP-3.5M (3,524,078 voters x 3
+// positions) and refuses a record more; what a tier can really afford is
+// preflight's disk and memory guard, not Validate.
+func TestValidateBoundsOfflineRecords(t *testing.T) {
 	c := good()
-	c.Voters = OfflineVoterCeiling + 1
+	c.Positions, c.Candidates = 3, 4
+	for _, voters := range []int{10_001, 483_000, 1_000_000, 1_921_917, 3_524_078} {
+		c.Voters = voters
+		if err := c.Validate(); err != nil {
+			t.Fatalf("offline %d x 3 must be accepted: %v", voters, err)
+		}
+	}
+	c.Voters = 3_524_079
+	if err := c.Validate(); err == nil || !strings.Contains(err.Error(), "bounded at 10572234 ballot records") {
+		t.Fatalf("offline 3,524,079 x 3 must be rejected with the bound, got %v", err)
+	}
+	c.Positions, c.Voters = 1, OfflineRecordCeiling+1
 	if err := c.Validate(); err == nil {
-		t.Fatalf("offline voters > %d must be rejected", OfflineVoterCeiling)
+		t.Fatal("the bound is on records: one position over it must be rejected too")
+	}
+	c.Voters = 1 << 62 // voters x positions would overflow int
+	c.Positions = 4
+	if err := c.Validate(); err == nil {
+		t.Fatal("an overflowing voters x positions must not slip under the bound")
 	}
 	// The same population is allowed on-chain.
-	c.Mode = "onchain"
+	c.Mode, c.Voters, c.Positions = "onchain", 3_524_079, 3
 	if err := c.Validate(); err != nil {
-		t.Fatalf("on-chain should allow large tiers: %v", err)
+		t.Fatalf("on-chain has no record bound: %v", err)
 	}
 }
 
-// The ceiling exists because offline generation runs unparallelized crypto.
-// Ground-truth mode runs none, so the capstone tiers must pass validation —
-// that is the whole reason the mode exists.
+// Ground-truth mode runs no cryptography, so the capstone tiers pass
+// validation there too.
 func TestValidateAllowsCapstoneTiersInGroundTruthMode(t *testing.T) {
 	c := good()
 	c.Mode = ModeGroundTruth
-	for _, voters := range []int{OfflineVoterCeiling + 1, 1_921_917, 3_524_078} {
+	for _, voters := range []int{OfflineRecordCeiling + 1, 1_921_917, 3_524_078} {
 		c.Voters = voters
 		if err := c.Validate(); err != nil {
 			t.Fatalf("ground-truth mode must accept %d voters: %v", voters, err)

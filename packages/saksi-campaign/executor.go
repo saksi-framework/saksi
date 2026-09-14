@@ -98,6 +98,8 @@ type Executor struct {
 
 	// faultGate, when set, refuses to fire runID's armed fault (fault.go).
 	faultGate func(runID string) error
+	// phaseTimeout is the server's per-phase timeout, recorded in journal line 1.
+	phaseTimeout time.Duration
 	// peersDown counts faults between their docker stop and start (RestorePeer).
 	peersDown atomic.Int32
 	// stopMu is held across a fault's docker stop, so RestorePeer never starts
@@ -107,6 +109,24 @@ type Executor struct {
 	// until the peer answers again. No run phase starts meanwhile (claim).
 	faultMu  sync.Mutex
 	faulting map[string]bool
+
+	// dialLedger opens the ledger the ballot-carrying stages (Submit and
+	// CeremonyStart) drive, with the func that closes it. Nil = the live
+	// network (fabric.Connect); tests set it to a fake ledger so every way
+	// those stages fail can be followed to run.end.
+	dialLedger func() (clientsdk.Ledger, func(), error)
+}
+
+// openLedger is dialLedger, or the live network's ledger when unset.
+func (e *Executor) openLedger() (clientsdk.Ledger, func(), error) {
+	if e.dialLedger != nil {
+		return e.dialLedger()
+	}
+	conn, err := e.fabric.Connect()
+	if err != nil {
+		return nil, nil, err
+	}
+	return conn.Ledger(), func() { _ = conn.Close() }, nil
 }
 
 // NewExecutor wires the production runner. demoBin is the saksi-demo path;
@@ -136,6 +156,9 @@ func (e *Executor) Generate(ctx context.Context, runID string, c ElectionConfig)
 	// The journal is created here, at the run's first stage, and reopened for
 	// appending by every later stage (journalFor).
 	env := CollectEnv(e.demoBin)
+	if e.phaseTimeout > 0 {
+		env["phase_timeout_s"] = e.phaseTimeout.Seconds()
+	}
 	j, jerr := OpenJournal(dir, env)
 	if jerr != nil {
 		e.publish(runID, "generate", "info", "run journal unavailable: "+jerr.Error())
@@ -483,14 +506,24 @@ func finaliseInput(dir string, c ElectionConfig, sa StreamAudit, stageErr error,
 	segs, resumed := segmentsFromJournal(dir)
 	in.Resumed = resumed
 	var sm submitMetrics
-	if readJSON(filepath.Join(dir, submitMetricsFile), &sm) != nil {
-		return in
-	}
+	haveWindow := readJSON(filepath.Join(dir, submitMetricsFile), &sm) == nil
 	// A journal that broke inside the window is a failed run, and this is the
 	// only place its reason survives to run.end. An explicit stage error still
 	// wins: it is the more proximate diagnosis.
 	if in.StageErr == nil && sm.JournalError != "" {
 		in.StageErr = errors.New(sm.JournalError)
+	}
+	if in.StageErr == nil {
+		in.StageErr = ballotStageErr(dir)
+	}
+	// An on-chain run that put no ballot on the chain measured nothing, however
+	// cleanly its other phases went: its local audit still passes, because the
+	// generated ballots are all there on disk.
+	if c.Mode == "onchain" && c.Voters*c.Positions > 0 && (!haveWindow || sm.Submitted == 0) {
+		in.NothingSubmitted = true
+	}
+	if !haveWindow {
+		return in
 	}
 	in.Dropped = sm.Dropped
 	// bench.Reconcile is the single definition of "every ballot landed", and
@@ -528,6 +561,12 @@ func finaliseInput(dir string, c ElectionConfig, sa StreamAudit, stageErr error,
 // one-blob bundle for this run, connects, and drives the full lifecycle via
 // submitOnChain. Without a live network it falls back to the legacy console
 // driver (consBin), which errors clearly rather than hanging if unconfigured.
+//
+// Whatever an on-chain Submit returns is stamped as stage.submit.end, which is
+// how a failure that never reached the ballot window (a bundle or connect
+// error, a lifecycle step) still reaches run.end: Verify runs as its own phase,
+// the repeat driver verifies even after a failed submit, and without the stamp
+// such a run was recorded failed:false (see ballotStageErr).
 func (e *Executor) Submit(ctx context.Context, runID string, c ElectionConfig) error {
 	if groundTruthOnly(c) {
 		e.publish(runID, "submit", "done",
@@ -538,23 +577,32 @@ func (e *Executor) Submit(ctx context.Context, runID string, c ElectionConfig) e
 		e.publish(runID, "submit", "done", "offline mode: nothing submitted on-chain")
 		return nil
 	}
+	j := e.journalFor(runID)
+	defer j.Close()
+	_ = j.Stamp("stage.submit.start", nil)
+	err := e.submit(ctx, runID, c)
+	_ = j.Stamp("stage.submit.end", stageEnd(err))
+	return err
+}
+
+func (e *Executor) submit(ctx context.Context, runID string, c ElectionConfig) error {
 	dir, err := e.store.Dir(runID)
 	if err != nil {
 		return err
 	}
-	if e.fabric.Enabled() {
+	if e.fabric.Enabled() || e.dialLedger != nil {
 		bundlePath, err := e.generateBundle(runID)
 		if err != nil {
 			e.publish(runID, "submit", "error", "bundle: "+err.Error())
-			return err
+			return fmt.Errorf("bundle: %w", err)
 		}
-		conn, err := e.fabric.Connect()
+		led, closeLedger, err := e.openLedger()
 		if err != nil {
 			e.publish(runID, "submit", "error", "connect to Fabric: "+err.Error())
-			return err
+			return fmt.Errorf("connect to Fabric: %w", err)
 		}
-		defer conn.Close()
-		return e.submitOnChain(ctx, runID, c, conn.Ledger(), bundlePath)
+		defer closeLedger()
+		return e.submitOnChain(ctx, runID, c, led, bundlePath)
 	}
 	if e.consBin == "" {
 		err := fmt.Errorf("on-chain submit requires a reachable Fabric network (no driver configured)")
@@ -1851,6 +1899,40 @@ func segmentsFromJournal(dir string) ([]Segment, bool) {
 		}
 	}
 	return segs, resumed
+}
+
+// ballotStageErr is the run's unrecovered failure of a stage that carries the
+// ballots to the chain: the last stage.submit.end or stage.ceremony.end
+// stamped ok:false, unless a later one of those succeeded (a retried ceremony
+// start) or a later resume closed the election (resume.close ok), which is the
+// one route that finishes what the failed stage left. nil when there is none.
+//
+// The stamp is written at the stage boundary (Submit, CeremonyStart), so every
+// way those stages fail reaches here the same way, whatever it was.
+func ballotStageErr(dir string) error {
+	events, err := readJournalEvents(dir)
+	if err != nil {
+		return nil
+	}
+	var failed error
+	for _, ev := range events {
+		switch name := jstring(ev, "event"); name {
+		case "stage.submit.end", "stage.ceremony.end":
+			// Absent ok (a journal written before the ceremony stamped one) is
+			// not a failure.
+			if ok, set := ev["ok"].(bool); set && !ok {
+				stage := strings.TrimSuffix(strings.TrimPrefix(name, "stage."), ".end")
+				failed = fmt.Errorf("%s: %s", stage, jstring(ev, "error"))
+			} else {
+				failed = nil
+			}
+		case "resume.close":
+			if jbool(ev, "ok") {
+				failed = nil
+			}
+		}
+	}
+	return failed
 }
 
 // segmentFromEvent reads a segment.end event back into its Segment.
