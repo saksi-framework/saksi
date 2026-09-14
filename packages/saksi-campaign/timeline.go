@@ -97,6 +97,29 @@ type stagePause struct {
 	mu     sync.Mutex
 	view   PauseView
 	decide chan pauseDecision
+	// closed is set, under mu, once the stage takes no more decisions: a
+	// run-all or skip was accepted, the wait ran out, or the phase was
+	// cancelled. A decision is either queued before it is set (and applied) or
+	// refused after it (409) — never accepted and then dropped.
+	closed bool
+}
+
+// closeIfIdle closes the stage to decisions unless one is already queued, in
+// which case that decision, accepted before the wait ran out, is applied.
+func (p *stagePause) closeIfIdle() bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if len(p.decide) > 0 {
+		return false
+	}
+	p.closed = true
+	return true
+}
+
+func (p *stagePause) close() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.closed = true
 }
 
 type pauseDecision struct{ action, scenario string }
@@ -113,8 +136,12 @@ func (p *stagePause) update(fn func(v *PauseView)) {
 	fn(&p.view)
 }
 
-// errNoPause is DecidePause on a run that is not holding at a stage.
-var errNoPause = errors.New("this run is not paused at an attack stage")
+// errNoPause is DecidePause on a run that is not holding at a stage, and
+// errPauseEnded one whose stage has already stopped taking decisions.
+var (
+	errNoPause    = errors.New("this run is not paused at an attack stage")
+	errPauseEnded = errors.New("this stage has already continued")
+)
 
 // PauseStatus reports where a run's lifecycle is paused, if it is.
 func (e *Executor) PauseStatus(runID string) PauseView {
@@ -137,7 +164,9 @@ func (e *Executor) DecidePause(runID, action, scenario string) error {
 	if p == nil {
 		return errNoPause
 	}
-	v := p.snapshot()
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	v := p.view
 	switch action {
 	case "run":
 		if !slices.Contains(v.Scenarios, scenario) {
@@ -147,8 +176,16 @@ func (e *Executor) DecidePause(runID, action, scenario string) error {
 	default:
 		return fmt.Errorf("unknown pause action %q (want run, run-all or skip)", action)
 	}
+	if p.closed {
+		return fmt.Errorf("%w: the %s stage takes no more decisions", errPauseEnded, v.Stage)
+	}
 	select {
 	case p.decide <- pauseDecision{action: action, scenario: scenario}:
+		// A decision that ends the stage closes it now, so nothing queued
+		// behind it is accepted only to be dropped.
+		if action != "run" {
+			p.closed = true
+		}
 		return nil
 	default:
 		return fmt.Errorf("the %s stage is still working through earlier decisions", v.Stage)
@@ -240,9 +277,13 @@ func (e *Executor) pauseForAttacks(ctx context.Context, runID string, c Election
 	for {
 		select {
 		case <-ctx.Done():
+			p.close()
 			resume("cancelled")
 			return
 		case <-timer.C:
+			if !p.closeIfIdle() {
+				continue // a decision accepted before the wait ran out goes first
+			}
 			runRest()
 			resume("timeout")
 			return
@@ -332,6 +373,14 @@ func (e *Executor) pausedWindow(ctx context.Context, runID string, c ElectionCon
 	n, at int, submit bench.SubmitFunc, opts bench.RunOpts) bench.RunResult {
 	first := runBench(ctx, at, submit, opts)
 	if first.Stopped || ctx.Err() != nil {
+		// The window ended before the pause point (its time bound, or a
+		// cancellation): the stage is never mounted, and the journal says so.
+		j := e.journalFor(runID)
+		_ = j.Stamp("attack.resume", map[string]any{
+			"stage": StageBallots, "reason": "not mounted: window stopped", "paused_ms": 0,
+		})
+		j.Close()
+		e.publish(runID, "attack", "info", "ballots stage not mounted: the window stopped before its pause point")
 		return joinWindows(n, at, first, bench.RunResult{LastIndex: -1, Stopped: true})
 	}
 
@@ -471,7 +520,7 @@ func (s *Server) handlePause(w http.ResponseWriter, r *http.Request, id string) 
 	}
 	if err := s.exec.DecidePause(runID, body.Action, body.Scenario); err != nil {
 		code := http.StatusBadRequest
-		if errors.Is(err, errNoPause) {
+		if errors.Is(err, errNoPause) || errors.Is(err, errPauseEnded) {
 			code = http.StatusConflict
 		}
 		http.Error(w, err.Error(), code)

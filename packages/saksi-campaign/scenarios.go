@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -307,17 +308,28 @@ func (e *Executor) RunScenarios(ctx context.Context, runID string, list []string
 	if err := writeNegativeTestsCSV(filepath.Join(srcDir, NegativeTestsFile), merged); err != nil {
 		return err
 	}
-	fails := 0
+	fails, passes, mounted := 0, 0, 0
 	for _, r := range results {
-		if r.Verdict == "FAIL" {
+		switch r.Verdict {
+		case "FAIL":
 			fails++
+		case "PASS":
+			passes++
+		}
+		if r.Verdict != "SKIPPED" {
+			mounted++
 		}
 	}
-	if fails == 0 {
-		e.publish(runID, "scenarios", "done", "all scenarios upheld their security property")
-	} else {
+	switch {
+	case fails > 0:
 		e.publish(runID, "scenarios", "error",
 			fmt.Sprintf("%d scenario(s) FAILED — a gate that should have rejected did not", fails))
+	case passes == mounted:
+		e.publish(runID, "scenarios", "done", "all scenarios upheld their security property")
+	default:
+		e.publish(runID, "scenarios", "done", fmt.Sprintf(
+			"%d of %d mounted scenario(s) rejected by their declared gate; the rest are INCONCLUSIVE, not passes",
+			passes, mounted))
 	}
 	return nil
 }
@@ -383,8 +395,13 @@ func classifyAudit(res *ScenarioResult, sc Scenario, sa StreamAudit, ok bool) {
 		res.Verdict = "INCONCLUSIVE"
 		res.Actual = "rejected by an unidentified gate: audit-stream produced no valid result (it refused the input before auditing)"
 		return
-	case sa.Overall != "fail":
+	case sa.Overall == "pass":
 		res.Verdict, res.Actual = "FAIL", "NOT rejected — the audit passed a mutated run"
+		return
+	case sa.Overall != "fail":
+		// Neither verdict: nothing says the attack got through, or what caught it.
+		res.Verdict = "INCONCLUSIVE"
+		res.Actual = fmt.Sprintf("rejected by an unidentified gate: audit-stream reported overall=%q, neither pass nor fail", sa.Overall)
 		return
 	}
 	ids := make([]string, 0, len(sa.FailedChecks))
@@ -950,22 +967,48 @@ func classifyLive(res *ScenarioResult, sc Scenario, submitErr error) {
 		return
 	}
 	text := clientsdk.ErrorText(submitErr)
-	loc := gateID.FindStringSubmatchIndex(text)
-	if loc == nil {
+	locs := gateID.FindAllStringSubmatchIndex(text, -1)
+	if len(locs) == 0 {
 		res.Verdict = "INCONCLUSIVE"
 		res.Actual = "rejected by an unidentified gate (the error names no gate id — a chaincode " +
 			"deployed before gate ids, or a transport failure): " + truncateErr(text)
 		return
 	}
-	observed, reason := text[loc[2]:loc[3]], truncateErr(text[loc[1]:])
-	res.GateObserved = observed
-	if sc.ChainGate != "" && observed == sc.ChainGate {
+	// Every gate the endorsers named must be the declared one. Several
+	// endorsers can each attach a message; if any of them refused at another
+	// gate, the attack did not reach the gate under test everywhere.
+	var ids []string
+	other := -1
+	for i, loc := range locs {
+		id := text[loc[2]:loc[3]]
+		if !slices.Contains(ids, id) {
+			ids = append(ids, id)
+		}
+		if other < 0 && id != sc.ChainGate {
+			other = i
+		}
+	}
+	res.GateObserved = strings.Join(ids, ";")
+	// One endorser's reason runs to the "; " ErrorText put before the next
+	// endorser's message.
+	reasonAt := func(i int) string {
+		r := text[locs[i][1]:]
+		if i+1 < len(locs) {
+			r = text[locs[i][1]:locs[i+1][0]]
+			if k := strings.LastIndex(r, "; "); k >= 0 {
+				r = r[:k]
+			}
+		}
+		return truncateErr(r)
+	}
+	if sc.ChainGate != "" && other < 0 {
 		res.Verdict = "PASS"
-		res.Actual = "rejected by chaincode gate " + observed + " (the declared gate): " + reason
+		res.Actual = "rejected by chaincode gate " + sc.ChainGate + " (the declared gate): " + reasonAt(0)
 		return
 	}
+	i := max(other, 0)
 	res.Verdict = "INCONCLUSIVE"
-	res.Actual = "rejected by " + observed + ": " + reason
+	res.Actual = "rejected by " + text[locs[i][2]:locs[i][3]] + ": " + reasonAt(i)
 }
 
 // mountLiveAttack applies the mutation and submits the tampered artifact,

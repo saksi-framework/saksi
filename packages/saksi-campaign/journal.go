@@ -514,6 +514,10 @@ type FinaliseInput struct {
 	// Set only when LedgerAudit is "ok"; a mismatch is a finding, NOT a
 	// failed run — it is a result the instrument exists to report.
 	LedgerMatchesLocal *bool
+	// SecurityRun reports that the run had an attack plan: its lifecycle paused
+	// to mount attacks, so its throughput is perturbed by design. It never
+	// yields a sustained TPS or a scaling verdict.
+	SecurityRun bool
 }
 
 // FinaliseResult is the run.end verdict.
@@ -574,7 +578,7 @@ func Finalise(j *Journal, f FinaliseInput) FinaliseResult {
 	}
 
 	res.ScalingLimit = "inconclusive"
-	if res.Sustained {
+	if res.Sustained && !f.SecurityRun {
 		seg := f.Segments[0]
 		if seg.WindowMs != 0 { // zero window: TPS stays nil, never divide by zero
 			tps := seg.TPS
@@ -621,6 +625,11 @@ func Finalise(j *Journal, f FinaliseInput) FinaliseResult {
 		}
 		if f.LedgerMatchesLocal != nil {
 			end["ledger_matches_local"] = *f.LedgerMatchesLocal
+		}
+		// Absent, not false, like bounded and resumed: why a run that
+		// sustained its window still has no sustained TPS or scaling verdict.
+		if f.SecurityRun {
+			end["security_run"] = true
 		}
 		_ = j.Stamp("run.end", end)
 	}

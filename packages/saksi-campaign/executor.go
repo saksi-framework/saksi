@@ -450,7 +450,8 @@ func finaliseInput(dir string, c ElectionConfig, sa StreamAudit, stageErr error,
 	in := FinaliseInput{
 		Voters: c.Voters, Positions: c.Positions,
 		ReconcileOK: true, StageErr: stageErr,
-		EByContest: make(map[string]int64, len(sa.Contests)),
+		EByContest:  make(map[string]int64, len(sa.Contests)),
+		SecurityRun: c.AttackPlan != nil,
 	}
 	for _, ct := range sa.Contests {
 		in.EByContest[ct.Contest] = ct.E
@@ -588,6 +589,17 @@ func (e *Executor) submitOnChain(ctx context.Context, runID string, c ElectionCo
 	}
 	if err := submitPartials(ctx, b, step); err != nil {
 		return err
+	}
+	// The ceremony stage pauses here on this path too: every partial is on the
+	// chain, the tally is not.
+	if c.AttackPlan.has(StageCeremony) {
+		dir, _ := e.store.Dir(runID)
+		e.pauseForAttacks(ctx, runID, c, StageCeremony,
+			MountContext{ElectionStatus: "closed", BallotsCommitted: committedFromMetrics(dir), BlockHeight: chainHeight(led)},
+			true, e.simulatedMount(ctx, runID, true))
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 	}
 	if err := step(ctx, "PublishTally", "", "PublishTally", b.Tally); err != nil {
 		return err
@@ -1370,7 +1382,7 @@ func (e *Executor) resumeBallots(ctx context.Context, runID string, c ElectionCo
 		Voters: c.Voters, Positions: c.Positions,
 		Segments: append(plan.segments, seg), Dropped: dropped,
 		Interrupted: res.Stopped, Resumed: true, EByContest: map[string]int64{},
-		StageErr: winErr,
+		StageErr: winErr, SecurityRun: c.AttackPlan != nil,
 	}
 	in.ReconcileErr = bench.Reconcile(res.Submitted, onChain, len(pending))
 	in.ReconcileOK = in.ReconcileErr == nil

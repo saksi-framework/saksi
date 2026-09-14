@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -748,5 +749,221 @@ func TestUnstagedRerunNeverReplacesAStagedVerdict(t *testing.T) {
 	}
 	if r := resultsByID(t, dir)["tamper-ballot-proof"]; r.Verdict != "INCONCLUSIVE" {
 		t.Errorf("a staged verdict did not replace a staged verdict: %+v", r)
+	}
+}
+
+// --- review fix round 1 -------------------------------------------------------
+
+// A window that stops before its pause point (its time bound, or a cancel)
+// never mounts the ballots stage, and the journal says so instead of staying
+// silent about a stage the plan listed.
+func TestWindowStoppedBeforeThePauseIsJournalledAsNotMounted(t *testing.T) {
+	orig := runBench
+	runBench = func(_ context.Context, n int, _ bench.SubmitFunc, _ bench.RunOpts) bench.RunResult {
+		return bench.RunResult{Stopped: true, LastIndex: -1, ByIndex: make([]time.Duration, n), OK: make([]bool, n)}
+	}
+	t.Cleanup(func() { runBench = orig })
+
+	dir := t.TempDir()
+	e := newTestExecutor(t, dir)
+	c := ElectionConfig{Mode: "onchain", Voters: 10, Positions: 1, AttackPlan: &AttackPlan{Stages: []string{StageBallots}}}
+	res := e.pausedWindow(context.Background(), "run-1", c, newGatedLedger(), 10, 5,
+		func(int) error { return nil }, bench.RunOpts{Concurrency: 2})
+
+	if !res.Stopped || res.LastIndex != -1 || len(res.OK) != 10 {
+		t.Fatalf("joined result = %+v, want a stopped window over 10 slots", res)
+	}
+	runDir := filepath.Join(dir, "run-1")
+	if p := journalEventsOfType(t, runDir, "attack.pause"); len(p) != 0 {
+		t.Errorf("a stage that was never reached journalled a pause: %v", p)
+	}
+	r := journalEventsOfType(t, runDir, "attack.resume")
+	if len(r) != 1 || jstring(r[0], "reason") != "not mounted: window stopped" || jstring(r[0], "stage") != StageBallots {
+		t.Fatalf("attack.resume = %v, want one {stage: ballots, reason: not mounted: window stopped}", r)
+	}
+}
+
+// The all-in-one /submit path pauses at the ceremony stage between the
+// partial decryptions and PublishTally, like the step-by-step ceremony does.
+func TestSubmitPathPausesAtCeremonyBeforePublishTally(t *testing.T) {
+	dir := t.TempDir()
+	runDir := filepath.Join(dir, "run-1")
+	e := newTestExecutor(t, dir)
+	path := attackRun(t, runDir, 4)
+	led := newGatedLedger()
+	c := ElectionConfig{Mode: "onchain", Voters: 4, Positions: 1, Candidates: 2, Concurrency: 2,
+		AttackPlan: &AttackPlan{Stages: []string{StageCeremony}}}
+
+	done := make(chan error, 1)
+	go func() { done <- e.submitOnChain(context.Background(), "run-1", c, led, path) }()
+	v := waitPause(t, e, "run-1", StageCeremony, done)
+	calls := led.callNames()
+	if calls[len(calls)-1] != "CloseElection" || slices.Contains(calls, "PublishTally") {
+		t.Fatalf("at the ceremony pause the chain has seen %v; want everything up to the partials and no PublishTally", calls)
+	}
+	if v.Mount.ElectionStatus != "closed" || v.Mount.BallotsCommitted == nil || *v.Mount.BallotsCommitted != 4 {
+		t.Errorf("ceremony mount context = %+v", v.Mount)
+	}
+	if err := e.DecidePause("run-1", "skip", ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if calls := led.callNames(); calls[len(calls)-1] != "PublishTally" {
+		t.Errorf("after the pause the lifecycle ended with %v, want PublishTally", calls)
+	}
+}
+
+// A security run's window may well be one uninterrupted segment, but its
+// throughput is perturbed by design: it never yields a sustained TPS or a
+// scaling verdict, and run.end says why.
+func TestFinaliseSecurityRunHasNoScalingVerdict(t *testing.T) {
+	seg := Segment{Index: 0, Committed: 1000, WindowMs: 10000, TPS: 100, DriverCeilingTPS: 1000}
+	in := FinaliseInput{Voters: 1000, Positions: 1, Segments: []Segment{seg}, ReconcileOK: true,
+		EByContest: map[string]int64{}}
+	if plain := Finalise(nil, in); plain.SustainedTPS == nil || plain.ScalingLimit == "inconclusive" {
+		t.Fatalf("control: a plain sustained run = %+v, want a sustained TPS and a verdict", plain)
+	}
+
+	dir := t.TempDir()
+	j, err := OpenJournal(dir, map[string]any{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	in.SecurityRun = true
+	got := Finalise(j, in)
+	j.Close()
+	if got.SustainedTPS != nil || got.ScalingLimit != "inconclusive" {
+		t.Errorf("security run = %+v, want no sustained TPS and scaling_limit inconclusive", got)
+	}
+	ends := journalEventsOfType(t, dir, "run.end")
+	if len(ends) != 1 || ends[0]["security_run"] != true || ends[0]["sustained_tps"] != nil ||
+		jstring(ends[0], "scaling_limit") != "inconclusive" {
+		t.Errorf("run.end = %v, want security_run true, sustained_tps null, scaling_limit inconclusive", ends)
+	}
+}
+
+// An audit document that is neither pass nor fail says nothing about whether
+// the attack got through: INCONCLUSIVE, never FAIL.
+func TestAuditWithoutAVerdictIsInconclusive(t *testing.T) {
+	sc := Registry()[0]
+	for _, overall := range []string{"", "error", "PASS"} {
+		var res ScenarioResult
+		classifyAudit(&res, sc, StreamAudit{Overall: overall}, true)
+		if res.Verdict != "INCONCLUSIVE" {
+			t.Errorf("overall=%q: verdict %q, want INCONCLUSIVE", overall, res.Verdict)
+		}
+	}
+	var res ScenarioResult
+	classifyAudit(&res, sc, StreamAudit{Overall: "pass"}, true)
+	if res.Verdict != "FAIL" {
+		t.Errorf("overall=pass: verdict %q, want FAIL", res.Verdict)
+	}
+}
+
+// "All scenarios upheld their security property" is claimed only when every
+// mounted scenario was rejected by its declared gate.
+func TestCatalogueSummaryClaimsAllUpheldOnlyWhenEveryMountedOnePassed(t *testing.T) {
+	for _, tc := range []struct {
+		failed func(string) string
+		want   string
+	}{
+		{declaredAuditGate, "all scenarios upheld their security property"},
+		{func(string) string { return "tally.shape" }, "0 of 2 mounted scenario(s) rejected by their declared gate"},
+	} {
+		store := NewRunStore(t.TempDir())
+		runID, dir, err := store.Create(good(), time.Now())
+		if err != nil {
+			t.Fatal(err)
+		}
+		attackRun(t, dir, 3)
+		hub := NewHub()
+		e := NewExecutor(store, hub, "saksi-demo", "", FabricConfig{})
+		e.run = fakeAuditor(tc.failed)
+		ch, cancel := hub.Subscribe(runID)
+		if err := e.RunScenarios(context.Background(), runID,
+			[]string{"tamper-ballot-proof", "dropped-ballot", "reordered-ballots"}); err != nil {
+			t.Fatal(err)
+		}
+		cancel()
+		var last Event
+		for ev := range ch {
+			if ev.Phase == "scenarios" && ev.Level == "done" {
+				last = ev
+			}
+		}
+		if !strings.HasPrefix(last.Msg, tc.want) {
+			t.Errorf("summary = %q, want it to start %q", last.Msg, tc.want)
+		}
+	}
+}
+
+// Several endorsers can each attach a message. If any of them names a gate
+// other than the declared one, the attack did not meet the gate under test
+// everywhere: INCONCLUSIVE, with every observed gate recorded.
+func TestLiveAttackNamingAnotherGateAnywhereIsInconclusive(t *testing.T) {
+	sc := Scenario{ID: "t", ChainGate: "cds"}
+	var res ScenarioResult
+	classifyLive(&res, sc, errString("submit SubmitBallot: failed to endorse; chaincode response 500, gate=cds: proof failed; "+
+		"chaincode response 500, gate=election-open: election \"e\" is not open for ballots"))
+	if res.Verdict != "INCONCLUSIVE" || res.GateObserved != "cds;election-open" {
+		t.Fatalf("verdict/observed = %q/%q, want INCONCLUSIVE with cds;election-open", res.Verdict, res.GateObserved)
+	}
+	if want := "rejected by election-open: election \"e\" is not open for ballots"; res.Actual != want {
+		t.Errorf("actual = %q, want %q", res.Actual, want)
+	}
+
+	res = ScenarioResult{}
+	classifyLive(&res, sc, errString("chaincode response 500, gate=cds: proof failed; chaincode response 500, gate=cds: proof failed"))
+	if res.Verdict != "PASS" || res.GateObserved != "cds" || res.Actual != "rejected by chaincode gate cds (the declared gate): proof failed" {
+		t.Errorf("two endorsers both at the declared gate = %+v, want PASS", res)
+	}
+}
+
+// A decision is either applied or refused: once a run-all or skip is accepted,
+// or the wait has run out, later decisions get 409 instead of a 202 that is
+// silently dropped; a decision queued before the wait ran out is still applied.
+func TestDecisionsAfterTheStageClosesAreRefusedNotDropped(t *testing.T) {
+	e := testExec(t)
+	view := PauseView{Paused: true, Stage: StageBallots, Scenarios: []string{"reused-nullifier"}}
+
+	p := &stagePause{decide: make(chan pauseDecision, 8), view: view}
+	e.setPause("r", p)
+	if err := e.DecidePause("r", "run-all", ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.DecidePause("r", "run", "reused-nullifier"); !errors.Is(err, errPauseEnded) {
+		t.Errorf("a decision after run-all = %v, want errPauseEnded", err)
+	}
+
+	p = &stagePause{decide: make(chan pauseDecision, 8), view: view}
+	e.setPause("r", p)
+	if err := e.DecidePause("r", "run", "reused-nullifier"); err != nil {
+		t.Fatal(err)
+	}
+	if p.closeIfIdle() {
+		t.Fatal("the wait closed the stage with a decision still queued; that decision would be dropped")
+	}
+	<-p.decide // the loop applies it
+	if !p.closeIfIdle() {
+		t.Fatal("an idle stage did not close when the wait ran out")
+	}
+	if err := e.DecidePause("r", "skip", ""); !errors.Is(err, errPauseEnded) {
+		t.Errorf("a decision after the timeout = %v, want errPauseEnded", err)
+	}
+
+	// Over HTTP that refusal is a 409.
+	s, h, exec := testServer(t, nil)
+	runID, _, err := s.store.Create(good(), time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	closed := &stagePause{decide: make(chan pauseDecision, 1), view: view, closed: true}
+	exec.setPause(runID, closed)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, postJSON("/api/runs/"+runID+"/pause", map[string]string{"action": "skip"}))
+	if rec.Code != http.StatusConflict {
+		t.Errorf("POST to a closed stage = %d, want 409", rec.Code)
 	}
 }
