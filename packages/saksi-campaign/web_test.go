@@ -1,6 +1,7 @@
 package campaign
 
 import (
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -72,6 +73,12 @@ func TestWizardDefinesEveryFunctionItCalls(t *testing.T) {
 		"showIDChip", "startRun", "runCheck", "startSaksi", "startCeremony",
 		"startVerify", "refreshCeremony", "renderTrail", "openStream", "closeStream",
 		"showLoader", "hideLoader", "fileChips", "artifactsFor", "config",
+		"checkAuth", "needSignIn", "showApp", "apiFetch", "errorBody", "renderErr", "setMode",
+		"showSetup", "syncPlan", "schedulePreflight", "runPreflight", "renderPreflight", "syncStart",
+		"watchJob", "watchLadder", "syncReset", "followReset", "startCampaign", "openCampaign",
+		"refreshCampaign", "renderCampaign", "loadCampaigns", "loadRuns", "renderRuns", "runAction",
+		"whenIdle", "renderFaultRuns", "syncFault", "applyPreset", "renderPresets", "onFormChange",
+		"syncHints", "hostCell", "boot", "refreshStudy",
 	} {
 		called := strings.Contains(js, fn+"(")
 		defined := strings.Contains(js, "function "+fn+"(") ||
@@ -92,6 +99,19 @@ func TestWizardDefinesEveryFunctionItCalls(t *testing.T) {
 		if !strings.Contains(js, decl) {
 			t.Errorf("wizard.html is missing the declaration %q", decl)
 		}
+	}
+}
+
+// A campaign row's "contended" chip must mean what preflight's host warning
+// means: the page carries the threshold as a literal, pinned here to the Go one.
+func TestWizardContendedThresholdMatchesPreflight(t *testing.T) {
+	page, err := webFS.ReadFile("web/wizard.html")
+	if err != nil {
+		t.Fatalf("read wizard.html: %v", err)
+	}
+	want := fmt.Sprintf("const HOST_WARN_FRACTION = %v;", hostLoadWarnFraction)
+	if !strings.Contains(string(page), want) {
+		t.Errorf("wizard.html must declare %q to match preflight.go's hostLoadWarnFraction", want)
 	}
 }
 

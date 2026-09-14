@@ -238,6 +238,60 @@
   .ctrl .tick { width:16px; height:16px; border-radius:50%; display:grid; place-items:center;
                 font-size:10px; font-weight:700; background:var(--line-2); color:var(--muted); flex:none }
   .ctrl.on .tick { background:var(--ok); color:#fff }
+
+  /* ---- study console: sign-in, modes, preflight, campaigns, runs, infra -- */
+  [hidden] { display:none !important }
+  #signin { max-width:400px; margin:48px auto }
+  .signwrap { padding:0 16px }
+  .modes { display:flex; gap:8px; flex-wrap:wrap; margin-bottom:16px }
+  .modes button { flex:1; min-width:220px; text-align:left; padding:10px 14px; border-radius:var(--radius) }
+  .modes button b { display:block; font-size:13px; font-weight:650 }
+  .modes button span { font-size:11px; color:var(--muted) }
+  .modes button.on { border-color:var(--accent); background:var(--accent-weak) }
+  .modes button.on span { color:var(--accent-ink) }
+  .presets button.on { border-color:var(--accent); background:var(--accent-weak); color:var(--accent-ink) }
+  .presets .grp { font-size:10px; text-transform:uppercase; letter-spacing:.06em; color:var(--muted);
+                  align-self:center; margin:0 2px 0 6px }
+  .presets .grp:first-child { margin-left:0 }
+  .warnText { color:var(--warn) }
+  .pill.bad { background:var(--bad-weak); border-color:transparent; color:var(--bad) }
+  .h3 { font-size:13px; margin:20px 0 6px; letter-spacing:-.01em }
+  .inline { display:flex; gap:9px; align-items:center; flex-wrap:wrap }
+  .inline input:not([type=checkbox]) { width:auto }
+  .inline input[type=checkbox] { width:auto; margin:0 }
+  .dock { margin-top:18px }
+
+  .pf { margin-top:18px; border:1px solid var(--line); border-radius:var(--radius-sm); background:var(--panel-2); padding:10px 13px }
+  .pfhead { display:flex; align-items:center; gap:9px; flex-wrap:wrap; margin-bottom:4px }
+  .pfhead h3 { margin:0; font-size:12px; text-transform:uppercase; letter-spacing:.07em; color:var(--muted) }
+  .pfhead .grow { margin-left:auto }
+  .pfrow { display:flex; gap:10px; align-items:flex-start; padding:6px 0; border-bottom:1px solid var(--line-2); font-size:12px }
+  .pfrow:last-child { border-bottom:0 }
+  .pfrow .lamp { width:9px; height:9px; border-radius:50%; margin-top:5px; flex:none; background:var(--line) }
+  .pfrow.green .lamp { background:var(--ok) }
+  .pfrow.amber .lamp { background:var(--warn) }
+  .pfrow.red .lamp { background:var(--bad) }
+  .pfrow .k { width:118px; flex:none; font-weight:600 }
+  .pfrow .v { flex:1; min-width:0; word-break:break-word }
+  .pfrow .msg { margin-top:2px }
+  .pfrow.red .msg { color:var(--bad) }
+  .pfrow.amber .msg { color:var(--warn) }
+  @media (max-width:560px){ .pfrow .k { width:84px } }
+  .joblog { background:var(--logbg); color:var(--logink); border-radius:var(--radius-sm); padding:9px 11px;
+            max-height:180px; overflow:auto; white-space:pre-wrap; font:11px/1.5 var(--mono); margin-top:8px }
+  .tl { display:grid; gap:2px; margin-top:8px }
+  .tlrow { display:flex; align-items:flex-start; gap:9px; margin:0; padding:7px 0; color:var(--ink);
+           border-bottom:1px solid var(--line-2); cursor:pointer; font-size:13px }
+  .tlrow input { width:auto; margin:3px 0 0 }
+  .tlrow .why { display:block; font-size:12px; color:var(--muted) }
+  .tlrow code { font-family:var(--mono); font-size:11px }
+  .slider { display:flex; align-items:center; gap:10px; margin:2px 0 4px 25px; font-size:12px; color:var(--muted) }
+  .slider input[type=range] { width:220px; max-width:60%; padding:0; accent-color:var(--accent) }
+  td .fchip { padding:2px 8px; font-size:11px }
+  td button.small { padding:3px 8px; font-size:11px }
+  td.nowrap, th.nowrap { white-space:nowrap }
+  ol.flow { margin:6px 0 0 18px; padding:0 }
+  ol.flow li { margin:3px 0 }
 </style>
 </head>
 <body>
@@ -249,16 +303,49 @@
     <button type="button" id="idChipCopy" title="Copy election id">copy</button>
     <a id="idChipTrail" href="#" title="Public trail">trail ↗</a>
   </span>
-  <span class="tag"><a href="/trail/">all elections</a> · <a href="/">classic console</a></span>
+  <span class="tag"><a href="/trail/">all elections</a> · <a href="/">classic console</a> ·
+    <a href="https://github.com/saksi-framework/saksi/blob/main/docs/research-election-console-runbook.md#10-running-the-study-from-the-wizard"
+       target="_blank" rel="noopener">study guide (runbook §10)</a> ·
+    <a href="https://github.com/saksi-framework/saksi/blob/main/docs/study-checklist.md" target="_blank" rel="noopener">checklist</a></span>
+  <span class="idchip" id="whoChip" hidden><code id="whoName"></code>
+    <button type="button" id="btnSignOut">sign out</button></span>
+  <span class="sub" id="authOff" hidden title="the console was started without --auth-file">authentication off</span>
 </header>
 
-<main>
+<div class="signwrap">
+  <section class="panel" id="signin" hidden>
+    <div class="phead"><h2>Sign in</h2><span class="meta small">admin account</span></div>
+    <p class="small muted" style="margin-top:0">This console has authentication on. The wizard runs
+      elections and campaigns, so it needs an admin account from the console's users file.</p>
+    <form id="signinForm">
+      <label for="siUser">Username</label>
+      <input id="siUser" autocomplete="username" required />
+      <label for="siPass">Password</label>
+      <input id="siPass" type="password" autocomplete="current-password" required />
+      <div class="err" id="siErr" aria-live="polite"></div>
+      <div class="actions"><div class="right"><button class="primary" type="submit" id="btnSignIn">Sign in</button></div></div>
+    </form>
+  </section>
+</div>
+
+<main id="main" hidden>
+  <div class="modes" id="modes" role="group" aria-label="What to run">
+    <button type="button" data-mode="single" class="on" aria-pressed="true"><b>Single election</b>
+      <span>explore the protocol · attack timeline · audit trail</span></button>
+    <button type="button" data-mode="campaign" aria-pressed="false"><b>Measurement campaign</b>
+      <span>warm-ups and measured repetitions · attacks off · summary.csv</span></button>
+  </div>
   <div class="rail" id="rail"></div>
   <div class="arail" id="arail" style="display:none"></div>
 
   <!-- 1 ─ Setup ---------------------------------------------------------- -->
   <section class="step on panel" data-step="0">
-    <div class="phead"><h2>Set up the election</h2><span class="meta small" id="setupHint">everything the run needs</span></div>
+    <div class="phead"><h2 id="setupTitle">Set up the election</h2><span class="meta small" id="setupHint">everything the run needs</span></div>
+
+    <label style="margin-top:0">Thesis run table
+      <span class="muted small">— fills the form and the campaign's warm-ups and repetitions; every field stays editable</span></label>
+    <div class="presets" id="presets"></div>
+    <div class="small muted" id="presetHint" style="margin-top:5px"></div>
 
     <label for="name">Election name</label>
     <input id="name" value="Demo Election" />
@@ -280,7 +367,7 @@
       <div><label for="candidates">Candidates each</label><input id="candidates" type="number" min="1" value="4" class="tnum" /></div>
       <div><label for="voters">Voters</label><input id="voters" type="number" min="1" value="10" class="tnum" /></div>
     </div>
-    <div class="presets" id="presets"></div>
+    <div class="small warnText" id="votersHint" hidden style="margin-top:5px"></div>
 
     <div class="grid2">
       <div><label for="distribution">Vote distribution</label>
@@ -299,44 +386,73 @@
           <option value="groundtruth">ground truth only — no encryption</option>
         </select>
         <div class="small muted" id="modeHint" style="margin-top:4px"></div></div>
+      <div><label for="concurrency">Ballots in flight</label>
+        <input id="concurrency" type="number" min="1" value="128" class="tnum" />
+        <div class="small muted" id="concHint" style="margin-top:4px">
+          How many ballot submissions are open at once. Keep it at least the orderer's
+          MaxMessageCount (50 in the declared config), or every block waits the 2 s
+          batch timeout and the run measures the timeout, not the network.
+        </div></div>
     </div>
 
-    <div style="margin-top:13px">
-      <label style="display:flex;align-items:center;gap:9px;cursor:pointer;margin:0">
-        <input type="checkbox" id="skipAttacks" style="width:auto;margin:0" />
-        <span>Skip attacks — run the election straight through</span>
-      </label>
-      <div class="small muted" style="margin-top:4px">
-        Attacks are offered inside the steps they belong to. Tick this for a clean end-to-end run.
+    <!-- Campaign: Repeat's warm-ups and measured repetitions. Attacks are forced off. -->
+    <div id="campaignBox" hidden>
+      <div class="grid3">
+        <div><label for="warmups">Warm-ups <span class="muted small">— run, then discarded</span></label>
+          <input id="warmups" type="number" min="0" value="2" class="tnum" /></div>
+        <div><label for="reps">Measured repetitions</label>
+          <input id="reps" type="number" min="1" value="10" class="tnum" /></div>
+        <div><label for="attacksOff">Attacks</label>
+          <input id="attacksOff" disabled value="off for every repetition" /></div>
       </div>
-      <!-- Attack timeline: the election pauses at each ticked stage and waits for Run or Skip. -->
+      <div class="small muted" style="margin-top:4px">
+        Each repetition is a whole election (generate, check, record, trustees, publish, verify) run
+        by the console against its own API, exactly as <code>saksi-campaign --repeat</code> runs it.
+        summary.csv summarises the measured repetitions only; a campaign never runs attacks.
+      </div>
+    </div>
+
+    <div style="margin-top:13px" id="attackBox">
+      <label style="display:flex;align-items:center;gap:9px;cursor:pointer;margin:0;color:var(--ink)">
+        <input type="checkbox" id="skipAttacks" style="width:auto;margin:0" />
+        <span>Skip all attacks — run the election straight through</span>
+      </label>
+      <!-- Attack timeline: the election pauses at each ticked moment and waits for Run or Skip. -->
       <div id="planBox">
-        <div class="plan">
-          <label><input type="checkbox" data-plan-stage="dkg" checked />before ballots</label>
-          <label><input type="checkbox" data-plan-stage="ballots" checked />during ballots, at
-            <input id="ballotsAt" type="number" min="0.05" max="0.95" step="0.05" value="0.5" class="tnum" />of them</label>
-          <label><input type="checkbox" data-plan-stage="close" checked />after ballots</label>
-          <label><input type="checkbox" data-plan-stage="ceremony" checked />during tally</label>
-          <label>wait up to <input id="pauseTimeout" type="number" min="1" value="300" class="tnum" />s per stage</label>
+        <div class="tl">
+          <label class="tlrow"><input type="checkbox" data-plan-stage="dkg" checked />
+            <span><b>Before ballots (DKG)</b>
+              <span class="why">Election created, no ballot cast yet: <code>tamper-dkg-transcript</code></span></span></label>
+          <label class="tlrow" style="border-bottom:0"><input type="checkbox" data-plan-stage="ballots" checked />
+            <span><b>During ballots (paused at <span id="ballotsAtLabel" class="tnum">50 %</span>)</b>
+              <span class="why">Election open, submission stopped part-way, attacks sent to the live election:
+                <code>tamper-ballot-proof</code>, <code>reused-nullifier</code>, <code>corrupted-ballot-bytes</code></span></span></label>
+          <div class="slider"><label for="ballotsAt" style="margin:0">pause after</label>
+            <input id="ballotsAt" type="range" min="0.05" max="0.95" step="0.05" value="0.5" />
+            <span>of the ballots</span></div>
+          <label class="tlrow" style="border-top:1px solid var(--line-2)"><input type="checkbox" data-plan-stage="close" checked />
+            <span><b>After ballots (sealed box)</b>
+              <span class="why">Election closed: <code>dropped-ballot</code>, <code>reordered-ballots</code></span></span></label>
+          <label class="tlrow"><input type="checkbox" data-plan-stage="ceremony" checked />
+            <span><b>During tally (ceremony)</b>
+              <span class="why">Trustee shares in, before the tally is published: <code>tamper-partial-decryption</code></span></span></label>
         </div>
-        <div class="small muted" style="margin-top:4px">
-          The election <b>pauses</b> at each ticked stage until you run or skip its attacks; if nobody
-          decides in time, that stage's attacks run and the election continues. This makes it a
-          <b>security run</b>: its throughput is marked perturbed in perf.csv and is not for RQ3.
+        <div class="inline small" style="margin-top:9px">
+          <label for="pauseTimeout" style="margin:0">Each stage waits up to</label>
+          <input id="pauseTimeout" type="number" min="1" value="300" class="tnum" style="width:80px" />
+          <span class="muted">s for a decision</span>
+        </div>
+        <div class="small muted" style="margin-top:6px">
+          The election <b>pauses</b> at each ticked moment until you run or skip its attacks; if nobody
+          decides in time, that stage's attacks run and the election continues. A pass counts only when
+          the attack is refused by the gate it declares; a refusal by any other gate is INCONCLUSIVE.
         </div>
       </div>
     </div>
 
     <details style="margin-top:13px">
-      <summary class="small muted" style="cursor:pointer">Advanced — on-chain submission load</summary>
+      <summary class="small muted" style="cursor:pointer">Advanced — send rate</summary>
       <div class="grid2" style="margin-top:9px">
-        <div><label for="concurrency">Ballots in flight</label>
-          <input id="concurrency" type="number" min="1" value="128" class="tnum" />
-          <div class="small muted" style="margin-top:4px">
-            How many ballot submissions are open at once. Keep it at least the orderer's
-            MaxMessageCount (50 in the declared config), or every block waits the 2 s
-            batch timeout and the run measures the timeout, not the network.
-          </div></div>
         <div><label for="sendRate">Send rate (ballots/s)</label>
           <input id="sendRate" type="number" min="0" step="any" value="0" class="tnum" />
           <div class="small muted" style="margin-top:4px">
@@ -346,8 +462,29 @@
       </div>
     </details>
 
+    <!-- Preflight: the conditions that silently spoil a measurement. A block stops Start. -->
+    <div class="pf" id="pf" aria-live="polite">
+      <div class="pfhead"><h3>Preflight</h3><span id="pfChip"></span>
+        <span class="meta small" id="pfAt"></span>
+        <button type="button" class="small grow" id="pfRefresh">Check again</button></div>
+      <div id="pfRows"><div class="loader"><span class="spin"></span>checking this console…</div></div>
+      <div id="ladderBox" hidden>
+        <div class="inline" style="margin-top:8px">
+          <button type="button" class="small" id="btnLadder">Run the validation ladder</button>
+          <span class="small muted" id="ladderStatus">1, 10, 100 and 1,000 voters on this build; needed before any tier above 1,000</span>
+        </div>
+        <div class="joblog" id="ladderLog" hidden></div>
+      </div>
+      <label class="inline small" id="forceBox" hidden style="margin:9px 0 0;color:var(--ink);cursor:pointer">
+        <input type="checkbox" id="force" />
+        <span><b>Start anyway</b> — the Fabric peer did not answer the probe but may be up by the first
+          ledger call (a campaign is sent with <code>force: true</code>)</span></label>
+    </div>
+
     <div class="err" id="configErr"></div>
-    <div class="actions"><div class="right"><button class="primary" id="btnStart">Generate ballots →</button></div></div>
+    <div class="actions">
+      <span class="pill warn" id="secRunChip" hidden>Security run — throughput perturbed, not for RQ3</span>
+      <div class="right"><button class="primary" id="btnStart">Generate ballots →</button></div></div>
   </section>
 
   <!-- 2 ─ Generate ------------------------------------------------------- -->
@@ -451,6 +588,103 @@
       <button id="atkRerun" style="display:none">Run again</button>
       <button class="primary" id="next5">Next →</button></div></div>
   </section>
+
+  <!-- Campaign view: live repetitions, then summary.csv ------------------- -->
+  <section class="panel" id="campaignView" hidden>
+    <div class="phead"><h2>Measurement campaign</h2><span id="cvChip"></span></div>
+    <div class="kv" id="cvKv"></div>
+    <div class="note" id="cvNote" hidden></div>
+    <h3 class="h3">Repetitions <span class="small muted" id="cvCount"></span></h3>
+    <div class="table-wrap" id="cvReps"></div>
+    <div class="small muted" style="margin-top:5px">
+      Refreshed every 3 s while the campaign runs. Host CPU is sampled before each repetition's
+      generate and after its verify; <span class="pill warn">contended</span> marks a sample above the
+      preflight's 25 % threshold, so that repetition shared the machine.
+    </div>
+    <div id="cvSumBox" hidden>
+      <h3 class="h3">Summary — measured repetitions (summary.csv)</h3>
+      <div class="table-wrap" id="cvSummary"></div>
+    </div>
+    <div class="joblog" id="cvLog" hidden></div>
+    <div class="err" id="cvErr"></div>
+    <div class="actions"><button type="button" id="cvBack">← Set up another</button><div class="right">
+      <button type="button" id="cvCancel" hidden>Cancel after this repetition</button>
+      <a class="fchip key" id="cvExport" href="#" download>Export bundle (.zip)</a></div></div>
+  </section>
+
+  <section class="panel dock" id="campaignsPanel" hidden>
+    <div class="phead"><h2>Campaigns</h2><button type="button" class="small" id="cpRefresh">Refresh</button></div>
+    <div id="cpList"><span class="muted small">loading…</span></div>
+  </section>
+
+  <section class="panel dock" id="runsPanel">
+    <div class="phead"><h2>Runs</h2><button type="button" class="small" id="rlRefresh">Refresh</button></div>
+    <div class="small" id="rlNote" aria-live="polite"></div>
+    <div id="rlList"><span class="muted small">loading…</span></div>
+    <div class="err" id="rlErr"></div>
+  </section>
+
+  <!-- Infrastructure (admin, loopback, typed confirmation) ----------------- -->
+  <section class="panel dock" id="infraPanel">
+    <div class="phead"><h2>Infrastructure</h2>
+      <span class="meta small">admin · this machine only · typed confirmation · refused while anything runs</span></div>
+
+    <h3 class="h3" style="margin-top:0">Reset network for this tier</h3>
+    <p class="small muted" style="margin:0">Runs <code>tools/tier.sh <span id="rsTier" class="tnum"></span></code>
+      (voters and positions from the form above): the Fabric network is torn down and brought back
+      with an empty ledger, and the console picks up the new identity without a restart.</p>
+    <div class="note"><b>This destroys the ledger.</b> Every election on the current network is gone
+      from the chain. Run folders stay on disk, and each campaign's and run's export is the record:
+      export before you reset.</div>
+    <div class="inline" style="margin-top:10px">
+      <input id="rsConfirm" placeholder="type RESET" autocomplete="off" spellcheck="false"
+             aria-label="Type RESET to confirm the network reset" style="width:170px" />
+      <button type="button" id="btnReset" disabled>Reset network</button>
+      <span class="small muted" id="rsStatus"></span>
+    </div>
+    <div class="joblog" id="rsLog" hidden></div>
+    <div class="err" id="rsErr"></div>
+
+    <h3 class="h3">Restart the peer mid-submission (T3)</h3>
+    <p class="small muted" style="margin:0">Arms a fault on a generated on-chain run that is idle, is not a
+      campaign repetition, has no attack plan and has not opened its ballot window. When that share
+      of the ballots has been dispatched, <code>peer0.org1.example.com</code> is stopped for the chosen
+      time while dispatch carries on; ballots sent meanwhile are recorded as drops.</p>
+    <div class="grid3">
+      <div><label for="ftRun">Run</label><select id="ftRun"></select></div>
+      <div><label for="ftAt">Stop the peer after (share of ballots)</label>
+        <input id="ftAt" type="number" min="0.05" max="0.95" step="0.05" value="0.5" class="tnum" /></div>
+      <div><label for="ftDown">Keep it down for (seconds, 5–120)</label>
+        <input id="ftDown" type="number" min="5" max="120" value="30" class="tnum" /></div>
+    </div>
+    <div class="inline" style="margin-top:10px">
+      <input id="ftConfirm" placeholder="type RESTART" autocomplete="off" spellcheck="false"
+             aria-label="Type RESTART to confirm the peer-restart fault" style="width:170px" />
+      <button type="button" id="btnFault" disabled>Arm the fault</button>
+    </div>
+    <div class="small" id="ftStatus" aria-live="polite"></div>
+    <div class="err" id="ftErr"></div>
+    <div class="note" style="border-left-color:var(--accent);background:var(--accent-weak)">
+      <b>The T3 flow: restart, resume, verify-only, verify.</b>
+      <ol class="flow">
+        <li><b>Restart the peer:</b> arm the fault above, then continue that run through <b>Check</b> and
+          <b>Encrypt &amp; record</b>.</li>
+        <li><b>Wait for the run to end.</b> It ends failed with drops (“N of M ballots did not commit”), and
+          the runs list shows it <b>interrupted</b>.</li>
+        <li><b>Resume</b> submits only the ballots the chain does not already hold, then closes the election.
+          If the close fails, the error shows under the runs list: press Resume again when it is offered.</li>
+        <li><b>Verify-only</b> is required: it reconciles the chain's committed ballots against the run
+          without submitting anything.</li>
+        <li>Then the trustees, publish the tally and <b>Verify</b>: the ledger should match the local record
+          with E = 0. The run is a security run; its throughput is not for RQ3.</li>
+      </ol>
+      <div style="margin-top:8px">With closed-loop dispatch (send rate 0) every ballot after the fault point
+        fails within about a second, whatever <i>down for</i> says: to measure loss over the outage window,
+        set a fixed send rate (Advanced) before generating the run.</div>
+      <div style="margin-top:8px">If the console dies while the peer is down, the peer stays down. Recover it
+        by hand: <code>docker start peer0.org1.example.com</code>, then check <code>tools/up.sh status</code>.</div>
+    </div>
+  </section>
 </main>
 
 <script>
@@ -477,8 +711,26 @@ const posLabel = (id) =>
 // The multi-seat race, identified by the id ph_position_id(2) emits.
 const SENATE_POSITION_ID = "senator";
 const candLabel = (id) => { const m = /^cand(\d+)$/.exec(id); return m ? "Candidate " + (+m[1] + 1) : id; };
-const PRESETS = [1, 10, 100, 1000, 10000, 50000, 483000, 1000000, 1921917, 3524078];
+// The thesis run table (rows 2-9 of the desktop-run cost model). SP is one
+// position, MP three; every row is 4 candidates, the paper's 5 trustees at
+// threshold 3, the realistic distribution, no senate cut and 128 ballots in
+// flight, on-chain unless it says offline. [label, voters, positions,
+// warm-ups, measured repetitions, mode].
+const RUN_TABLE = [
+  ["SP-1K", 1000, 1, 2, 10], ["MP-1K", 1000, 3, 2, 10],
+  ["SP-10K", 10000, 1, 2, 10], ["MP-10K", 10000, 3, 2, 10],
+  ["SP-50K", 50000, 1, 2, 5], ["MP-50K", 50000, 3, 2, 5],
+  ["SP-483K", 483000, 1, 1, 3], ["SP-1M", 1000000, 1, 1, 3],
+  ["SP-1.92M", 1921917, 1, 1, 1], ["SP-3.5M", 3524078, 1, 1, 1],
+  ["MP-483K offline", 483000, 3, 0, 1, "offline"], ["MP-1M offline", 1000000, 3, 0, 1, "offline"],
+  ["MP-1.92M offline", 1921917, 3, 0, 1, "offline"], ["MP-3.5M offline", 3524078, 3, 0, 1, "offline"],
+  ["MP-3.5M on-chain", 3524078, 3, 0, 1],
+].map(([label, voters, positions, warmups, reps, mode = "onchain"]) => ({ label, voters, positions, warmups, reps, mode }));
+const PAPER_TRUSTEES = ["COMELEC", "Civil Society Watch", "University IT", "Academe Observer", "Bar Association"];
 const OFFLINE_CEILING = 10000;
+// preflight.go hostLoadWarnFraction: a host sample above this share of the
+// machine is "contended". web_test.go pins the two together.
+const HOST_WARN_FRACTION = 0.25;
 const FILE_ORDER = ["election.csv","ballots.csv","correctness.csv","negative-tests.csv",
                     "ground-truth-ballots.csv","ground-truth-summary.csv","perf.csv",
                     "header.json","ballots.ndjson","run.json","receipts.csv","trail.ndjson"];
@@ -527,7 +779,8 @@ function renderRail() {
   $("rail").innerHTML = STEPS.map((label, i) => {
     const cls = i === here ? "active" : i < here ? "done" : (skipped(i) ? "skip" : "");
     return `<div class="rstep ${cls}"><span class="n">${i < here ? "✓" : i + 1}</span>${esc(label)}</div>`;
-  }).join("");
+  }).join("") + (step > 0 && cfg && cfg.attack_plan
+    ? '<span class="pill warn" style="align-self:center">Security run — throughput perturbed, not for RQ3</span>' : "");
   renderARail();
 }
 
@@ -555,6 +808,11 @@ function go(n) {
   step = n;
   const section = Math.min(n, ATTACK_STEP);
   document.querySelectorAll(".step").forEach((el) => el.classList.toggle("on", +el.dataset.step === section));
+  // The mode is chosen at setup; an election part-way through keeps its mode.
+  document.querySelectorAll("#modes [data-mode]").forEach((b) => {
+    b.disabled = n > 0;
+    b.title = n > 0 ? "finish or restart this election to switch" : "";
+  });
   renderRail();
   window.scrollTo({ top: 0, behavior: "smooth" });
 }
@@ -604,20 +862,83 @@ function renderTrustees(names) {
 const trusteeNames = () => [...document.querySelectorAll("[data-trustee]")].map((i) => i.value);
 function syncN() { $("nDisplay").value = trusteeNames().length; }
 
+let presetSel = "";
+const presetText = (p) => `${p.voters.toLocaleString()} voters × ${p.positions} position${p.positions > 1 ? "s" : ""} · ` +
+  `${p.mode === "offline" ? "offline" : "on-chain"} · ${p.warmups} warm-up${p.warmups === 1 ? "" : "s"} + ${p.reps} measured`;
+
 function renderPresets() {
   const box = $("presets"); box.innerHTML = "";
-  const offline = $("mode").value === "offline";
-  PRESETS.forEach((n) => {
+  RUN_TABLE.forEach((p, i) => {
+    if (i === 0 || i === 10) {
+      const g = document.createElement("span");
+      g.className = "grp"; g.textContent = i === 0 ? "rows 2-7" : "rows 8-9";
+      box.append(g);
+    }
     const b = document.createElement("button");
-    b.type = "button"; b.className = "tnum"; b.textContent = n.toLocaleString();
-    // The ceiling exists because offline generation runs unparallelized crypto;
-    // ground-truth mode runs none, so the capstone tiers are reachable there.
-    const blocked = offline && n > OFFLINE_CEILING;
-    b.disabled = blocked;
-    if (blocked) b.title = "on-chain or ground-truth mode only";
-    b.onclick = () => { $("voters").value = n; };
+    b.type = "button"; b.textContent = p.label; b.title = presetText(p);
+    b.classList.toggle("on", p.label === presetSel);
+    b.onclick = () => applyPreset(p);
     box.append(b);
   });
+  const sel = RUN_TABLE.find((p) => p.label === presetSel);
+  $("presetHint").textContent = sel ? sel.label + " — " + presetText(sel) : "";
+}
+
+function applyPreset(p) {
+  $("name").value = p.label;
+  renderTrustees(PAPER_TRUSTEES);
+  $("threshold").value = 3;
+  $("positions").value = p.positions;
+  $("candidates").value = 4;
+  $("voters").value = p.voters;
+  $("distribution").value = "realistic";
+  $("senateSeats").value = 0;
+  $("mode").value = p.mode;
+  $("concurrency").value = 128;
+  $("warmups").value = p.warmups;
+  $("reps").value = p.reps;
+  presetSel = p.label;
+  renderPresets();
+  onFormChange();
+}
+
+// A campaign's options and a preflight query take whole, non-negative numbers.
+const whole = (id) => Math.max(0, Math.floor(+$(id).value || 0));
+
+// syncHints states the limits the server will enforce, beside the field.
+function syncHints() {
+  const over = $("mode").value === "offline" && +$("voters").value > OFFLINE_CEILING;
+  $("votersHint").hidden = !over;
+  $("votersHint").textContent = over
+    ? `This console refuses offline runs above ${OFFLINE_CEILING.toLocaleString()} voters (OfflineVoterCeiling, until ` +
+      "the streaming generator lands): use on-chain or ground-truth mode, or run row 8 from the command line." : "";
+  const adv = lastPF && lastPF.concurrency_min_advised;
+  const el = $("concHint");
+  if (adv == null) {
+    el.className = "small muted";
+    el.textContent = "How many ballot submissions are open at once. Keep it at least the orderer's MaxMessageCount " +
+      "(not readable on this console), or every block waits the batch timeout and the run measures the timeout.";
+    return;
+  }
+  const n = +$("concurrency").value;
+  const bt = (lastPF.orderer_batch && lastPF.orderer_batch.BatchTimeout) || "batch";
+  const low = $("mode").value === "onchain" && n < adv;
+  el.className = "small " + (low ? "warnText" : "muted");
+  el.textContent = low
+    ? `Orderer rule: at least MaxMessageCount = ${adv} in flight. ${n} is below it, so every block waits the ${bt} timeout and the run measures the timeout, not the network.`
+    : `Orderer rule: at least MaxMessageCount = ${adv} in flight, so blocks cut on size, not on the ${bt} timeout.`;
+}
+
+// onFormChange runs on every edit that changes what preflight checks.
+function onFormChange(e) {
+  if (e && ["voters", "positions", "mode"].includes(e.target.id) && presetSel) {
+    presetSel = "";
+    renderPresets();
+  }
+  syncHints();
+  syncPlan();
+  syncReset();
+  schedulePreflight();
 }
 
 const config = () => ({
@@ -631,7 +952,7 @@ const config = () => ({
   senate_seats: +$("senateSeats").value,
   concurrency: +$("concurrency").value,
   send_rate: +$("sendRate").value,
-  skip_attacks: $("skipAttacks").checked,
+  skip_attacks: uiMode === "campaign" || $("skipAttacks").checked,
   mode: $("mode").value,
   attack_plan: attackPlan(),
 });
@@ -639,7 +960,7 @@ const config = () => ({
 // The attack timeline, or null for a run that never pauses (attacks skipped, a
 // ground-truth run with nothing to attack, or no stage ticked).
 function attackPlan() {
-  if ($("skipAttacks").checked || $("mode").value === "groundtruth") return null;
+  if (uiMode === "campaign" || $("skipAttacks").checked || $("mode").value === "groundtruth") return null;
   const stages = [...document.querySelectorAll("[data-plan-stage]")].filter((c) => c.checked)
     .map((c) => c.dataset.planStage);
   if (!stages.length) return null;
@@ -647,18 +968,58 @@ function attackPlan() {
 }
 
 /* ---- net -------------------------------------------------------------- */
+// apiFetch is every console call the page makes after sign-in. A 401 means the
+// session is gone (expired, signed out elsewhere, console restarted): back to
+// the sign-in box.
+async function apiFetch(path, opts) {
+  const res = await fetch(path, opts);
+  if (res.status === 401 && authOn) needSignIn("Your session ended. Sign in again to continue.");
+  return res;
+}
+
+// errorBody reads a refusal: the {error, warnings, busy, job} JSON the study
+// routes answer with, or the plain text http.Error writes.
+async function errorBody(res) {
+  const t = (await res.text()).trim();
+  try {
+    const j = JSON.parse(t);
+    if (j && typeof j.error === "string") return j;
+  } catch (_) {}
+  return t || res.statusText;
+}
+
+// renderErr shows a refusal verbatim, with every preflight finding it carries.
+function renderErr(id, body, status) {
+  const el = $(id);
+  if (!el) return;
+  const head = status ? `<b>Refused (${esc(status)})</b> ` : "";
+  if (typeof body === "string") { el.innerHTML = head + esc(body); return; }
+  el.innerHTML = head + esc(body.error) +
+    (body.warnings || []).map((w) => `<div style="margin-top:3px">${esc(w.severity)} <code>${esc(w.code)}</code>${
+      w.forceable ? " (forceable)" : ""} — ${esc(w.message)}</div>`).join("") +
+    (body.busy ? `<div style="margin-top:3px">busy: ${esc(body.busy.join(", "))}</div>` : "");
+}
+
+function apiError(res, body) {
+  return Object.assign(new Error(typeof body === "string" ? body : body.error), { status: res.status, body });
+}
+
 async function post(path, body, errEl) {
   if (errEl) $(errEl).textContent = "";
-  const res = await fetch(path, { method: "POST", headers: { "Content-Type": "application/json" },
-                                  body: JSON.stringify(body) });
+  const res = await apiFetch(path, { method: "POST", headers: { "Content-Type": "application/json" },
+                                     body: JSON.stringify(body) });
   if (!res.ok) {
-    const t = await res.text();
-    if (errEl) $(errEl).textContent = t.trim();
-    throw new Error(t);
+    const b = await errorBody(res);
+    if (errEl) renderErr(errEl, b, res.status);
+    throw apiError(res, b);
   }
-  return res.json();
+  return res.status === 204 ? null : res.json();
 }
-const getJSON = async (u) => { const r = await fetch(u); if (!r.ok) throw new Error(await r.text()); return r.json(); };
+const getJSON = async (u) => {
+  const r = await apiFetch(u);
+  if (!r.ok) throw apiError(r, await errorBody(r));
+  return r.json();
+};
 
 async function artifactsFor(id) {
   try {
@@ -699,6 +1060,7 @@ async function startRun() {
   let res;
   try { res = await post("/generate", cfg, "configErr"); } catch (_) { return; }
   runID = res.run_id;
+  loadRuns();
   $("runChip").textContent = runID;
   showIDChip();
   $("log").innerHTML = ""; $("genFiles").innerHTML = ""; $("genStats").innerHTML = "";
@@ -792,12 +1154,14 @@ async function startSaksi() {
       if (pauseBox === "stage3") stopPauseWatch();
       hideLoader(2);
       $("next2").disabled = false;
+      loadRuns();
       renderTrail();
       await renderStageResults(["dkg", "ballots", "close"], "stage3");
     } else if (e.level === "error") {
       if (pauseBox === "stage3") stopPauseWatch();
       hideLoader(2);
       $("err2").textContent = e.msg;
+      loadRuns();
     }
   });
 }
@@ -892,7 +1256,7 @@ async function startVerify() {
 
 async function loadResults() {
   try {
-    const res = await fetch(`/export/${encodeURIComponent(runID)}/correctness.csv`);
+    const res = await apiFetch(`/export/${encodeURIComponent(runID)}/correctness.csv`);
     if (!res.ok) return;
     const rows = (await res.text()).trim().split("\n").slice(1).map((r) => r.split(","));
     let pass = true;
@@ -1003,9 +1367,9 @@ function gateLine(a, live) {
   const expected = a.gate_expected || (live && a.chain_gate ? a.chain_gate : a.audit_gate);
   const kind = a.verdict ? (a.was_live ? "chaincode gate" : "auditor check")
                          : (live && a.chain_gate ? "chaincode gate" : "auditor check");
-  let s = "expected: " + kind + " " + (expected || "\u2014");
-  if (a.verdict && a.verdict !== "SKIPPED") s += " \u00b7 observed: " + (a.gate_observed || "none named");
-  if (a.mounted_stage) s += " \u00b7 mounted: " + a.mounted_stage;
+  let s = "declared gate: " + kind + " " + (expected || "\u2014");
+  if (a.verdict && a.verdict !== "SKIPPED") s += " \u00b7 observed gate: " + (a.gate_observed || "none named");
+  if (a.mounted_stage) s += " \u00b7 mounted at: " + a.mounted_stage;
   return '<div class="gate">' + esc(s) + "</div>";
 }
 
@@ -1121,7 +1485,7 @@ function renderPause(p, rows, stages, boxID, errEl) {
 
 /* ---- step 7..N: attacks, one per step ---------------------------------- */
 async function loadAttacks() {
-  const res = await fetch(`/api/scenarios/${encodeURIComponent(runID)}`);
+  const res = await apiFetch(`/api/scenarios/${encodeURIComponent(runID)}`);
   attacks = res.ok ? await res.json() : [];
 }
 
@@ -1225,10 +1589,737 @@ function paintAttack(a) {
   renderARail();
 }
 
+/* ---- sign-in ----------------------------------------------------------- */
+// GET /api/me: 404 means the console runs without authentication; 401 means
+// it has it and this browser is not signed in. Only an admin can use the page.
+let authOn = false, booted = false;
+
+async function checkAuth() {
+  let res;
+  try { res = await fetch("/api/me"); } catch (_) { showApp(null); return; }
+  if (res.status === 404) { authOn = false; showApp(null); return; }
+  authOn = true;
+  if (res.status === 401) { needSignIn(""); return; }
+  let me = {};
+  try { me = await res.json(); } catch (_) {}
+  if (me.role !== "admin") {
+    needSignIn(`Signed in as ${me.username || "?"} (${me.role || "?"}): the wizard needs an admin account.`);
+    return;
+  }
+  showApp(me);
+}
+
+function needSignIn(msg) {
+  stopStudyTimers();
+  stopTimers();
+  stopPauseWatch();
+  closeStream();
+  $("main").hidden = true;
+  $("signin").hidden = false;
+  $("whoChip").hidden = true;
+  $("authOff").hidden = true;
+  $("siErr").textContent = msg || "";
+  $("siUser").focus();
+}
+
+function showApp(me) {
+  $("signin").hidden = true;
+  $("main").hidden = false;
+  $("authOff").hidden = authOn;
+  $("whoChip").hidden = !me;
+  if (me) $("whoName").textContent = me.username + " · " + me.role;
+  if (!booted) { booted = true; boot(); return; }
+  refreshStudy();
+}
+
+$("signinForm").onsubmit = async (e) => {
+  e.preventDefault();
+  $("siErr").textContent = "";
+  $("btnSignIn").disabled = true;
+  let res;
+  try {
+    res = await fetch("/api/login", { method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ username: $("siUser").value, password: $("siPass").value }) });
+  } catch (err) {
+    $("btnSignIn").disabled = false;
+    $("siErr").textContent = String(err.message || err);
+    return;
+  }
+  $("btnSignIn").disabled = false;
+  if (res.status !== 204) { renderErr("siErr", await errorBody(res), res.status); return; }
+  $("siPass").value = "";
+  checkAuth();
+};
+
+$("btnSignOut").onclick = async () => {
+  try { await fetch("/api/logout", { method: "POST" }); } catch (_) {}
+  needSignIn("Signed out.");
+};
+
+/* ---- mode switch ------------------------------------------------------- */
+let uiMode = "single";
+
+function setMode(m) {
+  uiMode = m;
+  const camp = m === "campaign";
+  document.querySelectorAll("#modes [data-mode]").forEach((b) => {
+    b.classList.toggle("on", b.dataset.mode === m);
+    b.setAttribute("aria-pressed", String(b.dataset.mode === m));
+  });
+  $("campaignBox").hidden = !camp;
+  $("attackBox").hidden = camp;
+  $("rail").hidden = camp;
+  $("runsPanel").hidden = camp;
+  $("campaignsPanel").hidden = !camp;
+  $("setupTitle").textContent = camp ? "Set up the campaign" : "Set up the election";
+  $("setupHint").textContent = camp ? "repetitions of one configuration" : "everything the run needs";
+  $("btnStart").textContent = camp ? "Start campaign →" : "Generate ballots →";
+  $("configErr").textContent = "";
+  showSetup();
+  syncPlan();
+  schedulePreflight();
+  if (camp) loadCampaigns(); else loadRuns();
+}
+
+function showSetup() {
+  stopCampaignPoll();
+  campaignID = null;
+  $("campaignView").hidden = true;
+  go(0);
+}
+
+/* ---- attack timeline editor -------------------------------------------- */
+function syncPlan() {
+  $("ballotsAtLabel").textContent = Math.round(+$("ballotsAt").value * 100) + " %";
+  $("planBox").hidden = $("skipAttacks").checked || $("mode").value === "groundtruth";
+  $("secRunChip").hidden = !attackPlan();
+}
+
+/* ---- preflight --------------------------------------------------------- */
+let lastPF = null, pfTimer = null, pfSeq = 0;
+
+function schedulePreflight() {
+  clearTimeout(pfTimer);
+  pfTimer = setTimeout(runPreflight, 500);
+}
+
+async function runPreflight() {
+  clearTimeout(pfTimer);
+  const seq = ++pfSeq;
+  const q = new URLSearchParams({ mode: $("mode").value, voters: whole("voters"),
+    positions: whole("positions"), concurrency: whole("concurrency") });
+  $("pfAt").textContent = "checking…";
+  let rep;
+  try { rep = await getJSON("/api/preflight?" + q); }
+  catch (e) {
+    if (seq !== pfSeq) return;
+    lastPF = null;
+    $("pfAt").textContent = "";
+    $("pfChip").innerHTML = "";
+    $("pfRows").innerHTML = `<div class="err">preflight unavailable: ${esc(e.message)}</div>`;
+    syncStart();
+    return;
+  }
+  if (seq !== pfSeq) return;
+  lastPF = rep;
+  renderPreflight(rep);
+  syncHints();
+  syncStart();
+}
+
+const short = (c) => (c ? String(c).slice(0, 12) : "none");
+function bytes(n) {
+  if (n == null) return "unknown";
+  const u = ["B", "KB", "MB", "GB", "TB"];
+  let i = 0, v = n;
+  while (v >= 1024 && i < u.length - 1) { v /= 1024; i++; }
+  return v.toFixed(i ? 1 : 0) + " " + u[i];
+}
+const fixed = (v, d) => (v == null || !isFinite(v) ? null : Number(v).toFixed(d));
+
+// Each row is a positive fact with the finding codes that can turn it amber or
+// red. A finding whose code no row claims still gets a row of its own.
+const PF_ROWS = [
+  { key: "Fabric", codes: ["fabric_not_configured", "fabric_unreachable"], fact: (r) => {
+    const f = r.fabric || {};
+    if (!f.enabled) return "not configured on this console" + (r.run.mode === "onchain" ? "" : " (not needed for this mode)");
+    const reach = f.reachable === true ? "reachable" : f.reachable === false ? "not reachable" : "not probed";
+    return `${f.peer} · channel ${f.channel} · ${reach}`;
+  } },
+  { key: "Orderer batch", codes: [], fact: (r) => {
+    const ob = r.orderer_batch;
+    if (!ob) return { text: "declared configtx not found from this console's build", amber: r.run.mode === "onchain" };
+    return Object.entries(ob).map(([k, v]) => `${k} ${v}`).join(" · ");
+  } },
+  { key: "Ballots in flight", codes: ["concurrency_low"], fact: (r) =>
+    `${r.run.concurrency || "default"} in flight · advised at least ${r.concurrency_min_advised ?? "unknown"} (MaxMessageCount)` },
+  { key: "Ladder", codes: ["ladder_missing"], fact: (r) => {
+    const l = r.ladder || {};
+    if (l.ok) return `passed for this build (${short(l.console_commit)})`;
+    const why = l.ladder_commit ? `stale: ladder.json is for ${short(l.ladder_commit)}, the console is ${short(l.console_commit)}`
+                                : `not run for this build (${short(l.console_commit)})`;
+    return { text: why + " · needed above 1,000 voters", amber: true };
+  } },
+  { key: "Disk", codes: ["disk_short"], fact: (r) => {
+    const d = r.disk || {};
+    let text = `${bytes(d.free_bytes)} free on ${d.path}`;
+    if (d.projected_ledger_bytes != null) text += ` · this run projects ${bytes(d.projected_ledger_bytes)} of ledger`;
+    const runs = whole("warmups") + whole("reps");
+    if (uiMode === "campaign" && r.run.mode === "onchain" && d.projected_ledger_bytes != null && runs > 0) {
+      const all = runs * d.projected_ledger_bytes;
+      text += ` · the campaign's ${runs} runs project ${bytes(all)}`;
+      if (d.free_bytes != null && all > d.free_bytes) return { text: text + " — more than is free", amber: true };
+    }
+    return text;
+  } },
+  { key: "Host", codes: ["host_load", "host_cpu"], fact: (r) => {
+    const h = r.host || {};
+    const load = fixed(h.guest_load1, 2) == null ? "load average not readable" : `load ${fixed(h.guest_load1, 2)} / ${fixed(h.guest_load5, 2)}`;
+    const cpu = fixed(h.host_cpu_pct, 0) == null ? "Windows host CPU not sampled" : `Windows host CPU ${fixed(h.host_cpu_pct, 0)} %`;
+    return `${h.cpus} CPUs · ${load} · ${cpu}`;
+  } },
+  { key: "Verify threads", codes: ["verify_threads", "verify_threads_invalid"], fact: (r) =>
+    `the auditor verifies on ${r.verify_threads_default} thread${r.verify_threads_default === 1 ? "" : "s"}` },
+  { key: "Busy runs", codes: ["run_busy"], hideUnlessFound: true, fact: () => "" },
+];
+
+function renderPreflight(rep) {
+  const warnings = rep.warnings || [];
+  const claimed = new Set(PF_ROWS.flatMap((row) => row.codes));
+  const rows = PF_ROWS.map((row) => {
+    const found = warnings.filter((w) => row.codes.includes(w.code));
+    if (row.hideUnlessFound && !found.length) return "";
+    let fact = row.fact(rep);
+    const amberFact = typeof fact === "object" && fact.amber;
+    if (typeof fact === "object") fact = fact.text;
+    const tone = found.some((w) => w.severity === "block") ? "red"
+      : (found.length || amberFact) ? "amber" : "green";
+    return pfRow(row.key, tone, fact, found);
+  });
+  warnings.filter((w) => !claimed.has(w.code)).forEach((w) =>
+    rows.push(pfRow(w.code, w.severity === "block" ? "red" : "amber", "", [w])));
+  $("pfRows").innerHTML = rows.join("");
+
+  const blocks = warnings.filter((w) => w.severity === "block").length;
+  const warns = warnings.length - blocks;
+  $("pfChip").className = "verdict " + (blocks ? "fail" : warns ? "inc" : "pass");
+  $("pfChip").innerHTML = '<span class="dot2"></span>' + (blocks
+    ? `${blocks} block${blocks > 1 ? "s" : ""} Start`
+    : warns ? `${warns} warning${warns > 1 ? "s" : ""}` : "ready");
+  $("pfAt").textContent = "checked " + new Date(rep.at).toLocaleTimeString();
+  $("ladderBox").hidden = !!(rep.ladder && rep.ladder.ok) && !ladderWatching;
+}
+
+function pfRow(key, tone, fact, found) {
+  return `<div class="pfrow ${tone}"><span class="lamp" aria-hidden="true"></span>` +
+    `<div class="k">${esc(key)}</div><div class="v">${esc(fact)}` +
+    found.map((w) => `<div class="msg"><b>${esc(w.severity)}</b> <code>${esc(w.code)}</code> — ${esc(w.message)}</div>`).join("") +
+    "</div></div>";
+}
+
+// syncStart applies the preflight gate: any block disables Start, except when
+// every block is forceable (fabric_unreachable) and "Start anyway" is ticked.
+function syncStart() {
+  const blocks = lastPF ? (lastPF.warnings || []).filter((w) => w.severity === "block") : [];
+  const forceable = blocks.length > 0 && blocks.every((w) => w.forceable);
+  $("forceBox").hidden = !forceable;
+  if (!forceable) $("force").checked = false;
+  const blocked = blocks.length > 0 && !(forceable && $("force").checked);
+  $("btnStart").disabled = blocked || startBusy;
+  $("btnStart").title = blocked ? "preflight blocks this run: " + blocks.map((w) => w.code).join(", ") : "";
+}
+
+/* ---- console jobs: the ladder and the network reset -------------------- */
+const jobTimers = new Set();
+let ladderWatching = false;
+
+// watchJob polls GET /api/jobs/<id> every 2 s into a log box until the job ends.
+function watchJob(id, logID, statusID, onEnd) {
+  let timer = null;
+  const tick = async () => {
+    let v;
+    try { v = await getJSON("/api/jobs/" + encodeURIComponent(id)); }
+    catch (e) {
+      $(statusID).textContent = e.message;
+      if (e.status === 404 || e.status === 401) { clearInterval(timer); jobTimers.delete(timer); onEnd(null); }
+      return;
+    }
+    $(statusID).textContent = `${v.kind} ${v.id}: ${v.status}` + (v.error ? ` — ${v.error}` : "");
+    const box = $(logID);
+    box.hidden = false;
+    box.textContent = (v.log || []).slice(-20).join("\n") || "(no output yet)";
+    box.scrollTop = box.scrollHeight;
+    if (v.status !== "queued" && v.status !== "running") {
+      clearInterval(timer);
+      jobTimers.delete(timer);
+      onEnd(v);
+    }
+  };
+  timer = setInterval(tick, 2000);
+  jobTimers.add(timer);
+  tick();
+}
+
+$("btnLadder").onclick = async () => {
+  $("btnLadder").disabled = true;
+  $("ladderStatus").textContent = "starting…";
+  let res;
+  try { res = await post("/api/ladder", {}, null); }
+  catch (e) {
+    // Already running (a reload lost the page's watch): follow that job.
+    if (e.status === 409 && e.body && typeof e.body.job === "string" && e.body.job.startsWith("ladder-")) {
+      watchLadder(e.body.job);
+      return;
+    }
+    $("btnLadder").disabled = false;
+    $("ladderStatus").textContent = `Refused (${e.status || "?"}): ${e.message}`;
+    return;
+  }
+  watchLadder(res.job);
+};
+
+function watchLadder(id) {
+  ladderWatching = true;
+  watchJob(id, "ladderLog", "ladderStatus", (v) => {
+    ladderWatching = false;
+    $("btnLadder").disabled = false;
+    if (v && v.status === "done") {
+      const l = v.result || {};
+      $("ladderStatus").textContent = `Ladder passed on ${short(l.commit)} (${(l.runs || []).length} runs).`;
+    }
+    runPreflight();
+  });
+}
+
+function syncReset() {
+  const v = whole("voters"), p = whole("positions");
+  $("rsTier").textContent = `${v} ${p}`;
+  $("btnReset").disabled = resetBusy || $("rsConfirm").value !== "RESET" || v < 1 || p < 1;
+}
+let resetBusy = false;
+
+$("btnReset").onclick = async () => {
+  resetBusy = true;
+  syncReset();
+  $("rsStatus").textContent = "";
+  $("rsLog").hidden = true;
+  const body = { voters: whole("voters"), positions: whole("positions"), confirm: $("rsConfirm").value };
+  let res;
+  try { res = await post("/api/network/reset", body, "rsErr"); }
+  catch (e) {
+    if (e.status === 409 && e.body && typeof e.body.job === "string" && e.body.job.startsWith("network-reset-")) {
+      $("rsErr").textContent = "";
+      followReset(e.body.job);
+      return;
+    }
+    resetBusy = false;
+    syncReset();
+    return;
+  }
+  $("rsConfirm").value = "";
+  followReset(res.job);
+};
+
+function followReset(id) {
+  watchJob(id, "rsLog", "rsStatus", (v) => {
+    resetBusy = false;
+    syncReset();
+    if (v && v.result) {
+      const r = v.result;
+      $("rsStatus").textContent = `${v.id}: ${v.status} · exit ${r.exit_code}` +
+        `${r.timed_out ? " (timed out)" : ""} after ${Math.round((r.duration_ms || 0) / 1000)} s · log ${r.log}`;
+    }
+    runPreflight();
+    loadRuns();
+  });
+}
+
+/* ---- campaigns --------------------------------------------------------- */
+let campaignID = null, cvTimer = null, startBusy = false;
+const CAMPAIGN_LIVE = new Set(["queued", "running"]);
+
+async function startCampaign() {
+  const body = { config: config(), warmups: whole("warmups"), reps: whole("reps") };
+  if (!$("forceBox").hidden && $("force").checked) body.force = true;
+  startBusy = true;
+  syncStart();
+  let res;
+  try { res = await post("/api/campaigns", body, "configErr"); }
+  catch (_) { startBusy = false; syncStart(); return; }
+  startBusy = false;
+  syncStart();
+  openCampaign(res.campaign);
+  loadCampaigns();
+}
+
+function stopCampaignPoll() {
+  if (cvTimer) { clearInterval(cvTimer); cvTimer = null; }
+}
+
+async function openCampaign(id) {
+  stopCampaignPoll();
+  campaignID = id;
+  document.querySelectorAll(".step").forEach((el) => el.classList.remove("on"));
+  $("campaignView").hidden = false;
+  $("cvExport").href = "/api/campaigns/" + encodeURIComponent(id) + "/export";
+  $("cvErr").textContent = "";
+  $("cvNote").hidden = true;
+  $("cvLog").hidden = true;
+  $("cvReps").innerHTML = '<div class="loader" style="padding:10px"><span class="spin"></span>loading…</div>';
+  $("cvSumBox").hidden = true;
+  window.scrollTo({ top: 0, behavior: "smooth" });
+  await refreshCampaign();
+}
+
+// refreshCampaign polls every 3 s while the campaign is queued or running and
+// stops at any other status (done, failed, cancelled, interrupted).
+async function refreshCampaign() {
+  const id = campaignID;
+  if (!id) return;
+  let c;
+  try { c = await getJSON("/api/campaigns/" + encodeURIComponent(id)); }
+  catch (e) {
+    if (id !== campaignID) return;
+    $("cvErr").textContent = e.message;
+    if (e.status === 404 || e.status === 401) stopCampaignPoll();
+    return;
+  }
+  if (id !== campaignID) return;
+  $("cvErr").textContent = "";
+  renderCampaign(c);
+  campaignLog(id);
+  if (CAMPAIGN_LIVE.has(c.status)) {
+    if (!cvTimer) cvTimer = setInterval(refreshCampaign, 3000);
+  } else if (cvTimer) {
+    stopCampaignPoll();
+    loadCampaigns();
+  }
+}
+
+// The campaign's driver log lives on its job, in memory: absent after a restart.
+async function campaignLog(id) {
+  let v;
+  try { v = await getJSON("/api/jobs/" + encodeURIComponent(id)); } catch (_) { return; }
+  if (id !== campaignID) return;
+  $("cvLog").hidden = false;
+  $("cvLog").textContent = (v.log || []).slice(-12).join("\n") || "(no output yet)";
+  $("cvLog").scrollTop = $("cvLog").scrollHeight;
+}
+
+function statusChip(s) {
+  const cls = s === "done" ? "verdict pass" : s === "failed" ? "verdict fail"
+    : CAMPAIGN_LIVE.has(s) ? "pill on" : "verdict inc";
+  return cls.startsWith("verdict") ? `<span class="${cls}"><span class="dot2"></span>${esc(s)}</span>`
+                                   : `<span class="${cls}">${esc(s)}</span>`;
+}
+
+function hostCell(h, cpus) {
+  if (!h) return '<span class="muted">—</span>';
+  const parts = [];
+  if (h.host_cpu_pct != null) parts.push(`host ${fixed(h.host_cpu_pct, 0)} %`);
+  if (h.guest_load1 != null) parts.push(`load ${fixed(h.guest_load1, 2)}`);
+  const contended = (h.host_cpu_pct != null && h.host_cpu_pct > HOST_WARN_FRACTION * 100) ||
+    (h.guest_load1 != null && cpus > 0 && h.guest_load1 > HOST_WARN_FRACTION * cpus);
+  return (parts.length ? esc(parts.join(" · ")) : '<span class="muted">not readable</span>') +
+    (contended ? ' <span class="pill warn">contended</span>' : "");
+}
+
+function renderCampaign(c) {
+  const live = CAMPAIGN_LIVE.has(c.status);
+  const o = c.options || {}, cf = c.config || {};
+  const total = (o.warmups || 0) + (o.reps || 0);
+  const settled = c.reps.filter((r) => r.status === "done" || r.status === "failed").length;
+  $("cvChip").innerHTML = statusChip(c.status);
+  $("cvKv").innerHTML = [
+    [cf.name, "config"],
+    [`${Number(cf.voters).toLocaleString()} × ${cf.positions}`, "voters × positions"],
+    [cf.mode, "mode"],
+    [`${o.warmups} + ${o.reps}`, "warm-ups + measured"],
+    [`${settled} / ${total}`, "repetitions settled"],
+  ].map(([v, k]) => `<div><b>${esc(v)}</b>${esc(k)}</div>`).join("") +
+    `<div><b class="small" style="font-size:12px;font-family:var(--mono)">${esc(c.id)}</b>started ${
+      esc(new Date(c.created_at).toLocaleString())}${c.finished_at ? " · ended " + esc(new Date(c.finished_at).toLocaleTimeString()) : ""}</div>`;
+  const notes = [c.error, c.save_error && "campaign.json not saved: " + c.save_error].filter(Boolean);
+  if (notes.length) { $("cvNote").hidden = false; $("cvNote").textContent = notes.join(" · "); }
+  $("cvCount").textContent = `${c.reps.length} of ${total} started`;
+  $("cvCancel").hidden = !live;
+
+  const cpus = (c.preflight && c.preflight.host && c.preflight.host.cpus) || 0;
+  const num = (v, d) => (v == null ? '<span class="muted">—</span>' : esc(fixed(v, d)));
+  $("cvReps").innerHTML = c.reps.length ? `<table><thead><tr><th class="num">#</th><th>Kind</th><th>Run</th><th>Status</th>
+      <th class="num">Committed TPS</th><th class="num">p99 ms</th><th>Failed</th><th>Reason</th>
+      <th class="nowrap">Host at start</th><th class="nowrap">Host at end</th></tr></thead><tbody>${
+    c.reps.map((r) => `<tr><td class="num">${esc(r.index)}</td><td>${esc(r.kind)}</td>
+      <td class="small"><code>${esc(r.run_id)}</code></td><td>${statusChip(r.status)}</td>
+      <td class="num">${num(r.committed_tps, 1)}</td><td class="num">${num(r.latency_p99_ms, 1)}</td>
+      <td>${r.failed ? '<span class="pill bad">yes</span>' : '<span class="muted">no</span>'}</td>
+      <td class="small">${esc(r.fail_reason || "")}</td>
+      <td class="small">${hostCell(r.host_start, cpus)}</td><td class="small">${hostCell(r.host_end, cpus)}</td></tr>`).join("")
+  }</tbody></table>` : '<div class="muted small" style="padding:10px">No repetition has started yet.</div>';
+
+  const sum = c.summary || [];
+  $("cvSumBox").hidden = !sum.length;
+  if (sum.length) {
+    const cols = ["metric", "min", "median", "mean", "p95", "p99", "stddev", "n", "failed_reasons"];
+    const key = new Set(["committed_tps", "latency_p99_ms", "runs_failed", "failure_rate"]);
+    const cell = (v) => { const f = parseFloat(v); return v !== "" && isFinite(f) && String(f) === String(v).trim() ? esc(+f.toFixed(3)) : esc(v ?? ""); };
+    $("cvSummary").innerHTML = `<table><thead><tr>${cols.map((h, i) =>
+      `<th class="${i && i < 8 ? "num" : ""}">${esc(h)}</th>`).join("")}</tr></thead><tbody>${
+      sum.map((row) => `<tr${key.has(row.metric) ? ' style="font-weight:600"' : ""}>${cols.map((h, i) =>
+        `<td class="${i && i < 8 ? "num" : i === 8 ? "small" : ""}">${cell(row[h])}</td>`).join("")}</tr>`).join("")
+    }</tbody></table>`;
+  }
+}
+
+$("cvCancel").onclick = async () => {
+  $("cvCancel").disabled = true;
+  let r;
+  try { r = await post(`/api/campaigns/${encodeURIComponent(campaignID)}/cancel`, {}, "cvErr"); }
+  catch (_) { $("cvCancel").disabled = false; return; }
+  $("cvNote").hidden = false;
+  $("cvNote").textContent = `${r.campaign}: ${r.status}. The repetition in progress runs to its end first; a campaign ` +
+    "cancelled before its last repetition writes no summary.csv, and its finished rows stay in the export.";
+  refreshCampaign();
+};
+$("cvBack").onclick = () => { showSetup(); loadCampaigns(); };
+
+async function loadCampaigns() {
+  let list;
+  try { list = await getJSON("/api/campaigns"); }
+  catch (e) { $("cpList").innerHTML = `<div class="err">${esc(e.message)}</div>`; return; }
+  if (!list.length) { $("cpList").innerHTML = '<span class="muted small">No campaigns yet.</span>'; return; }
+  $("cpList").innerHTML = `<div class="table-wrap"><table><thead><tr><th>Campaign</th><th>Started</th><th>Configuration</th>
+    <th>Status</th><th class="num">Repetitions</th><th></th></tr></thead><tbody>${list.map((c) => {
+      const o = c.options || {}, cf = c.config || {};
+      const settled = (c.reps || []).filter((r) => r.status === "done" || r.status === "failed").length;
+      return `<tr><td class="small"><code>${esc(c.id)}</code></td>
+        <td class="small nowrap">${esc(new Date(c.created_at).toLocaleString())}</td>
+        <td class="small">${esc(cf.name)} · ${esc(Number(cf.voters).toLocaleString())} × ${esc(cf.positions)} · ${esc(cf.mode)}</td>
+        <td>${statusChip(c.status)}</td><td class="num">${settled} / ${(o.warmups || 0) + (o.reps || 0)}</td>
+        <td class="nowrap"><button type="button" class="small" data-open-campaign="${esc(c.id)}">Open</button>
+          <a class="fchip" href="/api/campaigns/${encodeURIComponent(c.id)}/export" download>export</a></td></tr>`;
+    }).join("")}</tbody></table></div>`;
+  $("cpList").querySelectorAll("[data-open-campaign]").forEach((b) => {
+    b.onclick = () => openCampaign(b.dataset.openCampaign);
+  });
+}
+
+/* ---- runs list --------------------------------------------------------- */
+let runsCache = [];
+const RUN_FILES = ["run.json", "perf.csv", "correctness.csv", "negative-tests.csv", "journal.ndjson"];
+const RUNS_SHOWN = 25;
+const securityRun = (r) => !!(r.config && (r.config.attack_plan || r.config.fault_plan));
+
+async function loadRuns() {
+  let runs;
+  try { runs = await getJSON("/runs"); }
+  catch (e) { $("rlErr").textContent = e.message; return; }
+  $("rlErr").textContent = "";
+  runsCache = runs.slice().sort((a, b) => String(b.created_at).localeCompare(String(a.created_at)));
+  renderRuns();
+  renderFaultRuns();
+}
+
+function runStatus(r) {
+  // resume_pending is the resume's exact count from segment.start, never the
+  // 202's journal estimate, which reads 0 after a fault dispatched every ballot.
+  const trail = [
+    r.was_interrupted ? "interrupted once" : "",
+    r.resume_pending != null ? `last resume: ${Number(r.resume_pending).toLocaleString()} pending` : "",
+    r.reconciled ? "verify-only reconciled" : "",
+  ].filter(Boolean).join(" · ");
+  const head = r.busy
+    ? `<span class="pill on">${r.paused_stage ? "paused at " + esc(r.paused_stage) : "running"}</span>`
+    : `<span class="pill ${{ ended: "ok", failed: "bad", interrupted: "warn" }[r.status] || ""}">${esc(r.status)}</span>`;
+  return head + (r.reason ? `<div class="small muted">${esc(r.reason)}</div>` : "") +
+    (trail ? `<div class="small muted">${esc(trail)}</div>` : "");
+}
+
+function renderRuns() {
+  if (!runsCache.length) { $("rlList").innerHTML = '<span class="muted small">No runs yet.</span>'; return; }
+  const rows = runsCache.slice(0, RUNS_SHOWN).map((r) => {
+    const c = r.config || {};
+    const tags = [
+      c.rep ? `<span class="pill">campaign ${esc(c.rep.kind)} ${esc(c.rep.index)}</span>` : "",
+      securityRun(r) ? `<span class="pill warn" title="throughput perturbed, not for RQ3">security run${c.fault_plan ? " · fault armed" : ""}</span>` : "",
+    ].join(" ");
+    // Resume answers an interrupted ballot window: exactly what the resume
+    // route's journal check (resumable) accepts. Verify-only belongs to a run
+    // that was interrupted (T3 requires it after the resume); it is not offered
+    // on a clean run, where it would stamp interrupted_at on a good record.
+    const c2 = r.config || {};
+    const acts = r.busy ? "" : [
+      r.resumable ? `<button type="button" class="small primary" data-run-act="resume" data-run="${esc(r.run_id)}">Resume</button>` : "",
+      caps.fabric && c2.mode === "onchain" && (r.resumable || r.was_interrupted)
+        ? `<button type="button" class="small${!r.resumable && !r.reconciled ? " primary" : ""}" data-run-act="verify-only" data-run="${esc(r.run_id)}">Verify-only</button>` : "",
+    ].join(" ");
+    const files = RUN_FILES.filter((f) => (r.artifacts || []).includes(f)).map((f) =>
+      `<a class="fchip" href="/export/${encodeURIComponent(r.run_id)}/${f}" download>${esc(f)}</a>`).join(" ");
+    return `<tr><td class="small"><code>${esc(r.run_id)}</code><div>${tags}</div></td>
+      <td class="small nowrap">${esc(new Date(r.created_at).toLocaleString())}</td>
+      <td class="small">${esc(c.mode)}</td>
+      <td class="num small">${esc(Number(c.voters).toLocaleString())} × ${esc(c.positions)}</td>
+      <td>${runStatus(r)}</td><td class="nowrap">${acts}</td><td class="small">${files || '<span class="muted">—</span>'}</td></tr>`;
+  }).join("");
+  $("rlList").innerHTML = `<div class="table-wrap"><table><thead><tr><th>Run</th><th>Created</th><th>Mode</th>
+    <th class="num">Voters × pos.</th><th>Status</th><th>Actions</th><th>Exports</th></tr></thead><tbody>${rows}</tbody></table></div>` +
+    (runsCache.length > RUNS_SHOWN ? `<div class="small muted" style="margin-top:5px">Newest ${RUNS_SHOWN} of ${runsCache.length} runs.</div>` : "");
+  $("rlList").querySelectorAll("[data-run-act]").forEach((b) => {
+    b.onclick = () => runAction(b.dataset.run, b.dataset.runAct, b);
+  });
+}
+
+async function runAction(id, action, btn) {
+  btn.disabled = true;
+  $("rlNote").textContent = "";
+  $("rlErr").textContent = "";
+  // Subscribed before the POST: the hub does not replay, and a failed close
+  // after the resume's submissions is reported only as an event.
+  const errors = [];
+  let ev = null;
+  try {
+    ev = new EventSource("/events?run=" + encodeURIComponent(id));
+    ev.onmessage = (m) => {
+      try {
+        const e = JSON.parse(m.data);
+        if (e.level === "error") { errors.push(e.msg); $("rlErr").textContent = errors.join(" · "); }
+      } catch (_) {}
+    };
+  } catch (_) {}
+  let r;
+  try { r = await post(`/api/runs/${encodeURIComponent(id)}/${action}`, {}, "rlErr"); }
+  catch (_) { if (ev) ev.close(); btn.disabled = false; return; }
+  $("rlNote").textContent = action === "resume"
+    ? `Resuming ${id} as segment ${r.segment} (journal estimate ${r.remaining} ballots; after a fault it can read 0 ` +
+      "while thousands are pending: the exact count shows in the list once the resume starts). It submits what the " +
+      "chain does not hold, then closes the election."
+    : `Verify-only on ${id}: reconciling the chain against this run; nothing is submitted.`;
+  loadRuns();
+  const tick = setInterval(loadRuns, 6000);
+  jobTimers.add(tick);
+  whenIdle(id, () => {
+    clearInterval(tick);
+    jobTimers.delete(tick);
+    if (ev) ev.close();
+    loadRuns();
+    if (errors.length) {
+      // A resume that could not close the election is retried with Resume,
+      // which reappears in the list when the route would take it again.
+      $("rlNote").textContent += ` It ended with an error${action === "resume" ? "; press Resume again when it is offered" : ""}.`;
+      return;
+    }
+    $("rlNote").textContent += action === "resume"
+      ? " Done: now run Verify-only (required after a fault), then the trustees, publish and Verify."
+      : " Done: continue with the trustees, publish the tally and Verify.";
+    // The run this page is walking: its ceremony is open now.
+    if (id === runID) { $("err2").textContent = ""; $("next2").disabled = false; }
+  });
+}
+
+// whenIdle polls a run's status every 3 s until no phase holds it.
+function whenIdle(id, fn) {
+  let timer = null;
+  const tick = async () => {
+    let s;
+    try { s = await getJSON(`/api/runs/${encodeURIComponent(id)}/status`); } catch (_) { return; }
+    if (!s.busy) { clearInterval(timer); jobTimers.delete(timer); fn(); }
+  };
+  timer = setInterval(tick, 3000);
+  jobTimers.add(timer);
+}
+
+/* ---- peer-restart fault ------------------------------------------------ */
+// The fault route's own refusals, mirrored so only runs it would take are
+// offered: on-chain, generated, idle, not a campaign repetition, no attack
+// plan, no time-bounded window, ballot window not opened. The route stays the
+// judge: it also refuses while any job runs or another run is busy.
+const faultEligible = (r) => {
+  const c = r.config || {};
+  return c.mode === "onchain" && !c.rep && !c.attack_plan && !c.fault_plan && !(c.window_s > 0) &&
+    !r.busy && r.status !== "new" && !r.ballots_started;
+};
+
+function renderFaultRuns() {
+  const sel = $("ftRun"), keep = sel.value;
+  const runs = runsCache.filter(faultEligible);
+  sel.innerHTML = runs.length
+    ? runs.map((r) => `<option value="${esc(r.run_id)}">${esc(r.run_id)}</option>`).join("")
+    : '<option value="">no eligible run — generate an on-chain election first</option>';
+  if (runs.some((r) => r.run_id === keep)) sel.value = keep;
+  else if (runs.some((r) => r.run_id === runID)) sel.value = runID;
+  syncFault();
+}
+
+function syncFault() {
+  $("btnFault").disabled = !$("ftRun").value || $("ftConfirm").value !== "RESTART";
+}
+
+$("btnFault").onclick = async () => {
+  const id = $("ftRun").value;
+  $("btnFault").disabled = true;
+  $("ftStatus").textContent = "";
+  let r;
+  try {
+    r = await post(`/api/runs/${encodeURIComponent(id)}/fault`,
+      { kind: "peer-restart", at: +$("ftAt").value, down_s: +$("ftDown").value, confirm: $("ftConfirm").value }, "ftErr");
+  } catch (_) { syncFault(); return; }
+  $("ftConfirm").value = "";
+  $("ftStatus").textContent = `Armed on ${r.run_id}: ${r.container} stops when ballot ${r.at_index} of ${r.ballots} ` +
+    `is dispatched and stays down ${r.down_s} s. Continue that run through Encrypt & record to fire it.`;
+  loadRuns();
+};
+
+/* ---- boot -------------------------------------------------------------- */
+function stopStudyTimers() {
+  clearTimeout(pfTimer);
+  stopCampaignPoll();
+  jobTimers.forEach((t) => clearInterval(t));
+  jobTimers.clear();
+  ladderWatching = false;
+  resetBusy = false;
+}
+
+// refreshStudy reloads what a sign-in may have interrupted.
+function refreshStudy() {
+  runPreflight();
+  syncReset();
+  if (uiMode === "campaign") loadCampaigns(); else loadRuns();
+  if (campaignID) refreshCampaign();
+}
+
+async function boot() {
+  // Ask the server what it can actually do before offering on-chain. Without
+  // this the page offered a mode the server could not honour, and the run
+  // silently executed locally while the UI said it was committing to Fabric.
+  try { caps = await getJSON("/api/capabilities"); } catch (_) {}
+  const opt = document.querySelector('#mode option[value="onchain"]');
+  if (opt && !caps.fabric) {
+    opt.disabled = true;
+    opt.textContent = "on-chain — no Fabric network configured";
+    $("modeHint").textContent =
+      "Start the console with --fabric-tls-cert, --fabric-cert and --fabric-key to enable on-chain mode.";
+  } else if (opt) {
+    opt.textContent = "on-chain — commits to " + (caps.peer || "Fabric");
+  }
+  refreshStudy();
+}
+
 /* ---- wiring ------------------------------------------------------------ */
 $("addTrustee").onclick = () => { const n = trusteeNames(); n.push("Trustee " + (n.length + 1)); renderTrustees(n); };
-$("mode").onchange = renderPresets;
-$("btnStart").onclick = startRun;
+["voters", "positions", "concurrency", "warmups", "reps"].forEach((id) => $(id).addEventListener("input", onFormChange));
+$("mode").addEventListener("change", onFormChange);
+$("skipAttacks").onchange = syncPlan;
+$("ballotsAt").oninput = syncPlan;
+document.querySelectorAll("[data-plan-stage]").forEach((c) => { c.onchange = syncPlan; });
+document.querySelectorAll("#modes [data-mode]").forEach((b) => { b.onclick = () => setMode(b.dataset.mode); });
+$("pfRefresh").onclick = runPreflight;
+$("force").onchange = syncStart;
+$("rsConfirm").oninput = syncReset;
+$("ftConfirm").oninput = syncFault;
+$("ftRun").onchange = syncFault;
+$("rlRefresh").onclick = loadRuns;
+$("cpRefresh").onclick = loadCampaigns;
+$("btnStart").onclick = () => (uiMode === "campaign" ? startCampaign() : startRun());
 $("back1").onclick = () => go(0);
 $("next1").onclick = runCheck;
 $("back2b").onclick = () => go(1);
@@ -1260,28 +2351,17 @@ $("next5").onclick = () => {
 $("atkRerun").onclick = () => runAttack(step - ATTACK_STEP);
 $("btnRestart").onclick = () => {
   closeStream(); stopTimers(); stopPauseWatch(); runID = null; cfg = null; attacks = [];
-  showIDChip(); go(0);
+  showIDChip(); go(0); runPreflight(); loadRuns();
 };
 
-// Ask the server what it can actually do before offering on-chain. Without
-// this the page offered a mode the server could not honour, and the run
-// silently executed locally while the UI said it was committing to Fabric.
-(async () => {
-  try { caps = await getJSON("/api/capabilities"); } catch (_) {}
-  const opt = document.querySelector('#mode option[value="onchain"]');
-  if (opt && !caps.fabric) {
-    opt.disabled = true;
-    opt.textContent = "on-chain — no Fabric network configured";
-    $("modeHint").textContent =
-      "Start the console with --fabric-tls-cert, --fabric-cert and --fabric-key to enable on-chain mode.";
-  } else if (opt) {
-    opt.textContent = "on-chain — commits to " + (caps.peer || "Fabric");
-  }
-})();
-
-renderTrustees(["COMELEC", "Civil Society Watch", "University IT", "Academe Observer", "Bar Association"]);
+renderTrustees(PAPER_TRUSTEES);
 renderPresets();
 renderRail();
+syncPlan();
+syncHints();
+syncReset();
+syncFault();
+checkAuth();
 </script>
 </body>
 </html>
