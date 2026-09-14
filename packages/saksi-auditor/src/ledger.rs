@@ -1,14 +1,17 @@
-//! Ledger-ordering digest for bulletin-board integrity (paper §Security,
-//! adversary class 5: a malicious bulletin-board node that drops **or reorders**
-//! ballots — "detected by proof and hash verification").
+//! Order-dependent digest over a recorded ballot sequence.
 //!
-//! A dropped ballot is caught by the homomorphic-sum check (the recorded set no
-//! longer matches the published tally). **Reordering** does not change the
-//! order-independent homomorphic tally, so it cannot be caught that way — it is
-//! caught by **hash verification**: this order-dependent digest over the recorded
-//! ballot sequence. A verifier recomputes it from the bulletin board's committed
-//! order (on Fabric, the block/transaction order) and compares; any reordering or
-//! omission yields a different digest.
+//! **No verifier uses this.** [`crate::audit`] never calls [`ledger_digest`],
+//! the chaincode has no ordering check, and the console's `reordered-ballots`
+//! scenario has no gate. Ballot reordering (paper adversary class 5, a
+//! malicious bulletin-board node) is therefore **not detected**: the
+//! homomorphic tally is order-independent, so reordering cannot change the
+//! result, and ordering integrity is not claimed.
+//!
+//! A dropped ballot, by contrast, is detected: the recorded set no longer sums
+//! to the published tally (`tally.homomorphic_sum`).
+//!
+//! The function is kept as public API, but nothing compares its output against
+//! a committed order (on Fabric, the block/transaction order).
 
 use saksi_protocol::{domain_hash, Ballot};
 
@@ -16,6 +19,8 @@ use saksi_protocol::{domain_hash, Ballot};
 /// content (position id, nullifier, credential commitment, and every ciphertext)
 /// into a running SHA-256 digest, so the result depends on both the set **and**
 /// its order. Reordering or dropping any ballot changes the output.
+///
+/// Not called by [`crate::audit`] or any other verifier (see the module docs).
 pub fn ledger_digest(ballots: &[Ballot]) -> [u8; 32] {
     let mut acc = domain_hash(b"saksi.auditor.ledger.v1", &[]);
     for ballot in ballots {
@@ -38,4 +43,23 @@ pub fn ledger_digest(ballots: &[Ballot]) -> [u8; 32] {
         acc = domain_hash(b"saksi.auditor.ledger.chain.v1", &parts);
     }
     acc
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ledger_digest;
+    use crate::fixtures::{multi_position_fixture, GenParams, SelectionProfile};
+
+    /// Unit test of the digest function alone. No verifier runs the digest, so
+    /// this proves nothing about whether an audit detects a reorder (it does not).
+    #[test]
+    fn ledger_digest_is_order_dependent() {
+        let f = multi_position_fixture(&GenParams::simple(4, 2, 2, SelectionProfile::Uniform));
+        let recorded = ledger_digest(&f.ballots);
+        assert_eq!(recorded, ledger_digest(&f.ballots), "deterministic");
+
+        let mut reversed = f.ballots.clone();
+        reversed.reverse();
+        assert_ne!(ledger_digest(&reversed), recorded, "order-dependent");
+    }
 }

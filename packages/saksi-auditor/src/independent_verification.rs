@@ -2,7 +2,8 @@
 //!
 //! Demonstrates "software independence" (Rivest): a verifier given ONLY the
 //! public election record reproduces the tally and accepts every proof; and when
-//! any single public record is modified, the verifier detects the inconsistency.
+//! the content of any single public record is modified, the verifier detects the
+//! inconsistency. (Ballot order is not content it checks; see below.)
 //!
 //! The verifier here is `saksi-auditor::audit` run on
 //! [`ElectionFixture::public_artifacts`] — the public bulletin-board data with
@@ -12,8 +13,10 @@
 //! generator-side test (`demo::audit_scores_e0_accuracy_against_ground_truth`).
 //!
 //! The tamper matrix covers every class of public-record mutation (matrix F5):
-//! ballot ciphertext/proof, tally total, dropped ballot, reordered ballots,
-//! partial-decryption share, and DKG transcript.
+//! ballot ciphertext/proof, tally total, dropped ballot, partial-decryption
+//! share, and DKG transcript are each detected. Reordered ballots are the
+//! exception: **not detected** — the tally is order-independent, so reordering
+//! cannot change the result; ordering integrity is not claimed.
 
 use crate::fixtures::{multi_position_fixture, GenParams, SelectionProfile};
 use crate::{audit, AuditStatus};
@@ -96,23 +99,25 @@ fn dropped_ballot_detected() {
     );
 }
 
-/// A pure reorder leaves the order-independent tally clean, so it is detected by
-/// the append-only ledger digest (the sole detector of a reorder).
+/// A pure reorder is NOT detected: the verifier accepts it, with the identical
+/// decoded tally, because the homomorphic tally is order-independent. Ordering
+/// integrity is not claimed (no verifier runs `ledger::ledger_digest`).
 #[test]
-fn reordered_ballots_detected_by_ledger_digest() {
-    let f = fixture();
-    let recorded = crate::ledger::ledger_digest(&f.ballots);
-    let mut served = f.ballots.clone();
-    served.reverse();
-    assert_ne!(
-        crate::ledger::ledger_digest(&served),
-        recorded,
-        "reordering must change the ledger digest"
-    );
-    // And confirm the tally itself is order-blind (so the digest is the detector).
-    let mut reordered = fixture();
-    reordered.ballots.reverse();
-    assert!(audit(reordered.public_artifacts()).passed());
+fn reordered_ballots_pass_audit_with_identical_tally() {
+    let tally_findings = |r: &crate::report::AuditReport| -> Vec<String> {
+        r.findings
+            .iter()
+            .filter(|x| x.check == "tally.homomorphic_sum")
+            .map(|x| x.detail.clone())
+            .collect()
+    };
+    let mut f = fixture();
+    let recorded = audit(f.public_artifacts());
+    f.ballots.reverse();
+    let report = audit(f.public_artifacts());
+    assert!(report.passed(), "a reorder is not detected: {report:#?}");
+    assert!(!tally_findings(&report).is_empty());
+    assert_eq!(tally_findings(&report), tally_findings(&recorded));
 }
 
 /// A tampered trustee partial-decryption share is detected.

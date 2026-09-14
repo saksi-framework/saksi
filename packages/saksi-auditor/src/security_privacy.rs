@@ -15,7 +15,8 @@
 //! | 2 | Malformed ballot / bad proof | [`crate::tests::tampered_ballot_cds_proof_is_caught`], [`crate::tests::tampered_credential_presentation_proof_is_caught`] |
 //! | 3 | Sub-threshold trustees       | [`crate::tests::under_threshold_decryptions_are_caught`] (+ positive control below) |
 //! | 4 | Malicious admin (params)     | [`crate::tests::bad_parameters_version_is_caught`], [`crate::tests::wrong_issuer_pk_is_caught`], [`crate::tests::dkg_transcript_trustee_count_mismatch_is_caught`] (+ control below) |
-//! | 5 | Malicious BB node (drop/reorder) | [`malicious_bb_node_dropping_a_committed_ballot_is_detected`] + [`malicious_bb_node_reordering_ballots_is_detected_by_ledger_digest`] (this module) |
+//! | 5 | Malicious BB node (drop)     | [`malicious_bb_node_dropping_a_committed_ballot_is_detected`] (this module) |
+//! | 5 | Malicious BB node (reorder)  | not detected — the tally is order-independent, so reordering cannot change the result; ordering integrity is not claimed ([`malicious_bb_node_reordering_ballots_is_not_detected_and_leaves_the_tally_unchanged`]) |
 //! | 6 | Network replay               | [`crate::tests::reused_nullifier_is_caught`] (replay == duplicate nullifier) |
 //!
 //! The chaincode-side rejections for classes 1/2/6 (on-chain, at endorsement)
@@ -33,7 +34,7 @@ use crate::fixtures::{multi_position_fixture, GenParams, SelectionProfile};
 use crate::{audit, AuditStatus};
 
 // ---------------------------------------------------------------------------
-// Phase 4 · class 5 — malicious bulletin-board node (drop)
+// Phase 4 · class 5 — malicious bulletin-board node (drop; reorder is not detected)
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -69,32 +70,37 @@ fn malicious_bb_node_dropping_a_committed_ballot_is_detected() {
 }
 
 #[test]
-fn malicious_bb_node_reordering_ballots_is_detected_by_ledger_digest() {
-    // Reordering does NOT change the order-independent homomorphic tally, so the
-    // tally check cannot catch it — the paper's "detected by hash verification"
-    // path is the order-dependent ledger digest.
-    let f = multi_position_fixture(&GenParams::simple(4, 2, 2, SelectionProfile::Uniform));
-    let recorded = crate::ledger::ledger_digest(&f.ballots);
-    // Positive control: recomputing over the same committed order matches.
-    assert_eq!(recorded, crate::ledger::ledger_digest(&f.ballots));
+fn malicious_bb_node_reordering_ballots_is_not_detected_and_leaves_the_tally_unchanged() {
+    // Ordering integrity is NOT claimed: no verifier checks ballot order (the
+    // `ledger::ledger_digest` hash chain exists but nothing runs it), and the
+    // chaincode has no ordering gate. What this test proves is why that is safe
+    // for correctness: the homomorphic tally is order-independent, so a pure
+    // reorder audits clean with the identical decoded tally.
+    let tally_findings = |r: &crate::report::AuditReport| -> Vec<String> {
+        r.findings
+            .iter()
+            .filter(|x| x.check == "tally.homomorphic_sum")
+            .map(|x| x.detail.clone())
+            .collect()
+    };
+
+    // Positive control: the recorded order audits clean.
+    let mut f = multi_position_fixture(&GenParams::simple(4, 2, 2, SelectionProfile::Uniform));
+    let recorded = audit(f.artifacts());
+    assert!(recorded.passed(), "positive control: {recorded:#?}");
 
     // Attack: a malicious BB node serves the same ballots in a different order.
-    let mut served = f.ballots.clone();
-    served.reverse();
-    assert_ne!(
-        crate::ledger::ledger_digest(&served),
-        recorded,
-        "reordering must change the ledger digest (hash verification detects it)"
-    );
-
-    // And confirm the tally really is order-blind, so the digest is the ONLY
-    // detector of a pure reorder: reverse a fresh fixture's ballots and audit.
-    let mut reordered =
-        multi_position_fixture(&GenParams::simple(4, 2, 2, SelectionProfile::Uniform));
-    reordered.ballots.reverse();
+    f.ballots.reverse();
+    let report = audit(f.artifacts());
     assert!(
-        audit(reordered.artifacts()).passed(),
-        "a pure reorder leaves the homomorphic tally clean — only the ledger digest catches it"
+        report.passed(),
+        "a pure reorder is not detected by the auditor: {report:#?}"
+    );
+    assert!(!tally_findings(&report).is_empty());
+    assert_eq!(
+        tally_findings(&report),
+        tally_findings(&recorded),
+        "reordering must not change the decoded tally"
     );
 }
 

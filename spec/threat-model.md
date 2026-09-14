@@ -58,6 +58,7 @@ public-blockchain voting designs.
 | Nullifier not tied to the signed credential | Presentation Chaum-Pedersen NIZK | off-chain |
 | Bad trustee decryption share | Per-trustee Chaum-Pedersen proof; `≥ t` distinct verified shares | off-chain |
 | Wrong tally published | Auditor recomputes homomorphic sum → published totals | off-chain |
+| Reordered ballots | Not detected — the tally is order-independent, so reordering cannot change the result; ordering integrity is not claimed | none |
 | Issuance↔presentation linkage | Pointcheval–Stern blinding `(b, α, β)` | crypto |
 | Vote secrecy | Threshold ElGamal; `< t` trustees learn nothing | crypto |
 
