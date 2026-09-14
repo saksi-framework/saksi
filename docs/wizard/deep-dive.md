@@ -196,16 +196,17 @@ threshold visible instead of automatic.
 Offline, `CeremonyStart` returns after generating the bundle and reports *"local
 ceremony ready — no ledger."*
 
-**Two encryptions, one population.** Step 2 wrote `ballots.ndjson`; this step
-writes `bundle.json`. Both encrypt the *same plaintext population* — the
-selection rule is deterministic — but share no ciphertexts, because encryption
-draws from `OsRng`. The auditor reads the stream; the ceremony submits the
-bundle.
+**One encryption, two readers.** Step 2 wrote `header.json` and
+`ballots.ndjson`; this step builds `bundle.json` from that header (`bundleFrom`)
+and points it at the same `ballots.ndjson`. The auditor reads the stream and the
+ceremony submits the bundle, and they are the same ciphertexts under the same
+election key.
 
-**Never regenerate mid-ceremony.** A regenerated bundle contains different
-trustee shares, so partials already submitted would correspond to nothing, and
-on-chain `CreateElection` would reject the election as a duplicate. The bundle
-is generated once, here, and read from cache thereafter.
+**Never regenerate mid-ceremony.** Every `gen` draws fresh randomness, including
+each trustee's DKG polynomial, so a regenerated election has a different key and
+different trustee shares: partials already submitted would correspond to
+nothing, and on-chain `CreateElection` would reject the election as a duplicate.
+The bundle is built once, here, and read from cache thereafter.
 
 ---
 

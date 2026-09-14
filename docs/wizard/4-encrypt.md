@@ -40,34 +40,33 @@ voting detectable without linking a ballot to a voter.
 
 On-chain, each committed transaction yields a real ledger receipt — block number,
 transaction id, block hash — polled into the page as it goes and recorded in
-`trail.json` / `receipts.csv`.
+`trail.ndjson` / `receipts.csv`.
 
-## Two encryptions of one population
+## One encryption, read by the ceremony and the auditor
 
-This is the subtlety most likely to cause confusion when reading the artifacts.
-
-Step 2 wrote `header.json` + `ballots.ndjson` — a complete encrypted run. This
-step writes `bundle.json` — **another** complete encrypted run. Both encrypt the
-*same plaintext population*, because the selection rule is deterministic. Neither
-contains the same ciphertexts as the other, because encryption draws from
-`OsRng`.
+Step 2 wrote `header.json` + `ballots.ndjson` — the election's only encryption.
+This step writes `bundle.json` by **reading** that header (`bundleFrom` in
+`ceremony.go`): the parameters, the DKG transcript, the partial decryptions and
+the tally are copied out of it, and `ballots_file` points at `ballots.ndjson`
+rather than inlining a second copy of the ballots.
 
 So:
 
 - The **stream** (`ballots.ndjson`) is what the independent auditor reads in step 6.
-- The **bundle** (`bundle.json`) is what the ceremony submits in step 5.
-- Their plaintext tallies are identical; their ciphertexts share nothing.
+- The **bundle** (`bundle.json`) is what the ceremony submits in steps 4 and 5.
+- They are the same ciphertexts under the same election key.
 
 ### The consequence: never regenerate mid-ceremony
 
-Because `gen` draws fresh randomness every time, a regenerated bundle contains
-**different trustee shares**. Partial decryptions already submitted against the
-old bundle would no longer correspond to anything, and on-chain `CreateElection`
-would additionally reject the election as a duplicate.
+Every `gen` draws fresh randomness, including each trustee's DKG polynomial, so
+a regenerated election has a **different key and different trustee shares**.
+Partial decryptions already submitted would no longer correspond to anything,
+and on-chain `CreateElection` would additionally reject the election as a
+duplicate.
 
-The ceremony therefore generates the bundle **once**, here, and every later step
-reads the cached file. Any change to this code path must preserve that. It is
-called out in the source for the same reason.
+The ceremony therefore builds the bundle **once**, from the header, and every
+later step reads the cached file. Any change to this code path must preserve
+that.
 
 ## Attacks at this stage
 
