@@ -51,7 +51,10 @@ func attackRun(t *testing.T, runDir string, n int) string {
 			Ciphertexts: []*pb.Ciphertext{{Pad: make([]byte, 32), Data: make([]byte, 32)}},
 			WellFormednessProofs: []*pb.CDSProof{{Version: 1, Branches: []*pb.CDSProofBranch{
 				{Response: make([]byte, 32)}}}},
-			CredentialPresentation: &pb.CredentialPresentation{Nullifier: &pb.Nullifier{Value: testNullifier(i)}},
+			CredentialPresentation: &pb.CredentialPresentation{
+				Nullifier:         &pb.Nullifier{Value: testNullifier(i)},
+				PresentationProof: fakeSignature(),
+			},
 		}))
 	}
 	if err := os.WriteFile(filepath.Join(runDir, BallotsFile), []byte(b.String()), 0o644); err != nil {
@@ -107,9 +110,21 @@ func declaredAuditGate(id string) string {
 	return ""
 }
 
+// fakeSignature is the 64-byte presentation-proof prefix the fake credential
+// gate accepts: a marker first byte stands in for a verifying signature.
+func fakeSignature() []byte {
+	sig := make([]byte, 64)
+	sig[0] = 0xC5
+	return sig
+}
+
 // gatedLedger is fakeLedger with SubmitBallot's gates in the chaincode's order
-// (decode, election open, nullifier unspent, CDS), each refusing with its
-// "gate=<id>:" prefix, so a live mount can be classified end to end.
+// (decode, shape, credential, election open, nullifier unspent, CDS), each
+// refusing with its "gate=<id>:" prefix, so a live mount can be classified end
+// to end. The shape and credential gates are stand-ins (ciphertexts and a
+// nullifier present; a marker signature) that no live mutation should trip:
+// the proof that the real ones pass the real crypto is the chaincode's
+// TestLiveAttackMutationsMeetTheirDeclaredGateFirst.
 type gatedLedger struct {
 	*fakeLedger
 	gmu        sync.Mutex
@@ -148,6 +163,13 @@ func (g *gatedLedger) ballotGates(h string) error {
 	raw, _ := hex.DecodeString(h)
 	if err := proto.Unmarshal(raw, &b); err != nil {
 		return fmt.Errorf("gate=decode: decode ballot: %w", err)
+	}
+	cp := b.GetCredentialPresentation()
+	if len(b.GetCiphertexts()) == 0 || len(cp.GetNullifier().GetValue()) == 0 {
+		return errors.New("gate=shape: ballot has no ciphertexts or no nullifier")
+	}
+	if p := cp.GetPresentationProof(); len(p) < 64 || p[0] != 0xC5 {
+		return errors.New("gate=credential: credential signature verification failed")
 	}
 	g.gmu.Lock()
 	defer g.gmu.Unlock()

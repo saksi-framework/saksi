@@ -387,14 +387,14 @@ window) — it is never a measured zero.
 | ` + "`committed_tps`" + ` | tx/s | committed ÷ window |
 | ` + "`driver_ceiling_tps`" + ` | tx/s | concurrency ÷ median submit latency — the harness's own ceiling. A ` + "`committed_tps`" + ` near it means the driver, not the network, was the limit |
 | ` + "`latency_*_ms`" + ` | ms | per-ballot submit→commit latency stats (nearest-rank percentiles, population stddev) |
-| ` + "`peak_cpu_pct_{peer,orderer,client}`" + ` | % | ` + "`docker stats`" + ` sampler peak (` + "`client`" + ` is this console's own process) |
+| ` + "`peak_cpu_pct_{peer,orderer,client}`" + ` | % | ` + "`docker stats`" + ` sampler peak (` + "`client`" + ` is this console's own process). On a security run the sampler also ran through the attack pause |
 | ` + "`peak_mem_mb_{peer,orderer,client}`" + ` | MB | same sampler |
 | ` + "`ledger_bytes_delta`" + ` | bytes | on-disk ledger growth over the ballot window; empty unless a peer volume path is configured |
 | ` + "`sustained`" + ` | bool | the run was one uninterrupted window |
 | ` + "`scaling_limit`" + ` | true\|false\|inconclusive | sustained TPS vs. the arrival rate the tier demands; ` + "`inconclusive`" + ` when the driver was the ceiling |
 | ` + "`failed`, `fail_reason`" + ` | bool, text | the run-failed predicate: stage error, any drop, reconcile mismatch, nonzero E, or interruption |
 | ` + "`verify_threads`" + ` | count | ` + "`timings.json` `verify_threads`" + ` — threads the auditor verified ballots on (all cores by default; ` + "`SAKSI_AUDIT_THREADS`" + ` pins it). Empty when the auditor did not report it |
-| ` + "`security_run`" + ` | true\|empty | ` + "`true`" + ` when the run had an ` + "`attack_plan`" + `: its lifecycle paused to mount attacks, so its throughput is **perturbed — not for RQ3**. The ballot window excludes the pause and the attacks mounted in it (the two halves of the window are summed), but the ledger still processed the attacks. Empty for every other run |
+| ` + "`security_run`" + ` | true\|empty | ` + "`true`" + ` when the run had an ` + "`attack_plan`" + `: its lifecycle paused to mount attacks, so its throughput is **perturbed — not for RQ3**. The ballot window excludes the pause and the attacks mounted in it (the two halves of the window are summed), but the ledger still processed the attacks, and the ` + "`peak_cpu_pct_*`/`peak_mem_mb_*`" + ` sampler ran through the pause, so those peaks include it. ` + "`scaling_limit`" + ` is always ` + "`inconclusive`" + `. Empty for every other run |
 
 A window that closed because it reached its own configured time bound
 (` + "`window_s`" + `, as a rate sweep's steps do) is **not** an interruption and not a

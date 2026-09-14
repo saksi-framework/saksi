@@ -454,7 +454,11 @@ Three caveats worth knowing before quoting a number:
 - `security_run` is `true` when the run had an `attack_plan`. Its lifecycle
   paused to mount attacks, so its throughput is **perturbed — not for RQ3**.
   The ballot window leaves the pause out (its two halves are summed), but the
-  ledger still processed the attacks. Empty for every other run.
+  ledger still processed the attacks, and the `peak_cpu_pct_*` and
+  `peak_mem_mb_*` columns come from a sampler that ran through the pause, so
+  they include the attacks and the idle wait. A security run never reports a
+  sustained TPS or a scaling verdict (`scaling_limit` is `inconclusive`, and
+  `run.end` carries `security_run: true`). Empty for every other run.
 
 ### `negative-tests.csv` — the attack record
 
@@ -491,6 +495,12 @@ other time (the step-7 catalogue, or `/attack` on its own). `election_status`
 (`open`, `closed`, `published`), `ballots_committed` and `block_height` are
 empty when there was no ledger to read them from. `live` repeats `on_chain`
 beside the rest of the mount context: `true` only for a real submission.
+
+Read a **simulated row mounted at a live pause** (`live=false` with an
+`election_status`) with care: its mount context describes the live election at
+that moment, but the mutation and the audit act on a copy of the generated run,
+not on the chain. It records when the attack was mounted, not what the ledger
+did with it.
 
 Which attacks go live: only those with an on-chain gate that leaves no state
 behind when it refuses — `tamper-ballot-proof` (`cds`), `reused-nullifier`

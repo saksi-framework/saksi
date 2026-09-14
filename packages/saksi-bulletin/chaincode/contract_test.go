@@ -796,13 +796,13 @@ func TestSubmitPartialDecryptionRejectsUnknownContestOrTrustee(t *testing.T) {
 
 	badContest := validPartialDecryption()
 	badContest.ContestId = "contest-9"
-	if err := sc.SubmitPartialDecryption(ctx, "election-2026", mustMarshalPartial(t, badContest)); err == nil || !strings.Contains(err.Error(), "contest") {
+	if err := sc.SubmitPartialDecryption(ctx, "election-2026", mustMarshalPartial(t, badContest)); err == nil || !strings.HasPrefix(err.Error(), "gate=membership: contest") {
 		t.Fatalf("expected an unknown-contest error, got: %v", err)
 	}
 
 	badTrustee := validPartialDecryption()
 	badTrustee.TrusteeId = "t9"
-	if err := sc.SubmitPartialDecryption(ctx, "election-2026", mustMarshalPartial(t, badTrustee)); err == nil || !strings.Contains(err.Error(), "trustee") {
+	if err := sc.SubmitPartialDecryption(ctx, "election-2026", mustMarshalPartial(t, badTrustee)); err == nil || !strings.HasPrefix(err.Error(), "gate=membership: trustee") {
 		t.Fatalf("expected an unknown-trustee error, got: %v", err)
 	}
 }
@@ -1168,5 +1168,103 @@ func TestPublishTallyRejectsMissingDKGTranscript(t *testing.T) {
 func TestGetTallyMissingIsError(t *testing.T) {
 	if _, err := (&SmartContract{}).GetTally(newContext(), "election-2026"); err == nil {
 		t.Fatal("GetTally for an election with no tally should fail")
+	}
+}
+
+// gateIDOf is the "gate=<id>" prefix of a rejection, "<accepted>" for none, or
+// "<no gate>" when the error names no gate.
+func gateIDOf(err error) string {
+	if err == nil {
+		return "<accepted>"
+	}
+	s := err.Error()
+	if !strings.HasPrefix(s, "gate=") || !strings.Contains(s, ":") {
+		return "<no gate> " + s
+	}
+	return s[len("gate="):strings.Index(s, ":")]
+}
+
+// editBallotHex decodes, edits and re-encodes a hex ballot.
+func editBallotHex(t *testing.T, h string, fn func(*saksiprotocolv1.Ballot)) string {
+	t.Helper()
+	raw, err := hex.DecodeString(h)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var b saksiprotocolv1.Ballot
+	if err := proto.Unmarshal(raw, &b); err != nil {
+		t.Fatal(err)
+	}
+	fn(&b)
+	return mustMarshal(t, &b)
+}
+
+// TestLiveAttackMutationsMeetTheirDeclaredGateFirst runs the campaign
+// console's three live ballot attacks against the real gates, with a real
+// credential signature and a real CDS proof, and pins the gate each is refused
+// by. A PASS in negative-tests.csv means "refused by the declared gate", so
+// the declared gate must be the FIRST check each tampered ballot fails.
+//
+// The mutations are copies of saksi-campaign/scenarios.go tamperBallotProof,
+// reuseNullifier and corruptBallotWire (this module cannot import the
+// console); keep them in step.
+func TestLiveAttackMutationsMeetTheirDeclaredGateFirst(t *testing.T) {
+	tamperProof := func(b *saksiprotocolv1.Ballot) { b.WellFormednessProofs[0].Branches[0].Response[0] ^= 0x01 }
+
+	sc, ctx := &SmartContract{}, newContext()
+	withCDSElection(t, sc, ctx)
+	donorHex := mustMarshal(t, validCDSBallot(t))
+	if err := sc.SubmitBallot(ctx, donorHex); err != nil {
+		t.Fatalf("committing the donor ballot: %v", err)
+	}
+	// The unsent target carries a nullifier the chain has not seen.
+	targetHex := editBallotHex(t, donorHex, func(b *saksiprotocolv1.Ballot) {
+		b.CredentialPresentation.Nullifier.Value = defaultNullifier()
+	})
+	donor, err := hex.DecodeString(donorHex)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var donorBallot saksiprotocolv1.Ballot
+	if err := proto.Unmarshal(donor, &donorBallot); err != nil {
+		t.Fatal(err)
+	}
+
+	cases := []struct {
+		name, ballotHex, want string
+	}{
+		// reused-nullifier: the unsent ballot with the committed ballot's nullifier.
+		{"reused-nullifier", editBallotHex(t, targetHex, func(b *saksiprotocolv1.Ballot) {
+			b.CredentialPresentation.Nullifier.Value = donorBallot.CredentialPresentation.Nullifier.Value
+		}), "nullifier"},
+		// A ballot that fails BOTH the nullifier and the CDS check is refused
+		// at the nullifier gate: the order the verdict rules rely on.
+		{"nullifier before cds", editBallotHex(t, donorHex, tamperProof), "nullifier"},
+		// corrupted-ballot-bytes: the first tag gets the reserved wire type 7.
+		{"corrupted-ballot-bytes", func() string {
+			raw, _ := hex.DecodeString(targetHex)
+			raw[0] |= 0x07
+			return hex.EncodeToString(raw)
+		}(), "decode"},
+	}
+	for _, c := range cases {
+		if got := gateIDOf(sc.SubmitBallot(ctx, c.ballotHex)); got != c.want {
+			t.Errorf("%s: refused at %q, want %q", c.name, got, c.want)
+		}
+	}
+
+	// tamper-ballot-proof on an unsent, otherwise valid ballot reaches the CDS
+	// gate (a fresh ledger, so its nullifier is unspent).
+	sc2, ctx2 := &SmartContract{}, newContext()
+	withCDSElection(t, sc2, ctx2)
+	if got := gateIDOf(sc2.SubmitBallot(ctx2, editBallotHex(t, donorHex, tamperProof))); got != "cds" {
+		t.Errorf("tamper-ballot-proof on an unsent ballot: refused at %q, want cds", got)
+	}
+	// ...and after close it never gets there: the old post-lifecycle mount.
+	if err := sc2.CloseElection(ctx2, "election-2026"); err != nil {
+		t.Fatal(err)
+	}
+	if got := gateIDOf(sc2.SubmitBallot(ctx2, editBallotHex(t, donorHex, tamperProof))); got != "election-open" {
+		t.Errorf("tamper-ballot-proof after close: refused at %q, want election-open", got)
 	}
 }
