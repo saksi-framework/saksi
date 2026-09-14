@@ -102,6 +102,7 @@ var routeAccess = map[string]access{
 	"/api/login":        accessPublic,
 	"/api/logout":       accessPublic,
 	"/api/me":           accessPublic,
+	"/favicon.ico":      accessPublic,
 	// The wizard page is static and holds no data; it signs in through
 	// /api/login, and each route it then calls keeps its own role.
 	"/wizard": accessPublic,

@@ -176,6 +176,11 @@ func NewServer(store *RunStore, exec *Executor, hub *Hub, fabric FabricConfig, a
 	mux.HandleFunc("/api/campaigns", s.handleCampaigns)
 	mux.HandleFunc("/api/campaigns/", s.handleCampaign)
 	mux.HandleFunc("/api/network/reset", s.handleNetworkReset)
+	// Browsers ask for a favicon on every page; without this route the request
+	// falls through to "/" and, with auth on, logs a 401 on the public board.
+	mux.HandleFunc("/favicon.ico", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	})
 	mountWebDir(mux, os.Getenv("SAKSI_WEB_DIR"))
 	s.routes = mux.patterns
 	s.handler = s.guard(s.authorize(mux))

@@ -126,7 +126,7 @@ func TestRouteRolesWhenAuthOn(t *testing.T) {
 			{get, "/api/trail"}, {get, "/api/trail/r1"}, {get, "/api/capabilities"},
 			{get, "/api/ceremony/r1"}, {get, "/runs"}, {get, "/board/"}, {get, "/trustee/"},
 			{get, "/admin/"}, {get, "/admin"}, {post, "/api/login"}, {post, "/api/logout"},
-			{get, "/wizard"},
+			{get, "/wizard"}, {get, "/favicon.ico"},
 		}},
 		{"trustee or admin", 401, 0, 0, []probe{{post, "/ceremony/publish"}, {get, "/events"}}},
 		{"trustee, own shares", 401, 0, 403, []probe{{post, "/ceremony/submit"}}},
