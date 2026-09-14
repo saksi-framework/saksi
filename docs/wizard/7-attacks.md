@@ -70,18 +70,16 @@ makes the verdict mean something.
 Each is grounded in an existing auditor tamper test, so the offline auditor is
 independently proven to reject it.
 
-## Attack 4 does not run offline — on purpose
+## Attack 4 never runs: no gate exists
 
-`reordered-ballots` is a **chaincode-layer** attack. Ordering is enforced at
-endorsement, and the offline record carries no ordering for the offline auditor
-to check. Running it here would prove nothing, so the step shows the briefing and
-a neutral *"not run offline"* state instead of a verdict.
+`reordered-ballots` is checked by **nothing**. The chaincode stores ballots by
+nullifier with no ordering or digest check, and the stateless auditor recomputes
+the same tally and proofs in any order. The step shows the briefing and a neutral
+*"no gate"* state; the row is `SKIPPED` with `actual` = "no gate exists to test".
 
-Asserting it against the offline auditor would produce a **false FAIL** — a
-reported security failure that did not happen. Reporting it as PASS would be
-worse. It is shown rather than hidden because the boundary between the two
-verifiers is a real property of the design, and a panel is entitled to ask about
-it. It is exercised for real by the `fabric` CI job against a live network.
+Asserting it against the auditor would produce a **false FAIL**, and reporting it
+as PASS would claim a gate that does not exist. It is shown rather than hidden
+because the gap is real, and a panel is entitled to ask about it.
 
 ## Reading a FAIL
 

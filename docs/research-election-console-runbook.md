@@ -293,10 +293,11 @@ nothing about the selection.
   corrupted bytes, tampered partial-decryption, tampered DKG) — each proven
   rejected by the real auditor.
 - **Network-gated (needs a live Fabric network):** on-chain `Submit` + perf
-  numbers, and the `reordered-ballots` scenario (ordering is a ledger property the
-  stateless auditor does not check, so it is enforced by the chain, not
-  `audit-stream`). These are skipped/errored clearly when no network/driver is
-  present — never a silent hang.
+  numbers. These error clearly when no network/driver is present — never a
+  silent hang.
+- **Not checked anywhere:** `reordered-ballots`. Neither the chaincode (no
+  ordering or digest check) nor the stateless auditor checks ballot order, so the
+  scenario is always `SKIPPED` with "no gate exists to test".
 
 ## 8. Where the data lands
 

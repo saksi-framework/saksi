@@ -1145,15 +1145,15 @@ async function showAttack(i) {
     <div class="want"><div class="lab">What Saksi should do</div>${esc(a.expected)}</div>
     <div><div class="lab">Guarantee at stake</div>${esc(a.property)}</div>`;
 
-  // Chaincode-layer attacks are not detectable by the offline auditor at all,
-  // so running one here would prove nothing. Say where it IS caught instead.
+  // An attack no verifier checks is never run: a verdict would prove nothing.
+  // Say plainly that nothing catches it.
   if (a.layer === "chaincode") {
     $("atkVerdict").className = "pill warn";
-    $("atkVerdict").textContent = "not run offline";
-    $("atkRun").innerHTML = `<div class="note">This attack is rejected at <b>on-chain endorsement</b>,
-      not by the offline auditor — ordering is the chaincode's guarantee, and the offline record
-      carries no ordering to check. It is exercised by the <code>fabric</code> CI job against a live
-      network. Shown here so the boundary between the two verifiers is explicit rather than hidden.</div>`;
+    $("atkVerdict").textContent = "no gate";
+    $("atkRun").innerHTML = `<div class="note"><b>No gate exists to test.</b> Ballot ordering is not
+      checked on-chain (the chaincode stores ballots by nullifier, with no ordering or digest check)
+      and not by the stateless auditor, which recomputes the same tally in any order. Shown here so
+      the gap is on record rather than hidden.</div>`;
     $("atkRerun").style.display = "none";
     renderARail();
     return;

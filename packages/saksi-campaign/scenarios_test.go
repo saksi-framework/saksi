@@ -140,6 +140,28 @@ func TestScenariosRejectTheirMutations(t *testing.T) {
 	}
 }
 
+// Nothing checks ballot order: not the chaincode (ballots are keyed by
+// nullifier, no digest) and not the stateless auditor. The row must say so, and
+// must never be mounted, rather than claim a gate that does not exist.
+func TestReorderedBallotsClaimsNoGate(t *testing.T) {
+	var sc Scenario
+	for _, s := range Registry() {
+		if s.ID == "reordered-ballots" {
+			sc = s
+		}
+	}
+	if sc.ChainGate != "" || sc.AuditGate != "" || sc.LiveCapable() {
+		t.Fatalf("reordered-ballots declares a gate: %+v", sc)
+	}
+	if want := "no gate: ordering is not checked on-chain or by the stateless auditor"; sc.Expected != want {
+		t.Errorf("Expected = %q, want %q", sc.Expected, want)
+	}
+	res := testExec(t).runOneScenario(context.Background(), "run", t.TempDir(), sc)
+	if res.Verdict != "SKIPPED" || res.Actual != "no gate exists to test" {
+		t.Errorf("verdict/actual = %q/%q, want SKIPPED / no gate exists to test", res.Verdict, res.Actual)
+	}
+}
+
 func TestSelectScenariosFilters(t *testing.T) {
 	got := selectScenarios([]string{"dropped-ballot", "reordered-ballots"})
 	if len(got) != 2 {

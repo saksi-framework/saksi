@@ -34,7 +34,8 @@ type Layer int
 const (
 	// LayerOffline: rejected by the offline auditor (audit-stream).
 	LayerOffline Layer = iota
-	// LayerChaincode: only rejected at on-chain endorsement (network-gated).
+	// LayerChaincode: not rejected by the offline auditor. The only scenario
+	// here, reordered-ballots, is rejected by nothing: see its registry entry.
 	LayerChaincode
 )
 
@@ -137,8 +138,8 @@ type ScenarioResult struct {
 
 // Registry is the offline-detectable attack catalog. Each entry is grounded in
 // an existing auditor tamper test (independent_verification.rs / tests.rs), so
-// the offline auditor is proven to reject it. Endorsement-only attacks (e.g. a
-// ballot submitted after close) would be LayerChaincode and are network-gated.
+// the offline auditor is proven to reject it, except reordered-ballots, which
+// no verifier checks (LayerChaincode, always SKIPPED).
 func Registry() []Scenario {
 	return []Scenario{
 		{
@@ -190,13 +191,14 @@ func Registry() []Scenario {
 			},
 		},
 		{
-			// Ordering is a LEDGER property: the stateless auditor recomputes the
-			// same tally + proofs regardless of ballot order, so audit-stream does
-			// NOT reject a reorder (verified: it passed a reordered run). The chain's
-			// ledger digest binds order — hence LayerChaincode, network-gated.
+			// No gate checks ordering. The stateless auditor recomputes the same
+			// tally and proofs whatever the ballot order (verified: it passed a
+			// reordered run), and the chaincode keys ballots by nullifier with no
+			// ordering or digest check at all. The scenario stays in the catalogue
+			// so the gap is on record, and it is never mounted.
 			ID: "reordered-ballots", Stage: StageClose, Property: "ledger integrity (ordering)",
 			Layer: LayerChaincode, Action: "swap the first two ballot lines",
-			Expected: "chaincode rejects: ledger digest mismatch",
+			Expected: "no gate: ordering is not checked on-chain or by the stateless auditor",
 			Mutate: func(dir string) error {
 				lines, err := readBallotLines(dir)
 				if err != nil {
@@ -322,11 +324,11 @@ func (e *Executor) runOneScenario(ctx context.Context, runID, srcDir string, sc 
 		GateExpected: sc.AuditGate,
 	}
 
-	// Chaincode-only attacks are not offline-detectable — never assert them
-	// against the offline auditor (that would be a false FAIL).
+	// An attack no verifier checks is never mounted: asserting it against the
+	// auditor would be a false FAIL, and no network would change that.
 	if sc.Layer == LayerChaincode {
-		res.Verdict, res.Actual = "SKIPPED", "chaincode-only — requires a live Fabric network"
-		e.publish(runID, "scenarios", "info", sc.ID+": skipped (chaincode-only)")
+		res.Verdict, res.Actual = "SKIPPED", "no gate exists to test"
+		e.publish(runID, "scenarios", "info", sc.ID+": skipped (no gate exists to test)")
 		return res
 	}
 
