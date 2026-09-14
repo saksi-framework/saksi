@@ -17,20 +17,16 @@ import (
 	"golang.org/x/crypto/bcrypt"
 )
 
-// fixtureHashes maps each fixture password to its cost-12 hash, computed once
-// per test binary: the users file accepts only cost 12, and every such hash is
-// slow, more so under -race.
-var fixtureHashes = sync.OnceValue(func() map[string]string {
-	m := make(map[string]string)
-	for _, pw := range []string{"admin-pw", "t1-pw", "t2-pw"} {
-		h, err := bcrypt.GenerateFromPassword([]byte(pw), hashPasswordCost)
-		if err != nil {
-			panic(err)
-		}
-		m[pw] = string(h)
+// fixtureHashes maps each fixture password to a precomputed cost-12 hash: the
+// users file accepts only cost 12, and generating those takes seconds under
+// -race. The login tests fail if a hash stops matching its password.
+func fixtureHashes() map[string]string {
+	return map[string]string{
+		"admin-pw": "$2a$12$uZB8nfhHls0y5nuOU9MCQOgGIT11PZQQZOMIoSGEeXp/djLna9gnm",
+		"t1-pw":    "$2a$12$ky1Xf/1W8PnDgsrwppIhC.vci4svtER878hjE4LAjumTHwq19i7rS",
+		"t2-pw":    "$2a$12$bMQW4I6jg1z7RSfM/UA8B.xGwOXT38iKyURf21hz0kkPqiMAVruQ6",
 	}
-	return m
-})
+}
 
 // burst sends n identical logins at once.
 func burst(h http.Handler, n int, remote, username, password string) []*httptest.ResponseRecorder {
@@ -352,7 +348,7 @@ func TestLoginLockoutTreatsUnknownUsersLikeKnownOnes(t *testing.T) {
 // address without a record of its own.
 func TestLoginPerAddressCapTripsAt50(t *testing.T) {
 	s, h := authServer(t)
-	const ip = "127.0.0.1"
+	const ip = "192.0.2.7"
 	// 49 failures across 49 names, settled directly: through HTTP each one
 	// would cost a cost-12 bcrypt compare.
 	for i := 0; i < 49; i++ {
@@ -377,6 +373,35 @@ func TestLoginPerAddressCapTripsAt50(t *testing.T) {
 	}
 	if _, ok := s.auth.attempt("192.0.2.9", "admin"); !ok {
 		t.Fatal("another address must not be capped")
+	}
+}
+
+// A local process can use any loopback address as its source, so every
+// loopback alias shares one lockout budget: per username and per address.
+func TestLoginLockoutTreatsEveryLoopbackAddressAsOne(t *testing.T) {
+	s, h := authServer(t)
+	burst(h, 5, "127.0.0.1:1000", "t2", "typo")
+	for _, alias := range []string{"127.0.0.2:1000", "[::1]:1000"} {
+		if rec := login(h, alias, "t2", "t2-pw"); rec.Code != http.StatusTooManyRequests {
+			t.Fatalf("t2 locked from 127.0.0.1, then from %s: want 429, got %d", alias, rec.Code)
+		}
+	}
+
+	// 5 failures so far on the shared address; 45 more across the aliases (settled
+	// directly, keyed exactly as the handler keys them) reach the cap of 50.
+	aliases := []string{"127.0.0.1:2000", "127.0.0.2:2000", "[::1]:2000"}
+	for i := 0; i < 45; i++ {
+		ip := remoteIP(&http.Request{RemoteAddr: aliases[i%len(aliases)]})
+		user := fmt.Sprintf("user%d", i)
+		if _, ok := s.auth.attempt(ip, user); !ok {
+			t.Fatalf("failure %d refused before the cap", i+6)
+		}
+		s.auth.settle(ip, user, false)
+	}
+	for _, alias := range aliases {
+		if rec := login(h, alias, "admin", "admin-pw"); rec.Code != http.StatusTooManyRequests {
+			t.Fatalf("admin from %s after 50 loopback failures: want 429, got %d", alias, rec.Code)
+		}
 	}
 }
 

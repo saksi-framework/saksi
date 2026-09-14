@@ -493,7 +493,8 @@ func (s *Server) handleExport(w http.ResponseWriter, r *http.Request) {
 
 // handleTrailAPI serves the on-chain audit trail for an election (== run id).
 // Sealed until the tally is published (buildTrail's gate), unless the caller
-// passes ?operator=1 from a loopback address.
+// passes ?operator=1 from a loopback address and, when auth is on, holds an
+// admin session.
 func (s *Server) handleTrailAPI(w http.ResponseWriter, r *http.Request) {
 	electionID := strings.TrimPrefix(r.URL.Path, "/api/trail/")
 	if electionID == "" {

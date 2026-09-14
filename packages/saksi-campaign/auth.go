@@ -155,8 +155,10 @@ func (a access) denial(sess *session) (int, string) {
 
 // routeMux is a ServeMux that remembers the patterns registered on it, so a
 // test can prove every route has an entry in routeAccess. The ServeMux is a
-// named field, not embedded, so no registration can reach it without being
-// recorded.
+// named field, not embedded, so no registration bypasses the recording by
+// accident (code in this package could still call m.mux.HandleFunc on
+// purpose; such a route would not be in the test's list, and authorize would
+// still treat it as admin-only, the zero value of access).
 type routeMux struct {
 	mux      *http.ServeMux
 	patterns []string
@@ -482,10 +484,16 @@ func (a *authState) settle(ip, user string, success bool) {
 	lockAt(a.userFails[key], maxLoginFailures)
 }
 
+// remoteIP is the lockout key for the caller's address. Every loopback address
+// (127.0.0.0/8, ::1) is one key: a local process can use any of them as its
+// source, and separate keys would hand it a fresh budget per alias.
 func remoteIP(r *http.Request) string {
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
-		return r.RemoteAddr
+		host = r.RemoteAddr
+	}
+	if ip := net.ParseIP(host); ip != nil && ip.IsLoopback() {
+		return "loopback"
 	}
 	return host
 }
