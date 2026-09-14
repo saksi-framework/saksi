@@ -69,9 +69,9 @@ offline (no network) or on-chain (live Fabric).
 ## Facts you'll need while helping me
 
 - **Offline vs network-gated**: Generate/Verify + 6 of 7 scenarios work fully
-  offline. On-chain `Submit` + perf numbers + the `reordered-ballots` scenario
-  need a live Fabric network (ordering is a *ledger* property the stateless
-  auditor doesn't check — so it's chaincode-layer, network-gated, not a bug).
+  offline. On-chain `Submit` + perf numbers need a live Fabric network. The
+  `reordered-ballots` scenario never runs anywhere: ordering is not checked
+  on-chain or by the stateless auditor, so there is no gate to test.
 - **Offline scale ceiling**: the console caps offline voters at 10,000 (offline
   generation isn't parallelized). Bigger tiers (50k/483k/1M) are on-chain/perf
   mode only.

@@ -811,7 +811,18 @@ func TestSubmitPathPausesAtCeremonyBeforePublishTally(t *testing.T) {
 	dir := t.TempDir()
 	runDir := filepath.Join(dir, "run-1")
 	e := newTestExecutor(t, dir)
-	path := attackRun(t, runDir, 4)
+	attackRun(t, runDir, 4)
+	// A bundle with partial decryptions, so the pause's place between the
+	// last partial and PublishTally is observable.
+	path := filepath.Join(runDir, "bundle.json")
+	raw, err := json.Marshal(onChainBundle{ElectionID: "run-1", Params: "aa", DKG: "bb", Tally: "tt",
+		BallotsFile: BallotsFile, BallotCount: 4, PartialDecryptions: []string{"p0", "p1"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, raw, 0o644); err != nil {
+		t.Fatal(err)
+	}
 	led := newGatedLedger()
 	c := ElectionConfig{Mode: "onchain", Voters: 4, Positions: 1, Candidates: 2, Concurrency: 2,
 		AttackPlan: &AttackPlan{Stages: []string{StageCeremony}}}
@@ -819,9 +830,12 @@ func TestSubmitPathPausesAtCeremonyBeforePublishTally(t *testing.T) {
 	done := make(chan error, 1)
 	go func() { done <- e.submitOnChain(context.Background(), "run-1", c, led, path) }()
 	v := waitPause(t, e, "run-1", StageCeremony, done)
-	calls := led.callNames()
-	if calls[len(calls)-1] != "CloseElection" || slices.Contains(calls, "PublishTally") {
-		t.Fatalf("at the ceremony pause the chain has seen %v; want everything up to the partials and no PublishTally", calls)
+	atPause := led.callNames()
+	if last := atPause[len(atPause)-1]; last != "SubmitPartialDecryption" || slices.Contains(atPause, "PublishTally") {
+		t.Fatalf("at the ceremony pause the chain has seen %v; want the last call to be SubmitPartialDecryption and no PublishTally", atPause)
+	}
+	if n := strings.Count(strings.Join(atPause, ","), "SubmitPartialDecryption"); n != 2 {
+		t.Errorf("partials committed before the pause = %d, want both", n)
 	}
 	if v.Mount.ElectionStatus != "closed" || v.Mount.BallotsCommitted == nil || *v.Mount.BallotsCommitted != 4 {
 		t.Errorf("ceremony mount context = %+v", v.Mount)
@@ -832,8 +846,8 @@ func TestSubmitPathPausesAtCeremonyBeforePublishTally(t *testing.T) {
 	if err := <-done; err != nil {
 		t.Fatal(err)
 	}
-	if calls := led.callNames(); calls[len(calls)-1] != "PublishTally" {
-		t.Errorf("after the pause the lifecycle ended with %v, want PublishTally", calls)
+	if after := led.callNames()[len(atPause):]; len(after) == 0 || after[0] != "PublishTally" {
+		t.Errorf("first ledger calls after the pause = %v, want PublishTally", after)
 	}
 }
 
@@ -918,6 +932,57 @@ func TestCatalogueSummaryClaimsAllUpheldOnlyWhenEveryMountedOnePassed(t *testing
 		if !strings.HasPrefix(last.Msg, tc.want) {
 			t.Errorf("summary = %q, want it to start %q", last.Msg, tc.want)
 		}
+	}
+
+	// Nothing mounted (reordered-ballots alone is always SKIPPED): claiming
+	// every property upheld would be vacuous.
+	store := NewRunStore(t.TempDir())
+	runID, dir, err := store.Create(good(), time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	attackRun(t, dir, 3)
+	hub := NewHub()
+	e := NewExecutor(store, hub, "saksi-demo", "", FabricConfig{})
+	ch, cancel := hub.Subscribe(runID)
+	if err := e.RunScenarios(context.Background(), runID, []string{"reordered-ballots"}); err != nil {
+		t.Fatal(err)
+	}
+	cancel()
+	for ev := range ch {
+		if ev.Phase == "scenarios" && ev.Level == "done" && ev.Msg != "no scenario was mounted, so no security property was tested" {
+			t.Errorf("summary with nothing mounted = %q", ev.Msg)
+		}
+	}
+}
+
+// An offline /run-all never reaches a pause, so an attack plan there would be
+// silently ignored on a run still marked security_run: refused with a pointer
+// to the step-by-step ceremony. The same plan stays valid for that flow, and
+// run-all without a plan is untouched.
+func TestOfflineRunAllRefusesAnAttackPlan(t *testing.T) {
+	_, h, _ := testServer(t, nil)
+	c := good()
+	c.AttackPlan = &AttackPlan{Stages: []string{StageDKG}}
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, postJSON("/run-all", c))
+	if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "step-by-step ceremony") {
+		t.Fatalf("offline /run-all with a plan = %d %q, want 400 pointing at the step-by-step ceremony", rec.Code, rec.Body)
+	}
+	if err := c.Validate(); err != nil {
+		t.Errorf("the offline plan must stay valid for the step-by-step flow: %v", err)
+	}
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, postJSON("/generate", c))
+	if rec.Code != http.StatusAccepted {
+		t.Errorf("/generate with an offline plan = %d, want 202", rec.Code)
+	}
+	c.AttackPlan = nil
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, postJSON("/run-all", c))
+	if rec.Code != http.StatusAccepted {
+		t.Errorf("offline /run-all without a plan = %d, want 202", rec.Code)
 	}
 }
 

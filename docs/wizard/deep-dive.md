@@ -331,10 +331,13 @@ clean — a real finding about the system.
 `negative-tests.csv` is regenerated in full from it. Running attacks one at a
 time therefore still leaves a complete export.
 
-**One attack does not run offline.** `reordered-ballots` is `LayerChaincode`:
-ordering is enforced at endorsement and the offline record carries no ordering
-to check. Asserting it against the offline auditor would produce a false FAIL.
-It is shown and labelled rather than hidden.
+**One attack never runs: no gate exists.** `reordered-ballots` is checked by
+nothing. Ordering is not checked on-chain (the chaincode stores ballots by
+nullifier, with no ordering or digest check) or by the stateless auditor, which
+recomputes the same tally and proofs in any order. Asserting it against the
+auditor would produce a false FAIL, and reporting it as PASS would claim a gate
+that does not exist, so the row is `SKIPPED` with "no gate exists to test". It
+is shown and labelled rather than hidden.
 
 ---
 
@@ -346,7 +349,7 @@ It is shown and labelled rather than hidden.
 | No double voting | per-position nullifier | 4, 7 |
 | Data completeness | the console's gate (`RunCheck`) | 3 |
 | Threshold *t*-of-*n* | the **auditor**, at verification time | 5, 6 |
-| Ledger ordering | the **chaincode**, at endorsement | 7 |
+| Ledger ordering | not checked (no gate) | 7 |
 | Tally correctness | `E = 0` | 6 |
 
 The two italicised rows are the awkward ones, and both are stated in the UI

@@ -324,6 +324,8 @@ func (e *Executor) RunScenarios(ctx context.Context, runID string, list []string
 	case fails > 0:
 		e.publish(runID, "scenarios", "error",
 			fmt.Sprintf("%d scenario(s) FAILED — a gate that should have rejected did not", fails))
+	case mounted == 0:
+		e.publish(runID, "scenarios", "done", "no scenario was mounted, so no security property was tested")
 	case passes == mounted:
 		e.publish(runID, "scenarios", "done", "all scenarios upheld their security property")
 	default:

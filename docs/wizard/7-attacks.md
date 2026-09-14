@@ -62,7 +62,7 @@ makes the verdict mean something.
 | 1 | `tamper-ballot-proof` | ballot well-formedness (CDS proof) | offline |
 | 2 | `reused-nullifier` | no double voting (per-position nullifier) | offline |
 | 3 | `dropped-ballot` | ballot-box completeness | offline |
-| 4 | `reordered-ballots` | ledger integrity (ordering) | **chaincode** |
+| 4 | `reordered-ballots` | ledger integrity (ordering) | **none** (no gate; recorded as `layer=chaincode`, never mounted) |
 | 5 | `corrupted-ballot-bytes` | wire integrity | offline |
 | 6 | `tamper-partial-decryption` | threshold-decryption integrity | offline |
 | 7 | `tamper-dkg-transcript` | DKG transcript integrity | offline |
@@ -164,8 +164,8 @@ caller authorization); caught by the auditor". That gap is a real weakness: any
 channel client can publish a transcript or a share before the real one, which
 is then refused as a duplicate. See the runbook's attack findings.
 
-`reordered-ballots` stays `SKIPPED`: ordering is a ledger property no single
-submission and no stateless audit expresses.
+`reordered-ballots` stays `SKIPPED`: no gate checks ordering, on-chain or in
+the stateless audit.
 
 ### Skipping
 
