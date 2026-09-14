@@ -138,6 +138,38 @@ pub struct StreamAudit {
     /// pre-existing v1 document without it still parses.
     #[serde(default)]
     pub timings_ms: TimingsMs,
+    /// Every Fatal check that failed, once per check id, in evaluation order,
+    /// with the first failure's detail. The ids are the stable
+    /// [`crate::AuditFinding::check`] names, so a caller can say WHICH gate
+    /// rejected a run instead of only that one did. Empty on a clean audit;
+    /// absent (read as empty) from older documents.
+    #[serde(default)]
+    pub failed_checks: Vec<FailedCheck>,
+}
+
+/// One failed audit check as `audit-stream --json` reports it.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct FailedCheck {
+    /// Stable check id, e.g. `"ballot.cds_proof"`.
+    pub check: String,
+    /// Detail of the first failure recorded under this id.
+    pub detail: String,
+}
+
+/// The failed Fatal checks of `report`, deduplicated by id (a check that fails
+/// for many ballots fails once per ballot; the id is what matters).
+fn failed_checks(report: &AuditReport) -> Vec<FailedCheck> {
+    let mut seen = std::collections::HashSet::new();
+    report
+        .findings
+        .iter()
+        .filter(|f| f.status == AuditStatus::Fail && f.severity == crate::Severity::Fatal)
+        .filter(|f| seen.insert(f.check))
+        .map(|f| FailedCheck {
+            check: f.check.to_string(),
+            detail: f.detail.clone(),
+        })
+        .collect()
 }
 
 impl StreamAudit {
@@ -608,6 +640,7 @@ pub(crate) fn audit_stream_dir_full(
             overall: if overall_pass { "pass" } else { "fail" }.to_string(),
             contests,
             timings_ms: timings.into(),
+            failed_checks: failed_checks(&report),
         },
         report,
     ))
@@ -702,6 +735,10 @@ mod tests {
                 .all(|c| c.e == 0 && c.decoded == c.ground_truth && c.pass),
             "clean run: every contest E=0 and pass: {sa:#?}"
         );
+        assert!(
+            sa.failed_checks.is_empty(),
+            "clean run names no failed check: {sa:#?}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -725,6 +762,13 @@ mod tests {
         assert!(
             sa.contests.iter().any(|c| c.e != 0 && !c.pass),
             "a tampered contest must report E != 0 and pass = false: {sa:#?}"
+        );
+        // The failing gate is named, once, by its stable id.
+        let ids: Vec<&str> = sa.failed_checks.iter().map(|f| f.check.as_str()).collect();
+        assert_eq!(
+            ids.iter().filter(|c| **c == "tally.accuracy").count(),
+            1,
+            "{ids:?}"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
