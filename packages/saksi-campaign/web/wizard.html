@@ -44,7 +44,7 @@
          -webkit-font-smoothing:antialiased }
   .tnum { font-variant-numeric:tabular-nums }
 
-  header { display:flex; align-items:center; gap:12px; padding:16px 28px; border-bottom:1px solid var(--line) }
+  header { display:flex; align-items:center; flex-wrap:wrap; gap:8px 12px; padding:16px 28px; border-bottom:1px solid var(--line) }
   header h1 { font-size:15px; margin:0; font-weight:650; letter-spacing:-.01em }
   .sub { color:var(--muted); font-size:12px }
   .tag { margin-left:auto; font-size:11px; text-transform:uppercase; letter-spacing:.06em;
@@ -2173,8 +2173,8 @@ async function runAction(id, action, btn) {
   btn.disabled = true;
   $("rlNote").textContent = "";
   $("rlErr").textContent = "";
-  // Subscribed before the POST: the hub does not replay, and a failed close
-  // after the resume's submissions is reported only as an event.
+  // Subscribed, and connected, before the POST: the hub does not replay, and a
+  // failed connect or close is reported only as an event.
   const errors = [];
   let ev = null;
   try {
@@ -2185,6 +2185,7 @@ async function runAction(id, action, btn) {
         if (e.level === "error") { errors.push(e.msg); $("rlErr").textContent = errors.join(" · "); }
       } catch (_) {}
     };
+    await new Promise((resolve) => { ev.onopen = resolve; ev.onerror = resolve; setTimeout(resolve, 3000); });
   } catch (_) {}
   let r;
   try { r = await post(`/api/runs/${encodeURIComponent(id)}/${action}`, {}, "rlErr"); }
