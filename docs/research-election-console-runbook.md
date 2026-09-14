@@ -592,9 +592,15 @@ generate → check → submit → ceremony → verify. `summary.csv` is written 
 the **measured** repetitions only: per numeric `perf.csv` column, one row of
 `min,median,mean,p95,p99,stddev,n`, plus `runs_measured`, `runs_failed`,
 `failure_rate` and `failed_reasons`. A run that failed — per `run.end`'s
-`failed` flag: a stage error, any drop, a reconcile mismatch, a non-zero `E`, or
-an interruption — is excluded from every throughput and latency statistic and
-counted in the failure rate instead.
+`failed` flag: a stage error, an on-chain run that put no ballot on the chain
+(`nothing_submitted`), any drop, a reconcile mismatch, a non-zero `E`, or an
+interruption — is excluded from every throughput and latency statistic and
+counted in the failure rate instead. A submit or ceremony-start stage that
+fails (a bundle or Fabric connect error, a lifecycle step, an unreadable ballot
+stream) is stamped `stage.submit.end` / `stage.ceremony.end` with `ok: false`,
+and the next verify records it as `stage_error: submit: …` or
+`stage_error: ceremony: …`; a later successful start, or a resume that closes
+the election, supersedes it.
 
 `--sweep k` runs time-bounded windows (`--window`, default 120 s) at a target
 send rate multiplied by `k` each step, sizing each step's concurrency from the

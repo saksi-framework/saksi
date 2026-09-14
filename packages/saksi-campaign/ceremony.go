@@ -242,15 +242,18 @@ func (e *Executor) useLedger(runID string, c ElectionConfig) (bool, error) {
 	return false, nil
 }
 
-func (e *Executor) CeremonyStart(ctx context.Context, runID string, c ElectionConfig) error {
+// CeremonyStart stamps every return, a bundle failure included, as
+// stage.ceremony.end with its outcome: that is what carries a failed start to
+// run.end (ballotStageErr).
+func (e *Executor) CeremonyStart(ctx context.Context, runID string, c ElectionConfig) (err error) {
 	j := e.journalFor(runID)
 	defer j.Close()
+	defer func() { _ = j.Stamp("stage.ceremony.end", stageEnd(err)) }()
 	path, err := e.generateBundle(runID)
 	if err != nil {
-		return err
+		return fmt.Errorf("bundle: %w", err)
 	}
 	_ = j.Stamp("stage.ceremony.start", nil)
-	defer func() { _ = j.Stamp("stage.ceremony.end", nil) }()
 	onChain, err := e.useLedger(runID, c)
 	if err != nil {
 		return err
@@ -270,19 +273,19 @@ func (e *Executor) CeremonyStart(ctx context.Context, runID string, c ElectionCo
 			"local ceremony ready — no ledger; the threshold gate is enforced by this console")
 		return e.writeCeremony(runID, c, nil)
 	}
-	conn, err := e.fabric.Connect()
+	led, closeLedger, err := e.openLedger()
 	if err != nil {
 		e.publish(runID, "ceremony", "error", "connect to Fabric: "+err.Error())
-		return err
+		return fmt.Errorf("connect to Fabric: %w", err)
 	}
-	defer conn.Close()
+	defer closeLedger()
 
-	b, step, err := e.lifecycle(runID, conn.Ledger(), path, "ceremony")
+	b, step, err := e.lifecycle(runID, led, path, "ceremony")
 	if err != nil {
 		return err
 	}
 	defer e.closeReceipts(runID)
-	if err := e.setupOnChain(ctx, runID, c, b, conn.Ledger(), step); err != nil {
+	if err := e.setupOnChain(ctx, runID, c, b, led, step); err != nil {
 		return err
 	}
 	e.publish(runID, "ceremony", "done", "election closed — trustees may now contribute")

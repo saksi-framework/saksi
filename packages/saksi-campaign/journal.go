@@ -483,7 +483,10 @@ type FinaliseInput struct {
 	ReconcileErr error
 	EByContest   map[string]int64
 	StageErr     error
-	Interrupted  bool
+	// NothingSubmitted reports an on-chain run that expected ballots and put
+	// none on the chain: no window was recorded, or it dispatched nothing.
+	NothingSubmitted bool
+	Interrupted      bool
 	// Bounded reports that the ballot window closed because it reached its own
 	// time bound (bench.RunOpts.MaxDuration), not because anything went wrong:
 	// a sweep step is a fixed slice of wall clock at a fixed offered rate, and
@@ -531,9 +534,10 @@ type FinaliseResult struct {
 	Sustained    bool
 }
 
-// runFailed implements the failed-run predicate: stage error, or any ballot
-// dropped, or a reconcile mismatch, or a nonzero E for any contest, or the
-// run was interrupted. Reason is the first clause that fired, in that order.
+// runFailed implements the failed-run predicate: stage error, or an on-chain
+// run that submitted nothing, or any ballot dropped, or a reconcile mismatch,
+// or a nonzero E for any contest, or the run was interrupted. Reason is the
+// first clause that fired, in that order.
 //
 // A BOUNDED window is the one stop that is not an interruption — see
 // FinaliseInput.Bounded. Its reconcile clause is decided by the caller
@@ -542,6 +546,9 @@ type FinaliseResult struct {
 func runFailed(f FinaliseInput) (bool, string) {
 	if f.StageErr != nil {
 		return true, "stage_error: " + f.StageErr.Error()
+	}
+	if f.NothingSubmitted {
+		return true, "nothing_submitted"
 	}
 	if f.Dropped > 0 {
 		return true, fmt.Sprintf("dropped: %d", f.Dropped)
