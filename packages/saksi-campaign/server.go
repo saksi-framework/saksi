@@ -12,6 +12,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -124,7 +125,7 @@ func NewServer(store *RunStore, exec *Executor, hub *Hub, fabric FabricConfig, a
 	for _, h := range allowHosts {
 		s.allowHosts[h] = true
 	}
-	mux := &routeMux{ServeMux: http.NewServeMux()}
+	mux := &routeMux{mux: http.NewServeMux()}
 	mux.HandleFunc("/", s.handleIndex)
 	mux.HandleFunc("/generate", s.handleGenerate)
 	mux.HandleFunc("/submit", s.handleSubmit)
@@ -505,6 +506,14 @@ func (s *Server) handleTrailAPI(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	operator := r.URL.Query().Get("operator") == "1" && isLoopback(r.RemoteAddr)
+	// With auth on, loopback alone is not enough: every SSH-tunnel user and any
+	// local process arrives as loopback. The unsealed view needs an admin
+	// session; anyone else falls back to the sealed view without an error, as a
+	// non-loopback caller always has.
+	if s.auth != nil {
+		sess := sessionFrom(r)
+		operator = operator && sess != nil && sess.Role == RoleAdmin
+	}
 
 	reader, led, err := s.dial()
 	if err != nil {
@@ -715,6 +724,14 @@ func (s *Server) handleCeremonyPublish(w http.ResponseWriter, r *http.Request) {
 	state, err := s.exec.CeremonyStatus(rec.RunID, rec.Config)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	// A trustee may publish only an election they are a trustee of. (Auth off,
+	// or an admin: no session trustee to check.)
+	if sess := sessionFrom(r); sess != nil && sess.Role == RoleTrustee &&
+		!slices.ContainsFunc(state.Trustees, func(t CeremonyTrustee) bool { return t.ID == sess.TrusteeID }) {
+		writeJSONResp(w, http.StatusForbidden, map[string]string{"error": fmt.Sprintf(
+			"trustee %q is not a trustee of this election", sess.TrusteeID)})
 		return
 	}
 	if !state.Unlocked {

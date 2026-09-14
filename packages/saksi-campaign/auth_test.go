@@ -3,11 +3,13 @@ package campaign
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -15,13 +17,34 @@ import (
 	"golang.org/x/crypto/bcrypt"
 )
 
-func mustHash(t *testing.T, pw string) string {
-	t.Helper()
-	h, err := bcrypt.GenerateFromPassword([]byte(pw), bcrypt.MinCost)
-	if err != nil {
-		t.Fatal(err)
+// fixtureHashes maps each fixture password to its cost-12 hash, computed once
+// per test binary: the users file accepts only cost 12, and every such hash is
+// slow, more so under -race.
+var fixtureHashes = sync.OnceValue(func() map[string]string {
+	m := make(map[string]string)
+	for _, pw := range []string{"admin-pw", "t1-pw", "t2-pw"} {
+		h, err := bcrypt.GenerateFromPassword([]byte(pw), hashPasswordCost)
+		if err != nil {
+			panic(err)
+		}
+		m[pw] = string(h)
 	}
-	return string(h)
+	return m
+})
+
+// burst sends n identical logins at once.
+func burst(h http.Handler, n int, remote, username, password string) []*httptest.ResponseRecorder {
+	recs := make([]*httptest.ResponseRecorder, n)
+	var wg sync.WaitGroup
+	for i := range recs {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			recs[i] = login(h, remote, username, password)
+		}()
+	}
+	wg.Wait()
+	return recs
 }
 
 // authServer is a console with auth on (through EnableAuth and a real users
@@ -41,9 +64,9 @@ func authServer(t *testing.T) (*Server, http.Handler) {
 	s.dial = func() (chainReader, clientsdk.Ledger, error) { return nil, nil, errors.New("offline") }
 
 	users := []User{
-		{Username: "admin", Role: RoleAdmin, PasswordBcrypt: mustHash(t, "admin-pw")},
-		{Username: "t1", Role: RoleTrustee, TrusteeID: "1", PasswordBcrypt: mustHash(t, "t1-pw")},
-		{Username: "t2", Role: RoleTrustee, TrusteeID: "2", PasswordBcrypt: mustHash(t, "t2-pw")},
+		{Username: "admin", Role: RoleAdmin, PasswordBcrypt: fixtureHashes()["admin-pw"]},
+		{Username: "t1", Role: RoleTrustee, TrusteeID: "1", PasswordBcrypt: fixtureHashes()["t1-pw"]},
+		{Username: "t2", Role: RoleTrustee, TrusteeID: "2", PasswordBcrypt: fixtureHashes()["t2-pw"]},
 	}
 	data, _ := json.Marshal(users)
 	path := filepath.Join(t.TempDir(), "users.json")
@@ -263,14 +286,18 @@ func TestLoginLocksOutAfterFiveFailures(t *testing.T) {
 	s.auth.now = func() time.Time { return now }
 	const ip = "192.0.2.3:1000"
 
-	for i := 1; i <= 5; i++ {
-		if rec := login(h, ip, "admin", "wrong"); rec.Code != http.StatusUnauthorized {
-			t.Fatalf("failure %d: want 401, got %d", i, rec.Code)
-		}
+	// Eight guesses at once: exactly five are checked, the rest refused, so
+	// concurrency cannot overrun the limit while bcrypt runs.
+	codes := map[int]int{}
+	for _, rec := range burst(h, 8, ip, "admin", "wrong") {
+		codes[rec.Code]++
+	}
+	if codes[http.StatusUnauthorized] != 5 || codes[http.StatusTooManyRequests] != 3 {
+		t.Fatalf("8 concurrent guesses: want 5x401 and 3x429, got %v", codes)
 	}
 	rec := login(h, ip, "admin", "admin-pw")
 	if rec.Code != http.StatusTooManyRequests || rec.Header().Get("Retry-After") != "30" {
-		t.Fatalf("sixth attempt, correct password: want 429 Retry-After 30, got %d %q", rec.Code, rec.Header().Get("Retry-After"))
+		t.Fatalf("correct password while locked: want 429 Retry-After 30, got %d %q", rec.Code, rec.Header().Get("Retry-After"))
 	}
 	if rec := login(h, "198.51.100.9:1000", "admin", "admin-pw"); rec.Code != http.StatusNoContent {
 		t.Fatalf("another address must not be locked out, got %d", rec.Code)
@@ -279,19 +306,164 @@ func TestLoginLocksOutAfterFiveFailures(t *testing.T) {
 	if rec := login(h, ip, "admin", "admin-pw"); rec.Code != http.StatusNoContent {
 		t.Fatalf("after the 30 s lockout: want 204, got %d %s", rec.Code, rec.Body)
 	}
+}
 
-	// A success of one's own does not wipe earlier failures, so a trustee
-	// cannot reset the counter between guesses at the admin password.
-	const insider = "192.0.2.4:1000"
-	for i := 0; i < 4; i++ {
-		login(h, insider, "admin", "guess")
+// Everyone on loopback shares one address, so a lockout keyed by address alone
+// let one trustee's typos lock the admin out.
+func TestLoginLockoutIsPerUsername(t *testing.T) {
+	_, h := authServer(t)
+	const ip = "127.0.0.1:1000"
+	burst(h, 5, ip, "t2", "typo")
+	if rec := login(h, ip, "admin", "admin-pw"); rec.Code != http.StatusNoContent {
+		t.Fatalf("t2's typos must not lock admin out: got %d %s", rec.Code, rec.Body)
 	}
-	if rec := login(h, insider, "t1", "t1-pw"); rec.Code != http.StatusNoContent {
-		t.Fatalf("insider's own login: want 204, got %d", rec.Code)
+	if rec := login(h, ip, "t2", "t2-pw"); rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("t2 itself should be locked: got %d", rec.Code)
 	}
-	login(h, insider, "admin", "guess")
-	if rec := login(h, insider, "admin", "admin-pw"); rec.Code != http.StatusTooManyRequests {
-		t.Fatalf("fifth failure after an interleaved success must lock out, got %d", rec.Code)
+}
+
+// The lockout is keyed on the submitted name and never on whether it exists,
+// so neither the 401s nor the 429 tell a real account from an unknown one.
+func TestLoginLockoutTreatsUnknownUsersLikeKnownOnes(t *testing.T) {
+	s, h := authServer(t)
+	now := time.Now()
+	s.auth.now = func() time.Time { return now }
+	const ip = "127.0.0.1:2000"
+	for _, user := range []string{"admin", "mallory"} {
+		for _, rec := range burst(h, 5, ip, user, "wrong") {
+			if rec.Code != http.StatusUnauthorized || strings.TrimSpace(rec.Body.String()) != `{"error":"invalid credentials"}` {
+				t.Fatalf("%s guess: got %d %s", user, rec.Code, rec.Body)
+			}
+		}
+	}
+	known, unknown := login(h, ip, "admin", "admin-pw"), login(h, ip, "mallory", "x")
+	if known.Code != http.StatusTooManyRequests || unknown.Code != known.Code ||
+		unknown.Body.String() != known.Body.String() ||
+		unknown.Header().Get("Retry-After") != known.Header().Get("Retry-After") {
+		t.Fatalf("locked known vs unknown differ: %d %q %q vs %d %q %q",
+			known.Code, known.Body, known.Header().Get("Retry-After"),
+			unknown.Code, unknown.Body, unknown.Header().Get("Retry-After"))
+	}
+}
+
+// Fifty failures from one address across any usernames lock the address. The
+// cap is checked before the per-username record, so it also bounds how many
+// records one address can create, and an over-long username counts against the
+// address without a record of its own.
+func TestLoginPerAddressCapTripsAt50(t *testing.T) {
+	s, h := authServer(t)
+	const ip = "127.0.0.1"
+	// 49 failures across 49 names, settled directly: through HTTP each one
+	// would cost a cost-12 bcrypt compare.
+	for i := 0; i < 49; i++ {
+		user := fmt.Sprintf("user%d", i)
+		if _, ok := s.auth.attempt(ip, user); !ok {
+			t.Fatalf("attempt %d refused before the cap", i+1)
+		}
+		s.auth.settle(ip, user, false)
+	}
+	long := strings.Repeat("x", maxUsernameBytes+1)
+	if rec := login(h, ip+":3000", long, "x"); rec.Code != http.StatusUnauthorized ||
+		strings.TrimSpace(rec.Body.String()) != `{"error":"invalid credentials"}` {
+		t.Fatalf("over-long username: want the usual 401, got %d %s", rec.Code, rec.Body)
+	}
+	for _, user := range []string{"admin", "someone-new"} {
+		if rec := login(h, ip+":3000", user, "admin-pw"); rec.Code != http.StatusTooManyRequests {
+			t.Fatalf("%s after 50 failures from the address: want 429, got %d", user, rec.Code)
+		}
+	}
+	if n := len(s.auth.userFails); n != 49 {
+		t.Fatalf("want 49 per-username records (none for the long name, none once capped), got %d", n)
+	}
+	if _, ok := s.auth.attempt("192.0.2.9", "admin"); !ok {
+		t.Fatal("another address must not be capped")
+	}
+}
+
+// A success clears its own (address, username) record only. The address keeps
+// its failures, so a trustee cannot launder guesses at the admin password with
+// logins of its own.
+func TestLoginSuccessResetsOnlyItsOwnKey(t *testing.T) {
+	s, _ := authServer(t)
+	a := s.auth
+	const ip = "127.0.0.1"
+	fail := func(user string, n int) {
+		t.Helper()
+		for i := 0; i < n; i++ {
+			if _, ok := a.attempt(ip, user); !ok {
+				t.Fatalf("%s attempt refused", user)
+			}
+			a.settle(ip, user, false)
+		}
+	}
+	fail("t1", 4)
+	fail("admin", 4)
+	if _, ok := a.attempt(ip, "t1"); !ok {
+		t.Fatal("t1 refused before its limit")
+	}
+	a.settle(ip, "t1", true)
+
+	if _, left := a.userFails[failKey{ip, "t1"}]; left {
+		t.Fatal("t1's success must reset t1's record")
+	}
+	if got := a.ipFails[ip].count; got != 8 {
+		t.Fatalf("address count %d: the success must hand back only its own reservation (want 8)", got)
+	}
+	fail("admin", 1)
+	if _, ok := a.attempt(ip, "admin"); ok {
+		t.Fatal("admin's earlier failures must stand: its fifth locks it")
+	}
+	fail("t1", 4) // t1 starts fresh: four more do not lock it
+}
+
+// With auth on, loopback alone no longer unseals the trail: every tunnel user
+// and local process is loopback. Anyone but an admin gets the sealed view.
+func TestTrailOperatorViewNeedsAdminWhenAuthOn(t *testing.T) {
+	s, h := authServer(t)
+	dir, err := s.store.Dir("run-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeFixtureTrail(t, dir)
+	s.dial = func() (chainReader, clientsdk.Ledger, error) {
+		return &fakeChainReader{status: "open", nullifiers: 1}, &fakeLedger{}, nil
+	}
+	for user, wantSealed := range map[string]bool{"": true, "t1": true, "admin": false} {
+		req := signIn(t, s, user, httptest.NewRequest(http.MethodGet, "/api/trail/run-1?operator=1", nil))
+		req.RemoteAddr = "127.0.0.1:54321"
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		var resp trailResponse
+		if rec.Code != http.StatusOK || json.Unmarshal(rec.Body.Bytes(), &resp) != nil {
+			t.Fatalf("as %q: got %d %s", user, rec.Code, rec.Body)
+		}
+		if resp.Sealed != wantSealed {
+			t.Errorf("as %q from loopback with operator=1: sealed=%v, want %v", user, resp.Sealed, wantSealed)
+		}
+	}
+}
+
+// A trustee id that holds no seat in the run must not publish its tally.
+func TestPublishRefusesATrusteeOutsideTheElection(t *testing.T) {
+	s, h := authServer(t)
+	s.auth.users["t9"] = User{Username: "t9", Role: RoleTrustee, TrusteeID: "9"}
+	runID, _ := seedRun(t, s, nil) // 3 trustees, threshold 2, nothing submitted
+	publish := func(user string) *httptest.ResponseRecorder {
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, signIn(t, s, user, postJSON("/ceremony/publish", map[string]string{"run_id": runID})))
+		return rec
+	}
+	if rec := publish("t9"); rec.Code != http.StatusForbidden || !strings.Contains(rec.Body.String(), `"error"`) {
+		t.Fatalf("trustee 9 publishing a 3-trustee run: want 403 JSON, got %d %s", rec.Code, rec.Body)
+	}
+	// Members pass the check and reach the threshold gate (409), not a dispatch.
+	for _, user := range []string{"t1", "admin"} {
+		if rec := publish(user); rec.Code != http.StatusConflict {
+			t.Errorf("%s: want the below-threshold 409, got %d %s", user, rec.Code, rec.Body)
+		}
 	}
 }
 
@@ -360,13 +532,28 @@ func TestTrusteeCannotSubmitAnotherTrusteesShares(t *testing.T) {
 }
 
 func TestUsersFileValidation(t *testing.T) {
-	hash := mustHash(t, "pw")
+	hash := fixtureHashes()["admin-pw"]
 	ok := `[{"username":"a","role":"admin","password_bcrypt":"` + hash + `"},` +
-		`{"username":"t","role":"trustee","trustee_id":"1","password_bcrypt":"` + hash + `"}]`
-	if users, err := parseUsers([]byte(ok)); err != nil || len(users) != 2 {
+		`{"username":"t","role":"trustee","trustee_id":"1","password_bcrypt":"` + hash + `"},` +
+		`{"username":"u","role":"trustee","trustee_id":"10","password_bcrypt":"` + hash + `"}]`
+	if users, err := parseUsers([]byte(ok)); err != nil || len(users) != 3 {
 		t.Fatalf("valid file rejected: %v", err)
 	}
+	cheap, err := bcrypt.GenerateFromPassword([]byte("pw"), bcrypt.MinCost)
+	if err != nil {
+		t.Fatal(err)
+	}
+	trustee := func(name, id string) string {
+		return `{"username":"` + name + `","role":"trustee","trustee_id":"` + id + `","password_bcrypt":"` + hash + `"}`
+	}
 	for name, tc := range map[string]struct{ file, wantErr string }{
+		"cost other than 12":    {`[{"username":"a","role":"admin","password_bcrypt":"` + string(cheap) + `"}]`, "has cost 4, want 12"},
+		"duplicate trustee id":  {`[` + trustee("t", "1") + `,` + trustee("u", "1") + `]`, `trustee_id "1" is already assigned to "t"`},
+		"trustee id zero pad":   {`[` + trustee("t", "01") + `]`, "no leading zero"},
+		"trustee id zero":       {`[` + trustee("t", "0") + `]`, "no leading zero"},
+		"trustee id not digits": {`[` + trustee("t", "1a") + `]`, "digits"},
+		"username too long": {`[{"username":"` + strings.Repeat("x", maxUsernameBytes+1) +
+			`","role":"admin","password_bcrypt":"` + hash + `"}]`, "longer than 256 bytes"},
 		"unknown role":          {`[{"username":"a","role":"root","password_bcrypt":"` + hash + `"}]`, "unknown role"},
 		"trustee without id":    {`[{"username":"a","role":"trustee","password_bcrypt":"` + hash + `"}]`, "needs a trustee_id"},
 		"admin with trustee id": {`[{"username":"a","role":"admin","trustee_id":"1","password_bcrypt":"` + hash + `"}]`, "must not have a trustee_id"},

@@ -13,6 +13,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -33,19 +34,24 @@ const (
 	RoleAdmin   = "admin"
 	RoleTrustee = "trustee"
 
-	sessionCookie     = "saksi_session"
-	sessionTTL        = 12 * time.Hour // the cookie's Max-Age=43200
-	maxLoginFailures  = 5
-	loginFailWindow   = 5 * time.Minute
-	loginLockout      = 30 * time.Second
-	hashPasswordCost  = 12
-	errLoginRequired  = "login required"
-	errBadCredentials = "invalid credentials"
+	sessionCookie      = "saksi_session"
+	sessionTTL         = 12 * time.Hour // the cookie's Max-Age=43200
+	maxLoginFailures   = 5              // per (remote IP, submitted username)
+	maxIPLoginFailures = 50             // per remote IP, across usernames
+	maxUsernameBytes   = 256
+	loginFailWindow    = 5 * time.Minute
+	loginLockout       = 30 * time.Second
+	hashPasswordCost   = 12
+	errLoginRequired   = "login required"
+	errBadCredentials  = "invalid credentials"
 )
+
+var trusteeIDPattern = regexp.MustCompile(`^[1-9][0-9]*$`)
 
 // dummyHash is compared against when the username does not exist, so an
 // unknown user costs the same bcrypt work as a wrong password. Cost 12, the
-// same as hash-password; its password is never valid for any account.
+// cost hash-password uses and the only cost the users file accepts; its
+// password is never valid for any account.
 var dummyHash = []byte("$2a$12$O/ckBLOYgz3kbuKTtSKRF.agFl431gkqGI0a8.Y7TIqRLYSu5zQ0S")
 
 // User is one entry of the users file.
@@ -71,6 +77,11 @@ const (
 // the request resolves to (so it cannot disagree with the mux about which
 // handler runs). Enforced only when auth is on. TestRouteAccessCoversEveryRoute
 // fails if NewServer registers a route that is not listed here.
+//
+// A handler behind a public subtree pattern (one ending in "/") must never pick
+// an action from the path suffix: the mux matches the escaped path, while the
+// handler reads the decoded r.URL.Path, so a suffix is not proof of which
+// action the table approved. Put actions that need a role on their own routes.
 var routeAccess = map[string]access{
 	// public: the bulletin board, the audit trail, ceremony status, the static
 	// apps, and the auth routes themselves.
@@ -143,20 +154,26 @@ func (a access) denial(sess *session) (int, string) {
 }
 
 // routeMux is a ServeMux that remembers the patterns registered on it, so a
-// test can prove every route has an entry in routeAccess.
+// test can prove every route has an entry in routeAccess. The ServeMux is a
+// named field, not embedded, so no registration can reach it without being
+// recorded.
 type routeMux struct {
-	*http.ServeMux
+	mux      *http.ServeMux
 	patterns []string
 }
 
 func (m *routeMux) Handle(pattern string, h http.Handler) {
 	m.patterns = append(m.patterns, pattern)
-	m.ServeMux.Handle(pattern, h)
+	m.mux.Handle(pattern, h)
 }
 
 func (m *routeMux) HandleFunc(pattern string, h func(http.ResponseWriter, *http.Request)) {
 	m.Handle(pattern, http.HandlerFunc(h))
 }
+
+func (m *routeMux) Handler(r *http.Request) (http.Handler, string) { return m.mux.Handler(r) }
+
+func (m *routeMux) ServeHTTP(w http.ResponseWriter, r *http.Request) { m.mux.ServeHTTP(w, r) }
 
 type session struct {
 	Username  string
@@ -165,11 +182,35 @@ type session struct {
 	expires   time.Time
 }
 
+// failRecord counts login attempts in one window: reservations still being
+// checked plus failures. At its limit it locks for loginLockout.
 type failRecord struct {
 	count       int
 	start       time.Time
 	lockedUntil time.Time
 }
+
+// lapsed reports whether the record's window is over with no lockout in force.
+func (rec *failRecord) lapsed(now time.Time) bool {
+	return !now.Before(rec.lockedUntil) && now.Sub(rec.start) > loginFailWindow
+}
+
+// blocked reports how long the record refuses attempts: while locked, or while
+// its count already reaches limit (concurrent attempts still being checked).
+func (rec *failRecord) blocked(now time.Time, limit int) (time.Duration, bool) {
+	if now.Before(rec.lockedUntil) {
+		return rec.lockedUntil.Sub(now), true
+	}
+	if rec.count >= limit {
+		return loginLockout, true
+	}
+	return 0, false
+}
+
+// failKey is one address guessing at one username. user is the submitted
+// string whether or not such a user exists, so a lockout reveals nothing
+// about which accounts are real.
+type failKey struct{ ip, user string }
 
 // authState holds the users and the live sessions.
 //
@@ -180,17 +221,19 @@ type authState struct {
 	users map[string]User
 	now   func() time.Time
 
-	mu       sync.Mutex
-	sessions map[string]session
-	fails    map[string]*failRecord
+	mu        sync.Mutex
+	sessions  map[string]session
+	ipFails   map[string]*failRecord  // per remote IP: the loose cap
+	userFails map[failKey]*failRecord // per (remote IP, submitted username)
 }
 
 func newAuthState(users map[string]User) *authState {
 	return &authState{
-		users:    users,
-		now:      time.Now,
-		sessions: make(map[string]session),
-		fails:    make(map[string]*failRecord),
+		users:     users,
+		now:       time.Now,
+		sessions:  make(map[string]session),
+		ipFails:   make(map[string]*failRecord),
+		userFails: make(map[failKey]*failRecord),
 	}
 }
 
@@ -225,25 +268,42 @@ func parseUsers(data []byte) (map[string]User, error) {
 		return nil, errors.New("users file has no users: nobody could log in")
 	}
 	users := make(map[string]User, len(list))
+	trusteeOwner := make(map[string]string)
 	for i, u := range list {
 		where := fmt.Sprintf("user %d (%q)", i+1, u.Username)
 		switch {
 		case strings.TrimSpace(u.Username) == "":
 			return nil, fmt.Errorf("user %d: username is empty", i+1)
+		case len(u.Username) > maxUsernameBytes:
+			return nil, fmt.Errorf("user %d: username is longer than %d bytes", i+1, maxUsernameBytes)
 		case u.Role != RoleAdmin && u.Role != RoleTrustee:
 			return nil, fmt.Errorf("%s: unknown role %q (want %q or %q)", where, u.Role, RoleAdmin, RoleTrustee)
 		case u.Role == RoleTrustee && u.TrusteeID == "":
 			return nil, fmt.Errorf("%s: a trustee needs a trustee_id", where)
+		case u.Role == RoleTrustee && !trusteeIDPattern.MatchString(u.TrusteeID):
+			return nil, fmt.Errorf("%s: trustee_id %q must be the trustee's wire id: digits, no leading zero", where, u.TrusteeID)
 		case u.Role == RoleAdmin && u.TrusteeID != "":
 			return nil, fmt.Errorf("%s: an admin must not have a trustee_id", where)
 		}
 		if _, dup := users[u.Username]; dup {
 			return nil, fmt.Errorf("%s: duplicate username", where)
 		}
-		if _, err := bcrypt.Cost([]byte(u.PasswordBcrypt)); err != nil {
+		if owner, dup := trusteeOwner[u.TrusteeID]; dup && u.TrusteeID != "" {
+			return nil, fmt.Errorf("%s: trustee_id %q is already assigned to %q", where, u.TrusteeID, owner)
+		}
+		cost, err := bcrypt.Cost([]byte(u.PasswordBcrypt))
+		if err != nil {
 			return nil, fmt.Errorf("%s: password_bcrypt is not a bcrypt hash (make one with `saksi-campaign hash-password`): %v", where, err)
 		}
+		// One cost for every account and for the unknown-user dummy compare, so
+		// response time cannot tell a real username from an unknown one.
+		if cost != hashPasswordCost {
+			return nil, fmt.Errorf("%s: password_bcrypt has cost %d, want %d (make one with `saksi-campaign hash-password`)", where, cost, hashPasswordCost)
+		}
 		users[u.Username] = u
+		if u.TrusteeID != "" {
+			trusteeOwner[u.TrusteeID] = u.Username
+		}
 	}
 	return users, nil
 }
@@ -304,9 +364,14 @@ func (a *authState) prune(now time.Time) {
 			delete(a.sessions, tok)
 		}
 	}
-	for ip, rec := range a.fails {
-		if !now.Before(rec.lockedUntil) && now.Sub(rec.start) > loginFailWindow {
-			delete(a.fails, ip)
+	for ip, rec := range a.ipFails {
+		if rec.lapsed(now) {
+			delete(a.ipFails, ip)
+		}
+	}
+	for key, rec := range a.userFails {
+		if rec.lapsed(now) {
+			delete(a.userFails, key)
 		}
 	}
 }
@@ -349,46 +414,72 @@ func (a *authState) end(token string) {
 	a.mu.Unlock()
 }
 
-// attempt reserves a login attempt for ip, or reports how long ip must wait.
-// The reservation counts BEFORE the password is checked, so concurrent guesses
-// cannot all slip past the limit while bcrypt runs. settle then undoes it on
-// success, or locks ip out once the failures reach the limit. A success never
-// clears earlier failures, so a user with a valid account of their own cannot
-// reset the counter between guesses at someone else's.
-func (a *authState) attempt(ip string) (time.Duration, bool) {
+// attempt reserves a login attempt by ip for the submitted username, or reports
+// how long the caller must wait. Two counters apply: 5 per (ip, username) and a
+// looser 50 per ip across usernames. The ip is checked first, so its cap also
+// bounds how many (ip, username) records one address can create. The username
+// is keyed as submitted, never checked for existence; one over
+// maxUsernameBytes gets no record of its own and counts against the ip only.
+//
+// Reservations count BEFORE the password is checked, so concurrent guesses
+// cannot overrun a limit while bcrypt runs; settle then resolves them.
+func (a *authState) attempt(ip, user string) (time.Duration, bool) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	now := a.now()
 	a.prune(now)
-	rec := a.fails[ip]
-	if rec != nil && now.Before(rec.lockedUntil) {
-		return rec.lockedUntil.Sub(now), false
+	ipRec := a.ipFails[ip]
+	if ipRec == nil || ipRec.lapsed(now) {
+		ipRec = &failRecord{start: now}
+		a.ipFails[ip] = ipRec
 	}
-	if rec == nil || now.Sub(rec.start) > loginFailWindow {
-		rec = &failRecord{start: now}
-		a.fails[ip] = rec
+	if wait, blocked := ipRec.blocked(now, maxIPLoginFailures); blocked {
+		return wait, false
 	}
-	if rec.count >= maxLoginFailures {
-		return loginLockout, false
+	if len(user) <= maxUsernameBytes {
+		key := failKey{ip, user}
+		rec := a.userFails[key]
+		if rec == nil || rec.lapsed(now) {
+			rec = &failRecord{start: now}
+			a.userFails[key] = rec
+		}
+		if wait, blocked := rec.blocked(now, maxLoginFailures); blocked {
+			return wait, false
+		}
+		rec.count++
 	}
-	rec.count++
+	ipRec.count++
 	return 0, true
 }
 
-func (a *authState) settle(ip string, success bool) {
+// settle resolves a reservation. A failure locks whichever counter reached its
+// limit. A success resets its own (ip, username) record and hands back only its
+// own reservation on the ip counter: earlier failures from that address stand,
+// so a valid login of one's own cannot launder guesses at another account.
+func (a *authState) settle(ip, user string, success bool) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	rec := a.fails[ip]
-	switch {
-	case rec == nil:
-	case success:
-		if rec.count > 0 {
-			rec.count--
+	now := a.now()
+	lockAt := func(rec *failRecord, limit int) {
+		if rec != nil && rec.count >= limit {
+			*rec = failRecord{start: now, lockedUntil: now.Add(loginLockout)}
 		}
-	case rec.count >= maxLoginFailures:
-		now := a.now()
-		*rec = failRecord{start: now, lockedUntil: now.Add(loginLockout)}
 	}
+	switch ipRec := a.ipFails[ip]; {
+	case !success:
+		lockAt(ipRec, maxIPLoginFailures)
+	case ipRec != nil && ipRec.count > 0:
+		ipRec.count--
+	}
+	if len(user) > maxUsernameBytes {
+		return
+	}
+	key := failKey{ip, user}
+	if success {
+		delete(a.userFails, key)
+		return
+	}
+	lockAt(a.userFails[key], maxLoginFailures)
 }
 
 func remoteIP(r *http.Request) string {
@@ -412,23 +503,25 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	ip := remoteIP(r)
-	wait, ok := s.auth.attempt(ip)
+	wait, ok := s.auth.attempt(ip, body.Username)
 	if !ok {
 		w.Header().Set("Retry-After", strconv.Itoa(int((wait+time.Second-1)/time.Second)))
 		writeJSONResp(w, http.StatusTooManyRequests, map[string]string{"error": "too many failed logins; try again shortly"})
 		return
 	}
+	// A username over maxUsernameBytes is never in the map (parseUsers refuses
+	// one), so it takes the unknown-user path with the same dummy compare.
 	u, known := s.auth.users[body.Username]
 	hash := dummyHash
 	if known {
 		hash = []byte(u.PasswordBcrypt)
 	}
 	if err := bcrypt.CompareHashAndPassword(hash, []byte(body.Password)); err != nil || !known {
-		s.auth.settle(ip, false)
+		s.auth.settle(ip, body.Username, false)
 		writeJSONResp(w, http.StatusUnauthorized, map[string]string{"error": errBadCredentials})
 		return
 	}
-	s.auth.settle(ip, true)
+	s.auth.settle(ip, body.Username, true)
 	token, err := s.auth.create(u)
 	if err != nil {
 		writeJSONResp(w, http.StatusInternalServerError, map[string]string{"error": "cannot create session"})
