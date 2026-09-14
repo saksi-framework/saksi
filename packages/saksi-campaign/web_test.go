@@ -66,7 +66,8 @@ func TestWizardDefinesEveryFunctionItCalls(t *testing.T) {
 	// Functions the page wires to events or calls across sections — the ones a
 	// bad merge or a mis-anchored patch can silently drop.
 	for _, fn := range []string{
-		"renderStages", "runStagedAttack", "loadAttacks", "showAttack", "runAttack",
+		"renderStageResults", "watchPauses", "stopPauseWatch", "renderPause", "attackRow",
+		"verdictChip", "gateLine", "attackPlan", "loadAttacks", "showAttack", "runAttack",
 		"paintAttack", "renderBoard", "loadResults", "renderRail", "renderARail",
 		"showIDChip", "startRun", "runCheck", "startSaksi", "startCeremony",
 		"startVerify", "refreshCeremony", "renderTrail", "openStream", "closeStream",
@@ -86,7 +87,7 @@ func TestWizardDefinesEveryFunctionItCalls(t *testing.T) {
 	// declared in one combined let statement, so match the initialiser rather
 	// than a "let <name>" prefix.
 	for _, decl := range []string{
-		"const skippedStages", "let attacks", "let caps", "runID = null",
+		"pauseTimer = null", "let attacks", "let caps", "runID = null",
 	} {
 		if !strings.Contains(js, decl) {
 			t.Errorf("wizard.html is missing the declaration %q", decl)

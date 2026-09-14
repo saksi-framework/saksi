@@ -214,6 +214,16 @@
   .atk .why { font-size:12px; color:var(--muted); margin-top:2px }
   .atk .out { font-size:12px; margin-top:5px; font-family:var(--mono); word-break:break-word }
   .atk .act { flex:none; display:flex; align-items:center; gap:7px }
+  .gate { font-size:11px; color:var(--muted); margin-top:3px; font-family:var(--mono) }
+  .verdict.inc { background:var(--warn-weak); color:var(--warn) }
+  .adot.inc .n { background:var(--warn); color:#fff }
+  .pausebar { display:flex; flex-wrap:wrap; align-items:center; gap:9px; margin:6px 0 4px;
+              padding:9px 11px; border:1px solid var(--warn); border-radius:var(--radius-sm); background:var(--warn-weak) }
+  .pausebar .grow { flex:1; min-width:200px; font-size:12px }
+  .plan { display:flex; flex-wrap:wrap; gap:6px 16px; margin-top:8px; font-size:12px }
+  .plan label { display:inline-flex; align-items:center; gap:6px; margin:0; color:var(--ink) }
+  .plan input[type=checkbox] { width:auto; margin:0 }
+  .plan input[type=number] { width:74px; padding:3px 6px }
 
   /* attack briefing */
   .brief { display:grid; gap:11px; margin:2px 0 16px }
@@ -298,6 +308,22 @@
       </label>
       <div class="small muted" style="margin-top:4px">
         Attacks are offered inside the steps they belong to. Tick this for a clean end-to-end run.
+      </div>
+      <!-- Attack timeline: the election pauses at each ticked stage and waits for Run or Skip. -->
+      <div id="planBox">
+        <div class="plan">
+          <label><input type="checkbox" data-plan-stage="dkg" checked />before ballots</label>
+          <label><input type="checkbox" data-plan-stage="ballots" checked />during ballots, at
+            <input id="ballotsAt" type="number" min="0.05" max="0.95" step="0.05" value="0.5" class="tnum" />of them</label>
+          <label><input type="checkbox" data-plan-stage="close" checked />after ballots</label>
+          <label><input type="checkbox" data-plan-stage="ceremony" checked />during tally</label>
+          <label>wait up to <input id="pauseTimeout" type="number" min="1" value="300" class="tnum" />s per stage</label>
+        </div>
+        <div class="small muted" style="margin-top:4px">
+          The election <b>pauses</b> at each ticked stage until you run or skip its attacks; if nobody
+          decides in time, that stage's attacks run and the election continues. This makes it a
+          <b>security run</b>: its throughput is marked perturbed in perf.csv and is not for RQ3.
+        </div>
       </div>
     </div>
 
@@ -512,9 +538,10 @@ function renderARail() {
   box.style.display = "flex";
   box.innerHTML = attacks.map((a, i) => {
     const na = a.layer === "chaincode" || a.verdict === "SKIPPED";
+    const inc = a.verdict === "INCONCLUSIVE";
     const cls = i === step - ATTACK_STEP ? "active"
-      : a.verdict === "PASS" ? "pass" : a.verdict === "FAIL" ? "fail" : na ? "na" : "";
-    const mark = a.verdict === "PASS" ? "✓" : a.verdict === "FAIL" ? "!" : na ? "⊘" : i + 1;
+      : a.verdict === "PASS" ? "pass" : a.verdict === "FAIL" ? "fail" : inc ? "inc" : na ? "na" : "";
+    const mark = a.verdict === "PASS" ? "✓" : a.verdict === "FAIL" ? "!" : inc ? "?" : na ? "⊘" : i + 1;
     return `<div class="adot ${cls}"><span class="n">${mark}</span>${esc(a.id)}</div>`;
   }).join("");
 }
@@ -605,7 +632,18 @@ const config = () => ({
   send_rate: +$("sendRate").value,
   skip_attacks: $("skipAttacks").checked,
   mode: $("mode").value,
+  attack_plan: attackPlan(),
 });
+
+// The attack timeline, or null for a run that never pauses (attacks skipped, a
+// ground-truth run with nothing to attack, or no stage ticked).
+function attackPlan() {
+  if ($("skipAttacks").checked || $("mode").value === "groundtruth") return null;
+  const stages = [...document.querySelectorAll("[data-plan-stage]")].filter((c) => c.checked)
+    .map((c) => c.dataset.planStage);
+  if (!stages.length) return null;
+  return { stages, ballots_at: +$("ballotsAt").value, timeout_s: +$("pauseTimeout").value };
+}
 
 /* ---- net -------------------------------------------------------------- */
 async function post(path, body, errEl) {
@@ -742,15 +780,21 @@ async function startSaksi() {
   $("next2").disabled = true;
   showLoader(2, "saksi");
   try { await post("/ceremony/start", { run_id: runID }, "err2"); } catch (_) { hideLoader(2); return; }
+  // A security run holds at each stage of its plan while this call runs.
+  if (cfg.attack_plan) watchPauses(["dkg", "ballots", "close"], "stage3", "err2", 2);
 
-  openStream(runID, (e) => {
+  openStream(runID, async (e) => {
     if (e.phase !== "ceremony") return;
+    // This stream stays open into the trustee step, whose publish also ends in
+    // a ceremony "done": only a watch on THIS step's panel is ours to stop.
     if (e.level === "done") {
+      if (pauseBox === "stage3") stopPauseWatch();
       hideLoader(2);
       $("next2").disabled = false;
       renderTrail();
-      renderStages(["dkg", "ballots", "close"], "stage3");
+      await renderStageResults(["dkg", "ballots", "close"], "stage3");
     } else if (e.level === "error") {
+      if (pauseBox === "stage3") stopPauseWatch();
       hideLoader(2);
       $("err2").textContent = e.msg;
     }
@@ -820,6 +864,8 @@ async function refreshCeremony() {
 
   if (st.published) {
     stopTimers();
+    if (pauseBox === "stage4") stopPauseWatch();
+    renderStageResults(["ceremony"], "stage4");
     $("tallyBox").innerHTML = `<div class="locked" style="border-style:solid;color:var(--ink)">
       <span class="verdict pass"><span class="dot2"></span>Tally published</span>
       <div class="small muted" style="margin-top:8px">${k} of ${n} trustees contributed.</div></div>`;
@@ -923,82 +969,152 @@ function renderBoard(rows) {
 }
 
 /* ---- attacks mounted during the election -------------------------------- */
-// Each protocol step offers the attacks that belong at its point in the
-// lifecycle, so the election is seen defending itself rather than being tested
-// afterwards. On-chain these are REAL submissions the chaincode refuses;
-// offline they are simulated against a copy, and labelled as such.
+// A security run PAUSES its lifecycle at each stage of its attack plan and waits
+// here for Run or Skip: the attacks meet the election in the state they belong
+// to (an open election, half its ballots cast, the rest not yet sent), so a
+// rejection is by the gate the attack tests. Mounted after the lifecycle, a
+// ballot attack is refused by the closed-election gate instead \u2014 that is why
+// there is no Run button once a stage has passed. On a ledger, attacks with an
+// on-chain gate are REAL submissions; the rest are simulated, and say so.
 const STAGE_TITLES = {
   dkg:      "Attacks before any ballot is cast",
   ballots:  "Attacks while ballots are being submitted",
   close:    "Attacks on the sealed ballot box",
   ceremony: "Attacks during the trustee ceremony",
 };
-const skippedStages = new Set();
+let pauseTimer = null, pauseKey = "", pauseGen = 0, pauseBox = "";
 
-async function renderStages(stages, boxID) {
-  const box = $(boxID);
-  if (!box) return;
-  if (!runID || (cfg && cfg.skip_attacks) || (cfg && cfg.mode === "groundtruth")) {
-    box.style.display = "none";
-    return;
+// verdictChip distinguishes the four outcomes. INCONCLUSIVE is never green: the
+// attack was refused, but not by the gate it tests (or was never mounted).
+function verdictChip(a) {
+  switch (a.verdict) {
+    case "PASS": return '<span class="verdict pass"><span class="dot2"></span>rejected by its gate</span>';
+    case "FAIL": return '<span class="verdict fail"><span class="dot2"></span>NOT REJECTED</span>';
+    case "INCONCLUSIVE": return '<span class="verdict inc"><span class="dot2"></span>INCONCLUSIVE</span>';
+    case "SKIPPED": return '<span class="pill warn">not run</span>';
   }
-  if (!attacks.length) { try { await loadAttacks(); } catch (_) { return; } }
-
-  const live = cfg && cfg.mode === "onchain" && caps.fabric;
-  const parts = stages.filter((st) => !skippedStages.has(st)).map((stage) => {
-    const rows = attacks.filter((a) => a.stage === stage);
-    if (!rows.length) return "";
-    const head = '<div class="stagehead"><h3>' + esc(STAGE_TITLES[stage] || stage) +
-      '</h3><button class="small skip" data-skipstage="' + esc(stage) + '">Skip</button></div>';
-    return head + rows.map((a) => {
-      const canLive = live && a.live;
-      const how = a.verdict
-        ? (a.was_live ? '<span class="pill ok">refused by the ledger</span>'
-                      : '<span class="pill">simulated</span>')
-        : (canLive ? '<span class="pill warn">real submission</span>'
-                   : '<span class="pill">simulated</span>');
-      const verdict = a.verdict === "PASS"
-        ? '<span class="verdict pass"><span class="dot2"></span>rejected</span>'
-        : a.verdict === "FAIL"
-          ? '<span class="verdict fail"><span class="dot2"></span>NOT REJECTED</span>'
-          : a.verdict === "SKIPPED" ? '<span class="pill warn">not run</span>' : "";
-      return '<div class="atk"><div class="body">' +
-        '<div class="nm">' + esc(a.id) + " " + how + "</div>" +
-        '<div class="why">' + esc(a.action) + " \u2014 expected: " + esc(a.expected) + "</div>" +
-        (a.actual ? '<div class="out muted">' + esc(a.actual) + "</div>" : "") +
-        '</div><div class="act">' + verdict +
-        '<button class="small" data-atk="' + esc(a.id) + '">' +
-        (a.verdict ? "Run again" : "Run") + "</button></div></div>";
-    }).join("");
-  }).join("");
-
-  box.innerHTML = parts;
-  box.style.display = parts ? "block" : "none";
-  box.querySelectorAll("[data-skipstage]").forEach((b) => {
-    b.onclick = () => { skippedStages.add(b.dataset.skipstage); renderStages(stages, boxID); };
-  });
-  box.querySelectorAll("[data-atk]").forEach((b) => {
-    b.onclick = () => runStagedAttack(b.dataset.atk, stages, boxID, b);
-  });
+  return "";
 }
 
-async function runStagedAttack(id, stages, boxID, btn) {
-  btn.disabled = true;
-  btn.textContent = "running\u2026";
-  const errEl = boxID === "stage4" ? "err3" : "err2";
-  try {
-    await post("/attack", { run_id: runID, scenario: id }, errEl);
-  } catch (_) {
-    btn.disabled = false;
-    btn.textContent = "Run";
-    return;
-  }
-  openStream(runID, async (e) => {
-    if (e.phase !== "attack") return;
-    if (e.level === "done" || e.level === "error") {
-      await loadAttacks();
-      await renderStages(stages, boxID);
+// gateLine names the gate that must refuse the attack and, once it has run,
+// the one that did.
+function gateLine(a, live) {
+  const expected = a.gate_expected || (live && a.chain_gate ? a.chain_gate : a.audit_gate);
+  const kind = a.verdict ? (a.was_live ? "chaincode gate" : "auditor check")
+                         : (live && a.chain_gate ? "chaincode gate" : "auditor check");
+  let s = "expected: " + kind + " " + (expected || "\u2014");
+  if (a.verdict && a.verdict !== "SKIPPED") s += " \u00b7 observed: " + (a.gate_observed || "none named");
+  if (a.mounted_stage) s += " \u00b7 mounted: " + a.mounted_stage;
+  return '<div class="gate">' + esc(s) + "</div>";
+}
+
+function attackRow(a, live, button) {
+  const how = (a.verdict ? a.was_live : (live && a.live))
+    ? '<span class="pill warn">real submission</span>' : '<span class="pill">simulated</span>';
+  return '<div class="atk"><div class="body">' +
+    '<div class="nm">' + esc(a.id) + " " + how + "</div>" +
+    '<div class="why">' + esc(a.action) + " \u2014 expected: " + esc(a.expected) + "</div>" +
+    gateLine(a, live) +
+    (a.actual ? '<div class="out muted">' + esc(a.actual) + "</div>" : "") +
+    '</div><div class="act">' + verdictChip(a) + (button || "") + "</div></div>";
+}
+
+// renderStageResults shows what each finished stage's attacks came to. Read
+// only: re-running one now would mount it on an election that has moved on.
+async function renderStageResults(stages, boxID) {
+  const box = $(boxID);
+  if (!box) return;
+  if (!runID || !cfg || !cfg.attack_plan) { box.style.display = "none"; return; }
+  try { await loadAttacks(); } catch (_) { return; }
+  const parts = stages.map((stage) => {
+    const rows = attacks.filter((a) => a.stage === stage && a.verdict);
+    if (!rows.length) return "";
+    return '<div class="stagehead"><h3>' + esc(STAGE_TITLES[stage] || stage) + "</h3></div>" +
+      rows.map((a) => attackRow(a, false)).join("");
+  }).join("");
+  box.innerHTML = parts;
+  box.style.display = parts ? "block" : "none";
+}
+
+// watchPauses polls the run's pause state while a lifecycle call is running
+// and renders the paused stage's panel into boxID.
+function watchPauses(stages, boxID, errEl, loaderN) {
+  stopPauseWatch();
+  const gen = pauseGen;
+  pauseBox = boxID;
+  const tick = async () => {
+    let p;
+    try { p = await getJSON(`/api/runs/${encodeURIComponent(runID)}/pause`); } catch (_) { return; }
+    // A poll that was in flight when the watch stopped must not paint a stale
+    // pause over the stage results.
+    if (gen !== pauseGen) return;
+    if (!p.paused || !stages.includes(p.stage)) {
+      if (pauseKey) {
+        pauseKey = "";
+        await renderStageResults(stages, boxID);
+        if (loaderN) startQuips($("loadTxt" + loaderN), "saksi");
+      }
+      return;
     }
+    try { await loadAttacks(); } catch (_) { return; }
+    if (gen !== pauseGen) return;
+    const rows = attacks.filter((a) => p.scenarios.includes(a.id));
+    const key = JSON.stringify([p, rows.map((a) => [a.id, a.verdict, a.actual])]);
+    if (key === pauseKey) return;
+    pauseKey = key;
+    if (loaderN) {
+      stopQuips();
+      $("loadTxt" + loaderN).textContent = "Paused \u2014 the election waits for your decision below";
+    }
+    renderPause(p, rows, stages, boxID, errEl);
+  };
+  tick();
+  pauseTimer = setInterval(tick, 700);
+}
+function stopPauseWatch() {
+  if (pauseTimer) { clearInterval(pauseTimer); pauseTimer = null; }
+  pauseKey = "";
+  pauseBox = "";
+  pauseGen++;
+}
+
+function renderPause(p, rows, stages, boxID, errEl) {
+  const m = p.mount || {};
+  const state = p.live
+    ? [m.election_status ? "election " + m.election_status : "",
+       m.ballots_committed != null ? m.ballots_committed + " ballots committed" : "",
+       m.block_height != null ? "block height " + m.block_height : ""].filter(Boolean).join(" \u00b7 ")
+    : "local run \u2014 no ledger, every attack is simulated";
+  const until = p.deadline ? new Date(p.deadline).toLocaleTimeString() : "";
+  const busy = !!p.running;
+  const done = attacks.filter((a) => a.stage !== p.stage && stages.includes(a.stage) && a.verdict);
+  const earlier = done.length
+    ? '<div class="small muted" style="margin-top:12px">Earlier stages</div>' + done.map((a) => attackRow(a, false)).join("")
+    : "";
+  $(boxID).innerHTML =
+    '<div class="stagehead"><h3>' + esc(STAGE_TITLES[p.stage] || p.stage) + "</h3></div>" +
+    '<div class="pausebar"><div class="grow"><b>Paused at ' + esc(p.stage) + "</b> \u2014 " + esc(state) +
+      (busy ? "<br>running " + esc(p.running) + "\u2026"
+            : (until ? "<br>if nobody decides, every attack below runs at " + esc(until) + " and the election continues" : "")) +
+    '</div><button class="small primary" data-pause="run-all"' + (busy ? " disabled" : "") +
+      ">Run all attacks at this stage</button>" +
+    '<button class="small" data-pause="skip"' + (busy ? " disabled" : "") + ">Skip this stage</button></div>" +
+    rows.map((a) => attackRow(a, p.live,
+      '<button class="small" data-pause-run="' + esc(a.id) + '"' + (busy ? " disabled" : "") + ">" +
+      (p.running === a.id ? "running\u2026" : a.verdict && a.mounted_stage === p.stage ? "Run again" : "Run") +
+      "</button>")).join("") +
+    earlier;
+  $(boxID).style.display = "block";
+  const decide = async (body, btn) => {
+    btn.disabled = true;
+    try { await post(`/api/runs/${encodeURIComponent(runID)}/pause`, body, errEl); }
+    catch (_) { btn.disabled = false; }
+  };
+  $(boxID).querySelectorAll("[data-pause]").forEach((b) => {
+    b.onclick = () => decide({ action: b.dataset.pause }, b);
+  });
+  $(boxID).querySelectorAll("[data-pause-run]").forEach((b) => {
+    b.onclick = () => decide({ action: "run", scenario: b.dataset.pauseRun }, b);
   });
 }
 
@@ -1087,14 +1203,22 @@ function paintAttack(a) {
     renderARail();
     return;
   }
-  const pass = a.verdict === "PASS";
-  $("atkVerdict").className = "verdict " + (pass ? "pass" : "fail");
-  $("atkVerdict").innerHTML = `<span class="dot2"></span>${pass ? "attack rejected" : "NOT REJECTED"}`;
+  const pass = a.verdict === "PASS", inc = a.verdict === "INCONCLUSIVE";
+  $("atkVerdict").className = "verdict " + (pass ? "pass" : inc ? "inc" : "fail");
+  $("atkVerdict").innerHTML = `<span class="dot2"></span>${
+    pass ? "rejected by its gate" : inc ? "INCONCLUSIVE" : "NOT REJECTED"}`;
+  const notMounted = inc && /^not mounted/.test(a.actual || "");
+  // A live submission has no positive control: it went to the ledger, not to
+  // a copy of the run.
   $("atkRun").innerHTML = `
-    <div class="ctrl on"><span class="tick">✓</span>Control passed — the untouched copy audits clean,
-      so any rejection below is caused by the mutation and nothing else</div>
-    <div class="ctrl ${pass ? "on" : ""}"><span class="tick">${pass ? "✓" : "!"}</span>${esc(a.actual || "")}</div>
-    ${pass ? "" : `<div class="note">A mutated run audited clean. This is a real finding:
+    ${notMounted || a.was_live ? "" : `<div class="ctrl on"><span class="tick">✓</span>Control passed — the untouched copy audits clean,
+      so any rejection below is caused by the mutation and nothing else</div>`}
+    <div class="ctrl ${pass ? "on" : ""}"><span class="tick">${pass ? "✓" : inc ? "?" : "!"}</span>${esc(a.actual || "")}</div>
+    ${gateLine(a, false)}
+    ${pass ? "" : inc
+      ? `<div class="note">Not a pass: the attack was ${notMounted ? "never mounted" :
+          "refused, but not by the gate it tests"}. It says nothing about "<b>${esc(a.property)}</b>" and is left out of the rejection rate.</div>`
+      : `<div class="note">A mutated run audited clean. This is a real finding:
       the guarantee "<b>${esc(a.property)}</b>" did not hold.</div>`}`;
   $("atkRerun").style.display = "inline-block";
   renderARail();
@@ -1109,11 +1233,13 @@ $("next1").onclick = runCheck;
 $("back2b").onclick = () => go(1);
 $("next2b").onclick = () => { if (cfg.mode === "groundtruth") go(2); else startSaksi(); };
 $("back2").onclick = () => go(2);
-$("next2").onclick = () => { startCeremony(); renderStages(["ceremony"], "stage4"); };
+$("next2").onclick = () => { startCeremony(); renderStageResults(["ceremony"], "stage4"); };
 $("back3").onclick = () => { stopTimers(); go(3); };
 $("btnPublish").onclick = async () => {
   $("btnPublish").disabled = true;
   try { await post("/ceremony/publish", { run_id: runID }, "err3"); } catch (_) { $("btnPublish").disabled = false; return; }
+  // The ceremony stage holds the publish until its attacks are decided.
+  if (cfg.attack_plan && cfg.attack_plan.stages.includes("ceremony")) watchPauses(["ceremony"], "stage4", "err3", null);
   setTimeout(refreshCeremony, 700);
 };
 $("next3").onclick = () => { stopTimers(); startVerify(); };
@@ -1132,8 +1258,8 @@ $("next5").onclick = () => {
 };
 $("atkRerun").onclick = () => runAttack(step - ATTACK_STEP);
 $("btnRestart").onclick = () => {
-  closeStream(); stopTimers(); runID = null; cfg = null; attacks = [];
-  skippedStages.clear(); showIDChip(); go(0);
+  closeStream(); stopTimers(); stopPauseWatch(); runID = null; cfg = null; attacks = [];
+  showIDChip(); go(0);
 };
 
 // Ask the server what it can actually do before offering on-chain. Without
