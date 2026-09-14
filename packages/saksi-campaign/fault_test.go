@@ -671,3 +671,102 @@ func TestArmedFaultIsReadWhenTheWindowOpens(t *testing.T) {
 		t.Fatalf("armedFault = %+v", got)
 	}
 }
+
+// While a fault has the peer stopped or recovering, no run phase starts: a run
+// started then would meet a missing peer, or measure the recovery.
+func TestNoPhaseStartsWhileAFaultHoldsThePeer(t *testing.T) {
+	s, root := gateServer(t, FabricConfig{}, "abc", 1<<62)
+	if err := os.MkdirAll(filepath.Join(root, "run-1"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	led := &fakeLedger{}
+	run, _ := dockerRecorder(led)
+	s.exec.run = run
+	oldSleep, oldPoll := faultSleep, peerReadyPoll
+	t.Cleanup(func() { faultSleep, peerReadyPoll = oldSleep, oldPoll })
+	peerReadyPoll = time.Millisecond
+	held, release := make(chan struct{}), make(chan struct{})
+	faultSleep = func(context.Context, time.Duration) { close(held); <-release }
+	j := s.exec.journalFor("run-1")
+	defer j.Close()
+	f := s.exec.newPeerFault(context.Background(), "run-1", j, led,
+		&FaultPlan{Kind: FaultPeerRestart, At: 0.5, DownS: 20}, 10, func() int { return 0 })
+
+	f.dispatched(5)
+	<-held
+	if why := s.claim("run-2", func() {}); !strings.Contains(why, "run-1") {
+		t.Fatalf("a phase while run-1's fault holds the peer: claim = %q", why)
+	}
+	gen := httptest.NewRecorder()
+	s.ServeHTTP(gen, postJSON("/generate", good()))
+	if gen.Code != http.StatusConflict || !strings.Contains(gen.Body.String(), "run-1") {
+		t.Fatalf("/generate during the fault: want 409 naming run-1, got %d %s", gen.Code, gen.Body)
+	}
+	close(release)
+	f.wait()
+	if why := s.claim("run-2", func() {}); why != "" {
+		t.Fatalf("once the peer answers, phases start again: %s", why)
+	}
+	s.finish("run-2")
+}
+
+// Ctrl-C while docker stop is still running: the restore waits for the stop to
+// finish, so it never starts a container that then finishes stopping.
+func TestRestorePeerWaitsForAStopInFlight(t *testing.T) {
+	dir := t.TempDir()
+	e := newTestExecutor(t, dir)
+	var mu sync.Mutex
+	var events []string
+	record := func(ev string) {
+		mu.Lock()
+		events = append(events, ev)
+		mu.Unlock()
+	}
+	stopping, finishStop := make(chan struct{}), make(chan struct{})
+	e.run = func(_ context.Context, name string, args ...string) ([]byte, error) {
+		switch args[0] {
+		case "stop":
+			record("stop-begin")
+			close(stopping)
+			<-finishStop
+			record("stop-end")
+		case "start":
+			record("start")
+		}
+		return nil, nil
+	}
+	oldSleep, oldPoll := faultSleep, peerReadyPoll
+	t.Cleanup(func() { faultSleep, peerReadyPoll = oldSleep, oldPoll })
+	peerReadyPoll = time.Millisecond
+	holdDown := make(chan struct{})
+	faultSleep = func(context.Context, time.Duration) { <-holdDown }
+	j := e.journalFor("run-1")
+	defer j.Close()
+	f := e.newPeerFault(context.Background(), "run-1", j, &fakeLedger{},
+		&FaultPlan{Kind: FaultPeerRestart, At: 0.5, DownS: 20}, 10, func() int { return 0 })
+
+	go f.dispatched(5)
+	<-stopping
+	restored := make(chan bool)
+	go func() {
+		ok, _ := e.RestorePeer()
+		restored <- ok
+	}()
+	select {
+	case <-restored:
+		t.Fatal("RestorePeer returned while docker stop was still running")
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(finishStop)
+	if !<-restored {
+		t.Fatal("RestorePeer must report the stopped peer")
+	}
+	mu.Lock()
+	got := strings.Join(events, ",")
+	mu.Unlock()
+	if got != "stop-begin,stop-end,start" {
+		t.Fatalf("docker order = %s, want the start after the stop finished", got)
+	}
+	close(holdDown)
+	f.wait()
+}

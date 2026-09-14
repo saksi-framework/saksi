@@ -379,9 +379,42 @@ func TestResumeFailsOnAGenuineDrop(t *testing.T) {
 	if got := latencyRows(t, runDir, 1)[lost]; got != "drop" {
 		t.Fatalf("index %d ok = %q, want drop", lost, got)
 	}
-	ends := journalEventsOfType(t, runDir, "stage.ballots.end")
-	if len(ends) == 0 || jint(ends[len(ends)-1], "dropped") != 1 {
+	// Stamped interrupted, not ended: a ballot that still did not land leaves
+	// the window open for the next resume.
+	ends := journalEventsOfType(t, runDir, "stage.ballots.interrupted")
+	if len(ends) == 0 || jint(ends[len(ends)-1], "dropped") != 1 || jint(ends[len(ends)-1], "segment") != 1 {
 		t.Fatalf("resumed window must report 1 dropped, got %v", ends)
+	}
+}
+
+// A resume whose ballots really drop must not strand the run: it stays
+// resumable, and the next resume commits what is left and closes.
+func TestALossyResumeStaysResumable(t *testing.T) {
+	e, led, c, runDir, path := crashedRun(t, 40, 20)
+	lost := testNullifierHex(39)
+	led.rejectBallot(lost)
+	if err := e.resumeAndClose(context.Background(), "run-1", c, led, led, path); err == nil ||
+		!strings.Contains(err.Error(), "did not commit") {
+		t.Fatalf("first resume: %v, want the dropped ballot named", err)
+	}
+	plan, err := planResume(runDir, c)
+	if err != nil || plan.CloseOnly || plan.Segment != 2 {
+		t.Fatalf("after a lossy resume: plan %+v err %v, want an open window for segment 2", plan, err)
+	}
+	led.mu.Lock()
+	delete(led.reject, lost)
+	led.mu.Unlock()
+	if err := e.resumeAndClose(context.Background(), "run-1", c, led, led, path); err != nil {
+		t.Fatalf("second resume: %v", err)
+	}
+	if got := len(led.acceptedIndices()); got != 40 {
+		t.Fatalf("chain holds %d, want 40", got)
+	}
+	if names := led.callNames(); names[len(names)-1] != "CloseElection" {
+		t.Fatalf("the second resume must close, calls end %v", names[len(names)-2:])
+	}
+	if _, err := os.Stat(filepath.Join(runDir, CeremonyFile)); err != nil {
+		t.Fatalf("the ceremony must be open: %v", err)
 	}
 }
 
@@ -606,5 +639,55 @@ func writeJournalLines(t *testing.T, runDir string, lines ...string) {
 	if err := os.WriteFile(filepath.Join(runDir, JournalFile),
 		[]byte(strings.Join(lines, "\n")+"\n"), 0o644); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// A resume that can only fail is refused before anything is dispatched: no
+// Fabric (400), no bundle (409), nothing to resume (409).
+func TestResumeAPIRefusesBeforeDispatch(t *testing.T) {
+	interrupted := func(t *testing.T, s *Server, bundle bool) string {
+		t.Helper()
+		runID, dir, err := s.store.Create(onchainConfig(), time.Now())
+		if err != nil {
+			t.Fatal(err)
+		}
+		writeJournalLines(t, dir, `{"event":"stage.ballots.start","n":100}`,
+			`{"event":"stage.ballots.interrupted","committed":50,"dropped":50}`)
+		if bundle {
+			writeRealBallotStream(t, dir, 100)
+		}
+		return runID
+	}
+	post := func(s *Server, runID string) *httptest.ResponseRecorder {
+		rec := httptest.NewRecorder()
+		s.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/api/runs/"+runID+"/resume", nil))
+		return rec
+	}
+
+	off, _ := gateServer(t, FabricConfig{}, "abc", 1<<62)
+	if rec := post(off, interrupted(t, off, true)); rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "Fabric") {
+		t.Fatalf("no Fabric: want 400, got %d %s", rec.Code, rec.Body)
+	}
+
+	on, _ := gateServer(t, enabledFabric(), "abc", 1<<62)
+	if rec := post(on, interrupted(t, on, false)); rec.Code != http.StatusConflict || !strings.Contains(rec.Body.String(), "read bundle") {
+		t.Fatalf("no bundle: want 409, got %d %s", rec.Code, rec.Body)
+	}
+	ended, dir, err := on.store.Create(onchainConfig(), time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeJournalLines(t, dir, `{"event":"stage.ballots.start","n":100}`, `{"event":"stage.ballots.end","dropped":0}`)
+	writeRealBallotStream(t, dir, 100)
+	if rec := post(on, ended); rec.Code != http.StatusConflict || !strings.Contains(rec.Body.String(), "nothing to resume") {
+		t.Fatalf("nothing to resume: want 409, got %d %s", rec.Code, rec.Body)
+	}
+	for _, s := range []*Server{off, on} {
+		s.mu.Lock()
+		busy := len(s.busy)
+		s.mu.Unlock()
+		if busy != 0 {
+			t.Fatal("a refused resume must not claim the run")
+		}
 	}
 }

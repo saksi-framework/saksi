@@ -661,7 +661,8 @@ curl -X POST http://127.0.0.1:8090/api/runs/<run-id>/resume
 Refused with **409** unless the run is `onchain` and its journal's last
 checkpoint is a `ballots.progress` or a `stage.ballots.start` with no matching
 `stage.ballots.end` — the decision is made from the journal alone, no network
-needed.
+needed. It is also refused before anything starts with **400** when the console
+has no Fabric network, and **409** when the run has no readable `bundle.json`.
 
 The committed set is the chain's `ListNullifiers` intersected with the bundle's
 nullifiers, by ballot index; `receipts.csv` is a cross-check, and a receipt
@@ -687,24 +688,34 @@ it. The close is careful and retryable:
 - A resume that was stopped (cancelled, or timed out) before every pending
   ballot was sent does **not** close: it fails with "the election stays open",
   its window is stamped interrupted, and the next resume sends the rest.
+- A resume in which ballots still did not land ("N of M resubmitted ballots
+  did not commit") does not close either: its window is stamped
+  `stage.ballots.interrupted` with its `dropped` count, so the next resume
+  retries those ballots and then closes.
 - A resume that landed every ballot but whose `CloseElection` failed fails with
   "resume again to retry the close". The next resume is planned close-only
   (`202 {"close_only": true}`): it submits nothing, only commits the close.
   Close-only is offered when the last window was a resume that ended with no
   drops, and there is neither a `CloseElection` receipt nor a `ceremony.json`.
 - A close the chain already holds (the chaincode answers "is already closed")
-  counts as done. Each attempt is stamped `resume.close {ok, close_only,
-  already_closed}`.
+  counts as done; only the chaincode's exact words for this election
+  (`election "<id>" is already closed`) are taken as that. Each attempt is
+  stamped `resume.close {ok, close_only, already_closed}`.
 
 The `202` body's `remaining` estimates the pending ballots from the interrupted
 window's own record: its ballots minus those it committed, or minus its last
 dispatch checkpoint after a hard kill. Ballots that landed despite an error
-make it an upper bound; the exact count is `segment.start {pending}`.
+make the first an overcount; after a hard kill, ballots that were in flight
+make the second an undercount. The exact count is `segment.start {pending}`.
 
 One loss is accepted: an attack run cancelled while paused at its ballots
 stage closes on resume without its ballots-stage attacks ever mounted; re-run
 the security run if those verdicts are needed. (A fault run carries no attack
-plan, so this never applies to T3.)
+plan, so this never applies to T3.) Likewise, for an attack run whose plan
+lists the close stage, the close-stage pause runs inside the resume that
+commits the close; if that close is a retry the chain answers "already
+closed", the pause does not run and the close-stage attacks have no rows in
+`negative-tests.csv`.
 
 ### Study API — preflight, ladder job, campaigns, export
 
@@ -818,10 +829,15 @@ seconds". If the question is how many ballots an outage of a given length
 loses, set `send_rate` so the window's remaining ballots are spread across the
 outage.
 
+While a fault has the peer stopped or recovering (from the stop until
+`fault.peer_ready`), no run phase starts on any other run: `/generate`,
+`/ceremony/start`, resume and the rest answer `409` naming the fault's run.
+
 **If the console stops during a fault**, the peer could be left stopped. Ctrl-C
 and SIGTERM start it again before the console exits ("started
-peer0.org1.example.com again" on stderr), and a panic in the restart starts it
-too. A console killed any other way (SIGKILL, a crash, closing WSL) cannot:
+peer0.org1.example.com again" on stderr); if the `docker stop` is still
+running, the start waits for it (up to a minute), and a second Ctrl-C exits at
+once without restoring. A panic in the restart starts the peer too. A console killed any other way (SIGKILL, a crash, closing WSL) cannot:
 run `docker start peer0.org1.example.com` and confirm with
 `tools/up.sh status`.
 

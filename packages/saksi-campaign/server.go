@@ -257,8 +257,8 @@ func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 }
 
 // claim takes the single-run lock for runID and stores its cancel func, or
-// returns why it cannot: a phase is already running on that run, or the network
-// is being reset (startExclusiveJob checks the other direction under the same
+// returns why it cannot: a phase is already running on that run, a fault has
+// the peer stopped or recovering, or the network is being reset (startExclusiveJob checks the other direction under the same
 // lock, so the two cannot interleave).
 func (s *Server) claim(runID string, cancel context.CancelFunc) string {
 	s.mu.Lock()
@@ -269,12 +269,15 @@ func (s *Server) claim(runID string, cancel context.CancelFunc) string {
 	if j := s.jobs.running(); j != nil && j.Kind == jobKindReset {
 		return fmt.Sprintf("the network is being reset (job %s): wait for it to finish", j.ID)
 	}
+	if fr := s.exec.faultingRun(); fr != "" {
+		return fmt.Sprintf("run %s's peer-restart fault has the Fabric peer stopped or recovering: wait for its fault.peer_ready", fr)
+	}
 	s.busy[runID] = cancel
 	return ""
 }
 
-// busyRunsLocked names every run but except with a phase running, noting the
-// stage a paused lifecycle holds at. Caller holds s.mu.
+// busyRunsLocked names every run with a phase running other than the one named
+// except, noting the stage a paused lifecycle holds at. Caller holds s.mu.
 func (s *Server) busyRunsLocked(except string) []string {
 	var names []string
 	for _, id := range slices.Sorted(maps.Keys(s.busy)) {
@@ -1007,10 +1010,12 @@ func (s *Server) handleVerifyOnly(w http.ResponseWriter, r *http.Request, id str
 // run's journal, no network), so a run that cannot be resumed gets a 409 with
 // the reason instead of a second window quietly opening on top of the first.
 //
-// The 202 body's `remaining` is the JOURNAL'S ESTIMATE (the interrupted
-// window's ballot count minus its last progress checkpoint), because the exact
-// figure needs a paged ListNullifiers walk intersected with the population and
-// this request must not block for it. The exact count is stamped as
+// The 202 body's `remaining` is the JOURNAL'S ESTIMATE (planResume: the
+// interrupted window's ballots minus those it committed when it stamped its
+// end, or minus its last progress checkpoint after a hard kill, which can
+// undercount the ballots that were in flight), because the exact figure needs
+// a paged ListNullifiers walk intersected with the population and this request
+// must not block for it. The exact count is stamped as
 // `segment.start {pending}` once the resume has taken its snapshot, and
 // published on the run's event stream.
 func (s *Server) handleResume(w http.ResponseWriter, r *http.Request, id string) {
@@ -1034,6 +1039,20 @@ func (s *Server) handleResume(w http.ResponseWriter, r *http.Request, id string)
 		return
 	}
 	plan, err := planResume(dir, rec.Config)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusConflict)
+		return
+	}
+	// Refused here, with the words Resume would fail with, rather than a 202
+	// for a phase that can only fail.
+	if !s.fabric.Enabled() {
+		http.Error(w, errNoFabric().Error(), http.StatusBadRequest)
+		return
+	}
+	bundlePath, err := s.exec.bundlePath(runID)
+	if err == nil {
+		_, err = loadBundle(bundlePath)
+	}
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusConflict)
 		return

@@ -222,6 +222,7 @@ func restorePeerOnSignal(exec *campaign.Executor) {
 	sigs := make(chan os.Signal, 1)
 	signal.Notify(sigs, os.Interrupt, syscall.SIGTERM)
 	sig := <-sigs
+	signal.Stop(sigs) // a second Ctrl-C kills at once, even while the restore waits
 	if restored, err := exec.RestorePeer(); restored {
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "stopping mid-fault: docker start peer0.org1.example.com failed: %v; start it by hand\n", err)

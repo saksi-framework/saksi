@@ -100,6 +100,13 @@ type Executor struct {
 	faultGate func(runID string) error
 	// peersDown counts faults between their docker stop and start (RestorePeer).
 	peersDown atomic.Int32
+	// stopMu is held across a fault's docker stop, so RestorePeer never starts
+	// a container that is still stopping.
+	stopMu sync.Mutex
+	// faultMu guards faulting: the runs whose fault is active, from firing
+	// until the peer answers again. No run phase starts meanwhile (claim).
+	faultMu  sync.Mutex
+	faulting map[string]bool
 }
 
 // NewExecutor wires the production runner. demoBin is the saksi-demo path;
@@ -1323,7 +1330,7 @@ func (e *Executor) resumeAndClose(ctx context.Context, runID string, c ElectionC
 	defer j.Close()
 	already := false
 	if err := e.closeElection(ctx, runID, c, b, led, step); err != nil {
-		if !strings.Contains(clientsdk.ErrorText(err), "is already closed") {
+		if !strings.Contains(clientsdk.ErrorText(err), fmt.Sprintf("election %q is already closed", b.ElectionID)) {
 			_ = j.Stamp("resume.close", map[string]any{"ok": false, "close_only": plan.CloseOnly, "error": err.Error()})
 			return fmt.Errorf("every ballot is on the chain but CloseElection failed: resume again to retry the close: %w", err)
 		}
@@ -1451,7 +1458,7 @@ func (e *Executor) resumeBallots(ctx context.Context, runID string, c ElectionCo
 		"submitted": res.Submitted, "committed": res.Committed, "replayed": replayed,
 		"dropped": dropped, "window_ms": res.Window.Milliseconds(),
 		"stopped": res.Stopped, "segment": plan.Segment,
-	}, res.Stopped)
+	}, res.Stopped || dropped > 0) // ballots that still did not land leave the window open: resume again
 	seg := segmentOf(plan.Segment, res, onChain)
 	stampSegmentEnd(j, seg)
 	winErr := journalWindowErr(j) // at the window's boundary, as above

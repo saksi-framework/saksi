@@ -224,6 +224,8 @@ func (s *Server) faultGate(runID string) error {
 // RestorePeer starts the peer again when a fault has it stopped, for a console
 // that is shutting down mid-fault; it reports whether one was down.
 func (e *Executor) RestorePeer() (bool, error) {
+	e.stopMu.Lock() // a docker stop still in flight finishes first
+	defer e.stopMu.Unlock()
 	if e.peersDown.Load() == 0 {
 		return false, nil
 	}
@@ -231,6 +233,31 @@ func (e *Executor) RestorePeer() (bool, error) {
 	defer cancel()
 	_, err := e.run(ctx, "docker", "start", faultPeerContainer)
 	return true, err
+}
+
+// setFaulting marks runID's fault active (from firing until the peer answers)
+// or over.
+func (e *Executor) setFaulting(runID string, active bool) {
+	e.faultMu.Lock()
+	defer e.faultMu.Unlock()
+	if !active {
+		delete(e.faulting, runID)
+		return
+	}
+	if e.faulting == nil {
+		e.faulting = make(map[string]bool)
+	}
+	e.faulting[runID] = true
+}
+
+// faultingRun names a run whose fault has the peer stopped or recovering, or "".
+func (e *Executor) faultingRun() string {
+	e.faultMu.Lock()
+	defer e.faultMu.Unlock()
+	for id := range e.faulting {
+		return id
+	}
+	return ""
 }
 
 // armedFault is the fault plan the window runs with: run.json's, read when the
@@ -292,7 +319,8 @@ func (f *peerFault) dispatched(i int) {
 		}
 	}
 	f.fired.Store(true)
-	f.e.peersDown.Add(1) // counted before the stop: a shutdown during it restores too
+	f.e.setFaulting(f.runID, true) // cleared when restore ends
+	f.e.peersDown.Add(1)           // counted before the stop: a shutdown during it restores too
 	func() {
 		// A panic after the stop must not leave the peer down.
 		defer func() {
@@ -343,7 +371,9 @@ func (f *peerFault) start() error {
 func (f *peerFault) stop() {
 	committed, height := f.committed(), chainHeight(f.led)
 	t0 := time.Now()
+	f.e.stopMu.Lock()
 	err := f.docker("stop")
+	f.e.stopMu.Unlock()
 	fields := map[string]any{"kind": f.plan.Kind, "container": faultPeerContainer, "at_index": f.at,
 		"ballots_committed": committed, "stop_ms": time.Since(t0).Milliseconds(), "ok": err == nil}
 	if height != nil {
@@ -361,6 +391,7 @@ func (f *peerFault) stop() {
 // cancelled window, a panic), and waits until it answers.
 func (f *peerFault) restore() {
 	defer close(f.done)
+	defer f.e.setFaulting(f.runID, false)
 	defer func() {
 		if p := recover(); p != nil {
 			fields := map[string]any{"container": faultPeerContainer, "error": fmt.Sprint(p)}
