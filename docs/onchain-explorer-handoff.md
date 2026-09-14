@@ -47,7 +47,8 @@ The console is done and verified end-to-end **offline**:
   ballots) into a run folder.
 - **Verify** shells `saksi-demo audit-stream --json` (real auditor) → writes CSVs.
 - **Scenarios**: 7 negative/vuln tests on a copied run (verify-before-mutate
-  control, fail-loud); 6 offline-detectable, `reordered-ballots` is chaincode-layer.
+  control, fail-loud); 6 offline-detectable, `reordered-ballots` has no gate
+  (ordering is not checked on-chain or by the stateless auditor) and is never run.
 - **All exports are CSV evidence:**
   - `ballots.csv` — per ballot: index, election_id, position, voter_credential_commitment,
     nullifier, #ciphertexts, #proofs, **ballot_sha256**, **ballot_json** (the actual

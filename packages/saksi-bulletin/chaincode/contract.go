@@ -102,26 +102,26 @@ type SmartContract struct {
 func (s *SmartContract) SubmitBallot(ctx contractapi.TransactionContextInterface, ballotHex string) error {
 	raw, err := hex.DecodeString(ballotHex)
 	if err != nil {
-		return fmt.Errorf("ballot is not valid hex: %w", err)
+		return rejectAt("decode", "ballot is not valid hex: %w", err)
 	}
 
 	var ballot saksiprotocolv1.Ballot
 	if err := proto.Unmarshal(raw, &ballot); err != nil {
-		return fmt.Errorf("decode ballot: %w", err)
+		return rejectAt("decode", "decode ballot: %w", err)
 	}
 
 	if ballot.GetVersion() != saksiprotocolv1.WireVersion {
-		return fmt.Errorf("unsupported ballot version %d, want %d", ballot.GetVersion(), saksiprotocolv1.WireVersion)
+		return rejectAt("shape", "unsupported ballot version %d, want %d", ballot.GetVersion(), saksiprotocolv1.WireVersion)
 	}
 	if ballot.GetElectionId() == "" {
-		return fmt.Errorf("ballot is missing an election id")
+		return rejectAt("shape", "ballot is missing an election id")
 	}
 	if len(ballot.GetCiphertexts()) == 0 {
-		return fmt.Errorf("ballot has no ciphertexts")
+		return rejectAt("shape", "ballot has no ciphertexts")
 	}
 	for i, ciphertext := range ballot.GetCiphertexts() {
 		if len(ciphertext.GetPad()) != ciphertextLen || len(ciphertext.GetData()) != ciphertextLen {
-			return fmt.Errorf(
+			return rejectAt("shape",
 				"ciphertext %d is malformed: pad=%d data=%d bytes, want %d each",
 				i, len(ciphertext.GetPad()), len(ciphertext.GetData()), ciphertextLen,
 			)
@@ -130,7 +130,7 @@ func (s *SmartContract) SubmitBallot(ctx contractapi.TransactionContextInterface
 
 	presentation := ballot.GetCredentialPresentation()
 	if presentation == nil || presentation.GetNullifier() == nil || len(presentation.GetNullifier().GetValue()) == 0 {
-		return fmt.Errorf("ballot is missing a credential-presentation nullifier")
+		return rejectAt("shape", "ballot is missing a credential-presentation nullifier")
 	}
 	nullifier := hex.EncodeToString(presentation.GetNullifier().GetValue())
 
@@ -141,7 +141,7 @@ func (s *SmartContract) SubmitBallot(ctx contractapi.TransactionContextInterface
 	// Chaum-Pedersen NIZK) are verified off-chain by the auditor.
 	proof := presentation.GetPresentationProof()
 	if len(proof) < signaturePrefixLen {
-		return fmt.Errorf(
+		return rejectAt("shape",
 			"ballot credential presentation_proof is %d bytes, shorter than the %d-byte signature prefix",
 			len(proof), signaturePrefixLen,
 		)
@@ -152,7 +152,7 @@ func (s *SmartContract) SubmitBallot(ctx contractapi.TransactionContextInterface
 		proof[:ciphertextLen],
 		proof[ciphertextLen:signaturePrefixLen],
 	); err != nil {
-		return fmt.Errorf("credential signature verification failed: %w", err)
+		return rejectAt("credential", "credential signature verification failed: %w", err)
 	}
 
 	stub := ctx.GetStub()
@@ -167,10 +167,10 @@ func (s *SmartContract) SubmitBallot(ctx contractapi.TransactionContextInterface
 		return fmt.Errorf("read election status: %w", err)
 	}
 	if status == nil {
-		return fmt.Errorf("election %q does not exist", ballot.GetElectionId())
+		return rejectAt("election-exists", "election %q does not exist", ballot.GetElectionId())
 	}
 	if string(status) != electionStatusOpen {
-		return fmt.Errorf("election %q is not open for ballots", ballot.GetElectionId())
+		return rejectAt("election-open", "election %q is not open for ballots", ballot.GetElectionId())
 	}
 
 	nullifierKey, err := stub.CreateCompositeKey(nullifierIndex, []string{ballot.GetElectionId(), nullifier})
@@ -182,7 +182,7 @@ func (s *SmartContract) SubmitBallot(ctx contractapi.TransactionContextInterface
 		return fmt.Errorf("read nullifier state: %w", err)
 	}
 	if spent != nil {
-		return fmt.Errorf("nullifier already spent in election %q (double vote)", ballot.GetElectionId())
+		return rejectAt("nullifier", "nullifier already spent in election %q (double vote)", ballot.GetElectionId())
 	}
 
 	// Verify each contest's CDS well-formedness OR-proof on-chain (ADR-0007,
@@ -200,13 +200,13 @@ func (s *SmartContract) SubmitBallot(ctx contractapi.TransactionContextInterface
 	// align in order to these indices.
 	contestIdxs := contestIndicesForPosition(contestIDs, ballot.GetPositionId())
 	if len(contestIdxs) == 0 {
-		return fmt.Errorf(
+		return rejectAt("shape",
 			"ballot position %q matches no contest in election %q",
 			ballot.GetPositionId(), ballot.GetElectionId(),
 		)
 	}
 	if len(ballot.GetCiphertexts()) != len(contestIdxs) || len(ballot.GetWellFormednessProofs()) != len(contestIdxs) {
-		return fmt.Errorf(
+		return rejectAt("shape",
 			"ballot (position %q) has %d ciphertexts / %d well-formedness proofs, expected %d for that position in election %q",
 			ballot.GetPositionId(), len(ballot.GetCiphertexts()), len(ballot.GetWellFormednessProofs()), len(contestIdxs), ballot.GetElectionId(),
 		)
@@ -221,7 +221,7 @@ func (s *SmartContract) SubmitBallot(ctx contractapi.TransactionContextInterface
 		return fmt.Errorf("read DKG transcript state: %w", err)
 	}
 	if dkgRaw == nil {
-		return fmt.Errorf("election %q has no published DKG transcript; ballot well-formedness cannot be verified", ballot.GetElectionId())
+		return rejectAt("dkg-missing", "election %q has no published DKG transcript; ballot well-formedness cannot be verified", ballot.GetElectionId())
 	}
 	var transcript saksiprotocolv1.DKGTranscript
 	if err := proto.Unmarshal(dkgRaw, &transcript); err != nil {
@@ -238,7 +238,7 @@ func (s *SmartContract) SubmitBallot(ctx contractapi.TransactionContextInterface
 		ciphertext := ballot.GetCiphertexts()[local]
 		proofMsg := ballot.GetWellFormednessProofs()[local]
 		if proofMsg.GetVersion() != saksiprotocolv1.WireVersion {
-			return fmt.Errorf(
+			return rejectAt("shape",
 				"contest %q: unsupported CDS proof version %d, want %d",
 				contestID, proofMsg.GetVersion(), saksiprotocolv1.WireVersion,
 			)
@@ -257,7 +257,7 @@ func (s *SmartContract) SubmitBallot(ctx contractapi.TransactionContextInterface
 			ballot.GetElectionId(), contestID, nullifierBytes,
 			electionPK, ciphertext.GetPad(), ciphertext.GetData(), branches,
 		); err != nil {
-			return fmt.Errorf("contest %q CDS well-formedness proof failed: %w", contestID, err)
+			return rejectAt("cds", "contest %q CDS well-formedness proof failed: %w", contestID, err)
 		}
 	}
 
@@ -527,23 +527,23 @@ func (s *SmartContract) GetElection(ctx contractapi.TransactionContextInterface,
 func (s *SmartContract) PublishDKGTranscript(ctx contractapi.TransactionContextInterface, transcriptHex string) error {
 	raw, err := hex.DecodeString(transcriptHex)
 	if err != nil {
-		return fmt.Errorf("DKG transcript is not valid hex: %w", err)
+		return rejectAt("decode", "DKG transcript is not valid hex: %w", err)
 	}
 
 	var transcript saksiprotocolv1.DKGTranscript
 	if err := proto.Unmarshal(raw, &transcript); err != nil {
-		return fmt.Errorf("decode DKG transcript: %w", err)
+		return rejectAt("decode", "decode DKG transcript: %w", err)
 	}
 
 	if transcript.GetVersion() != saksiprotocolv1.WireVersion {
-		return fmt.Errorf("unsupported DKG transcript version %d, want %d", transcript.GetVersion(), saksiprotocolv1.WireVersion)
+		return rejectAt("shape", "unsupported DKG transcript version %d, want %d", transcript.GetVersion(), saksiprotocolv1.WireVersion)
 	}
 	electionID := transcript.GetElectionId()
 	if electionID == "" {
-		return fmt.Errorf("DKG transcript is missing an election id")
+		return rejectAt("shape", "DKG transcript is missing an election id")
 	}
 	if len(transcript.GetTrusteeCommitments()) == 0 {
-		return fmt.Errorf("DKG transcript has no trustee commitments")
+		return rejectAt("shape", "DKG transcript has no trustee commitments")
 	}
 
 	stub := ctx.GetStub()
@@ -558,17 +558,17 @@ func (s *SmartContract) PublishDKGTranscript(ctx contractapi.TransactionContextI
 		return fmt.Errorf("read election state: %w", err)
 	}
 	if electionRaw == nil {
-		return fmt.Errorf("no election found with id %q", electionID)
+		return rejectAt("election-exists", "no election found with id %q", electionID)
 	}
 	var params saksiprotocolv1.ElectionParameters
 	if err := proto.Unmarshal(electionRaw, &params); err != nil {
 		return fmt.Errorf("decode stored election parameters: %w", err)
 	}
 	if transcript.GetThreshold() != params.GetThreshold() {
-		return fmt.Errorf("DKG transcript threshold %d does not match election threshold %d", transcript.GetThreshold(), params.GetThreshold())
+		return rejectAt("dkg-consistency", "DKG transcript threshold %d does not match election threshold %d", transcript.GetThreshold(), params.GetThreshold())
 	}
 	if got, want := len(transcript.GetTrusteeCommitments()), len(params.GetTrusteeIds()); got != want {
-		return fmt.Errorf("DKG transcript has %d trustee commitments, election has %d trustees", got, want)
+		return rejectAt("dkg-consistency", "DKG transcript has %d trustee commitments, election has %d trustees", got, want)
 	}
 
 	dkgKey, err := stub.CreateCompositeKey(dkgIndex, []string{electionID})
@@ -580,7 +580,7 @@ func (s *SmartContract) PublishDKGTranscript(ctx contractapi.TransactionContextI
 		return fmt.Errorf("read DKG state: %w", err)
 	}
 	if existing != nil {
-		return fmt.Errorf("a DKG transcript is already published for election %q", electionID)
+		return rejectAt("dkg-duplicate", "a DKG transcript is already published for election %q", electionID)
 	}
 	if err := stub.PutState(dkgKey, raw); err != nil {
 		return fmt.Errorf("store DKG transcript: %w", err)
@@ -676,6 +676,21 @@ func loadElection(stub interface {
 	return &params, nil
 }
 
+// rejectAt is a submission refused by one named gate. The error reads
+// "gate=<id>: <message>": the id is the stable, machine-readable part, which the
+// campaign console matches to report WHICH check stopped an attack (a
+// rejection by any other gate is not evidence about the gate under test). The
+// message after the prefix is unchanged, so anything matching the old wording
+// still matches. Internal failures (state reads, key building) carry no gate:
+// they are not a verdict on the submission.
+//
+// Gate ids: decode, shape, credential, election-exists, election-open,
+// election-closed, nullifier, dkg-missing, cds, dkg-consistency, dkg-duplicate,
+// cp-presence, membership, partial-duplicate.
+func rejectAt(gate, format string, args ...any) error {
+	return fmt.Errorf("gate="+gate+": "+format, args...)
+}
+
 func contains(haystack []string, needle string) bool {
 	for _, s := range haystack {
 		if s == needle {
@@ -697,32 +712,32 @@ func contains(haystack []string, needle string) bool {
 // A trustee may submit at most one share per contest.
 func (s *SmartContract) SubmitPartialDecryption(ctx contractapi.TransactionContextInterface, electionID string, partialHex string) error {
 	if electionID == "" {
-		return fmt.Errorf("missing election id")
+		return rejectAt("shape", "missing election id")
 	}
 	raw, err := hex.DecodeString(partialHex)
 	if err != nil {
-		return fmt.Errorf("partial decryption is not valid hex: %w", err)
+		return rejectAt("decode", "partial decryption is not valid hex: %w", err)
 	}
 
 	var partial saksiprotocolv1.PartialDecryption
 	if err := proto.Unmarshal(raw, &partial); err != nil {
-		return fmt.Errorf("decode partial decryption: %w", err)
+		return rejectAt("decode", "decode partial decryption: %w", err)
 	}
 
 	if partial.GetVersion() != saksiprotocolv1.WireVersion {
-		return fmt.Errorf("unsupported partial decryption version %d, want %d", partial.GetVersion(), saksiprotocolv1.WireVersion)
+		return rejectAt("shape", "unsupported partial decryption version %d, want %d", partial.GetVersion(), saksiprotocolv1.WireVersion)
 	}
 	if partial.GetTrusteeId() == "" {
-		return fmt.Errorf("partial decryption is missing a trustee id")
+		return rejectAt("shape", "partial decryption is missing a trustee id")
 	}
 	if partial.GetContestId() == "" {
-		return fmt.Errorf("partial decryption is missing a contest id")
+		return rejectAt("shape", "partial decryption is missing a contest id")
 	}
 	if len(partial.GetShare()) != ciphertextLen {
-		return fmt.Errorf("partial decryption share is %d bytes, want %d", len(partial.GetShare()), ciphertextLen)
+		return rejectAt("shape", "partial decryption share is %d bytes, want %d", len(partial.GetShare()), ciphertextLen)
 	}
 	if partial.GetProof() == nil {
-		return fmt.Errorf("partial decryption is missing a Chaum-Pedersen proof")
+		return rejectAt("cp-presence", "partial decryption is missing a Chaum-Pedersen proof")
 	}
 
 	stub := ctx.GetStub()
@@ -737,10 +752,10 @@ func (s *SmartContract) SubmitPartialDecryption(ctx contractapi.TransactionConte
 		return fmt.Errorf("read election status: %w", err)
 	}
 	if status == nil {
-		return fmt.Errorf("election %q does not exist", electionID)
+		return rejectAt("election-exists", "election %q does not exist", electionID)
 	}
 	if string(status) != electionStatusClosed {
-		return fmt.Errorf("election %q is not closed; partial decryption is not yet allowed", electionID)
+		return rejectAt("election-closed", "election %q is not closed; partial decryption is not yet allowed", electionID)
 	}
 
 	params, err := loadElection(stub, electionID)
@@ -748,10 +763,10 @@ func (s *SmartContract) SubmitPartialDecryption(ctx contractapi.TransactionConte
 		return err
 	}
 	if !contains(params.GetContestIds(), partial.GetContestId()) {
-		return fmt.Errorf("contest %q is not part of election %q", partial.GetContestId(), electionID)
+		return rejectAt("membership", "contest %q is not part of election %q", partial.GetContestId(), electionID)
 	}
 	if !contains(params.GetTrusteeIds(), partial.GetTrusteeId()) {
-		return fmt.Errorf("trustee %q is not part of election %q", partial.GetTrusteeId(), electionID)
+		return rejectAt("membership", "trustee %q is not part of election %q", partial.GetTrusteeId(), electionID)
 	}
 
 	partialKey, err := stub.CreateCompositeKey(partialDecIndex, []string{electionID, partial.GetContestId(), partial.GetTrusteeId()})
@@ -763,7 +778,7 @@ func (s *SmartContract) SubmitPartialDecryption(ctx contractapi.TransactionConte
 		return fmt.Errorf("read partial decryption state: %w", err)
 	}
 	if existing != nil {
-		return fmt.Errorf("trustee %q already submitted a partial decryption for contest %q in election %q", partial.GetTrusteeId(), partial.GetContestId(), electionID)
+		return rejectAt("partial-duplicate", "trustee %q already submitted a partial decryption for contest %q in election %q", partial.GetTrusteeId(), partial.GetContestId(), electionID)
 	}
 	if err := stub.PutState(partialKey, raw); err != nil {
 		return fmt.Errorf("store partial decryption: %w", err)

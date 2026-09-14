@@ -256,6 +256,16 @@ func (e *Executor) CeremonyStart(ctx context.Context, runID string, c ElectionCo
 		return err
 	}
 	if !onChain {
+		// The local lifecycle has the same stages; its attacks are simulated,
+		// and with no ledger there is no election state to record.
+		if c.AttackPlan != nil {
+			for _, stage := range []string{StageDKG, StageBallots, StageClose} {
+				e.pauseForAttacks(ctx, runID, c, stage, MountContext{}, false, e.simulatedMount(ctx, runID, false))
+			}
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+		}
 		e.publish(runID, "ceremony", "done",
 			"local ceremony ready — no ledger; the threshold gate is enforced by this console")
 		return e.writeCeremony(runID, c, nil)
@@ -362,6 +372,14 @@ func (e *Executor) CeremonyPublish(ctx context.Context, runID string, c Election
 		return err
 	}
 	if !onChain {
+		// The ceremony stage pauses here: trustees have acted, nothing is
+		// published yet.
+		if c.AttackPlan.has(StageCeremony) {
+			e.pauseForAttacks(ctx, runID, c, StageCeremony, MountContext{}, false, e.simulatedMount(ctx, runID, false))
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+		}
 		e.publish(runID, "ceremony", "done",
 			fmt.Sprintf("threshold met (%d of %d) — tally unlocked", state.Submitted, state.Threshold))
 		return e.markPublished(runID, c)
@@ -372,6 +390,12 @@ func (e *Executor) CeremonyPublish(ctx context.Context, runID string, c Election
 		return err
 	}
 	defer conn.Close()
+	if c.AttackPlan.has(StageCeremony) {
+		dir, _ := e.store.Dir(runID)
+		e.pauseForAttacks(ctx, runID, c, StageCeremony,
+			MountContext{ElectionStatus: "closed", BallotsCommitted: committedFromMetrics(dir), BlockHeight: chainHeight(conn.Ledger())},
+			true, e.simulatedMount(ctx, runID, true))
+	}
 
 	path, err := e.bundlePath(runID)
 	if err != nil {

@@ -45,7 +45,7 @@ every guarantee is enforced in the same place.**
 | No double voting | per-position nullifier | Steps 4, 7 |
 | Data completeness | the console's validation gate | Step 3 |
 | Threshold *t*-of-*n* | the **auditor**, at verification time — *not* the chaincode | Steps 5, 6 |
-| Ledger ordering | the **chaincode**, at endorsement — the offline auditor cannot see it | Step 7 |
+| Ledger ordering | not checked (no gate): neither the chaincode nor the stateless auditor checks ballot order | Step 7 |
 | Tally correctness | `E = Σ\|Tᵢ − Gᵢ\| = 0` | Step 6 |
 
 Two rows there are deliberately awkward, and both are stated in the UI rather

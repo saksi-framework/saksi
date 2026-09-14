@@ -471,8 +471,8 @@ func (s *Server) boardContests(
 // tamperedRefused counts the ballot-stage attacks the system refused. This is
 // the only honest source for a "rejected" figure: a synthetic run has no
 // spoiled ballots, so the number reports tampered ballots the verifier caught,
-// not voters' ballots thrown out. SKIPPED (chaincode-only, no network) rows are
-// not counted either way.
+// not voters' ballots thrown out. SKIPPED (never mounted) rows are not counted
+// either way.
 func tamperedRefused(results []ScenarioResult) (int, string) {
 	n, ran := 0, 0
 	for _, r := range results {

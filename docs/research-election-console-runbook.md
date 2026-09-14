@@ -293,10 +293,11 @@ nothing about the selection.
   corrupted bytes, tampered partial-decryption, tampered DKG) — each proven
   rejected by the real auditor.
 - **Network-gated (needs a live Fabric network):** on-chain `Submit` + perf
-  numbers, and the `reordered-ballots` scenario (ordering is a ledger property the
-  stateless auditor does not check, so it is enforced by the chain, not
-  `audit-stream`). These are skipped/errored clearly when no network/driver is
-  present — never a silent hang.
+  numbers. These error clearly when no network/driver is present — never a
+  silent hang.
+- **Not checked anywhere:** `reordered-ballots`. Neither the chaincode (no
+  ordering or digest check) nor the stateless auditor checks ballot order, so the
+  scenario is always `SKIPPED` with "no gate exists to test".
 
 ## 8. Where the data lands
 
@@ -308,7 +309,8 @@ Each run is a folder under `--runs`, named `<slug>-<timestamp>-<n>`:
 | `header.json` | election params/DKG/issuer/binding/partials/tally/ground-truth (hex protobuf) |
 | `ballots.ndjson` | one hex-protobuf ballot per line |
 | `correctness.csv` | 13 columns (written by Verify) — see below |
-| `negative-tests.csv` | `scenario,layer,action,expected,actual,verdict,property` (written by Scenarios) |
+| `negative-tests.csv` | one row per attack plus a `summary` row (written by Scenarios and by every attack mounted during the election) — see below |
+| `scenarios.json` | the accumulated attack verdicts `negative-tests.csv` is rebuilt from |
 | `scenarios/<id>/` | the mutated copy each scenario audited |
 | `journal.ndjson` | the run's event log — see below |
 | `perf.csv` | one row per run: the whole performance record — see below |
@@ -397,7 +399,11 @@ Two consequences worth knowing:
 Useful events: `stage.generate.*`, `stage.bundle.*`, `stage.ballots.*`,
 `stage.ceremony.*`, `stage.verify.*`, `segment.start`/`segment.end`,
 `ballots.progress {done}`, `interrupted_at {last_done}`, `sample` (one per
-container per sampler tick), and `run.end`, which carries the finaliser's
+container per sampler tick), the attack timeline's `attack.pause {stage,
+election_status, ballots_committed, block_height, scenarios, live}`,
+`attack.result {scenario, verdict, gate_expected, gate_observed}` and
+`attack.resume {stage, reason, paused_ms}` (`reason` is `run-all`, `skip`,
+`timeout` or `cancelled`), and `run.end`, which carries the finaliser's
 verdict: `failed`, `reason`, `sustained`, `arrival_tps`, `sustained_tps` and
 `scaling_limit` (`true` / `false` / `inconclusive`). The same reason string is
 `perf.csv`'s `fail_reason` column.
@@ -419,7 +425,7 @@ latency_min_ms,latency_p50_ms,latency_mean_ms,latency_p95_ms,latency_p99_ms,late
 peak_cpu_pct_peer,peak_cpu_pct_orderer,peak_cpu_pct_client,
 peak_mem_mb_peer,peak_mem_mb_orderer,peak_mem_mb_client,
 ledger_bytes_delta,sustained,scaling_limit,failed,fail_reason,
-verify_threads
+verify_threads,security_run
 ```
 
 Read the suffixes: `_inproc_ms` is measured inside the auditor process,
@@ -445,6 +451,104 @@ Three caveats worth knowing before quoting a number:
 - `driver_ceiling_tps` is concurrency ÷ median submit latency: the harness's own
   ceiling. A `committed_tps` close to it means the driver, not the network, was
   the limit, and the finaliser reports `scaling_limit: inconclusive`.
+- `security_run` is `true` when the run had an `attack_plan`. Its lifecycle
+  paused to mount attacks, so its throughput is **perturbed — not for RQ3**.
+  The ballot window leaves the pause out (its two halves are summed), but the
+  ledger still processed the attacks, and the `peak_cpu_pct_*` and
+  `peak_mem_mb_*` columns come from a sampler that ran through the pause, so
+  they include the attacks and the idle wait. A security run never reports a
+  sustained TPS or a scaling verdict (`scaling_limit` is `inconclusive`, and
+  `run.end` carries `security_run: true`). Empty for every other run.
+
+### `negative-tests.csv` — the attack record
+
+```
+scenario,stage,layer,action,expected,actual,verdict,property,on_chain,
+attempted,rejected,rate,
+mounted_stage,election_status,ballots_committed,block_height,live,
+gate_expected,gate_observed
+```
+
+Every attack declares the gate that must refuse it: a chaincode gate id when it
+is submitted to a live election (the chaincode's rejections start
+`gate=<id>:`), an auditor check id when it runs as a simulation
+(`audit-stream --json` reports `failed_checks`). The verdict is judged against
+that gate:
+
+| `verdict` | Meaning |
+|---|---|
+| `PASS` | refused **by the declared gate** |
+| `INCONCLUSIVE` | refused by a different gate (`actual` = `rejected by <gate>: <text>`), by one that names no gate, or never mounted faithfully (`actual` starts `not mounted:`) |
+| `FAIL` | nothing refused it: the ledger accepted it, or the audit passed the mutated copy |
+| `SKIPPED` | never mounted |
+
+`attempted`/`rejected`/`rate` count PASS and FAIL only: an INCONCLUSIVE row is
+not a trial of its gate. `gate_observed` is the chaincode gate that refused a
+live attack, or every auditor check that failed, `;`-joined (a ballot-level
+mutation also breaks the aggregate, so the decryption and tally checks fail
+beside the declared one).
+
+The mount context records the election as the attack found it.
+`mounted_stage` is `dkg`, `ballots`, `close` or `ceremony` for an attack
+mounted at a pause of the attack timeline, `unstaged` for one mounted any
+other time (the step-7 catalogue, or `/attack` on its own). `election_status`
+(`open`, `closed`, `published`), `ballots_committed` and `block_height` are
+empty when there was no ledger to read them from. `live` repeats `on_chain`
+beside the rest of the mount context: `true` only for a real submission.
+
+Read a **simulated row mounted at a live pause** (`live=false` with an
+`election_status`) with care: its mount context describes the live election at
+that moment, but the mutation and the audit act on a copy of the generated run,
+not on the chain. It records when the attack was mounted, not what the ledger
+did with it.
+
+Which attacks go live: only those with an on-chain gate that leaves no state
+behind when it refuses — `tamper-ballot-proof` (`cds`), `reused-nullifier`
+(`nullifier`) and `corrupted-ballot-bytes` (`decode`), mounted at the `ballots`
+pause while the election is open. `tamper-dkg-transcript` and
+`tamper-partial-decryption` would be **accepted** by the chaincode (it checks
+transcript shape and proof presence, not the points or the proof, and not who
+submits them), so they are always simulated and their `actual` says "on-chain:
+not checked (shape/presence only, no caller authorization); caught by the
+auditor" on a live election.
+`dropped-ballot` is not expressible as one submission; `reordered-ballots`
+stays `SKIPPED`.
+
+One row per scenario. A verdict mounted at a pause is never replaced by an
+`unstaged` one: re-running an attack from step 7 after a security run leaves the
+staged (often live) row in place, and the re-run is recorded in the journal as
+`attack.rerun.unstaged {scenario, verdict, actual, live, gate_expected,
+gate_observed, kept_mounted_stage}`.
+
+#### Findings: two front-running denial-of-service paths
+
+The chaincode never asks who is calling (no `GetClientIdentity` anywhere), and
+the DKG and partial-decryption gates check shape and presence, not content. Any
+client with write access to the channel can therefore get in first:
+
+- **DKG transcript.** Right after `CreateElection`, an attacker publishes a
+  transcript with the right threshold and commitment count but a tampered
+  commitment. `PublishDKGTranscript` accepts it. The operator's real transcript
+  is then refused as `gate=dkg-duplicate: a DKG transcript is already published
+  for election …`, and the election is unusable: with a non-canonical constant
+  term every `SubmitBallot` fails in `deriveElectionPublicKey` with an error that
+  carries no gate id ("derive election public key: trustee commitment 0 constant
+  term is not a canonical ristretto255 point"); with a substituted valid point
+  the joint key is wrong and every honest ballot fails `gate=cds`.
+- **Partial decryption.** After `CloseElection`, an attacker submits a share
+  under trustee id X for contest C with any 32-byte share and any proof attached.
+  `SubmitPartialDecryption` stores it under (election, C, X). Trustee X's real
+  share is then refused as `gate=partial-duplicate: trustee "X" already submitted
+  a partial decryption for contest "C" …`. The auditor rejects the planted share
+  (`decryption.cp_proof`), and front-running enough trustees leaves fewer than
+  the threshold of valid shares, so no tally for that contest can be verified.
+
+`CreateElection` (squatting an election id) and `CloseElection` (closing an
+election early) have no caller check either. The console does not mount these
+attacks live, because they would poison the election under test; the scenarios
+run simulated and their rows say "on-chain: not checked (shape/presence only, no
+caller authorization)". Adding caller authorization to the chaincode is a
+separate decision and is not part of this change.
 
 `latencies.csv` is `index,segment,ms,ok` with `ok ∈ {commit, drop, replay}`.
 `replay` appears only on resumed runs (see §9) and marks a ballot the chain had

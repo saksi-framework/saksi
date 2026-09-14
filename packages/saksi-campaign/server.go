@@ -348,6 +348,15 @@ func (s *Server) handleRunAll(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, errNoFabric().Error(), http.StatusBadRequest)
 		return
 	}
+	// Offline, run-all never reaches a pause (Submit is a no-op and the
+	// ceremony is not on this path), so the plan would be silently ignored on a
+	// run still marked security_run. On-chain run-all pauses in submitOnChain.
+	if c.AttackPlan != nil && c.Mode == "offline" {
+		http.Error(w, "attack_plan is not run by an offline /run-all: use the step-by-step "+
+			"ceremony (/generate, /ceremony/start, /ceremony/submit, /ceremony/publish), which pauses at each stage",
+			http.StatusBadRequest)
+		return
+	}
 	if !s.admit(w, c) {
 		return
 	}
@@ -889,6 +898,8 @@ func (s *Server) handleRunAction(w http.ResponseWriter, r *http.Request) {
 		s.handleResume(w, r, id)
 	case "verify-only":
 		s.handleVerifyOnly(w, r, id)
+	case "pause":
+		s.handlePause(w, r, id)
 	default:
 		http.NotFound(w, r)
 	}

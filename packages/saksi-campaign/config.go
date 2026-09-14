@@ -11,6 +11,7 @@ package campaign
 
 import (
 	"fmt"
+	"slices"
 	"strings"
 	"time"
 )
@@ -73,7 +74,33 @@ type ElectionConfig struct {
 	// run. The attacks are opt-in either way; this removes the offer entirely
 	// so a straight demonstration is one click.
 	SkipAttacks bool `json:"skip_attacks"`
+	// AttackPlan makes this a SECURITY RUN: the lifecycle pauses at each listed
+	// stage and that stage's attacks are mounted at the moment they belong to
+	// (timeline.go). Nil runs the lifecycle straight through, exactly as before.
+	// A security run's throughput is perturbed by design and marked so in
+	// perf.csv (security_run).
+	AttackPlan *AttackPlan `json:"attack_plan,omitempty"`
 }
+
+// AttackPlan is ElectionConfig.attack_plan.
+type AttackPlan struct {
+	// Stages are the lifecycle stages to pause at: dkg, ballots, close, ceremony.
+	Stages []string `json:"stages"`
+	// BallotsAt is the fraction of the ballots the window dispatches before the
+	// ballots stage pauses. Zero means DefaultBallotsAt.
+	BallotsAt float64 `json:"ballots_at"`
+	// TimeoutS is how long a paused stage waits for the operator; when it runs
+	// out, every attack at that stage not yet run is run and the lifecycle
+	// continues, so an unattended security run still carries out its plan.
+	// Zero means DefaultPauseTimeout.
+	TimeoutS float64 `json:"timeout_s,omitempty"`
+}
+
+// DefaultBallotsAt pauses the ballot window half way through.
+const DefaultBallotsAt = 0.5
+
+// DefaultPauseTimeout bounds how long a paused stage waits for the operator.
+const DefaultPauseTimeout = 5 * time.Minute
 
 // DefaultConcurrency is the in-flight ballot submission count when the config
 // does not say otherwise.
@@ -182,6 +209,46 @@ func (c ElectionConfig) Validate() error {
 		return fmt.Errorf(
 			"offline mode is capped at %d voters (got %d); use ground-truth mode for larger tiers until the streaming generator lands",
 			OfflineVoterCeiling, c.Voters)
+	}
+	return c.validateAttackPlan()
+}
+
+// validateAttackPlan admits a plan only for a single election that runs its
+// attacks: a campaign repetition is a measurement and never runs them, and a
+// ground-truth run has no ciphertexts to attack.
+func (c ElectionConfig) validateAttackPlan() error {
+	p := c.AttackPlan
+	if p == nil {
+		return nil
+	}
+	switch {
+	case c.SkipAttacks:
+		return fmt.Errorf("attack_plan contradicts skip_attacks: drop one of them")
+	case c.Rep != nil:
+		return fmt.Errorf("attack_plan is for a single election: a campaign repetition never runs attacks")
+	case c.Mode == ModeGroundTruth:
+		return fmt.Errorf("attack_plan needs encrypted ballots; %q mode produces none", ModeGroundTruth)
+	case len(p.Stages) == 0:
+		return fmt.Errorf("attack_plan lists no stages")
+	case p.BallotsAt < 0 || p.BallotsAt >= 1:
+		return fmt.Errorf("attack_plan ballots_at must be between 0 and 1, exclusive (got %v)", p.BallotsAt)
+	case p.TimeoutS < 0:
+		return fmt.Errorf("attack_plan timeout_s must be >= 0 (got %v)", p.TimeoutS)
+	}
+	seen := make(map[string]bool, len(p.Stages))
+	for _, st := range p.Stages {
+		if !slices.Contains(StageOrder, st) {
+			return fmt.Errorf("attack_plan stage %q is not one of %v", st, StageOrder)
+		}
+		if seen[st] {
+			return fmt.Errorf("attack_plan lists stage %q twice", st)
+		}
+		seen[st] = true
+	}
+	// Pausing mid-window needs a ballot already cast (to reuse its nullifier)
+	// and one not yet cast (to tamper with before it reaches the chain).
+	if seen[StageBallots] && c.Voters*c.Positions < 2 {
+		return fmt.Errorf("attack_plan's ballots stage needs at least 2 ballots (got %d)", c.Voters*c.Positions)
 	}
 	return nil
 }

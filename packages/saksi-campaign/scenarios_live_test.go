@@ -64,7 +64,7 @@ func liveRun(t *testing.T) string {
 // path without building real protobuf ballots.
 func flipLine(stage string, idx int) Scenario {
 	return Scenario{
-		ID: "test-" + stage, Stage: stage, Layer: LayerOffline,
+		ID: "test-" + stage, Stage: stage, Layer: LayerOffline, ChainGate: "cds",
 		Action: "flip a line", Expected: "rejected", Property: "test",
 		Mutate: func(dir string) error {
 			lines, err := readBallotLines(dir)
@@ -89,18 +89,60 @@ func testExec(t *testing.T) *Executor {
 // because that message is what the demonstration shows.
 func TestLiveAttackRejectionIsAPass(t *testing.T) {
 	dir := liveRun(t)
-	sub := &fakeSubmitter{err: errString("contest \"president/cand0\" CDS well-formedness proof failed")}
+	sub := &fakeSubmitter{err: errString("gate=cds: contest \"president/cand0\" CDS well-formedness proof failed")}
 
 	res := testExec(t).mountLiveAttack("run", dir, flipLine(StageBallots, 0), sub, "e2e")
 
 	if res.Verdict != "PASS" {
-		t.Fatalf("verdict = %q, want PASS: a rejected attack is the gate working", res.Verdict)
+		t.Fatalf("verdict = %q, want PASS: a rejection by the declared gate is the gate working", res.Verdict)
 	}
 	if !res.OnChain {
 		t.Error("OnChain = false; a live submission must be recorded as such")
 	}
+	if res.GateExpected != "cds" || res.GateObserved != "cds" {
+		t.Errorf("gates expected/observed = %q/%q, want cds/cds", res.GateExpected, res.GateObserved)
+	}
 	if !strings.Contains(res.Actual, "CDS well-formedness proof failed") {
 		t.Errorf("the chaincode's message was lost: %q", res.Actual)
+	}
+}
+
+// The defect this rule exists for: a tampered proof mounted after the election
+// closed is refused by the closed-election gate, which runs before the proof
+// check. The ledger said no, but not to the proof — so it is not a pass.
+func TestLiveAttackRejectedByAnotherGateIsInconclusive(t *testing.T) {
+	dir := liveRun(t)
+	sub := &fakeSubmitter{err: errString("gate=election-open: election \"e2e\" is not open for ballots")}
+
+	res := testExec(t).mountLiveAttack("run", dir, flipLine(StageBallots, 0), sub, "e2e")
+
+	if res.Verdict != "INCONCLUSIVE" {
+		t.Fatalf("verdict = %q, want INCONCLUSIVE: the gate under test never ran", res.Verdict)
+	}
+	if res.GateObserved != "election-open" || res.GateExpected != "cds" {
+		t.Errorf("gates expected/observed = %q/%q", res.GateExpected, res.GateObserved)
+	}
+	if want := `rejected by election-open: election "e2e" is not open for ballots`; res.Actual != want {
+		t.Errorf("actual = %q, want %q", res.Actual, want)
+	}
+	if a, r := res.rejection(); a != 0 || r != 0 {
+		t.Errorf("an inconclusive trial counted as attempted=%d rejected=%d; it is not a trial of the gate", a, r)
+	}
+}
+
+// A rejection that names no gate — a chaincode deployed before gate ids, an
+// endorsement timeout — cannot be attributed to the gate under test either.
+func TestLiveAttackRejectedByAnUnidentifiedGateIsInconclusive(t *testing.T) {
+	dir := liveRun(t)
+	sub := &fakeSubmitter{err: errString("contest \"president/cand0\" CDS well-formedness proof failed")}
+
+	res := testExec(t).mountLiveAttack("run", dir, flipLine(StageBallots, 0), sub, "e2e")
+
+	if res.Verdict != "INCONCLUSIVE" || res.GateObserved != "" {
+		t.Fatalf("verdict/observed = %q/%q, want INCONCLUSIVE with no observed gate", res.Verdict, res.GateObserved)
+	}
+	if !strings.Contains(res.Actual, "unidentified gate") {
+		t.Errorf("actual should say the gate is unidentified: %q", res.Actual)
 	}
 }
 
@@ -168,8 +210,8 @@ func TestLiveAttackRoutesByStage(t *testing.T) {
 	}
 	for _, tc := range cases {
 		dir := liveRun(t)
-		sub := &fakeSubmitter{err: errString("rejected")}
-		sc := Scenario{ID: "t", Stage: tc.stage, Action: "a", Expected: "e", Property: "p", Mutate: tc.mutate}
+		sub := &fakeSubmitter{err: errString("gate=t: rejected")}
+		sc := Scenario{ID: "t", Stage: tc.stage, Action: "a", Expected: "e", Property: "p", Mutate: tc.mutate, ChainGate: "t"}
 
 		res := testExec(t).mountLiveAttack("run", dir, sc, sub, "e2e")
 
@@ -198,8 +240,10 @@ func TestLiveAttackRefusesToSubmitAnUnchangedArtifact(t *testing.T) {
 	if len(sub.ballotCalls) != 0 {
 		t.Error("submitted an artifact the mutation never changed")
 	}
-	if res.Verdict != "FAIL" || !strings.Contains(res.Actual, "changed no ballot") {
-		t.Errorf("expected a clear no-op failure, got %q / %q", res.Verdict, res.Actual)
+	// Nothing was mounted, so nothing was tested: INCONCLUSIVE, never FAIL (a
+	// gate letting an attack through) and never PASS.
+	if res.Verdict != "INCONCLUSIVE" || !strings.Contains(res.Actual, "changed no ballot") {
+		t.Errorf("expected a clear not-mounted result, got %q / %q", res.Verdict, res.Actual)
 	}
 }
 
