@@ -17,6 +17,11 @@
 //!   prints structured per-contest correctness `{overall, contests:[{contest,
 //!   ground_truth, decoded, E, pass}]}`. Exits non-zero on FAIL.
 //!
+//! - `forge-ballot <dir> --position P --candidate K` — print one forged ballot
+//!   (hex) for the election in `<dir>`: genuine proofs under a self-issued
+//!   credential. The chaincode commits it; the auditor refuses it
+//!   (`ballot.issuer_binding`). For recording the ballot-stuffing sample chain.
+//!
 //! Both audit subcommands verify ballots on every core. `SAKSI_AUDIT_THREADS=<n>`
 //! pins the thread count (`1` = the serial path); the output is identical at any
 //! `n`, and an invalid value is an error.
@@ -26,8 +31,8 @@ use std::process::ExitCode;
 
 use saksi_auditor::demo::{
     audit_bundle_json, audit_stream_dir, election_bundle_json, election_bundle_json_params,
-    write_election_stream_params, write_election_stream_params_chunked, GenParams,
-    SelectionProfile,
+    forge_self_issued_ballot, write_election_stream_params, write_election_stream_params_chunked,
+    GenParams, SelectionProfile,
 };
 use saksi_auditor::ground_truth::write_ground_truth_csvs;
 use saksi_auditor::stream::DEFAULT_CHUNK_VOTERS;
@@ -40,6 +45,7 @@ fn main() -> ExitCode {
         Some("gen-ground-truth") => cmd_gen_ground_truth(&args[2..]),
         Some("audit") => cmd_audit(args.get(2).map(String::as_str)),
         Some("audit-stream") => cmd_audit_stream(&args[2..]),
+        Some("forge-ballot") => cmd_forge_ballot(&args[2..]),
         _ => {
             eprintln!(
                 "usage: saksi-demo <gen [--voters N] [--positions P] [--candidates C] \
@@ -47,7 +53,8 @@ fn main() -> ExitCode {
                  [--threshold T] [--trustees N] [--trustee-names a,b,c] [--stream DIR] [--chunk N] [outfile] \
                  | gen-ground-truth [--voters N] [--positions P] [--candidates C] \
                  [--distribution uniform|skewed|realistic] [--election-id S] --out-dir DIR \
-                 | audit <bundle.json> | audit-stream <dir> [--json]>"
+                 | audit <bundle.json> | audit-stream <dir> [--json] \
+                 | forge-ballot <dir> --position P --candidate K>"
             );
             ExitCode::FAILURE
         }
@@ -547,5 +554,32 @@ mod tests {
         let err = parse_gen_args(&sv(&["--stream", "/tmp/r", "out.json"]))
             .expect_err("mutually exclusive");
         assert!(err.contains("mutually exclusive"), "got: {err}");
+    }
+}
+
+fn cmd_forge_ballot(args: &[String]) -> ExitCode {
+    let usage = "usage: saksi-demo forge-ballot <dir> --position P --candidate K";
+    let (mut dir, mut position, mut candidate) = (None, None, None);
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--position" => position = it.next(),
+            "--candidate" => candidate = it.next().and_then(|k| k.parse::<usize>().ok()),
+            other => dir = Some(other),
+        }
+    }
+    let (Some(dir), Some(position), Some(candidate)) = (dir, position, candidate) else {
+        eprintln!("{usage}");
+        return ExitCode::FAILURE;
+    };
+    match forge_self_issued_ballot(Path::new(dir), position, candidate) {
+        Ok(hex) => {
+            println!("{hex}");
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("forge-ballot: {e}");
+            ExitCode::FAILURE
+        }
     }
 }

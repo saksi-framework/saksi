@@ -317,7 +317,7 @@ func TestSimulatedMutationsHitTheirDeclaredField(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	pdHex, err := tamperPartialProof(h["partial_decryptions"].([]any)[0].(string))
+	pdHex, err := TamperPartialProof(h["partial_decryptions"].([]any)[0].(string))
 	if err != nil {
 		t.Fatal(err)
 	}

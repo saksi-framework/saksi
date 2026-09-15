@@ -526,6 +526,134 @@ pub fn audit_bundle_json(bundle: &str) -> Result<AuditReport, String> {
     Ok(crate::audit_with_evidence(artifacts, pool.as_ref()).0)
 }
 
+/// Builds one **forged** ballot record, as hex, for the election whose
+/// `header.json` is in `dir`: a vote for candidate `candidate` (0-based) in
+/// `position_id`, under a credential issued by a freshly generated issuer key
+/// the election never declared.
+///
+/// Every proof in it is genuine. The CDS proofs are made under the election's
+/// joint key, rebuilt from the header's DKG transcript, and bound to the forged
+/// credential's nullifier; the credential signature verifies under the issuer
+/// key the ballot itself carries. Those are the checks the chaincode runs at
+/// endorsement, so a ledger commits this ballot. Only the auditor's
+/// `ballot.issuer_binding` check, which holds that key against the election's
+/// issuer key, refuses it. It exists to record the ballot-stuffing sample
+/// chain; the generator never calls it.
+pub fn forge_self_issued_ballot(
+    dir: &std::path::Path,
+    position_id: &str,
+    candidate: usize,
+) -> Result<String, String> {
+    use curve25519_dalek::scalar::Scalar;
+    use rand_core::OsRng;
+    use saksi_credentials::{
+        issuer_pre_sign, issuer_sign, voter_begin_issuance, voter_blind_challenge,
+        voter_finalize_issuance, IssuerSecretKey,
+    };
+    use saksi_crypto::elgamal::{encrypt, Plaintext};
+    use saksi_crypto::nizk::cds::CDSProof;
+    use saksi_protocol::{Ciphertext as WireCiphertext, WIRE_VERSION};
+
+    let header = crate::stream::read_header(dir)?;
+    let hexd = |s: &str, what: &str| hex::decode(s).map_err(|e| format!("{what} not hex: {e}"));
+    let parameters = ElectionParameters::decode(&hexd(&header.params, "params")?[..])
+        .map_err(|e| format!("decode params: {e}"))?;
+    let transcript = DKGTranscript::decode(&hexd(&header.dkg, "dkg")?[..])
+        .map_err(|e| format!("decode dkg: {e}"))?;
+    let binding_context = hexd(&header.binding_context, "binding_context")?;
+    let election_public_key = crate::fixtures::joint_public_key_from_transcript(&transcript);
+
+    // The position's contests, in order: the same prefix rule as the
+    // chaincode's contestIndicesForPosition and the auditor.
+    let prefix = format!("{position_id}/");
+    let contests: Vec<&String> = parameters
+        .contest_ids
+        .iter()
+        .filter(|c| c.starts_with(&prefix))
+        .collect();
+    if contests.is_empty() {
+        return Err(format!(
+            "position {position_id:?} matches no contest of the election"
+        ));
+    }
+    if candidate >= contests.len() {
+        return Err(format!(
+            "candidate {candidate} is out of range: {position_id:?} has {} candidates",
+            contests.len()
+        ));
+    }
+
+    let mut rng = OsRng;
+    let attacker = IssuerSecretKey::generate(&mut rng);
+    let attacker_pk = attacker.public_key();
+    let (request, blind_state) = voter_begin_issuance(&mut rng);
+    let (pre_sig, session) = issuer_pre_sign(&attacker, &request, &mut rng);
+    let (blinded, finalize_state) =
+        voter_blind_challenge(blind_state, &pre_sig, &attacker_pk, &mut rng);
+    let response = issuer_sign(&attacker, session, &blinded);
+    let credential = voter_finalize_issuance(finalize_state, &response, &attacker_pk)
+        .map_err(|e| format!("issue the forged credential: {e:?}"))?;
+    let presentation = credential.present(
+        &attacker_pk,
+        parameters.election_id.as_bytes(),
+        position_id.as_bytes(),
+        &binding_context,
+        &mut rng,
+    );
+    let nullifier = presentation
+        .nullifier
+        .as_ref()
+        .ok_or("the presentation has no nullifier")?
+        .value
+        .clone();
+
+    let choice_set = [Scalar::ZERO, Scalar::ONE];
+    let mut ciphertexts = Vec::with_capacity(contests.len());
+    let mut proofs = Vec::with_capacity(contests.len());
+    for (k, contest_id) in contests.iter().enumerate() {
+        let choice = usize::from(k == candidate);
+        let r = Scalar::random(&mut rng);
+        let ct = encrypt(
+            &election_public_key,
+            Plaintext::from_small_integer(choice as u64),
+            r,
+        );
+        let context = crate::ballot::cds_context_for_test(
+            parameters.election_id.as_bytes(),
+            contest_id.as_bytes(),
+            &nullifier,
+        );
+        let proof = CDSProof::prove(
+            &election_public_key,
+            &ct,
+            &choice_set,
+            choice,
+            &r,
+            &context,
+            &mut rng,
+        )
+        .map_err(|e| format!("CDS prove for {contest_id}: {e:?}"))?;
+        let (pad, data) = ct.to_compressed_bytes();
+        ciphertexts.push(WireCiphertext {
+            version: WIRE_VERSION,
+            pad: pad.to_vec(),
+            data: data.to_vec(),
+        });
+        proofs.push(proof.to_wire());
+    }
+
+    let ballot = Ballot {
+        version: WIRE_VERSION,
+        election_id: parameters.election_id.clone(),
+        voter_credential_commitment: presentation.credential_commitment.clone(),
+        ciphertexts,
+        well_formedness_proofs: proofs,
+        credential_presentation: Some(presentation),
+        position_id: position_id.to_string(),
+    };
+    Ok(hex::encode(ballot.encode_to_vec()))
+}
+
 /// Audits a **stream run folder** (`header.json` + `ballots.ndjson`, the shape
 /// [`write_election_stream_params`] writes) and projects the result into
 /// [`StreamAudit`] — structured per-contest correctness the console's Verify
@@ -770,6 +898,76 @@ mod tests {
             1,
             "{ids:?}"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn forged_self_issued_ballot_passes_the_chain_checks_and_fails_issuer_binding() {
+        let dir = std::env::temp_dir().join("saksi-forge-self-issued");
+        let _ = std::fs::remove_dir_all(&dir);
+        let p = GenParams {
+            election_id: "forge-e".into(),
+            election_name: "Forge".into(),
+            threshold: 2,
+            trustees: 3,
+            trustee_names: (1..=3).map(|i| format!("T{i}")).collect(),
+            voters: 3,
+            positions: 1,
+            candidates: 2,
+            profile: SelectionProfile::Realistic,
+        };
+        write_election_stream_params(&dir, &p).expect("write stream");
+
+        let forged_hex = forge_self_issued_ballot(&dir, "president", 1).expect("forge");
+        let ballot = Ballot::decode(&hex::decode(&forged_hex).unwrap()[..]).expect("decodes");
+        let header = crate::stream::read_header(&dir).expect("header");
+        let binding = hex::decode(&header.binding_context).unwrap();
+        let presentation = ballot
+            .credential_presentation
+            .as_ref()
+            .expect("presentation");
+
+        // The chaincode's credential check holds: the credential verifies under
+        // the issuer key the ballot itself carries, which is not the election's.
+        let embedded: [u8; 32] = presentation
+            .issuer_public_key
+            .as_slice()
+            .try_into()
+            .unwrap();
+        let embedded = IssuerPublicKey(point_from_compressed(embedded).unwrap());
+        saksi_credentials::verify_presentation(
+            presentation,
+            &embedded,
+            b"forge-e",
+            b"president",
+            &binding,
+        )
+        .expect("the credential verifies under its own issuer key");
+        assert_ne!(
+            presentation.issuer_public_key,
+            hex::decode(&header.issuer_pk).unwrap()
+        );
+
+        // Appended to the published ballots, the auditor names issuer binding,
+        // and not the CDS proofs, which are genuine under the election's key.
+        let mut lines = std::fs::read_to_string(dir.join(crate::stream::BALLOTS_FILE)).unwrap();
+        lines.push_str(&forged_hex);
+        lines.push('\n');
+        std::fs::write(dir.join(crate::stream::BALLOTS_FILE), lines).unwrap();
+        let hp = dir.join(crate::stream::HEADER_FILE);
+        let mut v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&hp).unwrap()).unwrap();
+        v["n"] = serde_json::json!(4);
+        v["voter_ids"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!("forged"));
+        std::fs::write(&hp, serde_json::to_string_pretty(&v).unwrap()).unwrap();
+
+        let sa = audit_stream_dir(&dir).expect("audits");
+        let ids: Vec<&str> = sa.failed_checks.iter().map(|f| f.check.as_str()).collect();
+        assert!(ids.contains(&"ballot.issuer_binding"), "{ids:?}");
+        assert!(!ids.contains(&"ballot.cds_proof"), "{ids:?}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

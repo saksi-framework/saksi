@@ -243,7 +243,7 @@ func Registry() []Scenario {
 						return fmt.Errorf("no partial_decryptions in header")
 					}
 					s, _ := arr[0].(string)
-					tampered, err := tamperPartialProof(s)
+					tampered, err := TamperPartialProof(s)
 					if err != nil {
 						return err
 					}
@@ -585,10 +585,12 @@ func corruptBallotWire(hexLine string) (string, error) {
 	return hex.EncodeToString(raw), nil
 }
 
-// tamperPartialProof flips the low bit of a partial decryption's
+// TamperPartialProof flips the low bit of a partial decryption's
 // Chaum-Pedersen response: a well-formed proof that does not verify. (Flipping
 // the last hex character, as this scenario once did, rewrote the contest id.)
-func tamperPartialProof(hexStr string) (string, error) {
+// Exported so a driver outside this package (cmd/samplechain) can apply the
+// exact same mutation a staged attack does, rather than reimplementing it.
+func TamperPartialProof(hexStr string) (string, error) {
 	var pd pb.PartialDecryption
 	if err := decodeHexProto(hexStr, &pd); err != nil {
 		return "", fmt.Errorf("partial decryption: %w", err)
