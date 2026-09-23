@@ -324,18 +324,18 @@ func (e *Executor) CeremonySubmit(ctx context.Context, runID string, c ElectionC
 		return e.markSubmitted(runID, c, trusteeID)
 	}
 
-	conn, err := e.fabric.Connect()
+	_, led, closeChain, err := e.openCeremonyChain()
 	if err != nil {
 		e.publish(runID, "ceremony", "error", "connect to Fabric: "+err.Error())
 		return err
 	}
-	defer conn.Close()
+	defer closeChain()
 
 	path, err := e.bundlePath(runID)
 	if err != nil {
 		return err
 	}
-	_, step, err := e.lifecycle(runID, conn.Ledger(), path, "ceremony")
+	_, step, err := e.lifecycle(runID, led, path, "ceremony")
 	if err != nil {
 		return err
 	}
@@ -501,22 +501,22 @@ func (e *Executor) CeremonyStatus(runID string, c ElectionConfig) (CeremonyState
 // contributed when its partial decryption for the first contest is readable
 // back from the chain.
 func (e *Executor) refreshFromChain(state *CeremonyState, b *onChainBundle) {
-	conn, err := e.fabric.Connect()
+	chain, _, closeChain, err := e.openCeremonyChain()
 	if err != nil {
 		return // keep the local view; the UI still shows on_chain
 	}
-	defer conn.Close()
+	defer closeChain()
 
 	contest, err := firstContestID(b)
 	if err != nil {
 		return
 	}
 	for i := range state.Trustees {
-		if _, err := conn.Bulletin.GetPartialDecryption(b.ElectionID, contest, state.Trustees[i].ID); err == nil {
+		if _, err := chain.GetPartialDecryption(b.ElectionID, contest, state.Trustees[i].ID); err == nil {
 			state.Trustees[i].Submitted = true
 		}
 	}
-	if _, err := conn.Bulletin.GetTally(b.ElectionID); err == nil {
+	if _, err := chain.GetTally(b.ElectionID); err == nil {
 		state.Published = true
 	}
 }
