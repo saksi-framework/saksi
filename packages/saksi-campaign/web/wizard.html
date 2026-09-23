@@ -1263,7 +1263,8 @@ async function refreshCeremony() {
       catch (e) {
         // 409: a submit is already running (this trustee's or another's); the
         // server's state decides the card, so re-poll instead of re-enabling.
-        if (e.status === 409) { refreshCeremony(); return; }
+        // Its refusal text would outlive the other phase, so clear it.
+        if (e.status === 409) { $("err3").textContent = ""; refreshCeremony(); return; }
         b.disabled = false; b.textContent = label; return;
       }
       setTimeout(refreshCeremony, 700);

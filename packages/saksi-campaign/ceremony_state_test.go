@@ -555,3 +555,22 @@ func TestCeremonySubmitRefusedBeforeClose(t *testing.T) {
 		t.Fatal("ceremony.json created before the election closed")
 	}
 }
+
+// A phase that failed only because its last commit status was lost leaves
+// every share on chain: once the chain confirms the trustee, its stale
+// submit_error is gone, not shown beside "contributed".
+func TestChainConfirmedTrusteeClearsSubmitError(t *testing.T) {
+	_, h, exec, runID, c, chain := onChainCeremony(t)
+	chain.commitThenFail = stateContestID(stateContests - 1)
+	if err := exec.CeremonySubmit(context.Background(), runID, c, "1"); err == nil {
+		t.Fatal("submit should fail on the lost commit status")
+	}
+	st := getCeremony(t, h, runID) // the chain confirms trustee 1 here
+	if !st.Trustees[0].Submitted || st.Trustees[0].SubmitError != "" {
+		t.Fatalf("first poll: submitted=%v submit_error=%q", st.Trustees[0].Submitted, st.Trustees[0].SubmitError)
+	}
+	st = getCeremony(t, h, runID) // now read from ceremony.json, not probed
+	if !st.Trustees[0].Submitted || st.Trustees[0].SubmitError != "" {
+		t.Fatalf("second poll: submitted=%v submit_error=%q", st.Trustees[0].Submitted, st.Trustees[0].SubmitError)
+	}
+}

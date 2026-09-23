@@ -565,7 +565,11 @@ func (e *Executor) CeremonyStatus(runID string, c ElectionConfig) (CeremonyState
 	for i := range state.Trustees {
 		id := state.Trustees[i].ID
 		state.Trustees[i].Submitting = state.Busy == id
-		state.Trustees[i].SubmitError = e.submitErr[[2]string{runID, id}]
+		// A submitted trustee has no pending error: a phase that failed only
+		// on a lost commit status left every share on chain.
+		if !state.Trustees[i].Submitted {
+			state.Trustees[i].SubmitError = e.submitErr[[2]string{runID, id}]
+		}
 	}
 	e.submitMu.Unlock()
 
@@ -645,7 +649,19 @@ func (e *Executor) recordChainSubmitted(runID string, c ElectionConfig, ids []st
 			s.Trustees[i].Submitted = true
 		}
 	}
-	_ = e.saveCeremony(runID, s)
+	if e.saveCeremony(runID, s) == nil {
+		e.clearSubmitErr(runID, ids...)
+	}
+}
+
+// clearSubmitErr forgets the last submit error of trustees now recorded as
+// submitted.
+func (e *Executor) clearSubmitErr(runID string, ids ...string) {
+	e.submitMu.Lock()
+	defer e.submitMu.Unlock()
+	for _, id := range ids {
+		delete(e.submitErr, [2]string{runID, id})
+	}
 }
 
 // beginSubmit records trustee's submit phase as running on runID and clears
@@ -820,7 +836,11 @@ func (e *Executor) markSubmitted(runID string, c ElectionConfig, trusteeID strin
 			}
 		}
 	}
-	return e.writeCeremonyLocked(runID, c, &s)
+	if err := e.writeCeremonyLocked(runID, c, &s); err != nil {
+		return err
+	}
+	e.clearSubmitErr(runID, trusteeID)
+	return nil
 }
 
 func (e *Executor) markPublished(runID string, c ElectionConfig) error {

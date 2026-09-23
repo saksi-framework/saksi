@@ -228,8 +228,8 @@ func TestWizardCeremonyRendersSubmitState(t *testing.T) {
 		`"Try again"`:       "the retry label",
 		"st.busy !== tr.id": "other trustees wait while one is recorded",
 		"Another trustee's share is being recorded; this unlocks when it finishes.": "the wait text",
-		"st.published || !!st.busy":                        "publish stays disabled while a submit runs",
-		"e.status === 409) { refreshCeremony(); return; }": "a 409 re-polls instead of restoring the button",
+		"st.published || !!st.busy": "publish stays disabled while a submit runs",
+		`e.status === 409) { $("err3").textContent = ""; refreshCeremony(); return; }`: "a 409 clears its refusal and re-polls instead of restoring the button",
 	} {
 		if !strings.Contains(body, clause) {
 			t.Errorf("refreshCeremony lost %q (%s)", clause, rule)
