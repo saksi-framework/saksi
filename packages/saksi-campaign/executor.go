@@ -115,6 +115,40 @@ type Executor struct {
 	// network (fabric.Connect); tests set it to a fake ledger so every way
 	// those stages fail can be followed to run.end.
 	dialLedger func() (clientsdk.Ledger, func(), error)
+	// dialCeremony opens what the trustee ceremony's submit and status paths
+	// use: the chain's read side and the ledger, with the func that closes
+	// them. Nil = the live network (fabric.Connect); tests set it to a fake.
+	dialCeremony func() (ceremonyChain, clientsdk.Ledger, func(), error)
+
+	// submitMu guards the trustee ceremony's in-flight record: the trustee
+	// whose CeremonySubmit is running on each run, and each (run, trustee)'s
+	// last failed submit's error text.
+	submitMu   sync.Mutex
+	submitting map[string]string
+	submitErr  map[[2]string]string
+	// ceremonyMu serialises every read-change-write of a run's ceremony.json.
+	ceremonyMu sync.Mutex
+}
+
+// ceremonyChain is what the trustee ceremony reads back from the chain.
+// *clientsdk.BulletinClient satisfies it.
+type ceremonyChain interface {
+	GetPartialDecryption(electionID, contestID, trusteeID string) (string, error)
+	GetTally(electionID string) (string, error)
+}
+
+var _ ceremonyChain = (*clientsdk.BulletinClient)(nil)
+
+// openCeremonyChain is dialCeremony, or the live network when unset.
+func (e *Executor) openCeremonyChain() (ceremonyChain, clientsdk.Ledger, func(), error) {
+	if e.dialCeremony != nil {
+		return e.dialCeremony()
+	}
+	conn, err := e.fabric.Connect()
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	return conn.Bulletin, conn.Ledger(), func() { _ = conn.Close() }, nil
 }
 
 // openLedger is dialLedger, or the live network's ledger when unset.
@@ -405,7 +439,11 @@ func (e *Executor) verify(ctx context.Context, runID string, c ElectionConfig, l
 	} else {
 		e.publish(runID, "verify", "error", "audit FAIL (see correctness.csv)")
 	}
-	_ = j.Stamp("stage.verify.end", map[string]any{"ok": true, "overall": sa.Overall})
+	failed := make([]string, 0, len(sa.FailedChecks))
+	for _, fc := range sa.FailedChecks {
+		failed = append(failed, fc.Check)
+	}
+	_ = j.Stamp("stage.verify.end", map[string]any{"ok": true, "overall": sa.Overall, "failed_checks": failed})
 	e.finalise(j, dir, runID, c, sa, nil, lc)
 	return sa, nil
 }

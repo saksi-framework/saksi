@@ -281,7 +281,8 @@ loopback bind. Do not expose it to an untrusted network.
 | `GET /api/board/<run>` | `BoardResponse` — ranked contests with seats/elected/ties, ballot accounting, cryptographic digests, the check list, and the artifact list. **Offline-first**: it reads the run folder and only *enriches* from the ledger, so unlike `/api/trail/<id>` it never 502s without a network |
 | `GET /api/board/<run>/files/<name>` | The public copy of a run's verification records, listed in the board's `files` field: `header.json`, `ballots.ndjson`, `receipts.csv`, `trail.ndjson` (or `trail.json`), `ledger/header.json` and `ledger/ballots.ndjson`. **409 until the tally is published**, because `header.json` carries the tally from generation onwards. Both headers are served with `ground_truth` and `voter_ids` emptied, so `saksi-demo audit-stream` on the public copy runs every check except accuracy: its only failed check is `tally.accuracy` ("ground truth has 0 entries … accuracy check skipped"), and each contest's `decoded` should equal its `published_tally`. Every other file (ground truth, `correctness.csv`, `ballots.csv`, `election.csv`, the journal, perf, `run.json`) stays behind admin-only `/export/` |
 | `GET /api/verify-code/<run>/<code>` | `VerifyCodeResponse` — the ballot record whose nullifier starts with the code's eight hex characters. `409` if the prefix is ambiguous, `400` if the code is not hex |
-| `GET /api/ceremony/<run>` | `CeremonyView` — `CeremonyState` (unchanged, same JSON paths the wizard reads) plus the run's decryption context and an audit-log timeline |
+| `GET /api/ceremony/<run>` | `CeremonyView` — `CeremonyState` (same JSON paths the wizard reads) plus the run's decryption context and an audit-log timeline. `ready` is true only once the bundle exists **and** `closed_at` is set (CeremonyStart finished: after CloseElection on-chain). `busy` names the trustee whose submit phase is running; each trustee carries `submitting` (set before `POST /ceremony/submit` answers 202) and `submit_error` (its last failed submit, cleared when a later one starts or succeeds). On-chain a trustee reads `submitted` only when every contest's share is on the chain with the bundle's bytes |
+| `POST /ceremony/submit` | `202`, or `409` `trustee <id>'s shares are already being recorded` while that trustee's submit runs (other busy cases: `a phase is already running on this run`). Idempotent on-chain: a contest whose share the chain already holds with the bundle's bytes is skipped (`SubmitPartialDecryption <ref> already on chain (skipped)`, no receipt); a different share fails the phase with `a different share is already recorded for contest <contest_id> (trustee <id>)` |
 
 A tracking code `BC-XXXX-XXXX` is the first eight hex characters of a ballot's
 nullifier. Nullifiers are derived **per voter per position**, so a code
@@ -743,7 +744,9 @@ a failed run's raw `reason` only to an admin session, or to everyone when auth
 is off, since it can name internal addresses), `busy` (with `paused_stage`), `ballots_started`, `resumable`
 (the resume route's own journal check), `was_interrupted`, `resume_pending`
 (the latest `segment.start {pending}`) and `reconciled` (a
-`verify_only.reconcile` on record), which the wizard uses to offer Resume,
+`verify_only.reconcile` on record), `audit_overall` (`pass` or `fail`, the
+latest completed Verify's verdict, from its `stage.verify.end`; absent if never
+verified) and `audit_failed_checks` (that Verify's failed check ids), which the wizard uses to offer Resume,
 Verify-only and the peer-restart fault only where they apply.
 
 | Route | What it does |

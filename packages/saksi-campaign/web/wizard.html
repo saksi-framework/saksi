@@ -768,6 +768,7 @@ const QUIPS = {
 };
 
 let step = 0, runID = null, cfg = null, es = null, quipTimer = null, trailTimer = null, ceremonyTimer = null;
+let ceremonyPeriod = 4000;
 let attacks = [];   // the scenario catalog for this run, with verdicts as they land
 let caps = { fabric: false };   // what the SERVER can do, not what the page assumes
 
@@ -1221,7 +1222,7 @@ async function startCeremony() {
   go(4);
   await refreshCeremony();
   stopTimers();
-  ceremonyTimer = setInterval(refreshCeremony, 4000);
+  ceremonyTimer = setInterval(refreshCeremony, ceremonyPeriod = 4000);
 }
 
 async function refreshCeremony() {
@@ -1235,21 +1236,37 @@ async function refreshCeremony() {
   bar.classList.toggle("met", st.unlocked);
   bar.firstElementChild.style.width = Math.min(100, (k / Math.max(1, t)) * 100) + "%";
 
-  $("cards").innerHTML = st.trustees.map((tr) => `
+  // One trustee's shares are committed at a time (st.busy); the server's state,
+  // not the click, decides what each card offers, so a reload or a second tab
+  // shows the same thing.
+  $("cards").innerHTML = st.trustees.map((tr) => {
+    const waiting = !tr.submitted && !tr.submitting && st.busy && st.busy !== tr.id;
+    const label = tr.submitted ? "Done" : tr.submitting ? "Recording…" : tr.submit_error ? "Try again" : "Submit share";
+    return `
     <div class="tcard${tr.submitted ? " submitted" : ""}">
-      <div><div class="who">${esc(tr.name)}</div><div class="role">holds 1 of ${n} key shares</div></div>
+      <div><div class="who">${esc(tr.name)}</div><div class="role">holds 1 of ${n} key shares</div>${
+        tr.submit_error && !tr.submitting ? `<div class="small" style="color:var(--bad);margin-top:4px">${esc(tr.submit_error)}</div>` : ""}${
+        waiting ? `<div class="small muted" style="margin-top:4px">Another trustee's share is being recorded; this unlocks when it finishes.</div>` : ""}</div>
       <div>${tr.submitted
         ? '<span class="pill ok">✓ contributed</span>'
-        : '<span class="pill">awaiting</span>'}</div>
+        : tr.submitting ? '<span class="pill on">recording</span>' : '<span class="pill">awaiting</span>'}</div>
       <button class="small${tr.submitted ? "" : " primary"}" data-trustee-id="${esc(tr.id)}"
-        ${tr.submitted ? "disabled" : ""}>${tr.submitted ? "Done" : "Submit share"}</button>
-    </div>`).join("");
+        ${tr.submitted || tr.submitting || waiting ? "disabled" : ""}>${label}</button>
+    </div>`;
+  }).join("");
 
   document.querySelectorAll("[data-trustee-id]").forEach((b) => {
     b.onclick = async () => {
-      b.disabled = true; b.textContent = "Submitting…";
+      const label = b.textContent;
+      b.disabled = true; b.textContent = "Recording…";
       try { await post("/ceremony/submit", { run_id: runID, trustee_id: b.dataset.trusteeId }, "err3"); }
-      catch (_) { b.disabled = false; b.textContent = "Submit share"; return; }
+      catch (e) {
+        // 409: a submit is already running (this trustee's or another's); the
+        // server's state decides the card, so re-poll instead of re-enabling.
+        // Its refusal text would outlive the other phase, so clear it.
+        if (e.status === 409) { $("err3").textContent = ""; refreshCeremony(); return; }
+        b.disabled = false; b.textContent = label; return;
+      }
       setTimeout(refreshCeremony, 700);
     };
   });
@@ -1261,7 +1278,15 @@ async function refreshCeremony() {
        endorsement.`
     : `Local ceremony — real cryptographic shares, no ledger. The threshold gate is enforced here.`;
 
-  $("btnPublish").disabled = !st.unlocked || st.published;
+  $("btnPublish").disabled = !st.unlocked || st.published || !!st.busy;
+
+  // Poll faster while a trustee's shares are being recorded (the trustee app
+  // does the same). Only re-arm a live timer: stopTimers() means we left step 4.
+  const period = st.busy ? 1500 : 4000;
+  if (ceremonyTimer && period !== ceremonyPeriod) {
+    clearInterval(ceremonyTimer);
+    ceremonyTimer = setInterval(refreshCeremony, ceremonyPeriod = period);
+  }
   $("next3").disabled = !st.published;
 
   if (st.published) {

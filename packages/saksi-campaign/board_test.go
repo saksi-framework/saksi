@@ -230,6 +230,9 @@ func TestBoardChecksReflectArtifacts(t *testing.T) {
 	  {"Scenario":"reused-nullifier","Stage":"ballots","Verdict":"FAIL"},
 	  {"Scenario":"late-ballot","Stage":"close","Verdict":"PASS"}
 	]`)
+	if err := exec.writeCeremony(runID, good(), nil); err != nil { // CeremonyStart finished
+		t.Fatal(err)
+	}
 	if err := exec.markSubmitted(runID, good(), "1"); err != nil {
 		t.Fatal(err)
 	}

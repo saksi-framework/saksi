@@ -204,3 +204,38 @@ func TestWizardDefaultsMatchThePaper(t *testing.T) {
 		}
 	}
 }
+
+// Step 4 renders each trustee card from the server's ceremony state, not from
+// the click: a submit in flight shows a disabled "Recording…", a failed one its
+// error and "Try again", and while another trustee's shares are being recorded
+// the rest wait. A 409 from the submit route re-polls rather than re-enabling
+// "Submit share", which is what left the card stuck before.
+func TestWizardCeremonyRendersSubmitState(t *testing.T) {
+	page, err := webFS.ReadFile("web/wizard.html")
+	if err != nil {
+		t.Fatalf("read wizard.html: %v", err)
+	}
+	js := string(page)
+	start := strings.Index(js, "async function refreshCeremony()")
+	if start < 0 {
+		t.Fatal("wizard.html no longer defines refreshCeremony")
+	}
+	body := js[start : start+strings.Index(js[start:], "\n}\n")]
+	for clause, rule := range map[string]string{
+		"tr.submitting":     "a submit in flight disables the card",
+		`"Recording…"`:      "the in-flight label",
+		"tr.submit_error":   "a failed submit shows its error",
+		`"Try again"`:       "the retry label",
+		"st.busy !== tr.id": "other trustees wait while one is recorded",
+		"Another trustee's share is being recorded; this unlocks when it finishes.": "the wait text",
+		"st.published || !!st.busy": "publish stays disabled while a submit runs",
+		`e.status === 409) { $("err3").textContent = ""; refreshCeremony(); return; }`: "a 409 clears its refusal and re-polls instead of restoring the button",
+	} {
+		if !strings.Contains(body, clause) {
+			t.Errorf("refreshCeremony lost %q (%s)", clause, rule)
+		}
+	}
+	if strings.Contains(body, `b.textContent = "Submit share"`) {
+		t.Error(`refreshCeremony's click handler restores "Submit share" on failure; it must keep the card's own label and re-poll on 409`)
+	}
+}

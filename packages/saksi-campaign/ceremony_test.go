@@ -84,6 +84,9 @@ func TestPublishRefusedBelowThresholdAndAllowedAtIt(t *testing.T) {
 		t.Fatal(err)
 	}
 	writeBundle(t, dir, runID, 4, 3)
+	if err := exec.writeCeremony(runID, c, nil); err != nil { // CeremonyStart finished
+		t.Fatal(err)
+	}
 
 	publish := func() int {
 		w := httptest.NewRecorder()
@@ -315,6 +318,9 @@ func TestCeremonySubmitDecidesPublishedSignatures(t *testing.T) {
 		t.Fatal(err)
 	}
 	writeBundle(t, dir, runID, 2, 3)
+	if err := exec.writeCeremony(runID, c, nil); err != nil { // CeremonyStart finished
+		t.Fatal(err)
+	}
 
 	// Plant a signed tally in the bundle the way the generator now emits it.
 	raw, err := os.ReadFile(filepath.Join(dir, "bundle.json"))
