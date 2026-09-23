@@ -541,6 +541,10 @@ type runView struct {
 	WasInterrupted bool `json:"was_interrupted"`
 	ResumePending  *int `json:"resume_pending,omitempty"`
 	Reconciled     bool `json:"reconciled"`
+	// The latest completed Verify's verdict ("pass" or "fail") and its failed
+	// check ids; absent if the run was never verified.
+	AuditOverall      string   `json:"audit_overall,omitempty"`
+	AuditFailedChecks []string `json:"audit_failed_checks,omitempty"`
 }
 
 // fillState reads where the run in dir stands into v.
@@ -570,6 +574,16 @@ func (s *Server) fillState(v *runView, dir string) {
 			}
 		case "verify_only.reconcile":
 			v.Reconciled = true
+		case "stage.verify.end":
+			if o := jstring(ev, "overall"); o != "" {
+				v.AuditOverall, v.AuditFailedChecks = o, nil
+				checks, _ := ev["failed_checks"].([]any)
+				for _, c := range checks {
+					if id, ok := c.(string); ok {
+						v.AuditFailedChecks = append(v.AuditFailedChecks, id)
+					}
+				}
+			}
 		case "run.end":
 			v.Status, v.Reason = "ended", ""
 			if jbool(ev, "failed") {

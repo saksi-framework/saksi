@@ -437,7 +437,11 @@ func (e *Executor) verify(ctx context.Context, runID string, c ElectionConfig, l
 	} else {
 		e.publish(runID, "verify", "error", "audit FAIL (see correctness.csv)")
 	}
-	_ = j.Stamp("stage.verify.end", map[string]any{"ok": true, "overall": sa.Overall})
+	failed := make([]string, 0, len(sa.FailedChecks))
+	for _, fc := range sa.FailedChecks {
+		failed = append(failed, fc.Check)
+	}
+	_ = j.Stamp("stage.verify.end", map[string]any{"ok": true, "overall": sa.Overall, "failed_checks": failed})
 	e.finalise(j, dir, runID, c, sa, nil, lc)
 	return sa, nil
 }

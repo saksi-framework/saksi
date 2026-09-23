@@ -373,6 +373,43 @@ func TestCeremonyReadyOnlyAfterClose(t *testing.T) {
 	}
 }
 
+// /runs carries the latest Verify's verdict and its failed check ids.
+func TestRunsCarryTheAuditVerdict(t *testing.T) {
+	s, h, exec := testServer(t, nil)
+	c := good()
+	runID, _, err := s.store.Create(c, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	exec.run = func(_ context.Context, _ string, _ ...string) ([]byte, error) {
+		return []byte(`{"overall":"fail","contests":[],"failed_checks":[{"check":"tally.accuracy","detail":"x"},{"check":"ballots.cds","detail":"y"}]}`), nil
+	}
+	if _, err := exec.Verify(context.Background(), runID, c); err != nil {
+		t.Fatal(err)
+	}
+
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/runs", nil))
+	var rows []struct {
+		RunID        string   `json:"run_id"`
+		AuditOverall string   `json:"audit_overall"`
+		AuditFailed  []string `json:"audit_failed_checks"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &rows); err != nil {
+		t.Fatalf("%v: %s", err, w.Body)
+	}
+	for _, r := range rows {
+		if r.RunID != runID {
+			continue
+		}
+		if r.AuditOverall != "fail" || !slices.Equal(r.AuditFailed, []string{"tally.accuracy", "ballots.cds"}) {
+			t.Fatalf("audit_overall=%q audit_failed_checks=%v", r.AuditOverall, r.AuditFailed)
+		}
+		return
+	}
+	t.Fatalf("run %s not in /runs: %s", runID, w.Body)
+}
+
 // The in-flight mark is set before the 202 is written, so a poll straight
 // after the POST can never see the trustee idle and re-offer the button.
 func TestCeremonySubmitMarkedBeforeAccepted(t *testing.T) {
