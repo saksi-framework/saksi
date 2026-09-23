@@ -307,11 +307,21 @@ func (s *Server) finish(runID string) {
 // dispatch runs fn as the run's single active phase under a timeout context,
 // releasing the lock when done. Returns 409 if the run is already busy.
 func (s *Server) dispatch(w http.ResponseWriter, runID string, fn func(context.Context)) {
+	s.dispatchClaimed(w, runID, nil, fn)
+}
+
+// dispatchClaimed is dispatch that runs claimed, when set, once the run is
+// claimed and before the phase starts or the 202 is written: state a poll
+// straight after the 202 must already see. fn is what clears it.
+func (s *Server) dispatchClaimed(w http.ResponseWriter, runID string, claimed func(), fn func(context.Context)) {
 	ctx, cancel := context.WithTimeout(context.Background(), s.timeout)
 	if why := s.claim(runID, cancel); why != "" {
 		cancel()
 		http.Error(w, why, http.StatusConflict)
 		return
+	}
+	if claimed != nil {
+		claimed()
 	}
 	go func() {
 		defer cancel()
@@ -844,7 +854,15 @@ func (s *Server) handleCeremonySubmit(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "trustee_id is required", http.StatusBadRequest)
 		return
 	}
-	s.dispatch(w, runID, func(ctx context.Context) {
+	// A second click while this trustee's shares are still being committed
+	// gets its own answer, so the page can say what is happening.
+	if s.exec.submittingTrustee(runID) == body.Trustee {
+		http.Error(w, fmt.Sprintf("trustee %s's shares are already being recorded", body.Trustee), http.StatusConflict)
+		return
+	}
+	// The in-flight mark is set before the 202, so a poll straight after it
+	// sees the trustee recording; CeremonySubmit's own defer clears it.
+	s.dispatchClaimed(w, runID, func() { s.exec.beginSubmit(runID, body.Trustee) }, func(ctx context.Context) {
 		_ = s.exec.CeremonySubmit(ctx, runID, rec.Config, body.Trustee)
 	})
 }

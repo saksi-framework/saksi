@@ -1,6 +1,7 @@
 package campaign
 
 import (
+	"bytes"
 	"context"
 	"encoding/hex"
 	"encoding/json"
@@ -63,6 +64,11 @@ type CeremonyTrustee struct {
 	// is the authority and this is a convenience record. Nil when the trustee
 	// has not contributed, or when the chain (not this console) observed it.
 	SubmittedAt *time.Time `json:"submitted_at,omitempty"`
+	// Submitting is true while this trustee's submit phase runs; SubmitError
+	// is its last submit phase's error, cleared when a later one starts.
+	// Neither is persisted: both describe this console process.
+	Submitting  bool   `json:"submitting"`
+	SubmitError string `json:"submit_error,omitempty"`
 }
 
 // CeremonyState is the /api/ceremony/<runID> body and the ceremony.json shape.
@@ -77,8 +83,11 @@ type CeremonyState struct {
 	// OnChain distinguishes a ledger-backed ceremony from a local one, so the
 	// UI can say which it is rather than implying a ledger that isn't there.
 	OnChain bool `json:"on_chain"`
-	// Ready reports whether setup has run and trustees may act.
+	// Ready reports whether trustees may act: the bundle exists and the
+	// election is closed (ClosedAt, stamped when CeremonyStart finishes).
 	Ready bool `json:"ready"`
+	// Busy is the trustee whose submit phase is running now; empty when none.
+	Busy string `json:"busy,omitempty"`
 	// StartedAt and ClosedAt are both stamped at CeremonyStart: that call is
 	// what runs the lifecycle prefix up to and including CloseElection, so it
 	// is the moment the election stopped accepting ballots. Offline there is
@@ -99,13 +108,9 @@ type CeremonyState struct {
 func partialsByTrustee(b *onChainBundle) (map[string][]string, error) {
 	byTrustee := make(map[string][]string)
 	for i, ph := range b.PartialDecryptions {
-		raw, err := hex.DecodeString(ph)
+		pd, err := decodePartial(ph)
 		if err != nil {
-			return nil, fmt.Errorf("partial decryption %d is not valid hex: %w", i, err)
-		}
-		var pd saksiprotocolv1.PartialDecryption
-		if err := proto.Unmarshal(raw, &pd); err != nil {
-			return nil, fmt.Errorf("decode partial decryption %d: %w", i, err)
+			return nil, fmt.Errorf("partial decryption %d: %w", i, err)
 		}
 		id := pd.GetTrusteeId()
 		if id == "" {
@@ -114,6 +119,46 @@ func partialsByTrustee(b *onChainBundle) (map[string][]string, error) {
 		byTrustee[id] = append(byTrustee[id], ph)
 	}
 	return byTrustee, nil
+}
+
+// decodePartial decodes one hex-encoded partial decryption.
+func decodePartial(ph string) (*saksiprotocolv1.PartialDecryption, error) {
+	raw, err := hex.DecodeString(ph)
+	if err != nil {
+		return nil, fmt.Errorf("not valid hex: %w", err)
+	}
+	var pd saksiprotocolv1.PartialDecryption
+	if err := proto.Unmarshal(raw, &pd); err != nil {
+		return nil, fmt.Errorf("decode: %w", err)
+	}
+	return &pd, nil
+}
+
+// sameShare reports whether the chain's hex partial is the bundle's, byte for
+// byte (the chaincode stores the submitted bytes verbatim).
+func sameShare(chainHex, bundleHex string) bool {
+	a, errA := hex.DecodeString(chainHex)
+	b, errB := hex.DecodeString(bundleHex)
+	return errA == nil && errB == nil && bytes.Equal(a, b)
+}
+
+// shareOnChain reports whether trustee's partial for its own contest is on
+// chain, and fails if the chain holds a different one. Any read error counts
+// as absent: the chaincode still refuses a duplicate, so the worst case is a
+// failed phase a retry resolves.
+func shareOnChain(chain ceremonyChain, electionID, trusteeID, pdHex string) (bool, error) {
+	pd, err := decodePartial(pdHex)
+	if err != nil {
+		return false, err
+	}
+	got, err := chain.GetPartialDecryption(electionID, pd.GetContestId(), trusteeID)
+	if err != nil {
+		return false, nil
+	}
+	if !sameShare(got, pdHex) {
+		return false, fmt.Errorf("a different share is already recorded for contest %s (trustee %s)", pd.GetContestId(), trusteeID)
+	}
+	return true, nil
 }
 
 // bundlePath is where the run's cached on-chain bundle lives. It is generated
@@ -295,7 +340,14 @@ func (e *Executor) CeremonyStart(ctx context.Context, runID string, c ElectionCo
 // CeremonySubmit submits exactly one trustee's partial decryptions — one per
 // contest. Every other trustee's shares stay untouched, which is what makes the
 // threshold visible: the tally cannot be published until enough of them act.
-func (e *Executor) CeremonySubmit(ctx context.Context, runID string, c ElectionConfig, trusteeID string) error {
+//
+// It is idempotent on-chain: a contest whose share the chain already holds
+// with the bundle's bytes is skipped, so a retry after a phase that failed
+// partway (or lost a commit status) never trips the chaincode's duplicate
+// gate.
+func (e *Executor) CeremonySubmit(ctx context.Context, runID string, c ElectionConfig, trusteeID string) (err error) {
+	e.beginSubmit(runID, trusteeID)
+	defer func() { e.endSubmit(runID, trusteeID, err) }()
 	b, err := e.readBundle(runID)
 	if err != nil {
 		return err
@@ -324,7 +376,7 @@ func (e *Executor) CeremonySubmit(ctx context.Context, runID string, c ElectionC
 		return e.markSubmitted(runID, c, trusteeID)
 	}
 
-	_, led, closeChain, err := e.openCeremonyChain()
+	chain, led, closeChain, err := e.openCeremonyChain()
 	if err != nil {
 		e.publish(runID, "ceremony", "error", "connect to Fabric: "+err.Error())
 		return err
@@ -342,6 +394,15 @@ func (e *Executor) CeremonySubmit(ctx context.Context, runID string, c ElectionC
 	defer e.closeReceipts(runID)
 	for i, pd := range mine {
 		ref := fmt.Sprintf("%s/%d", name, i)
+		held, err := shareOnChain(chain, b.ElectionID, trusteeID, pd)
+		if err != nil {
+			e.publish(runID, "ceremony", "error", err.Error())
+			return err
+		}
+		if held {
+			e.publish(runID, "ceremony", "info", fmt.Sprintf("SubmitPartialDecryption %s already on chain (skipped)", ref))
+			continue
+		}
 		if err := step(ctx, "SubmitPartialDecryption", ref, "SubmitPartialDecryption", b.ElectionID, pd); err != nil {
 			return err
 		}
@@ -473,18 +534,31 @@ func tallyToPublish(tallyHex string, state CeremonyState) (string, error) {
 func (e *Executor) CeremonyStatus(runID string, c ElectionConfig) (CeremonyState, error) {
 	state := e.readCeremony(runID, c)
 	state.OnChain = e.onChainRun(c)
+	// The bundle is written at the start of CeremonyStart and ClosedAt at its
+	// end, after CloseElection on-chain: between the two trustees may not act.
+	state.Ready = false
 
 	if b, err := e.readBundle(runID); err == nil {
-		state.Ready = true
-		if byTrustee, err := partialsByTrustee(b); err == nil {
+		state.Ready = state.ClosedAt != nil
+		byTrustee, err := partialsByTrustee(b)
+		if err == nil {
 			for i := range state.Trustees {
 				state.Trustees[i].Contests = len(byTrustee[state.Trustees[i].ID])
 			}
 		}
 		if state.OnChain {
-			e.refreshFromChain(&state, b)
+			e.refreshFromChain(&state, b, byTrustee)
 		}
 	}
+
+	e.submitMu.Lock()
+	state.Busy = e.submitting[runID]
+	for i := range state.Trustees {
+		id := state.Trustees[i].ID
+		state.Trustees[i].Submitting = state.Busy == id
+		state.Trustees[i].SubmitError = e.submitErr[[2]string{runID, id}]
+	}
+	e.submitMu.Unlock()
 
 	state.Submitted = 0
 	for _, t := range state.Trustees {
@@ -498,46 +572,71 @@ func (e *Executor) CeremonyStatus(runID string, c ElectionConfig) (CeremonyState
 
 // refreshFromChain lets the ledger correct the local record — it is the
 // authority for what was actually committed. A trustee counts as having
-// contributed when its partial decryption for the first contest is readable
-// back from the chain.
-func (e *Executor) refreshFromChain(state *CeremonyState, b *onChainBundle) {
+// contributed only when EVERY one of its partials is on chain with the
+// bundle's bytes: a phase that failed partway has some contests there and must
+// not read as done. Trustees this console already recorded are not probed.
+func (e *Executor) refreshFromChain(state *CeremonyState, b *onChainBundle, byTrustee map[string][]string) {
 	chain, _, closeChain, err := e.openCeremonyChain()
 	if err != nil {
 		return // keep the local view; the UI still shows on_chain
 	}
 	defer closeChain()
 
-	contest, err := firstContestID(b)
-	if err != nil {
-		return
-	}
 	for i := range state.Trustees {
-		if _, err := chain.GetPartialDecryption(b.ElectionID, contest, state.Trustees[i].ID); err == nil {
-			state.Trustees[i].Submitted = true
+		t := &state.Trustees[i]
+		mine := byTrustee[t.ID]
+		if t.Submitted || len(mine) == 0 {
+			continue
 		}
+		all := true
+		for _, pd := range mine {
+			if held, err := shareOnChain(chain, b.ElectionID, t.ID, pd); err != nil || !held {
+				all = false
+				break
+			}
+		}
+		t.Submitted = all
 	}
 	if _, err := chain.GetTally(b.ElectionID); err == nil {
 		state.Published = true
 	}
 }
 
-// firstContestID decodes the election parameters to find a contest id to probe
-// with. Every trustee owns exactly one partial per contest, so one contest is
-// enough to tell whether a trustee has acted.
-func firstContestID(b *onChainBundle) (string, error) {
-	raw, err := hex.DecodeString(b.Params)
-	if err != nil {
-		return "", err
+// beginSubmit records trustee's submit phase as running on runID and clears
+// its last error.
+func (e *Executor) beginSubmit(runID, trusteeID string) {
+	e.submitMu.Lock()
+	defer e.submitMu.Unlock()
+	if e.submitting == nil {
+		e.submitting = map[string]string{}
+		e.submitErr = map[[2]string]string{}
 	}
-	var params saksiprotocolv1.ElectionParameters
-	if err := proto.Unmarshal(raw, &params); err != nil {
-		return "", err
+	e.submitting[runID] = trusteeID
+	delete(e.submitErr, [2]string{runID, trusteeID})
+}
+
+// endSubmit clears the running record and keeps err, if any, as the
+// trustee's last submit error.
+func (e *Executor) endSubmit(runID, trusteeID string, err error) {
+	e.submitMu.Lock()
+	defer e.submitMu.Unlock()
+	delete(e.submitting, runID)
+	k := [2]string{runID, trusteeID}
+	if err == nil {
+		delete(e.submitErr, k)
+		return
 	}
-	ids := params.GetContestIds()
-	if len(ids) == 0 {
-		return "", fmt.Errorf("election has no contests")
+	if e.submitErr == nil {
+		e.submitErr = map[[2]string]string{}
 	}
-	return ids[0], nil
+	e.submitErr[k] = err.Error()
+}
+
+// submittingTrustee is the trustee whose submit phase is running on runID.
+func (e *Executor) submittingTrustee(runID string) string {
+	e.submitMu.Lock()
+	defer e.submitMu.Unlock()
+	return e.submitting[runID]
 }
 
 // trusteeDisplayName maps a wire trustee id ("1".."n") back to the operator's

@@ -119,6 +119,13 @@ type Executor struct {
 	// use: the chain's read side and the ledger, with the func that closes
 	// them. Nil = the live network (fabric.Connect); tests set it to a fake.
 	dialCeremony func() (ceremonyChain, clientsdk.Ledger, func(), error)
+
+	// submitMu guards the trustee ceremony's in-flight record: the trustee
+	// whose CeremonySubmit is running on each run, and each (run, trustee)'s
+	// last failed submit's error text.
+	submitMu   sync.Mutex
+	submitting map[string]string
+	submitErr  map[[2]string]string
 }
 
 // ceremonyChain is what the trustee ceremony reads back from the chain.
