@@ -136,6 +136,9 @@ func onChainCeremony(t *testing.T) (*Server, http.Handler, *Executor, string, El
 	if err := writeJSON(filepath.Join(dir, "bundle.json"), b); err != nil {
 		t.Fatal(err)
 	}
+	if err := exec.writeCeremony(runID, c, nil); err != nil { // CeremonyStart finished
+		t.Fatal(err)
+	}
 	exec.fabric = unreachableFabric(t)
 	chain := &partialChain{fakeLedger: &fakeLedger{Partials: map[string]string{}}}
 	exec.dialCeremony = func() (ceremonyChain, clientsdk.Ledger, func(), error) {
@@ -463,9 +466,6 @@ func TestCeremonySubmitRefusedLeavesNoMark(t *testing.T) {
 // console, observed it.
 func TestRefreshFromChainRecordsAChainConfirmedTrustee(t *testing.T) {
 	_, _, exec, runID, c, chain := onChainCeremony(t)
-	if err := exec.writeCeremony(runID, c, nil); err != nil { // CeremonyStart finished
-		t.Fatal(err)
-	}
 	for i := 0; i < stateContests; i++ {
 		chain.Partials[stateContestID(i)+"|1"] = bundlePartial(t, exec, runID, "1", i)
 	}
@@ -516,5 +516,42 @@ func TestCeremonyReadyForLegacyCeremonyFile(t *testing.T) {
 	}
 	if !st.Ready || st.ClosedAt != nil {
 		t.Fatalf("legacy ceremony.json: ready=%v closed_at=%v, want ready with no closed_at", st.Ready, st.ClosedAt)
+	}
+}
+
+// A start that wrote the bundle and then failed leaves the election unclosed:
+// a submit is refused before any phase runs and creates no ceremony.json,
+// and markSubmitted refuses on its own too.
+func TestCeremonySubmitRefusedBeforeClose(t *testing.T) {
+	s, h, exec := testServer(t, nil)
+	c := good()
+	c.AttackPlan = &AttackPlan{Stages: []string{StageDKG}}
+	runID, dir, err := s.store.Create(c, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeBundle(t, dir, runID, 2, 3)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // the operator cancels at the first attack pause
+	if err := exec.CeremonyStart(ctx, runID, c); err == nil {
+		t.Fatal("cancelled CeremonyStart reported success")
+	}
+	if _, err := os.Stat(filepath.Join(dir, "bundle.json")); err != nil {
+		t.Fatal("the failed start should leave its bundle behind")
+	}
+
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, postJSON("/ceremony/submit", map[string]string{"run_id": runID, "trustee_id": "1"}))
+	if w.Code != http.StatusConflict {
+		t.Fatalf("submit before close: %d, want 409", w.Code)
+	}
+	if got := strings.TrimSpace(w.Body.String()); got != "the election is not closed yet: trustees can submit after Encrypt & record finishes" {
+		t.Errorf("body = %q", got)
+	}
+	if err := exec.markSubmitted(runID, c, "1"); err == nil {
+		t.Error("markSubmitted succeeded with no ceremony.json")
+	}
+	if _, err := os.Stat(filepath.Join(dir, CeremonyFile)); err == nil {
+		t.Fatal("ceremony.json created before the election closed")
 	}
 }

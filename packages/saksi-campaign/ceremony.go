@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -797,9 +798,18 @@ func (e *Executor) saveCeremony(runID string, s CeremonyState) error {
 	return os.WriteFile(path, data, 0o644)
 }
 
+// errNotClosed is markSubmitted's refusal before CeremonyStart has finished.
+var errNotClosed = errors.New("the election is not closed yet: trustees can submit after Encrypt & record finishes")
+
+// markSubmitted refuses when there is no ceremony.json: only a finished
+// CeremonyStart (or a resume's close) creates it, and a submit must never be
+// what makes a run look closed.
 func (e *Executor) markSubmitted(runID string, c ElectionConfig, trusteeID string) error {
 	e.ceremonyMu.Lock()
 	defer e.ceremonyMu.Unlock()
+	if !e.ceremonyRecorded(runID) {
+		return errNotClosed
+	}
 	s := e.readCeremony(runID, c)
 	now := time.Now().UTC()
 	for i := range s.Trustees {

@@ -874,6 +874,13 @@ func (s *Server) handleCeremonySubmit(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, fmt.Sprintf("trustee %s's shares are already being recorded", body.Trustee), http.StatusConflict)
 		return
 	}
+	// Trustees act only on a closed election. Without this, an offline
+	// CeremonyStart that failed after writing the bundle let a submit create
+	// ceremony.json and so mark the run ready.
+	if st, err := s.exec.CeremonyStatus(runID, rec.Config); err != nil || !st.Ready {
+		http.Error(w, "the election is not closed yet: trustees can submit after Encrypt & record finishes", http.StatusConflict)
+		return
+	}
 	// The in-flight mark is set before the 202, so a poll straight after it
 	// sees the trustee recording; CeremonySubmit's own defer clears it.
 	s.dispatchClaimed(w, runID, func() { s.exec.beginSubmit(runID, body.Trustee) }, func(ctx context.Context) {
