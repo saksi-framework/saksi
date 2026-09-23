@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -144,8 +145,9 @@ func sameShare(chainHex, bundleHex string) bool {
 
 // shareOnChain reports whether trustee's partial for its own contest is on
 // chain, and fails if the chain holds a different one. Any read error counts
-// as absent: the chaincode still refuses a duplicate, so the worst case is a
-// failed phase a retry resolves.
+// as absent, a transient one included: submitting a share that was in fact
+// there is refused by the chaincode's partial-duplicate gate, so the worst
+// case is a failed phase that a retry resolves.
 func shareOnChain(chain ceremonyChain, electionID, trusteeID, pdHex string) (bool, error) {
 	pd, err := decodePartial(pdHex)
 	if err != nil {
@@ -534,12 +536,16 @@ func tallyToPublish(tallyHex string, state CeremonyState) (string, error) {
 func (e *Executor) CeremonyStatus(runID string, c ElectionConfig) (CeremonyState, error) {
 	state := e.readCeremony(runID, c)
 	state.OnChain = e.onChainRun(c)
-	// The bundle is written at the start of CeremonyStart and ClosedAt at its
-	// end, after CloseElection on-chain: between the two trustees may not act.
+	// The bundle is written at the start of CeremonyStart and ceremony.json
+	// (with ClosedAt) at its end, after CloseElection on-chain: between the two
+	// trustees may not act. A ceremony.json from before closed_at existed
+	// (fcbb227) has none, and was still only ever written once the election
+	// was closed, so the file itself is the close record (as closeRecorded
+	// reads it).
 	state.Ready = false
 
 	if b, err := e.readBundle(runID); err == nil {
-		state.Ready = state.ClosedAt != nil
+		state.Ready = state.ClosedAt != nil || e.ceremonyRecorded(runID)
 		byTrustee, err := partialsByTrustee(b)
 		if err == nil {
 			for i := range state.Trustees {
@@ -547,7 +553,9 @@ func (e *Executor) CeremonyStatus(runID string, c ElectionConfig) (CeremonyState
 			}
 		}
 		if state.OnChain {
-			e.refreshFromChain(&state, b, byTrustee)
+			if seen := e.refreshFromChain(&state, b, byTrustee); len(seen) > 0 {
+				e.recordChainSubmitted(runID, c, seen)
+			}
 		}
 	}
 
@@ -575,10 +583,12 @@ func (e *Executor) CeremonyStatus(runID string, c ElectionConfig) (CeremonyState
 // contributed only when EVERY one of its partials is on chain with the
 // bundle's bytes: a phase that failed partway has some contests there and must
 // not read as done. Trustees this console already recorded are not probed.
-func (e *Executor) refreshFromChain(state *CeremonyState, b *onChainBundle, byTrustee map[string][]string) {
+// It returns the trustees the chain newly confirmed, for the caller to record
+// so later polls skip them.
+func (e *Executor) refreshFromChain(state *CeremonyState, b *onChainBundle, byTrustee map[string][]string) (seen []string) {
 	chain, _, closeChain, err := e.openCeremonyChain()
 	if err != nil {
-		return // keep the local view; the UI still shows on_chain
+		return nil // keep the local view; the UI still shows on_chain
 	}
 	defer closeChain()
 
@@ -596,10 +606,45 @@ func (e *Executor) refreshFromChain(state *CeremonyState, b *onChainBundle, byTr
 			}
 		}
 		t.Submitted = all
+		if all {
+			seen = append(seen, t.ID)
+		}
 	}
 	if _, err := chain.GetTally(b.ElectionID); err == nil {
 		state.Published = true
 	}
+	return seen
+}
+
+// ceremonyRecorded reports whether runID has a ceremony.json.
+func (e *Executor) ceremonyRecorded(runID string) bool {
+	path, err := e.ceremonyPath(runID)
+	if err != nil {
+		return false
+	}
+	_, err = os.Stat(path)
+	return err == nil
+}
+
+// recordChainSubmitted persists trustees the chain showed holding every
+// share, so later polls do not probe them again. SubmittedAt stays nil: the
+// chain, not this console, observed it. Nothing is written when there is no
+// ceremony.json yet — only a finished CeremonyStart creates it — and the
+// file's timestamps are left as they are. Best effort: a failed write only
+// means the next poll probes again.
+func (e *Executor) recordChainSubmitted(runID string, c ElectionConfig, ids []string) {
+	e.ceremonyMu.Lock()
+	defer e.ceremonyMu.Unlock()
+	if !e.ceremonyRecorded(runID) {
+		return
+	}
+	s := e.readCeremony(runID, c)
+	for i := range s.Trustees {
+		if slices.Contains(ids, s.Trustees[i].ID) {
+			s.Trustees[i].Submitted = true
+		}
+	}
+	_ = e.saveCeremony(runID, s)
 }
 
 // beginSubmit records trustee's submit phase as running on runID and clears
@@ -713,11 +758,16 @@ func (e *Executor) readCeremony(runID string, c ElectionConfig) CeremonyState {
 	return fresh
 }
 
+// writeCeremony, markSubmitted, markPublished and recordChainSubmitted each
+// read, change and rewrite ceremony.json under ceremonyMu, so a status poll
+// recording a chain observation cannot drop a concurrent phase's write.
 func (e *Executor) writeCeremony(runID string, c ElectionConfig, state *CeremonyState) error {
-	path, err := e.ceremonyPath(runID)
-	if err != nil {
-		return err
-	}
+	e.ceremonyMu.Lock()
+	defer e.ceremonyMu.Unlock()
+	return e.writeCeremonyLocked(runID, c, state)
+}
+
+func (e *Executor) writeCeremonyLocked(runID string, c ElectionConfig, state *CeremonyState) error {
 	s := e.readCeremony(runID, c)
 	if state != nil {
 		s = *state
@@ -731,6 +781,15 @@ func (e *Executor) writeCeremony(runID string, c ElectionConfig, state *Ceremony
 	if s.ClosedAt == nil {
 		s.ClosedAt = &now
 	}
+	return e.saveCeremony(runID, s)
+}
+
+// saveCeremony writes s as runID's ceremony.json, verbatim.
+func (e *Executor) saveCeremony(runID string, s CeremonyState) error {
+	path, err := e.ceremonyPath(runID)
+	if err != nil {
+		return err
+	}
 	data, err := json.MarshalIndent(s, "", "  ")
 	if err != nil {
 		return err
@@ -739,6 +798,8 @@ func (e *Executor) writeCeremony(runID string, c ElectionConfig, state *Ceremony
 }
 
 func (e *Executor) markSubmitted(runID string, c ElectionConfig, trusteeID string) error {
+	e.ceremonyMu.Lock()
+	defer e.ceremonyMu.Unlock()
 	s := e.readCeremony(runID, c)
 	now := time.Now().UTC()
 	for i := range s.Trustees {
@@ -749,15 +810,17 @@ func (e *Executor) markSubmitted(runID string, c ElectionConfig, trusteeID strin
 			}
 		}
 	}
-	return e.writeCeremony(runID, c, &s)
+	return e.writeCeremonyLocked(runID, c, &s)
 }
 
 func (e *Executor) markPublished(runID string, c ElectionConfig) error {
+	e.ceremonyMu.Lock()
+	defer e.ceremonyMu.Unlock()
 	s := e.readCeremony(runID, c)
 	s.Published = true
 	if s.PublishedAt == nil {
 		now := time.Now().UTC()
 		s.PublishedAt = &now
 	}
-	return e.writeCeremony(runID, c, &s)
+	return e.writeCeremonyLocked(runID, c, &s)
 }

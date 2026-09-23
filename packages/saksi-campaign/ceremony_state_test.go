@@ -457,3 +457,64 @@ func TestCeremonySubmitRefusedLeavesNoMark(t *testing.T) {
 		t.Fatalf("refused submit left busy=%q submitting=%v", st.Busy, *st.Trustees[0].Submitting)
 	}
 }
+
+// A trustee the chain confirms in full is recorded, so later polls do not
+// probe its shares again; SubmittedAt stays nil because the chain, not this
+// console, observed it.
+func TestRefreshFromChainRecordsAChainConfirmedTrustee(t *testing.T) {
+	_, _, exec, runID, c, chain := onChainCeremony(t)
+	if err := exec.writeCeremony(runID, c, nil); err != nil { // CeremonyStart finished
+		t.Fatal(err)
+	}
+	for i := 0; i < stateContests; i++ {
+		chain.Partials[stateContestID(i)+"|1"] = bundlePartial(t, exec, runID, "1", i)
+	}
+	var probed []string
+	exec.dialCeremony = func() (ceremonyChain, clientsdk.Ledger, func(), error) {
+		return probeChain{chain, &probed}, chain, func() {}, nil
+	}
+	st, err := exec.CeremonyStatus(runID, c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !st.Trustees[0].Submitted {
+		t.Fatal("trustee 1 not confirmed from the chain")
+	}
+	probed = nil
+	st, err = exec.CeremonyStatus(runID, c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !st.Trustees[0].Submitted || st.Trustees[0].SubmittedAt != nil {
+		t.Fatalf("second poll: submitted=%v submitted_at=%v", st.Trustees[0].Submitted, st.Trustees[0].SubmittedAt)
+	}
+	if slices.Contains(probed, "1") {
+		t.Fatalf("second poll probed trustee 1 again: %v", probed)
+	}
+}
+
+// A ceremony.json written before closed_at existed still means the election
+// closed; a bundle with no ceremony.json does not.
+func TestCeremonyReadyForLegacyCeremonyFile(t *testing.T) {
+	s, _, exec := testServer(t, nil)
+	c := good()
+	runID, dir, err := s.store.Create(c, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeBundle(t, dir, runID, 2, 3)
+	if st, _ := exec.CeremonyStatus(runID, c); st.Ready {
+		t.Fatal("ready with a bundle and no ceremony.json")
+	}
+	legacy := `{"threshold":2,"trustees":[{"id":"1","name":"TA","submitted":false,"contests":0}],"ready":true,"started_at":"2026-09-01T00:00:00Z"}`
+	if err := os.WriteFile(filepath.Join(dir, CeremonyFile), []byte(legacy), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	st, err := exec.CeremonyStatus(runID, c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !st.Ready || st.ClosedAt != nil {
+		t.Fatalf("legacy ceremony.json: ready=%v closed_at=%v, want ready with no closed_at", st.Ready, st.ClosedAt)
+	}
+}

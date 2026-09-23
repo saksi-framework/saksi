@@ -126,6 +126,8 @@ type Executor struct {
 	submitMu   sync.Mutex
 	submitting map[string]string
 	submitErr  map[[2]string]string
+	// ceremonyMu serialises every read-change-write of a run's ceremony.json.
+	ceremonyMu sync.Mutex
 }
 
 // ceremonyChain is what the trustee ceremony reads back from the chain.
