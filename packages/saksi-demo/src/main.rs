@@ -16,6 +16,14 @@
 //! - `audit-stream <dir> [--json]` — audit a stream run folder; with `--json`,
 //!   prints structured per-contest correctness `{overall, contests:[{contest,
 //!   ground_truth, decoded, E, pass}]}`. Exits non-zero on FAIL.
+//! - `forge-ballot <dir> --position P --candidate K` — print one forged ballot
+//!   (hex) for the election in `<dir>`: genuine proofs under a self-issued
+//!   credential. The chaincode's `issuer` gate and the auditor's
+//!   `ballot.issuer_binding` refuse it (the `self-issued-credential` attack).
+//! - `overvote-ballot <dir> <line>` — print ballot line `<line>` (0-based) of
+//!   `<dir>` with two candidate slots re-encrypted to 1 and its old selection
+//!   proof kept. The chaincode's `selection` gate and the auditor's
+//!   `ballot.selection_sum` refuse it (the `overvote` attack).
 //!
 //! Both audit subcommands verify ballots on every core. `SAKSI_AUDIT_THREADS=<n>`
 //! pins the thread count (`1` = the serial path); the output is identical at any
@@ -26,8 +34,8 @@ use std::process::ExitCode;
 
 use saksi_auditor::demo::{
     audit_bundle_json, audit_stream_dir, election_bundle_json, election_bundle_json_params,
-    write_election_stream_params, write_election_stream_params_chunked, GenParams,
-    SelectionProfile,
+    forge_self_issued_ballot, overvote_ballot, write_election_stream_params,
+    write_election_stream_params_chunked, GenParams, SelectionProfile,
 };
 use saksi_auditor::ground_truth::write_ground_truth_csvs;
 use saksi_auditor::stream::DEFAULT_CHUNK_VOTERS;
@@ -40,6 +48,8 @@ fn main() -> ExitCode {
         Some("gen-ground-truth") => cmd_gen_ground_truth(&args[2..]),
         Some("audit") => cmd_audit(args.get(2).map(String::as_str)),
         Some("audit-stream") => cmd_audit_stream(&args[2..]),
+        Some("forge-ballot") => cmd_forge_ballot(&args[2..]),
+        Some("overvote-ballot") => cmd_overvote_ballot(&args[2..]),
         _ => {
             eprintln!(
                 "usage: saksi-demo <gen [--voters N] [--positions P] [--candidates C] \
@@ -47,7 +57,8 @@ fn main() -> ExitCode {
                  [--threshold T] [--trustees N] [--trustee-names a,b,c] [--stream DIR] [--chunk N] [outfile] \
                  | gen-ground-truth [--voters N] [--positions P] [--candidates C] \
                  [--distribution uniform|skewed|realistic] [--election-id S] --out-dir DIR \
-                 | audit <bundle.json> | audit-stream <dir> [--json]>"
+                 | audit <bundle.json> | audit-stream <dir> [--json] \
+                 | forge-ballot <dir> --position P --candidate K | overvote-ballot <dir> <line>>"
             );
             ExitCode::FAILURE
         }
@@ -430,6 +441,52 @@ fn cmd_audit_stream(args: &[String]) -> ExitCode {
         }
         Err(e) => {
             eprintln!("audit-stream error: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn cmd_forge_ballot(args: &[String]) -> ExitCode {
+    let (mut dir, mut position, mut candidate) = (None, None, None);
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--position" => position = it.next(),
+            "--candidate" => candidate = it.next().and_then(|k| k.parse::<usize>().ok()),
+            other => dir = Some(other),
+        }
+    }
+    let (Some(dir), Some(position), Some(candidate)) = (dir, position, candidate) else {
+        eprintln!("usage: saksi-demo forge-ballot <dir> --position P --candidate K");
+        return ExitCode::FAILURE;
+    };
+    print_ballot(
+        "forge-ballot",
+        forge_self_issued_ballot(Path::new(dir), position, candidate),
+    )
+}
+
+fn cmd_overvote_ballot(args: &[String]) -> ExitCode {
+    let (Some(dir), Some(Ok(line)), None) = (
+        args.first(),
+        args.get(1).map(|l| l.parse::<usize>()),
+        args.get(2),
+    ) else {
+        eprintln!("usage: saksi-demo overvote-ballot <dir> <line>");
+        return ExitCode::FAILURE;
+    };
+    print_ballot("overvote-ballot", overvote_ballot(Path::new(dir), line))
+}
+
+/// Prints a helper's ballot hex on stdout, or its error on stderr.
+fn print_ballot(cmd: &str, result: Result<String, String>) -> ExitCode {
+    match result {
+        Ok(hex) => {
+            println!("{hex}");
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("{cmd}: {e}");
             ExitCode::FAILURE
         }
     }

@@ -526,6 +526,254 @@ pub fn audit_bundle_json(bundle: &str) -> Result<AuditReport, String> {
     Ok(crate::audit_with_evidence(artifacts, pool.as_ref()).0)
 }
 
+/// One freshly encrypted ballot slot: the wire ciphertext and CDS proof, and
+/// the ciphertext and randomness a selection proof sums over.
+type EncryptedSlot = (
+    saksi_protocol::Ciphertext,
+    saksi_protocol::CDSProof,
+    saksi_crypto::elgamal::Ciphertext,
+    curve25519_dalek::scalar::Scalar,
+);
+
+/// The election a stream run folder describes, as the attack helpers below
+/// need it: its parameters, its binding context and its joint public key,
+/// rebuilt from the header's DKG transcript.
+struct StreamElection {
+    parameters: ElectionParameters,
+    binding_context: Vec<u8>,
+    public_key: saksi_crypto::elgamal::PublicKey,
+}
+
+impl StreamElection {
+    fn read(dir: &std::path::Path) -> Result<Self, String> {
+        let header = crate::stream::read_header(dir)?;
+        let hexd = |s: &str, what: &str| hex::decode(s).map_err(|e| format!("{what} not hex: {e}"));
+        let parameters = ElectionParameters::decode(&hexd(&header.params, "params")?[..])
+            .map_err(|e| format!("decode params: {e}"))?;
+        let transcript = DKGTranscript::decode(&hexd(&header.dkg, "dkg")?[..])
+            .map_err(|e| format!("decode dkg: {e}"))?;
+        Ok(Self {
+            parameters,
+            binding_context: hexd(&header.binding_context, "binding_context")?,
+            public_key: crate::fixtures::joint_public_key_from_transcript(&transcript),
+        })
+    }
+
+    /// The position's contests, in order: the same prefix rule as the
+    /// chaincode's contestIndicesForPosition and the auditor. An empty
+    /// position is the legacy whole-ballot record, which covers every contest.
+    fn contests(&self, position_id: &str) -> Result<Vec<String>, String> {
+        let prefix = format!("{position_id}/");
+        let contests: Vec<String> = self
+            .parameters
+            .contest_ids
+            .iter()
+            .filter(|c| position_id.is_empty() || c.starts_with(&prefix))
+            .cloned()
+            .collect();
+        if contests.is_empty() {
+            return Err(format!(
+                "position {position_id:?} matches no contest of the election"
+            ));
+        }
+        Ok(contests)
+    }
+
+    /// Encrypts `choice` (0 or 1) for `contest_id` under fresh randomness, with
+    /// a genuine CDS proof bound to `nullifier`.
+    fn encrypt_slot(
+        &self,
+        contest_id: &str,
+        choice: usize,
+        nullifier: &[u8],
+        rng: &mut rand_core::OsRng,
+    ) -> Result<EncryptedSlot, String> {
+        use curve25519_dalek::scalar::Scalar;
+        use saksi_crypto::elgamal::{encrypt, Plaintext};
+        use saksi_crypto::nizk::cds::CDSProof;
+
+        let r = Scalar::random(rng);
+        let ct = encrypt(
+            &self.public_key,
+            Plaintext::from_small_integer(choice as u64),
+            r,
+        );
+        let context = crate::ballot::cds_context_for_test(
+            self.parameters.election_id.as_bytes(),
+            contest_id.as_bytes(),
+            nullifier,
+        );
+        let proof = CDSProof::prove(
+            &self.public_key,
+            &ct,
+            &[Scalar::ZERO, Scalar::ONE],
+            choice,
+            &r,
+            &context,
+            rng,
+        )
+        .map_err(|e| format!("CDS prove for {contest_id}: {e:?}"))?;
+        let (pad, data) = ct.to_compressed_bytes();
+        let wire = saksi_protocol::Ciphertext {
+            version: saksi_protocol::WIRE_VERSION,
+            pad: pad.to_vec(),
+            data: data.to_vec(),
+        };
+        Ok((wire, proof.to_wire(), ct, r))
+    }
+}
+
+/// Builds one **forged** ballot record, as hex, for the election whose
+/// `header.json` is in `dir`: a vote for candidate `candidate` (0-based) in
+/// `position_id`, under a credential issued by a freshly generated issuer key
+/// the election never declared.
+///
+/// Every proof in it is genuine. The CDS proofs and the sum-to-one selection
+/// proof are made under the election's joint key, rebuilt from the header's
+/// DKG transcript, and bound to the forged credential's nullifier; the
+/// credential signature verifies under the issuer key the ballot itself
+/// carries. So the only checks that can refuse it are the ones that hold that
+/// key against the election's issuer key: the chaincode's `issuer` gate and
+/// the auditor's `ballot.issuer_binding`. It backs the `self-issued-credential`
+/// attack; the generator never calls it.
+pub fn forge_self_issued_ballot(
+    dir: &std::path::Path,
+    position_id: &str,
+    candidate: usize,
+) -> Result<String, String> {
+    use curve25519_dalek::scalar::Scalar;
+    use rand_core::OsRng;
+    use saksi_credentials::{
+        issuer_pre_sign, issuer_sign, voter_begin_issuance, voter_blind_challenge,
+        voter_finalize_issuance, IssuerSecretKey,
+    };
+    use saksi_crypto::nizk::selection::{prove_selection, selection_context};
+
+    let election = StreamElection::read(dir)?;
+    let contests = election.contests(position_id)?;
+    if candidate >= contests.len() {
+        return Err(format!(
+            "candidate {candidate} is out of range: {position_id:?} has {} candidates",
+            contests.len()
+        ));
+    }
+    let election_id = election.parameters.election_id.clone();
+
+    let mut rng = OsRng;
+    let attacker = IssuerSecretKey::generate(&mut rng);
+    let attacker_pk = attacker.public_key();
+    let (request, blind_state) = voter_begin_issuance(&mut rng);
+    let (pre_sig, session) = issuer_pre_sign(&attacker, &request, &mut rng);
+    let (blinded, finalize_state) =
+        voter_blind_challenge(blind_state, &pre_sig, &attacker_pk, &mut rng);
+    let response = issuer_sign(&attacker, session, &blinded);
+    let credential = voter_finalize_issuance(finalize_state, &response, &attacker_pk)
+        .map_err(|e| format!("issue the forged credential: {e:?}"))?;
+    let presentation = credential.present(
+        &attacker_pk,
+        election_id.as_bytes(),
+        position_id.as_bytes(),
+        &election.binding_context,
+        &mut rng,
+    );
+    let nullifier = presentation
+        .nullifier
+        .as_ref()
+        .ok_or("the presentation has no nullifier")?
+        .value
+        .clone();
+
+    let mut ciphertexts = Vec::with_capacity(contests.len());
+    let mut proofs = Vec::with_capacity(contests.len());
+    let mut cts = Vec::with_capacity(contests.len());
+    let mut r_sum = Scalar::ZERO;
+    for (k, contest_id) in contests.iter().enumerate() {
+        let (wire, proof, ct, r) = election.encrypt_slot(
+            contest_id,
+            usize::from(k == candidate),
+            &nullifier,
+            &mut rng,
+        )?;
+        ciphertexts.push(wire);
+        proofs.push(proof);
+        cts.push(ct);
+        r_sum += r;
+    }
+    let selection = prove_selection(
+        &election.public_key,
+        &cts,
+        &r_sum,
+        &selection_context(election_id.as_bytes(), position_id.as_bytes(), &nullifier),
+        &mut rng,
+    );
+
+    let ballot = Ballot {
+        version: saksi_protocol::WIRE_VERSION,
+        election_id,
+        voter_credential_commitment: presentation.credential_commitment.clone(),
+        ciphertexts,
+        well_formedness_proofs: proofs,
+        credential_presentation: Some(presentation),
+        position_id: position_id.to_string(),
+        selection_proof: Some(selection.to_wire()),
+    };
+    Ok(hex::encode(ballot.encode_to_vec()))
+}
+
+/// Builds an **overvote** from ballot line `line` (0-based) of the stream run
+/// folder `dir`, as hex: the same record, credential presentation and
+/// nullifier, with its first two candidate slots re-encrypted to 1 under fresh
+/// randomness.
+///
+/// The attacker is that ballot's own voter, so the credential is legitimate.
+/// The two new CDS proofs are genuine and bound to the same nullifier, so every
+/// per-slot check passes. The record keeps its old selection proof, which no
+/// longer matches the ciphertexts: the chaincode's `selection` gate and the
+/// auditor's `ballot.selection_sum` are the checks that refuse it. It backs the
+/// `overvote` attack; the generator never calls it.
+pub fn overvote_ballot(dir: &std::path::Path, line: usize) -> Result<String, String> {
+    use std::io::BufRead;
+
+    let election = StreamElection::read(dir)?;
+    let path = dir.join(crate::stream::BALLOTS_FILE);
+    let file = std::fs::File::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;
+    let raw = std::io::BufReader::new(file)
+        .lines()
+        .nth(line)
+        .ok_or_else(|| format!("{} has no ballot line {line}", path.display()))?
+        .map_err(|e| format!("read ballot line {line}: {e}"))?;
+    let bytes = hex::decode(raw.trim()).map_err(|e| format!("ballot line {line} not hex: {e}"))?;
+    let mut ballot = Ballot::decode(&bytes[..])
+        .map_err(|e| format!("ballot line {line} did not decode: {e}"))?;
+
+    let contests = election.contests(&ballot.position_id)?;
+    if contests.len() < 2
+        || ballot.ciphertexts.len() != contests.len()
+        || ballot.well_formedness_proofs.len() != contests.len()
+    {
+        return Err(format!(
+            "ballot line {line} has {} slots for {} contests; an overvote needs at least two",
+            ballot.ciphertexts.len(),
+            contests.len()
+        ));
+    }
+    let nullifier = ballot
+        .credential_presentation
+        .as_ref()
+        .and_then(|p| p.nullifier.as_ref())
+        .ok_or_else(|| format!("ballot line {line} has no nullifier"))?
+        .value
+        .clone();
+
+    let mut rng = rand_core::OsRng;
+    for (k, contest_id) in contests.iter().enumerate().take(2) {
+        let (wire, proof, _, _) = election.encrypt_slot(contest_id, 1, &nullifier, &mut rng)?;
+        ballot.ciphertexts[k] = wire;
+        ballot.well_formedness_proofs[k] = proof;
+    }
+    Ok(hex::encode(ballot.encode_to_vec()))
+}
+
 /// Audits a **stream run folder** (`header.json` + `ballots.ndjson`, the shape
 /// [`write_election_stream_params`] writes) and projects the result into
 /// [`StreamAudit`] — structured per-contest correctness the console's Verify
@@ -717,6 +965,106 @@ mod tests {
         };
         let err = election_bundle_json_params(&p).expect_err("t>n must be rejected");
         assert!(err.contains("threshold"), "unexpected error: {err}");
+    }
+
+    /// Writes a clean 3-voter, 1-position, 3-candidate stream into a fresh
+    /// temp folder named `name`, checks it audits clean (the positive control),
+    /// and returns it.
+    fn clean_stream(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(name);
+        let _ = std::fs::remove_dir_all(&dir);
+        write_election_stream_params(&dir, &GenParams::simple(3, 1, 3, SelectionProfile::Uniform))
+            .expect("write stream");
+        let sa = audit_stream_dir(&dir).expect("audits");
+        assert_eq!(sa.overall, "pass", "positive control: {sa:#?}");
+        dir
+    }
+
+    /// Replaces ballot line 0 of the stream in `dir` and returns the ids of the
+    /// checks the audit then fails.
+    fn audit_with_line0(dir: &std::path::Path, ballot_hex: &str) -> Vec<String> {
+        let path = dir.join(crate::stream::BALLOTS_FILE);
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let mut lines: Vec<&str> = raw.lines().collect();
+        lines[0] = ballot_hex;
+        std::fs::write(&path, lines.join("\n") + "\n").unwrap();
+        let sa = audit_stream_dir(dir).expect("audits");
+        sa.failed_checks.into_iter().map(|f| f.check).collect()
+    }
+
+    #[test]
+    fn forged_self_issued_ballot_passes_the_chain_checks_and_fails_issuer_binding() {
+        let dir = clean_stream("saksi-forge-self-issued");
+        let forged_hex = forge_self_issued_ballot(&dir, "president", 1).expect("forge");
+        let ballot = Ballot::decode(&hex::decode(&forged_hex).unwrap()[..]).expect("decodes");
+        let header = crate::stream::read_header(&dir).expect("header");
+        let presentation = ballot
+            .credential_presentation
+            .as_ref()
+            .expect("presentation");
+
+        // The chaincode's credential check holds: the credential verifies under
+        // the issuer key the ballot itself carries, which is not the election's.
+        let embedded: [u8; 32] = presentation
+            .issuer_public_key
+            .as_slice()
+            .try_into()
+            .unwrap();
+        let embedded = IssuerPublicKey(point_from_compressed(embedded).unwrap());
+        saksi_credentials::verify_presentation(
+            presentation,
+            &embedded,
+            header.election_id.as_bytes(),
+            b"president",
+            &hex::decode(&header.binding_context).unwrap(),
+        )
+        .expect("the credential verifies under its own issuer key");
+        assert_ne!(
+            presentation.issuer_public_key,
+            hex::decode(&header.issuer_pk).unwrap()
+        );
+        assert!(
+            ballot.selection_proof.is_some(),
+            "carries a selection proof"
+        );
+
+        // Only issuer binding names it: its CDS and selection proofs are
+        // genuine under the election's key.
+        let ids = audit_with_line0(&dir, &forged_hex);
+        assert!(ids.iter().any(|c| c == "ballot.issuer_binding"), "{ids:?}");
+        assert!(!ids.iter().any(|c| c == "ballot.cds_proof"), "{ids:?}");
+        assert!(!ids.iter().any(|c| c == "ballot.selection_sum"), "{ids:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn overvote_ballot_passes_cds_and_fails_selection_sum() {
+        let dir = clean_stream("saksi-overvote");
+        let original = std::fs::read_to_string(dir.join(crate::stream::BALLOTS_FILE))
+            .unwrap()
+            .lines()
+            .next()
+            .unwrap()
+            .to_string();
+        let over_hex = overvote_ballot(&dir, 0).expect("overvote");
+        let (was, now) = (
+            Ballot::decode(&hex::decode(&original).unwrap()[..]).unwrap(),
+            Ballot::decode(&hex::decode(&over_hex).unwrap()[..]).unwrap(),
+        );
+        // Same voter, same nullifier, same (now stale) selection proof; slots
+        // 0 and 1 re-encrypted, the third untouched.
+        assert_eq!(was.credential_presentation, now.credential_presentation);
+        assert_eq!(was.selection_proof, now.selection_proof);
+        assert_ne!(was.ciphertexts[0], now.ciphertexts[0]);
+        assert_ne!(was.ciphertexts[1], now.ciphertexts[1]);
+        assert_eq!(was.ciphertexts[2], now.ciphertexts[2]);
+
+        let ids = audit_with_line0(&dir, &over_hex);
+        assert!(ids.iter().any(|c| c == "ballot.selection_sum"), "{ids:?}");
+        assert!(!ids.iter().any(|c| c == "ballot.cds_proof"), "{ids:?}");
+        assert!(!ids.iter().any(|c| c == "ballot.issuer_binding"), "{ids:?}");
+        assert!(overvote_ballot(&dir, 99).is_err(), "no such line");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
