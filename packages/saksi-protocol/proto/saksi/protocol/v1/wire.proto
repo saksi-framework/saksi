@@ -134,5 +134,10 @@ message ElectionParameters {
   repeated string contest_ids = 3;
   repeated string trustee_ids = 4;
   uint32 threshold = 5;
+  // The election's trust-anchor credential issuer: a 32-byte compressed
+  // ristretto255 point. SubmitBallot refuses (gate `issuer`) a ballot whose
+  // credential presentation names any other issuer key. Empty on an election
+  // created before this field existed; the gate is then skipped.
+  bytes issuer_public_key = 6;
 }
 

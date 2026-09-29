@@ -125,12 +125,14 @@ pub(crate) fn happy_path_fixture() -> ElectionFixture {
     let trustee_ids: Vec<String> = (1..=5).map(|i: u32| i.to_string()).collect();
     let contest_ids: Vec<String> = vec!["contest-1".into(), "contest-2".into()];
     let threshold: u32 = 3;
-    let parameters = ElectionParameters {
+    let mut parameters = ElectionParameters {
         version: WIRE_VERSION,
         election_id: "election-2026".into(),
         contest_ids: contest_ids.clone(),
         trustee_ids: trustee_ids.clone(),
         threshold,
+        // Filled below once the issuer keypair exists.
+        issuer_public_key: Vec::new(),
     };
 
     // -- DKG --------------------------------------------------------------
@@ -145,6 +147,9 @@ pub(crate) fn happy_path_fixture() -> ElectionFixture {
 
     let issuer_sk = IssuerSecretKey::generate(&mut rng);
     let issuer_pk = issuer_sk.public_key();
+    // Bind the issuer on-chain: the params carry the same key as the header's
+    // `issuer_pk`, so SubmitBallot's `issuer` gate refuses any other issuer.
+    parameters.issuer_public_key = issuer_pk.as_point().compress().to_bytes().to_vec();
 
     let mut credentials: Vec<Credential> = Vec::with_capacity(6);
     for _ in 0..6 {
@@ -736,12 +741,14 @@ pub(crate) fn gen_prologue(params: &GenParams) -> GenPrologue {
             contest_ids.push(format!("{}/cand{k}", ph_position_id(p)));
         }
     }
-    let parameters = ElectionParameters {
+    let mut parameters = ElectionParameters {
         version: WIRE_VERSION,
         election_id: params.election_id.clone(),
         contest_ids,
         trustee_ids,
         threshold: params.threshold as u32,
+        // Filled below once the issuer keypair exists.
+        issuer_public_key: Vec::new(),
     };
 
     // -- DKG (t-of-n; every dealer polynomial drawn from OsRng) --------------
@@ -755,6 +762,8 @@ pub(crate) fn gen_prologue(params: &GenParams) -> GenPrologue {
 
     let issuer_secret_key = IssuerSecretKey::generate(&mut rng);
     let issuer_public_key = issuer_secret_key.public_key();
+    // Bind the issuer on-chain (see `happy_path_fixture`).
+    parameters.issuer_public_key = issuer_public_key.as_point().compress().to_bytes().to_vec();
 
     GenPrologue {
         parameters,
