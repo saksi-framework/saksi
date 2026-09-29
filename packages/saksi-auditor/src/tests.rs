@@ -462,6 +462,53 @@ fn wrong_issuer_pk_is_caught() {
     );
 }
 
+/// The generator binds its issuer into the election parameters: the params'
+/// `issuer_public_key` is the same compressed point as the fixture's issuer key
+/// (the header's `issuer_pk`), on both generator paths.
+#[test]
+fn generator_binds_issuer_key_into_parameters() {
+    let happy = happy_path_fixture();
+    let multi = multi_position_fixture(&GenParams::simple(2, 1, 2, SelectionProfile::Uniform));
+    for fixture in [&happy, &multi] {
+        let expected = fixture.issuer_public_key.as_point().compress().to_bytes();
+        assert_eq!(fixture.parameters.issuer_public_key, expected.to_vec());
+    }
+}
+
+/// Params that name a different issuer than the one the auditor is given
+/// (the header's `issuer_pk`) fail `parameters.issuer_binding`.
+#[test]
+fn parameters_issuer_mismatch_is_caught() {
+    let mut fixture = happy_path_fixture();
+    let other_pk = IssuerSecretKey::generate(&mut OsRng).public_key();
+    fixture.parameters.issuer_public_key = other_pk.as_point().compress().to_bytes().to_vec();
+
+    let report = audit(fixture.artifacts());
+    assert_eq!(report.overall, AuditStatus::Fail);
+    assert!(
+        report.findings.iter().any(
+            |f| f.check == "parameters.issuer_binding" && matches!(f.status, AuditStatus::Fail)
+        ),
+        "expected parameters.issuer_binding Fail in {report:#?}"
+    );
+}
+
+/// Legacy params with no issuer key still audit clean: the check is skipped.
+#[test]
+fn parameters_without_issuer_key_still_pass() {
+    let mut fixture = happy_path_fixture();
+    fixture.parameters.issuer_public_key.clear();
+    let report = audit(fixture.artifacts());
+    assert!(
+        report.passed(),
+        "legacy params should audit clean: {report:#?}"
+    );
+    assert!(!report
+        .findings
+        .iter()
+        .any(|f| f.check == "parameters.issuer_binding"));
+}
+
 // ---------------------------------------------------------------------------
 // 12. DKG transcript trustee-count mismatch
 // ---------------------------------------------------------------------------

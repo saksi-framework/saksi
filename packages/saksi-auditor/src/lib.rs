@@ -268,6 +268,7 @@ fn audit_streaming_chunked(
     if !params_ok {
         return (builder.finish(), Vec::new(), timings);
     }
+    check_parameters_issuer(inputs.parameters, inputs.issuer_public_key, &mut builder);
 
     // -- 2-4. DKG transcript ----------------------------------------------
 
@@ -503,6 +504,31 @@ fn check_parameters(parameters: &ElectionParameters, builder: &mut ReportBuilder
         );
     }
     ok
+}
+
+/// `parameters.issuer_binding`: params that carry an issuer key must name the
+/// issuer the auditor was given (the header's `issuer_pk`). Params without one
+/// predate the field and are skipped, as the chaincode's `issuer` gate is.
+fn check_parameters_issuer(
+    parameters: &ElectionParameters,
+    issuer_public_key: &IssuerPublicKey,
+    builder: &mut ReportBuilder,
+) {
+    if parameters.issuer_public_key.is_empty() {
+        return;
+    }
+    let expected = issuer_public_key.as_point().compress().to_bytes();
+    if parameters.issuer_public_key.as_slice() == expected.as_slice() {
+        builder.pass(
+            "parameters.issuer_binding",
+            "election parameters name the trust-anchor issuer key",
+        );
+    } else {
+        builder.fail(
+            "parameters.issuer_binding",
+            "election parameters issuer_public_key does not match the trust-anchor issuer key",
+        );
+    }
 }
 
 /// Incremental cross-ballot nullifier uniqueness (the double-vote check).
