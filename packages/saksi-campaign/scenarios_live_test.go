@@ -420,3 +420,53 @@ func TestLegacyElectionNeverMountsTheIssuerBoundAttacksLive(t *testing.T) {
 		}
 	}
 }
+
+// A legacy election's audit always fails parameters.issuer_binding (no issuer
+// key in its params). The scenario audit sets that one finding aside, so the
+// unmutated copy is still a clean positive control, a mutation caught by its
+// declared check is a PASS, and one nothing else catches is still a FAIL.
+func TestLegacyElectionFindingIsSetAsideByTheScenarioAudit(t *testing.T) {
+	for _, tc := range []struct {
+		legacy  bool
+		mutated string // failed checks after mutation, beside the legacy finding
+		want    string
+	}{
+		{true, "ballot.issuer_binding", "PASS"},
+		{true, "", "FAIL"},
+		// On an election with an issuer key the finding is real: the control fails.
+		{false, "ballot.issuer_binding", "INCONCLUSIVE"},
+	} {
+		dir := t.TempDir()
+		attackRun(t, dir, 3)
+		p := &pb.ElectionParameters{ElectionId: "run-1"}
+		if !tc.legacy {
+			p.IssuerPublicKey = make([]byte, 32)
+		}
+		if err := mutateHeader(dir, func(h map[string]any) error { h["params"] = hexProto(t, p); return nil }); err != nil {
+			t.Fatal(err)
+		}
+		audits := 0
+		e := testExec(t)
+		e.run = func(_ context.Context, _ string, args ...string) ([]byte, error) {
+			if args[0] != "audit-stream" {
+				return fakeHelper(args)
+			}
+			audits++
+			checks := `{"check":"parameters.issuer_binding","detail":"no issuer key"}`
+			if audits%2 == 0 && tc.mutated != "" {
+				checks += `,{"check":"` + tc.mutated + `","detail":"d"}`
+			}
+			return []byte(`{"overall":"fail","failed_checks":[` + checks + `]}`), nil
+		}
+		var sc Scenario
+		for _, s := range Registry() {
+			if s.ID == "self-issued-credential" {
+				sc = s
+			}
+		}
+		res := e.runOneScenario(context.Background(), "run-1", dir, sc)
+		if res.Verdict != tc.want {
+			t.Errorf("legacy=%v mutated=%q: verdict %q (%s), want %s", tc.legacy, tc.mutated, res.Verdict, res.Actual, tc.want)
+		}
+	}
+}

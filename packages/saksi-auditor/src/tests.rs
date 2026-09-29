@@ -493,20 +493,34 @@ fn parameters_issuer_mismatch_is_caught() {
     );
 }
 
-/// Legacy params with no issuer key still audit clean: the check is skipped.
+/// Legacy params with no issuer key are a downgrade (the chain's issuer and
+/// selection gates were off): `parameters.issuer_binding` fails, and nothing
+/// else does.
 #[test]
-fn parameters_without_issuer_key_still_pass() {
+fn parameters_without_issuer_key_are_flagged() {
     let mut fixture = happy_path_fixture();
     fixture.parameters.issuer_public_key.clear();
     let report = audit(fixture.artifacts());
-    assert!(
-        report.passed(),
-        "legacy params should audit clean: {report:#?}"
+    assert_eq!(
+        only_failures(&report),
+        ["parameters.issuer_binding"],
+        "{report:#?}"
     );
-    assert!(!report
+    assert!(report
+        .finding("parameters.issuer_binding")
+        .unwrap()
+        .detail
+        .contains("carry no issuer key"));
+}
+
+/// The checks the report fails, in order.
+fn only_failures(report: &AuditReport) -> Vec<&str> {
+    report
         .findings
         .iter()
-        .any(|f| f.check == "parameters.issuer_binding"));
+        .filter(|f| f.status == AuditStatus::Fail)
+        .map(|f| f.check)
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -629,7 +643,12 @@ fn legacy_params_skip_selection_sum() {
         b.selection_proof = None;
     }
     let report = audit(fixture.artifacts());
-    assert!(report.passed(), "{report:#?}");
+    // Only the downgrade itself is flagged.
+    assert_eq!(
+        only_failures(&report),
+        ["parameters.issuer_binding"],
+        "{report:#?}"
+    );
     assert!(report.finding("ballot.selection_sum").is_none());
 }
 

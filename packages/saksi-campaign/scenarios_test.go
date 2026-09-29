@@ -9,6 +9,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	pb "github.com/saksi-framework/saksi/packages/saksi-protocol/go/saksiprotocolv1"
 )
 
 // findDemo locates the saksi-demo binary; the scenario integration test needs
@@ -437,5 +439,49 @@ func TestNegativeTestsCSVRejectionRates(t *testing.T) {
 	}
 	if rows[len(rows)-1][scenarioCol] != "summary" {
 		t.Errorf("summary must be the last row, got %q", rows[len(rows)-1][scenarioCol])
+	}
+}
+
+// A real legacy election (params with no issuer key) against the real
+// auditor: the audit flags the downgrade (parameters.issuer_binding), the
+// scenario audit sets that aside, and self-issued-credential is still caught
+// by the header-based ballot.issuer_binding after a clean positive control.
+func TestSelfIssuedCredentialOnARealLegacyRun(t *testing.T) {
+	demo := findDemo(t)
+	ctx := context.Background()
+	store := NewRunStore(t.TempDir())
+	c := good()
+	c.Voters, c.Positions, c.Candidates = 4, 1, 2
+	runID, srcDir, err := store.Create(c, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	e := NewExecutor(store, NewHub(), demo, "", FabricConfig{})
+	if err := e.Generate(ctx, runID, c); err != nil {
+		t.Fatalf("generate: %v", err)
+	}
+	if err := mutateHeader(srcDir, func(h map[string]any) error {
+		var p pb.ElectionParameters
+		if err := decodeHexProto(h["params"].(string), &p); err != nil {
+			return err
+		}
+		p.IssuerPublicKey = nil
+		enc, err := encodeHexProto(&p)
+		h["params"] = enc
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	out, _ := e.run(ctx, demo, "audit-stream", srcDir, "--json")
+	if !strings.Contains(string(out), `"parameters.issuer_binding"`) {
+		t.Fatalf("the auditor did not flag the legacy params: %s", out)
+	}
+
+	for _, sc := range selectScenarios([]string{"self-issued-credential", "overvote"}) {
+		res := e.runOneScenario(ctx, runID, srcDir, sc)
+		want := map[string]string{"self-issued-credential": "PASS", "overvote": "SKIPPED"}[sc.ID]
+		if res.Verdict != want {
+			t.Errorf("%s on a legacy run: %s (%s), want %s", sc.ID, res.Verdict, res.Actual, want)
+		}
 	}
 }

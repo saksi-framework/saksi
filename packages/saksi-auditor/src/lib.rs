@@ -506,15 +506,20 @@ fn check_parameters(parameters: &ElectionParameters, builder: &mut ReportBuilder
     ok
 }
 
-/// `parameters.issuer_binding`: params that carry an issuer key must name the
-/// issuer the auditor was given (the header's `issuer_pk`). Params without one
-/// predate the field and are skipped, as the chaincode's `issuer` gate is.
+/// `parameters.issuer_binding`: the params must name the issuer the auditor
+/// was given (the header's `issuer_pk`). Params without an issuer key predate
+/// the field, and the chain then skips its `issuer` and `selection` gates: that
+/// downgrade fails here rather than passing silently.
 fn check_parameters_issuer(
     parameters: &ElectionParameters,
     issuer_public_key: &IssuerPublicKey,
     builder: &mut ReportBuilder,
 ) {
     if parameters.issuer_public_key.is_empty() {
+        builder.fail(
+            "parameters.issuer_binding",
+            "election parameters carry no issuer key, so the chain's issuer and selection gates were off for this election",
+        );
         return;
     }
     let expected = issuer_public_key.as_point().compress().to_bytes();

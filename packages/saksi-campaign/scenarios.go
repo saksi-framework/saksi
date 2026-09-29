@@ -480,7 +480,36 @@ func (e *Executor) auditStream(ctx context.Context, dir string) (StreamAudit, bo
 	if json.Unmarshal(out, &sa) != nil {
 		return StreamAudit{}, false
 	}
+	if legacyElection(dir) {
+		sa = withoutLegacyFinding(sa)
+	}
 	return sa, true
+}
+
+// legacyFinding is the check a legacy election's audit always fails: its
+// params carry no issuer key, so the chain's issuer and selection gates were
+// off. The finding is about the election, not about any attack on it.
+const legacyFinding = "parameters.issuer_binding"
+
+// withoutLegacyFinding drops legacyFinding from a legacy election's audit, so
+// the positive control and the verdict judge only what the mutation changed:
+// an unmutated legacy copy then passes, and a mutation that nothing else
+// catches is still a FAIL.
+func withoutLegacyFinding(sa StreamAudit) StreamAudit {
+	if sa.Overall != "fail" || len(sa.FailedChecks) == 0 {
+		return sa
+	}
+	kept := sa.FailedChecks[:0:0]
+	for _, f := range sa.FailedChecks {
+		if f.Check != legacyFinding {
+			kept = append(kept, f)
+		}
+	}
+	sa.FailedChecks = kept
+	if len(kept) == 0 {
+		sa.Overall = "pass"
+	}
+	return sa
 }
 
 func selectScenarios(list []string) []Scenario {
