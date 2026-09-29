@@ -63,6 +63,13 @@ message Ballot {
   // PRF(s_cred, election_id || position_id) so double voting is prevented per
   // voter per position. Empty on a legacy single-position ballot.
   string position_id = 7;
+  // Proof that this record's ciphertexts encrypt exactly one selection in
+  // total: a Chaum-Pedersen proof that (sum A_k, sum B_k - G) is an encryption
+  // of zero under the election key, with Fiat-Shamir context
+  // "saksi.ballot.selection.v1" || binding_context(election_id, position_id,
+  // nullifier). Required (gate `selection`) when the election parameters carry
+  // an issuer_public_key; elections without one skip the check (legacy).
+  ChaumPedersenProof selection_proof = 8;
 }
 
 message TrusteeCommitment {

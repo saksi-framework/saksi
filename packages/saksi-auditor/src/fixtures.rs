@@ -240,6 +240,7 @@ pub(crate) fn happy_path_fixture() -> ElectionFixture {
             // all contests (the pre-R2 model). The multi-position generator
             // (`multi_position_fixture`) emits one record per position instead.
             position_id: String::new(),
+            selection_proof: None,
         });
     }
 
@@ -878,6 +879,7 @@ pub(crate) fn build_voter(pro: &GenPrologue, params: &GenParams, voter_idx: usiz
             well_formedness_proofs: proofs,
             credential_presentation: Some(presentation),
             position_id,
+            selection_proof: None,
         });
     }
 
