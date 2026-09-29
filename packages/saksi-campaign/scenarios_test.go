@@ -311,7 +311,7 @@ func exportOnce(t *testing.T, dir string, res ScenarioResult) {
 // The wizard runs one attack per step, so each call to RunScenarios carries a
 // single scenario. Before the accumulator existed the CSV was recreated from
 // only that call's results, so the export ended up holding whichever scenario
-// ran last and silently lost the other six.
+// ran last and silently lost the others.
 func TestScenarioResultsAccumulateAcrossSeparateRuns(t *testing.T) {
 	dir := t.TempDir()
 

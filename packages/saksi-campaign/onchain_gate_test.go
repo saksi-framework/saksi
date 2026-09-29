@@ -145,13 +145,14 @@ func TestStagesPartitionTheCatalogue(t *testing.T) {
 func TestOnlyAttacksWithAnOnChainGateAreLiveCapable(t *testing.T) {
 	live := map[string]string{
 		"tamper-ballot-proof": "cds", "reused-nullifier": "nullifier", "corrupted-ballot-bytes": "decode",
+		"self-issued-credential": "issuer", "overvote": "selection",
 	}
 	for _, sc := range Registry() {
 		gate, want := live[sc.ID]
 		if sc.LiveCapable() != want || sc.ChainGate != gate {
 			t.Errorf("%s: LiveCapable=%v ChainGate=%q, want %v %q", sc.ID, sc.LiveCapable(), sc.ChainGate, want, gate)
 		}
-		if want && (sc.Stage != StageBallots || sc.MutateBallot == nil) {
+		if want && (sc.Stage != StageBallots || (sc.MutateBallot == nil && sc.ForgeBallot == nil)) {
 			t.Errorf("%s is live but cannot be mounted mid-submission", sc.ID)
 		}
 		if !want && sc.Layer != LayerChaincode && sc.OnChainNote == "" {

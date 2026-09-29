@@ -1,6 +1,7 @@
 package campaign
 
 import (
+	"context"
 	"encoding/hex"
 	"encoding/json"
 	"os"
@@ -317,3 +318,49 @@ func TestChangedHeaderHelpersDetectNoChange(t *testing.T) {
 type errString string
 
 func (e errString) Error() string { return string(e) }
+
+// The two attacks saksi-demo builds are mounted at the ballots pause against
+// the ballot the window has not sent: the helper is asked for THAT ballot, what
+// it prints is what reaches the ledger, and a refusal at the declared gate
+// (issuer, selection) is a PASS.
+func TestHelperBuiltBallotAttacksMountLiveAtTheirGate(t *testing.T) {
+	for id, gate := range map[string]string{"self-issued-credential": "issuer", "overvote": "selection"} {
+		t.Run(id, func(t *testing.T) {
+			dir := t.TempDir()
+			e := newTestExecutor(t, dir)
+			attackRun(t, filepath.Join(dir, "run-1"), 4)
+			var calls [][]string
+			e.run = func(_ context.Context, _ string, args ...string) ([]byte, error) {
+				calls = append(calls, args)
+				return fakeHelper(args)
+			}
+			var sc Scenario
+			for _, s := range Registry() {
+				if s.ID == id {
+					sc = s
+				}
+			}
+			var submitted []string
+			res := e.mountBallotLive(context.Background(), "run-1", sc, 2, 0, func(h string) error {
+				submitted = append(submitted, h)
+				return errString("chaincode response 500, gate=" + gate + ": refused")
+			})
+
+			if res.Verdict != "PASS" || res.GateObserved != gate || !res.OnChain {
+				t.Fatalf("verdict %q observed %q (%s), want a live PASS at %s", res.Verdict, res.GateObserved, res.Actual, gate)
+			}
+			if len(calls) != 1 || len(submitted) != 1 {
+				t.Fatalf("helper calls %v, submissions %d; want one of each", calls, len(submitted))
+			}
+			runDir := filepath.Join(dir, "run-1")
+			want := map[string][]string{
+				"self-issued-credential": {"forge-ballot", runDir, "--position", "president", "--candidate", "0"},
+				"overvote":               {"overvote-ballot", runDir, "2"},
+			}[id]
+			if strings.Join(calls[0], " ") != strings.Join(want, " ") {
+				t.Errorf("helper called with %v, want %v", calls[0], want)
+			}
+			assertCarriesMutation(t, id, submitted[0])
+		})
+	}
+}
