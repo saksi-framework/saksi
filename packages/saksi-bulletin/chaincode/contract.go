@@ -8,6 +8,7 @@ import (
 	"slices"
 	"strings"
 
+	"github.com/gtank/ristretto255"
 	"github.com/hyperledger/fabric-contract-api-go/contractapi"
 	"github.com/saksi-framework/saksi/packages/saksi-bulletin/chaincode/cdsverify"
 	"github.com/saksi-framework/saksi/packages/saksi-bulletin/chaincode/credverify"
@@ -542,6 +543,13 @@ func (s *SmartContract) CreateElection(ctx contractapi.TransactionContextInterfa
 	threshold := int(params.GetThreshold())
 	if threshold < 1 || threshold > trustees {
 		return fmt.Errorf("election threshold %d is out of range 1..%d", threshold, trustees)
+	}
+	// A non-empty issuer key binds every ballot's credential to it (the issuer
+	// gate), so it must be a real point: 32 bytes, canonical ristretto255.
+	if k := params.GetIssuerPublicKey(); len(k) > 0 {
+		if _, err := new(ristretto255.Element).SetCanonicalBytes(k); err != nil {
+			return fmt.Errorf("election issuer_public_key is not a canonical 32-byte ristretto255 point: %w", err)
+		}
 	}
 
 	stub := ctx.GetStub()

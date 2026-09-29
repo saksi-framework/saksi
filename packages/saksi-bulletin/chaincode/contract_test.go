@@ -1313,3 +1313,30 @@ func TestLiveAttackMutationsMeetTheirDeclaredGateFirst(t *testing.T) {
 		t.Errorf("tamper-ballot-proof after close: refused at %q, want election-open", got)
 	}
 }
+
+// CreateElection refuses an issuer key the issuer gate could never match
+// honestly: not 32 bytes, or not a canonical ristretto255 encoding. An empty
+// key (a legacy election) and a real point are accepted.
+func TestCreateElectionValidatesTheIssuerKey(t *testing.T) {
+	sigPK, _, _, _ := loadSigVector(t)
+	for _, c := range []struct {
+		name string
+		key  []byte
+		ok   bool
+	}{
+		{"empty (legacy)", nil, true},
+		{"a real point", sigPK, true},
+		{"31 bytes", sigPK[:31], false},
+		{"33 bytes", append(append([]byte{}, sigPK...), 0), false},
+		{"non-canonical", bytes.Repeat([]byte{0xFF}, 32), false},
+	} {
+		sc, ctx := &SmartContract{}, newContext()
+		err := sc.CreateElection(ctx, mustMarshalParams(t, &saksiprotocolv1.ElectionParameters{
+			Version: saksiprotocolv1.WireVersion, ElectionId: "e", ContestIds: []string{"p/0"},
+			TrusteeIds: []string{"t1"}, Threshold: 1, IssuerPublicKey: c.key,
+		}))
+		if (err == nil) != c.ok {
+			t.Errorf("%s: err = %v, want ok=%v", c.name, err, c.ok)
+		}
+	}
+}
