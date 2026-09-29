@@ -173,3 +173,45 @@ func TestSubmitBallotSelectionProof(t *testing.T) {
 		}
 	}
 }
+
+// An empty position_id is the legacy whole-ballot record: its nullifier is no
+// position's and its selection proof only bounds the sum over every contest.
+// After a voter's per-position record is in, such a record would be a second
+// vote in that position, so an issuer-bound election with per-position
+// contests refuses it at `shape`. Legacy elections keep accepting it.
+func TestSubmitBallotRefusesAnEmptyPositionOnAPositionedElection(t *testing.T) {
+	v := loadSelectionVector(t)
+	sigPK, _, _, _ := loadSigVector(t)
+
+	sc, ctx := &SmartContract{}, newContext()
+	withSelectionElection(t, sc, ctx, v, sigPK)
+	if err := sc.SubmitBallot(ctx, mustMarshal(t, selectionBallot(t, v, false, v.proof))); err != nil {
+		t.Fatalf("the per-position record must be accepted: %v", err)
+	}
+	// The same voter's whole-ballot record, under its own (unspent) nullifier.
+	whole := selectionBallot(t, v, false, v.proof)
+	whole.PositionId = ""
+	whole.CredentialPresentation.Nullifier.Value = bytes.Repeat([]byte{0x42}, 32)
+	if got := gateIDOf(sc.SubmitBallot(ctx, mustMarshal(t, whole))); got != "shape" {
+		t.Errorf("empty-position record after a per-position one: refused at %q, want shape", got)
+	}
+
+	// A position that matches no contest was already refused at shape.
+	nowhere := selectionBallot(t, v, false, v.proof)
+	nowhere.PositionId = "no-such-position"
+	nowhere.CredentialPresentation.Nullifier.Value = bytes.Repeat([]byte{0x43}, 32)
+	if got := gateIDOf(sc.SubmitBallot(ctx, mustMarshal(t, nowhere))); got != "shape" {
+		t.Errorf("unknown position: refused at %q, want shape", got)
+	}
+
+	// Legacy control: without an issuer key, the whole-ballot record over the
+	// same contests is accepted as before (its CDS proofs bind contest ids and
+	// the nullifier, not the position).
+	sc2, ctx2 := &SmartContract{}, newContext()
+	withSelectionElection(t, sc2, ctx2, v, nil)
+	legacy := selectionBallot(t, v, false, v.proof)
+	legacy.PositionId = ""
+	if err := sc2.SubmitBallot(ctx2, mustMarshal(t, legacy)); err != nil {
+		t.Errorf("legacy election: the whole-ballot record must still be accepted: %v", err)
+	}
+}

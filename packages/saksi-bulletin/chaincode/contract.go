@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"slices"
 	"strings"
 
 	"github.com/hyperledger/fabric-contract-api-go/contractapi"
@@ -41,6 +42,12 @@ func contestIndicesForPosition(contestIDs []string, positionID string) []int {
 		}
 	}
 	return idxs
+}
+
+// positionedContests reports whether any contest id is "<position>/<candidate>",
+// the per-position layout.
+func positionedContests(contestIDs []string) bool {
+	return slices.ContainsFunc(contestIDs, func(c string) bool { return strings.Contains(c, "/") })
 }
 
 const (
@@ -217,6 +224,17 @@ func (s *SmartContract) SubmitBallot(ctx contractapi.TransactionContextInterface
 	// The contests this record's position covers (ADR-0007 one-record-per-
 	// position; empty position_id = legacy whole-ballot). Ciphertexts/proofs
 	// align in order to these indices.
+	// An empty position_id is the legacy whole-ballot record. Its nullifier is
+	// no position's, and its selection proof only bounds the sum over every
+	// contest, so on an election with per-position contests it would be a
+	// second vote in one of them. An issuer-bound election refuses it; a legacy
+	// one keeps the old behaviour.
+	if ballot.GetPositionId() == "" && len(params.GetIssuerPublicKey()) > 0 && positionedContests(contestIDs) {
+		return rejectAt("shape",
+			"ballot names no position, but election %q's contests are per position",
+			ballot.GetElectionId(),
+		)
+	}
 	contestIdxs := contestIndicesForPosition(contestIDs, ballot.GetPositionId())
 	if len(contestIdxs) == 0 {
 		return rejectAt("shape",

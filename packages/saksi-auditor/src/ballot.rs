@@ -168,6 +168,23 @@ pub(crate) fn verify_ballot(
         );
         return None;
     }
+    // An empty position_id is the legacy whole-ballot record. Its nullifier is
+    // no position's, and its selection proof only bounds the sum over every
+    // contest, so on per-position contests it would be a second vote in one of
+    // them. Refused when the params carry an issuer key (the chaincode's
+    // `shape` gate); legacy params keep the old behaviour.
+    if ballot.position_id.is_empty()
+        && !parameters.issuer_public_key.is_empty()
+        && parameters.contest_ids.iter().any(|c| c.contains('/'))
+    {
+        builder.fail(
+            "ballot.shape",
+            format!(
+                "ballot[{idx}] names no position, but the election's contests are per position"
+            ),
+        );
+        return None;
+    }
     if contest_idxs.is_empty() {
         builder.fail(
             "ballot.shape",
