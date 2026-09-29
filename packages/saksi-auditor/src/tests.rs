@@ -510,6 +510,130 @@ fn parameters_without_issuer_key_still_pass() {
 }
 
 // ---------------------------------------------------------------------------
+// 11b. Sum-to-one selection proof
+// ---------------------------------------------------------------------------
+
+fn selection_fails(report: &AuditReport) -> Vec<usize> {
+    failed_ballots(report, "ballot.selection_sum")
+}
+
+/// Rewrites `fixture.ballots[idx]` as an overvote: every candidate of its
+/// position encrypted as 1, each with a valid CDS proof bound to the record's
+/// nullifier. The selection proof is left as it was (the honest one).
+fn make_overvote(fixture: &mut ElectionFixture, idx: usize) {
+    use curve25519_dalek::scalar::Scalar;
+    use saksi_crypto::elgamal::{encrypt, Plaintext};
+    use saksi_crypto::nizk::cds::{binding_context, CDSProof};
+
+    let pk = crate::fixtures::joint_public_key_from_transcript(&fixture.dkg_transcript);
+    let ballot = &mut fixture.ballots[idx];
+    let nullifier = ballot
+        .credential_presentation
+        .as_ref()
+        .unwrap()
+        .nullifier
+        .as_ref()
+        .unwrap()
+        .value
+        .clone();
+    let contests =
+        crate::contest_indices_for_position(&fixture.parameters.contest_ids, &ballot.position_id);
+    for (local, &global) in contests.iter().enumerate() {
+        let r = Scalar::random(&mut OsRng);
+        let ct = encrypt(&pk, Plaintext::from_small_integer(1), r);
+        let ctx = binding_context(
+            fixture.parameters.election_id.as_bytes(),
+            fixture.parameters.contest_ids[global].as_bytes(),
+            &nullifier,
+        );
+        let cds = CDSProof::prove(
+            &pk,
+            &ct,
+            &[Scalar::ZERO, Scalar::ONE],
+            1,
+            &r,
+            &ctx,
+            &mut OsRng,
+        )
+        .expect("CDS prove");
+        let (pad, data) = ct.to_compressed_bytes();
+        ballot.ciphertexts[local].pad = pad.to_vec();
+        ballot.ciphertexts[local].data = data.to_vec();
+        ballot.well_formedness_proofs[local] = cds.to_wire();
+    }
+}
+
+/// Honest generator output carries a verifying selection proof on every record.
+#[test]
+fn honest_ballots_pass_selection_sum() {
+    for fixture in [
+        happy_path_fixture(),
+        multi_position_fixture(&GenParams::simple(3, 2, 3, SelectionProfile::Uniform)),
+    ] {
+        let report = audit(fixture.artifacts());
+        assert!(report.passed(), "{report:#?}");
+        let pass = report
+            .finding("ballot.selection_sum")
+            .expect("selection rollup");
+        assert_eq!(pass.status, AuditStatus::Pass);
+        assert!(
+            pass.detail
+                .starts_with(&format!("{} ", fixture.ballots.len())),
+            "every record counted: {pass:#?}"
+        );
+    }
+}
+
+/// An overvote (two or more candidates at 1, every CDS proof valid) is flagged
+/// `ballot.selection_sum` and kept out of the tally, whether it reuses the
+/// honest selection proof or carries none.
+#[test]
+fn overvote_is_caught_by_selection_sum() {
+    let mut fixture =
+        multi_position_fixture(&GenParams::simple(3, 2, 3, SelectionProfile::Uniform));
+    make_overvote(&mut fixture, 1);
+    make_overvote(&mut fixture, 4);
+    fixture.ballots[4].selection_proof = None;
+
+    let report = audit(fixture.artifacts());
+    assert_eq!(report.overall, AuditStatus::Fail);
+    assert_eq!(selection_fails(&report), [1, 4]);
+    assert!(
+        failed_ballots(&report, "ballot.cds_proof").is_empty(),
+        "CDS alone passes an overvote"
+    );
+}
+
+/// A tampered selection proof on an otherwise honest record is caught.
+#[test]
+fn tampered_selection_proof_is_caught() {
+    let mut fixture = happy_path_fixture();
+    fixture.ballots[2]
+        .selection_proof
+        .as_mut()
+        .unwrap()
+        .response[0] ^= 0x01;
+    let report = audit(fixture.artifacts());
+    assert_eq!(report.overall, AuditStatus::Fail);
+    assert_eq!(selection_fails(&report), [2]);
+}
+
+/// Legacy params without an issuer key skip the selection check entirely, so
+/// an overvote without a proof raises no `ballot.selection_sum` finding.
+#[test]
+fn legacy_params_skip_selection_sum() {
+    let mut fixture =
+        multi_position_fixture(&GenParams::simple(2, 1, 3, SelectionProfile::Uniform));
+    fixture.parameters.issuer_public_key.clear();
+    for b in &mut fixture.ballots {
+        b.selection_proof = None;
+    }
+    let report = audit(fixture.artifacts());
+    assert!(report.passed(), "{report:#?}");
+    assert!(report.finding("ballot.selection_sum").is_none());
+}
+
+// ---------------------------------------------------------------------------
 // 12. DKG transcript trustee-count mismatch
 // ---------------------------------------------------------------------------
 
