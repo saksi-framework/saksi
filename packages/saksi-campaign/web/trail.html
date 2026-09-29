@@ -175,7 +175,9 @@
     </section>
   </div>
 
-  <div id="errorBox" class="err" style="display:none"></div>
+  <div id="loading" class="sub">Loading…</div>
+  <div id="errorBox" class="err" style="display:none"><span id="errorText"></span>
+    <button id="btnRetry" type="button">Retry</button></div>
 </main>
 
 <script>
@@ -387,19 +389,26 @@ function renderIndex(doc) {
 async function load() {
   const id = electionIDFromPath();
   $("errorBox").style.display = "none";
+  $("loading").style.display = "block";
+  $("btnRefresh").disabled = true; $("btnRefresh").textContent = "Refreshing…";
   const url = id ? "/api/trail/" + encodeURIComponent(id) : "/api/trail";
   try {
     const res = await fetch(url);
-    if (!res.ok) throw new Error("request failed: " + res.status);
+    // The console's own refusal text is user-facing; show it, not just the code.
+    if (!res.ok) throw new Error(`${res.status} ${(await res.text()).trim() || res.statusText}`);
     const doc = await res.json();
     if (id) { render(doc); } else { renderIndex(doc); }
   } catch (e) {
     $("errorBox").style.display = "block";
-    $("errorBox").textContent = "Failed to load: " + e.message;
+    $("errorText").textContent = "Failed to load: " + e.message;
+  } finally {
+    $("loading").style.display = "none";
+    $("btnRefresh").disabled = false; $("btnRefresh").textContent = "Refresh";
   }
 }
 
 $("btnRefresh").onclick = load;
+$("btnRetry").onclick = load;
 load();
 </script>
 </body>

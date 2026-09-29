@@ -197,7 +197,7 @@
         <span class="phase" data-phase="submit"><span class="dot"></span><button id="btnSubmit">Submit</button></span>
         <span class="phase" data-phase="verify"><span class="dot"></span><button id="btnVerify">Verify</button></span>
         <span class="phase" data-phase="scenarios"><span class="dot"></span><button id="btnScenarios">Scenarios</button></span>
-        <button class="small" id="btnCancel" disabled style="margin-left:auto">Cancel</button>
+        <button class="small" id="btnCancel" disabled title="start a run first" style="margin-left:auto">Cancel</button>
       </div>
       <div id="log" aria-live="polite"></div>
     </section>
@@ -384,6 +384,19 @@ function openStream(runID) {
   };
 }
 
+// busy disables a button and swaps its label for the in-flight word while its
+// request runs; the returned function puts both back.
+function busy(b, word) {
+  const label = b.textContent;
+  b.disabled = true; b.textContent = word;
+  return () => { b.disabled = false; b.textContent = label; };
+}
+// errRetry shows a load failure inline with a Retry button that calls fn again.
+function errRetry(box, msg, fn) {
+  box.innerHTML = `<p class="err">${esc(msg)} <button class="small" type="button">Retry</button></p>`;
+  box.querySelector("button").onclick = fn;
+}
+
 async function post(path, body) {
   $("configErr").textContent = "";
   const res = await fetch(path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
@@ -391,26 +404,28 @@ async function post(path, body) {
   return res.json();
 }
 
-async function startWithConfig(path) {
+async function startWithConfig(path, btn) {
   resetPhases(); $("resultsPanel").style.display = "none"; $("log").innerHTML = "";
   const cfg = config();
+  const done = busy(btn, "Starting…");
   try {
     const { run_id } = await post(path, cfg);
     currentRun = run_id; $("runIdChip").textContent = run_id;
-    $("btnCancel").disabled = false;
+    $("btnCancel").disabled = false; $("btnCancel").title = "";
     showTrailPanel(run_id, cfg.mode);
     runBusy = true;
     startTrailPoll(run_id);
     openStream(run_id);
-  } catch (_) {}
+  } catch (_) {} finally { done(); }
 }
-async function phase(path) {
+async function phase(path, btn) {
   if (!currentRun) { $("configErr").textContent = "Generate a run first."; return; }
+  const done = busy(btn, "Starting…");
   try {
     await post(path, { run_id: currentRun });
     runBusy = true;
     startTrailPoll(currentRun);
-  } catch (_) {}
+  } catch (_) {} finally { done(); }
 }
 
 async function artifactsFor(runID) {
@@ -424,7 +439,7 @@ async function artifactsFor(runID) {
 async function loadResults(runID) {
   try {
     const res = await fetch(`/export/${runID}/correctness.csv`);
-    if (!res.ok) return;
+    if (!res.ok) { $("configErr").textContent = `correctness.csv for ${runID} is not available (${res.status}).`; return; }
     const rows = (await res.text()).trim().split("\n").slice(1).map((r) => r.split(","));
     let pass = true;
     let html = '<table><thead><tr><th>Contest</th><th class="num">Ground truth</th><th class="num">Decoded</th><th class="num">E</th><th>Result</th></tr></thead><tbody>';
@@ -445,7 +460,9 @@ async function loadResults(runID) {
 
 async function loadHistory() {
   try {
-    const recs = await (await fetch("/runs")).json();
+    const res = await fetch("/runs");
+    if (!res.ok) throw new Error((await res.text()).trim() || res.statusText);
+    const recs = await res.json();
     if (!recs.length) {
       $("history").innerHTML = '<p class="muted small">No runs yet — configure an election and press Run all.</p>';
       $("histHint").textContent = ""; return;
@@ -481,18 +498,27 @@ async function loadHistory() {
       tr.addEventListener("click", open);
       tr.addEventListener("keydown", (ev) => { if (ev.key === "Enter" || ev.key === " ") { ev.preventDefault(); open(ev); } });
     });
-  } catch (_) {}
+  } catch (e) { errRetry($("history"), "Could not load the run history: " + e.message, loadHistory); }
 }
 
 // --- wiring ---
 $("addTrustee").onclick = () => { const n = trusteeNames(); n.push("Trustee " + (n.length + 1)); renderTrustees(n); };
 $("mode").onchange = renderPresets;
-$("btnRunAll").onclick = () => startWithConfig("/run-all");
-$("btnGenerate").onclick = () => startWithConfig("/generate");
-$("btnSubmit").onclick = () => phase("/submit");
-$("btnVerify").onclick = () => phase("/verify");
-$("btnScenarios").onclick = () => { if (currentRun) post("/scenarios", { run_id: currentRun, list: [] }).catch(() => {}); else $("configErr").textContent = "Generate a run first."; };
-$("btnCancel").onclick = () => { if (currentRun) post("/cancel", { run_id: currentRun }).catch(() => {}); };
+$("btnRunAll").onclick = () => startWithConfig("/run-all", $("btnRunAll"));
+$("btnGenerate").onclick = () => startWithConfig("/generate", $("btnGenerate"));
+$("btnSubmit").onclick = () => phase("/submit", $("btnSubmit"));
+$("btnVerify").onclick = () => phase("/verify", $("btnVerify"));
+$("btnScenarios").onclick = () => {
+  if (!currentRun) { $("configErr").textContent = "Generate a run first."; return; }
+  const done = busy($("btnScenarios"), "Starting…");
+  post("/scenarios", { run_id: currentRun, list: [] }).catch(() => {}).finally(done);
+};
+// Cancel stops the run's phase in progress; it asks first.
+$("btnCancel").onclick = () => {
+  if (!currentRun || !confirm(`Cancel run ${currentRun}? The phase in progress stops.`)) return;
+  const done = busy($("btnCancel"), "Cancelling…");
+  post("/cancel", { run_id: currentRun }).catch(() => {}).finally(done);
+};
 
 renderTrustees(["Trustee 1", "Trustee 2", "Trustee 3"]);
 renderPresets();

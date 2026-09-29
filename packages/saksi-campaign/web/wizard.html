@@ -1043,6 +1043,23 @@ function apiError(res, body) {
   return Object.assign(new Error(typeof body === "string" ? body : body.error), { status: res.status, body });
 }
 
+// busy disables a button and swaps its label for the in-flight word while its
+// request runs; the returned function puts both back.
+function busy(b, word) {
+  const label = b.textContent;
+  b.disabled = true; b.textContent = word;
+  return () => { b.disabled = false; b.textContent = label; };
+}
+
+// addRetry puts a Retry button after an inline error; it clears the error and
+// calls fn again.
+function addRetry(id, fn) {
+  const b = document.createElement("button");
+  b.type = "button"; b.className = "small"; b.textContent = "Retry"; b.style.marginLeft = "8px";
+  b.onclick = () => { $(id).textContent = ""; fn(); };
+  $(id).append(b);
+}
+
 async function post(path, body, errEl) {
   if (errEl) $(errEl).textContent = "";
   const res = await apiFetch(path, { method: "POST", headers: { "Content-Type": "application/json" },
@@ -1096,8 +1113,13 @@ function stopTimers() {
 /* ---- step 2: generate -------------------------------------------------- */
 async function startRun() {
   cfg = config();
+  $("err1").textContent = "";
+  const label = $("btnStart").textContent;
+  startBusy = true; syncStart(); $("btnStart").textContent = "Generating…";
   let res;
-  try { res = await post("/generate", cfg, "configErr"); } catch (_) { return; }
+  try { res = await post("/generate", cfg, "configErr"); }
+  catch (_) { return; }
+  finally { startBusy = false; $("btnStart").textContent = label; syncStart(); }
   runID = res.run_id;
   loadRuns();
   $("runChip").textContent = runID;
@@ -1114,7 +1136,7 @@ async function startRun() {
       if (e.level === "done" || e.level === "error") {
         hideLoader(1);
         if (e.level === "done") await finishGenerate();
-        else $("err1").textContent = "Generation failed — see the log above.";
+        else { $("err1").textContent = "Generation failed — see the log above."; addRetry("err1", startRun); }
       }
     }
   });
@@ -1140,11 +1162,18 @@ async function finishGenerate() {
 async function runCheck() {
   go(2);
   $("checks").innerHTML = ""; $("digest").textContent = ""; $("checkChip").textContent = "";
+  $("err2b").textContent = "";
   $("next2b").disabled = true;
+  $("next2b").title = "the check is running";
   showLoader("2b", "check");
   let rep;
   try { rep = await getJSON(`/api/check/${encodeURIComponent(runID)}`); }
-  catch (e) { hideLoader("2b"); $("err2b").textContent = String(e.message || e); return; }
+  catch (e) {
+    hideLoader("2b");
+    $("err2b").textContent = String(e.message || e); addRetry("err2b", runCheck);
+    $("next2b").title = "the check did not run";
+    return;
+  }
   hideLoader("2b");
 
   $("checks").innerHTML = rep.checks.map((c) => `
@@ -1167,6 +1196,7 @@ async function runCheck() {
   // A population that fails the gate must not proceed — that is what
   // "fail-closed" means, and it is the whole point of having the gate.
   $("next2b").disabled = !rep.pass;
+  $("next2b").title = rep.pass ? "" : "the data check failed; this population must not proceed";
   $("next2b").textContent = cfg.mode === "groundtruth" ? "Done — files ready" : "Encrypt →";
   if (!rep.pass) $("err2b").textContent = "This population must not proceed to encryption.";
 }
@@ -1181,7 +1211,9 @@ async function startSaksi() {
     : "local — no ledger";
   $("next2").disabled = true;
   showLoader(2, "saksi");
-  try { await post("/ceremony/start", { run_id: runID }, "err2"); } catch (_) { hideLoader(2); return; }
+  $("next2").title = "encrypting and recording; this unlocks when the election is closed";
+  try { await post("/ceremony/start", { run_id: runID }, "err2"); }
+  catch (_) { hideLoader(2); addRetry("err2", startSaksi); $("next2").title = "encrypt & record did not start"; return; }
   // A security run holds at each stage of its plan while this call runs.
   if (cfg.attack_plan) watchPauses(["dkg", "ballots", "close"], "stage3", "err2", 2);
 
@@ -1193,6 +1225,7 @@ async function startSaksi() {
       if (pauseBox === "stage3") stopPauseWatch();
       hideLoader(2);
       $("next2").disabled = false;
+      $("next2").title = "";
       loadRuns();
       renderTrail();
       await renderStageResults(["dkg", "ballots", "close"], "stage3");
@@ -1200,6 +1233,8 @@ async function startSaksi() {
       if (pauseBox === "stage3") stopPauseWatch();
       hideLoader(2);
       $("err2").textContent = e.msg;
+      addRetry("err2", startSaksi);
+      $("next2").title = "encrypt & record failed; retry it, or resume the run from the runs list";
       loadRuns();
     }
   });
@@ -1228,7 +1263,9 @@ async function startCeremony() {
 
 async function refreshCeremony() {
   let st;
-  try { st = await getJSON(`/api/ceremony/${encodeURIComponent(runID)}`); } catch (_) { return; }
+  // The poll is the retry: a failed read says so until the next one lands.
+  try { st = await getJSON(`/api/ceremony/${encodeURIComponent(runID)}`); }
+  catch (e) { $("qtext").textContent = `Could not read the ceremony state (${e.message}); retrying.`; return; }
 
   const n = st.trustees.length, k = st.submitted, t = st.threshold;
   $("qtext").textContent = `${k} of ${t} required · ${n} trustees hold a share`;
@@ -1279,7 +1316,13 @@ async function refreshCeremony() {
        endorsement.`
     : `Local ceremony — real cryptographic shares, no ledger. The threshold gate is enforced here.`;
 
-  $("btnPublish").disabled = !st.unlocked || st.published || !!st.busy;
+  $("btnPublish").disabled = !st.unlocked || st.published || !!st.busy || publishing;
+  $("btnPublish").textContent = st.published ? "Tally published" : publishing ? "Publishing…" : "Publish tally";
+  $("btnPublish").title = st.published ? "the tally is already published"
+    : publishing ? "the tally is being published"
+    : st.busy ? "a trustee's share is being recorded; this unlocks when it finishes"
+    : !st.unlocked ? `needs ${t} of ${n} trustee shares; ${k} contributed so far` : "";
+  $("next3").title = st.published ? "" : "publish the tally first";
 
   // Poll faster while a trustee's shares are being recorded (the trustee app
   // does the same). Only re-arm a live timer: stopTimers() means we left step 4.
@@ -1308,10 +1351,11 @@ async function startVerify() {
   go(5);
   showLoader(4, "verify");
   $("results").style.display = "none";
-  try { await post("/verify", { run_id: runID }, "err4"); } catch (_) { hideLoader(4); return; }
+  try { await post("/verify", { run_id: runID }, "err4"); } catch (_) { hideLoader(4); addRetry("err4", startVerify); return; }
   openStream(runID, async (e) => {
     if (e.phase === "verify" && (e.level === "done" || e.level === "error")) {
       hideLoader(4);
+      if (e.level === "error") { $("err4").textContent = e.msg; addRetry("err4", startVerify); }
       loadRuns();
       await loadResults();
     }
@@ -1321,7 +1365,10 @@ async function startVerify() {
 async function loadResults() {
   try {
     const res = await apiFetch(`/export/${encodeURIComponent(runID)}/correctness.csv`);
-    if (!res.ok) return;
+    if (!res.ok) {
+      if (!$("err4").textContent) $("err4").textContent = `correctness.csv is not available (${res.status}): verify has not produced it.`;
+      return;
+    }
     const rows = (await res.text()).trim().split("\n").slice(1).map((r) => r.split(","));
     let pass = true;
     const body = rows.map(([c, gt, dec, e, p]) => {
@@ -1535,9 +1582,9 @@ function renderPause(p, rows, stages, boxID, errEl) {
     earlier;
   $(boxID).style.display = "block";
   const decide = async (body, btn) => {
-    btn.disabled = true;
+    const done = busy(btn, "Sending…");
     try { await post(`/api/runs/${encodeURIComponent(runID)}/pause`, body, errEl); }
-    catch (_) { btn.disabled = false; }
+    catch (_) { done(); }
   };
   $(boxID).querySelectorAll("[data-pause]").forEach((b) => {
     b.onclick = () => decide({ action: b.dataset.pause }, b);
@@ -1699,17 +1746,17 @@ function showApp(me) {
 $("signinForm").onsubmit = async (e) => {
   e.preventDefault();
   $("siErr").textContent = "";
-  $("btnSignIn").disabled = true;
+  const done = busy($("btnSignIn"), "Signing in…");
   let res;
   try {
     res = await fetch("/api/login", { method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ username: $("siUser").value, password: $("siPass").value }) });
   } catch (err) {
-    $("btnSignIn").disabled = false;
+    done();
     $("siErr").textContent = String(err.message || err);
     return;
   }
-  $("btnSignIn").disabled = false;
+  done();
   if (res.status !== 204) { renderErr("siErr", await errorBody(res), res.status); return; }
   $("siPass").value = "";
   checkAuth();
@@ -1913,7 +1960,8 @@ function syncStart() {
   if (!forceable) $("force").checked = false;
   const blocked = blocks.length > 0 && !(forceable && $("force").checked);
   $("btnStart").disabled = blocked || startBusy;
-  $("btnStart").title = blocked ? "preflight blocks this run: " + blocks.map((w) => w.code).join(", ") : "";
+  $("btnStart").title = startBusy ? "starting; wait for the console to answer"
+    : blocked ? "preflight blocks this run: " + blocks.map((w) => w.code).join(", ") : "";
 }
 
 /* ---- console jobs: the ladder and the network reset -------------------- */
@@ -1982,6 +2030,10 @@ function syncReset() {
   const v = whole("voters"), p = whole("positions");
   $("rsTier").textContent = `${v} ${p}`;
   $("btnReset").disabled = resetBusy || $("rsConfirm").value !== "RESET" || v < 1 || p < 1;
+  $("btnReset").textContent = resetBusy ? "Resetting…" : "Reset network";
+  $("btnReset").title = resetBusy ? "a reset is running; its log is below"
+    : v < 1 || p < 1 ? "set voters and positions (at least 1) in the form above"
+    : $("rsConfirm").value !== "RESET" ? "type RESET in the box to enable" : "";
 }
 let resetBusy = false;
 
@@ -2048,13 +2100,14 @@ async function startCampaign() {
   if (sweep) { body.sweep = sweep; body.window_s = whole("windowS"); }
   if (whole("burst")) body.burst = whole("burst");
   if (!$("forceBox").hidden && $("force").checked) body.force = true;
+  const label = $("btnStart").textContent;
   startBusy = true;
   syncStart();
+  $("btnStart").textContent = "Starting…";
   let res;
   try { res = await post("/api/campaigns", body, "configErr"); }
-  catch (_) { startBusy = false; syncStart(); return; }
-  startBusy = false;
-  syncStart();
+  catch (_) { return; }
+  finally { startBusy = false; $("btnStart").textContent = label; syncStart(); }
   openCampaign(res.campaign);
   loadCampaigns();
 }
@@ -2070,6 +2123,8 @@ async function openCampaign(id) {
   $("campaignView").hidden = false;
   $("cvExport").href = "/api/campaigns/" + encodeURIComponent(id) + "/export";
   $("cvErr").textContent = "";
+  // A cancel sent on the last campaign viewed left this button busy.
+  Object.assign($("cvCancel"), { disabled: false, textContent: "Cancel after this repetition", title: "" });
   $("cvNote").hidden = true;
   $("cvLog").hidden = true;
   $("cvReps").innerHTML = '<div class="loader" style="padding:10px"><span class="spin"></span>loading…</div>';
@@ -2089,6 +2144,7 @@ async function refreshCampaign() {
     if (id !== campaignID) return;
     $("cvErr").textContent = e.message;
     if (e.status === 404 || e.status === 401) stopCampaignPoll();
+    else if (!cvTimer) addRetry("cvErr", refreshCampaign);
     return;
   }
   if (id !== campaignID) return;
@@ -2179,10 +2235,13 @@ function renderCampaign(c) {
 }
 
 $("cvCancel").onclick = async () => {
-  $("cvCancel").disabled = true;
+  if (!confirm(`Cancel campaign ${campaignID}? The repetition in progress runs to its end, then no more start; ` +
+    "a campaign cancelled before its last repetition writes no summary.csv.")) return;
+  const done = busy($("cvCancel"), "Cancelling…");
   let r;
   try { r = await post(`/api/campaigns/${encodeURIComponent(campaignID)}/cancel`, {}, "cvErr"); }
-  catch (_) { $("cvCancel").disabled = false; return; }
+  catch (_) { done(); return; }
+  $("cvCancel").title = "cancel requested; the repetition in progress runs to its end";
   $("cvNote").hidden = false;
   $("cvNote").textContent = `${r.campaign}: ${r.status}. The repetition in progress runs to its end first; a campaign ` +
     "cancelled before its last repetition writes no summary.csv, and its finished rows stay in the export.";
@@ -2193,7 +2252,7 @@ $("cvBack").onclick = () => { showSetup(); loadCampaigns(); };
 async function loadCampaigns() {
   let list;
   try { list = await getJSON("/api/campaigns"); }
-  catch (e) { $("cpList").innerHTML = `<div class="err">${esc(e.message)}</div>`; return; }
+  catch (e) { $("cpList").innerHTML = `<div class="err" id="cpErr">${esc(e.message)}</div>`; addRetry("cpErr", loadCampaigns); return; }
   if (!list.length) { $("cpList").innerHTML = '<span class="muted small">No campaigns yet.</span>'; return; }
   $("cpList").innerHTML = `<div class="table-wrap"><table><thead><tr><th>Campaign</th><th>Started</th><th>Configuration</th>
     <th>Status</th><th class="num">Repetitions</th><th></th></tr></thead><tbody>${list.map((c) => {
@@ -2222,7 +2281,7 @@ async function loadRuns() {
   // Load failures go in the list itself: #rlErr belongs to the run actions,
   // and this reload runs while their errors arrive.
   try { runs = await getJSON("/runs"); }
-  catch (e) { $("rlList").innerHTML = `<div class="err">${esc(e.message)}</div>`; return; }
+  catch (e) { $("rlList").innerHTML = `<div class="err" id="rlLoadErr">${esc(e.message)}</div>`; addRetry("rlLoadErr", loadRuns); return; }
   runsCache = runs.slice().sort((a, b) => String(b.created_at).localeCompare(String(a.created_at)));
   renderRuns();
   renderFaultRuns();
@@ -2275,12 +2334,16 @@ function renderRuns() {
     <th class="num">Voters × pos.</th><th>Status</th><th>Actions</th><th>Exports</th></tr></thead><tbody>${rows}</tbody></table></div>` +
     (runsCache.length > RUNS_SHOWN ? `<div class="small muted" style="margin-top:5px">Newest ${RUNS_SHOWN} of ${runsCache.length} runs.</div>` : "");
   $("rlList").querySelectorAll("[data-run-act]").forEach((b) => {
-    b.onclick = () => b.dataset.runAct === "open" ? openRun(b.dataset.run) : runAction(b.dataset.run, b.dataset.runAct, b);
+    b.onclick = () => {
+      if (b.dataset.runAct !== "open") return runAction(b.dataset.run, b.dataset.runAct, b);
+      const done = busy(b, "Opening…");
+      openRun(b.dataset.run).finally(done);
+    };
   });
 }
 
 async function runAction(id, action, btn) {
-  btn.disabled = true;
+  const done = busy(btn, action === "resume" ? "Resuming…" : "Reconciling…");
   $("rlNote").textContent = "";
   $("rlErr").textContent = "";
   // Subscribed, and connected, before the POST: the hub does not replay, and a
@@ -2299,7 +2362,7 @@ async function runAction(id, action, btn) {
   } catch (_) {}
   let r;
   try { r = await post(`/api/runs/${encodeURIComponent(id)}/${action}`, {}, "rlErr"); }
-  catch (_) { if (ev) ev.close(); btn.disabled = false; return; }
+  catch (_) { if (ev) ev.close(); done(); return; }
   $("rlNote").textContent = action === "resume"
     ? `Resuming ${id} as segment ${r.segment} (journal estimate ${r.remaining} ballots; after a fault it can read 0 ` +
       "while thousands are pending: the exact count shows in the list once the resume starts). It submits what the " +
@@ -2346,6 +2409,7 @@ async function openRun(id) {
   stopTimers();
   stopPauseWatch();
   closeStream();
+  publishing = false;
   runID = r.run_id;
   cfg = r.config || {};
   $("runChip").textContent = runID;
@@ -2400,8 +2464,13 @@ function renderFaultRuns() {
   syncFault();
 }
 
+let faultBusy = false;
 function syncFault() {
-  $("btnFault").disabled = !$("ftRun").value || $("ftConfirm").value !== "RESTART";
+  $("btnFault").disabled = faultBusy || !$("ftRun").value || $("ftConfirm").value !== "RESTART";
+  $("btnFault").textContent = faultBusy ? "Arming…" : "Arm the fault";
+  $("btnFault").title = faultBusy ? "arming the fault"
+    : !$("ftRun").value ? "no eligible run: generate an on-chain election first"
+    : $("ftConfirm").value !== "RESTART" ? "type RESTART in the box to enable" : "";
 }
 
 ["sweep", "windowS", "burst", "sendRate"].forEach((id) => $(id).addEventListener("input", () => {
@@ -2411,14 +2480,16 @@ function syncFault() {
 
 $("btnFault").onclick = async () => {
   const id = $("ftRun").value;
-  $("btnFault").disabled = true;
+  faultBusy = true; syncFault();
   $("ftStatus").textContent = "";
   let r;
   try {
     r = await post(`/api/runs/${encodeURIComponent(id)}/fault`,
       { kind: "peer-restart", at: +$("ftAt").value, down_s: +$("ftDown").value, confirm: $("ftConfirm").value }, "ftErr");
-  } catch (_) { syncFault(); return; }
+  } catch (_) { return; }
+  finally { faultBusy = false; syncFault(); }
   $("ftConfirm").value = "";
+  syncFault();
   $("ftStatus").textContent = `Armed on ${r.run_id}: ${r.container} stops when ballot ${r.at_index} of ${r.ballots} ` +
     `is dispatched and stays down ${r.down_s} s. Continue that run through Encrypt & record to fire it.`;
   loadRuns();
@@ -2432,6 +2503,7 @@ function stopStudyTimers() {
   jobTimers.clear();
   ladderWatching = false;
   resetBusy = false;
+  publishing = false;
 }
 
 // refreshStudy reloads what a sign-in may have interrupted.
@@ -2472,8 +2544,8 @@ $("force").onchange = syncStart;
 $("rsConfirm").oninput = syncReset;
 $("ftConfirm").oninput = syncFault;
 $("ftRun").onchange = syncFault;
-$("rlRefresh").onclick = loadRuns;
-$("cpRefresh").onclick = loadCampaigns;
+$("rlRefresh").onclick = () => { const done = busy($("rlRefresh"), "Refreshing…"); loadRuns().finally(done); };
+$("cpRefresh").onclick = () => { const done = busy($("cpRefresh"), "Refreshing…"); loadCampaigns().finally(done); };
 $("btnStart").onclick = () => (uiMode === "campaign" ? startCampaign() : startRun());
 $("back1").onclick = () => go(0);
 $("next1").onclick = runCheck;
@@ -2482,18 +2554,39 @@ $("next2b").onclick = () => { if (cfg.mode === "groundtruth") go(2); else startS
 $("back2").onclick = () => go(2);
 $("next2").onclick = () => { startCeremony(); renderStageResults(["ceremony"], "stage4"); };
 $("back3").onclick = () => { stopTimers(); go(3); };
+// The ceremony state carries no "publishing" flag, so the page holds one from
+// the click until the run is idle again (whenIdle), then asks the server.
+let publishing = false;
 $("btnPublish").onclick = async () => {
-  $("btnPublish").disabled = true;
-  try { await post("/ceremony/publish", { run_id: runID }, "err3"); } catch (_) { $("btnPublish").disabled = false; return; }
+  publishing = true;
+  $("btnPublish").disabled = true; $("btnPublish").textContent = "Publishing…";
+  try { await post("/ceremony/publish", { run_id: runID }, "err3"); }
+  catch (_) { publishing = false; refreshCeremony(); return; }
   // The ceremony stage holds the publish until its attacks are decided.
   if (cfg.attack_plan && cfg.attack_plan.stages.includes("ceremony")) watchPauses(["ceremony"], "stage4", "err3", null);
+  const id = runID;
+  whenIdle(id, async () => {
+    if (id !== runID) return;
+    publishing = false;
+    await refreshCeremony();
+    const st = await getJSON(`/api/ceremony/${encodeURIComponent(id)}`).catch(() => null);
+    if (st && !st.published) {
+      $("err3").textContent = "The publish ended without a published tally; see the console log.";
+      addRetry("err3", () => $("btnPublish").click());
+    }
+  });
   setTimeout(refreshCeremony, 700);
 };
 $("next3").onclick = () => { stopTimers(); startVerify(); };
 $("back4").onclick = () => go(4);
 $("btnScenarios").onclick = async () => {
-  $("btnScenarios").disabled = true;
-  try { await startAttacks(); } finally { $("btnScenarios").disabled = false; }
+  const done = busy($("btnScenarios"), "Loading attacks…");
+  $("err4").textContent = "";
+  try { await startAttacks(); } finally { done(); }
+  if (!attacks.length) {
+    $("err4").textContent = "No attack scenarios came back for this run.";
+    addRetry("err4", () => $("btnScenarios").click());
+  }
 };
 $("back5").onclick = () => {
   const i = step - ATTACK_STEP;
@@ -2505,7 +2598,7 @@ $("next5").onclick = () => {
 };
 $("atkRerun").onclick = () => runAttack(step - ATTACK_STEP);
 $("btnRestart").onclick = () => {
-  closeStream(); stopTimers(); stopPauseWatch(); runID = null; cfg = null; attacks = [];
+  closeStream(); stopTimers(); stopPauseWatch(); runID = null; cfg = null; attacks = []; publishing = false;
   showIDChip(); go(0); runPreflight(); loadRuns();
 };
 

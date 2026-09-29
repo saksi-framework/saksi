@@ -80,6 +80,7 @@ func TestWizardDefinesEveryFunctionItCalls(t *testing.T) {
 		"refreshCampaign", "renderCampaign", "loadCampaigns", "loadRuns", "renderRuns", "runAction",
 		"whenIdle", "renderFaultRuns", "syncFault", "applyPreset", "renderPresets", "onFormChange",
 		"syncHints", "hostCell", "boot", "refreshStudy", "openRun", "syncSweepHint", "duration",
+		"busy", "addRetry",
 	} {
 		called := strings.Contains(js, fn+"(")
 		defined := strings.Contains(js, "function "+fn+"(") ||
@@ -237,5 +238,98 @@ func TestWizardCeremonyRendersSubmitState(t *testing.T) {
 	}
 	if strings.Contains(body, `b.textContent = "Submit share"`) {
 		t.Error(`refreshCeremony's click handler restores "Submit share" on failure; it must keep the card's own label and re-poll on 409`)
+	}
+}
+
+// webBlock returns the text of page from the first occurrence of start to the
+// next line that closes a top-level block, so a check reads one handler.
+func webBlock(t *testing.T, page, start string) string {
+	t.Helper()
+	i := strings.Index(page, start)
+	if i < 0 {
+		t.Fatalf("page no longer contains %q", start)
+	}
+	j := strings.Index(page[i:], "\n}")
+	if j < 0 {
+		t.Fatalf("%q has no end", start)
+	}
+	return page[i : i+j]
+}
+
+func readWeb(t *testing.T, name string) string {
+	t.Helper()
+	b, err := webFS.ReadFile("web/" + name)
+	if err != nil {
+		t.Fatalf("read %s: %v", name, err)
+	}
+	return string(b)
+}
+
+// Destructive console actions ask first: the network reset and the T3 fault
+// are gated on a typed word, cancelling a campaign or a classic-console run on
+// a confirm(). DESIGN.md "Do's and Don'ts", saksi console bullet.
+func TestConsoleDestructiveActionsConfirm(t *testing.T) {
+	wiz := readWeb(t, "wizard.html")
+	for block, want := range map[string]string{
+		"function syncReset()":                `$("rsConfirm").value !== "RESET"`,
+		"function syncFault()":                `$("ftConfirm").value !== "RESTART"`,
+		`$("cvCancel").onclick = async () =>`: "if (!confirm(",
+	} {
+		if !strings.Contains(webBlock(t, wiz, block), want) {
+			t.Errorf("wizard.html %s lost its confirmation %q", block, want)
+		}
+	}
+	idx := readWeb(t, "index.html")
+	if !strings.Contains(webBlock(t, idx, `$("btnCancel").onclick = () =>`), "confirm(") {
+		t.Error("index.html's Cancel no longer asks before cancelling the run")
+	}
+}
+
+// A disabled console control says why in its title, and a control whose
+// request is in flight says what it is doing, so a greyed-out button is never
+// a mystery.
+func TestConsoleDisabledControlsSayWhy(t *testing.T) {
+	wiz := readWeb(t, "wizard.html")
+	for block, wants := range map[string][]string{
+		"function syncReset()": {"type RESET in the box to enable", "set voters and positions", `"Resetting…"`},
+		"function syncFault()": {"type RESTART in the box to enable", "no eligible run: generate an on-chain election first", `"Arming…"`},
+		"function syncStart()": {"preflight blocks this run: ", "starting; wait for the console to answer"},
+		"async function refreshCeremony()": {
+			"needs ${t} of ${n} trustee shares", "the tally is already published", `"Publishing…"`,
+			"a trustee's share is being recorded; this unlocks when it finishes", "publish the tally first",
+		},
+		"async function runAction(":           {`"Resuming…"`, `"Reconciling…"`},
+		`$("cvCancel").onclick = async () =>`: {`"Cancelling…"`},
+	} {
+		body := webBlock(t, wiz, block)
+		for _, want := range wants {
+			if !strings.Contains(body, want) {
+				t.Errorf("wizard.html %s lost %q", block, want)
+			}
+		}
+	}
+	// The publish flag is released once the run is idle, so the button never
+	// stays on "Publishing…" after a publish that failed on the server.
+	if !strings.Contains(webBlock(t, wiz, `$("btnPublish").onclick = async () =>`), "whenIdle(id") {
+		t.Error("the Publish handler no longer waits for the run to go idle before releasing its busy state")
+	}
+}
+
+// Load failures show inline with a Retry, not a silent empty panel.
+func TestConsoleErrorsOfferRetry(t *testing.T) {
+	wiz := readWeb(t, "wizard.html")
+	for _, want := range []string{
+		`addRetry("err2b", runCheck)`, `addRetry("err2", startSaksi)`, `addRetry("err4", startVerify)`,
+		`addRetry("rlLoadErr", loadRuns)`, `addRetry("cpErr", loadCampaigns)`, `addRetry("cvErr", refreshCampaign)`,
+	} {
+		if !strings.Contains(wiz, want) {
+			t.Errorf("wizard.html lost the retry %q", want)
+		}
+	}
+	if !strings.Contains(readWeb(t, "index.html"), `errRetry($("history")`) {
+		t.Error("index.html's history no longer offers a retry when it fails to load")
+	}
+	if !strings.Contains(readWeb(t, "trail.html"), `$("btnRetry").onclick = load`) {
+		t.Error("trail.html's error no longer offers a retry")
 	}
 }
