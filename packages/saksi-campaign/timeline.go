@@ -392,8 +392,9 @@ func (e *Executor) pausedWindow(ctx context.Context, runID string, c ElectionCon
 	committed := first.Committed
 	mc := MountContext{ElectionStatus: "open", BallotsCommitted: &committed, BlockHeight: chainHeight(led)}
 	simulate := e.simulatedMount(ctx, runID, true)
+	runDir, _ := e.store.Dir(runID)
 	e.pauseForAttacks(ctx, runID, c, StageBallots, mc, true, func(sc Scenario) ScenarioResult {
-		if !sc.LiveCapable() || (sc.MutateBallot == nil && sc.ForgeBallot == nil) {
+		if !sc.LiveCapable() || (sc.MutateBallot == nil && sc.ForgeBallot == nil) || legacyChainSkips(sc, runDir) {
 			return simulate(sc)
 		}
 		return e.mountBallotLive(ctx, runID, sc, at, donor, func(h string) error {

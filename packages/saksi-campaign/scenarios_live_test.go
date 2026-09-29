@@ -8,6 +8,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	pb "github.com/saksi-framework/saksi/packages/saksi-protocol/go/saksiprotocolv1"
 )
 
 // fakeSubmitter stands in for the bulletin client so the live attack path can
@@ -362,5 +364,59 @@ func TestHelperBuiltBallotAttacksMountLiveAtTheirGate(t *testing.T) {
 			}
 			assertCarriesMutation(t, id, submitted[0])
 		})
+	}
+}
+
+// On an election created before the issuer binding (params with no issuer
+// key) the chaincode skips the issuer and selection gates, so the two attacks
+// saksi-demo builds would be committed if mounted live. Neither is: the forged
+// credential runs simulated, where the header-based ballot.issuer_binding still
+// catches it, and the overvote is SKIPPED, since ballot.selection_sum is
+// skipped on such params too and a clean audit would be a false FAIL.
+func TestLegacyElectionNeverMountsTheIssuerBoundAttacksLive(t *testing.T) {
+	setParams := func(t *testing.T, runDir string, p *pb.ElectionParameters) {
+		t.Helper()
+		if err := mutateHeader(runDir, func(h map[string]any) error {
+			h["params"] = hexProto(t, p)
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, tc := range []struct{ id, verdict, actual string }{
+		{"self-issued-credential", "PASS", "on-chain: not mounted (legacy election, params carry no issuer key: the chaincode skips gate issuer) — rejected by auditor check ballot.issuer_binding"},
+		{"overvote", "SKIPPED", "legacy election (params carry no issuer key)"},
+	} {
+		t.Run(tc.id, func(t *testing.T) {
+			dir := t.TempDir()
+			e := newTestExecutor(t, dir)
+			runDir := filepath.Join(dir, "run-1")
+			attackRun(t, runDir, 3)
+			setParams(t, runDir, &pb.ElectionParameters{ElectionId: "run-1"})
+			e.run = fakeAuditor(declaredAuditGate)
+			// Enabled, but nothing answers: a live mount would come back
+			// SKIPPED "connect to Fabric".
+			e.fabric = FabricConfig{PeerEndpoint: "127.0.0.1:1", GatewayPeer: "p", TLSCert: "x", MSPID: "m",
+				Cert: "x", Key: "x", Channel: "c", Chaincode: "cc"}
+
+			if err := e.RunStagedAttack(context.Background(), "run-1", ElectionConfig{Mode: "onchain"}, tc.id); err != nil {
+				t.Fatal(err)
+			}
+			r := resultsByID(t, runDir)[tc.id]
+			if r.Verdict != tc.verdict || r.OnChain || !strings.HasPrefix(r.Actual, tc.actual) {
+				t.Errorf("verdict %q onChain %v actual %q; want %s, simulated, actual starting %q",
+					r.Verdict, r.OnChain, r.Actual, tc.verdict, tc.actual)
+			}
+		})
+	}
+
+	// The same attacks on an election with an issuer key stay live.
+	runDir := t.TempDir()
+	attackRun(t, runDir, 1)
+	setParams(t, runDir, &pb.ElectionParameters{ElectionId: "run-1", IssuerPublicKey: make([]byte, 32)})
+	for _, sc := range Registry() {
+		if legacyChainSkips(sc, runDir) {
+			t.Errorf("%s treated as legacy on an election with an issuer key", sc.ID)
+		}
 	}
 }

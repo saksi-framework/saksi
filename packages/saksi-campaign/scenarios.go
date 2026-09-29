@@ -384,6 +384,15 @@ func (e *Executor) runOneScenario(ctx context.Context, runID, srcDir string, sc 
 		e.publish(runID, "scenarios", "info", sc.ID+": skipped (no gate exists to test)")
 		return res
 	}
+	// ballot.selection_sum only runs when the params carry an issuer key, so on
+	// an election created before the issuer binding an overvote audits clean:
+	// a false FAIL, not a finding.
+	if sc.AuditGate == "ballot.selection_sum" && legacyElection(srcDir) {
+		res.Verdict, res.Actual = "SKIPPED", "legacy election (params carry no issuer key): "+
+			"neither the chaincode nor the auditor checks the selection proof, so there is no gate to test"
+		e.publish(runID, "scenarios", "info", sc.ID+": skipped (legacy election, no selection gate)")
+		return res
+	}
 
 	// A trial that could not be set up faithfully is INCONCLUSIVE, never FAIL:
 	// FAIL is the claim that a gate let an attack through, and nothing was
@@ -1269,6 +1278,26 @@ func headerList(dir, field string) ([]string, error) {
 	return out, nil
 }
 
+// legacyElection reports whether the run's election parameters carry no
+// issuer key: an election created before the issuer binding, on which the
+// chaincode skips its issuer and selection gates. An unreadable header is not
+// called legacy; the mount then fails on its own and says why.
+func legacyElection(dir string) bool {
+	h, err := headerField(dir, "params")
+	if err != nil {
+		return false
+	}
+	var p pb.ElectionParameters
+	return decodeHexProto(h, &p) == nil && len(p.GetIssuerPublicKey()) == 0
+}
+
+// legacyChainSkips reports whether sc's chain gate is one a legacy election
+// skips. Mounted live there, the attack would be committed to the ledger, so it
+// runs simulated instead.
+func legacyChainSkips(sc Scenario, dir string) bool {
+	return (sc.ChainGate == "issuer" || sc.ChainGate == "selection") && legacyElection(dir)
+}
+
 func headerField(dir, field string) (string, error) {
 	h, err := headerMap(dir)
 	if err != nil {
@@ -1305,7 +1334,7 @@ func (e *Executor) RunStagedAttack(ctx context.Context, runID string, c Election
 	// ballot attack is refused by the closed-election gate before the gate it
 	// tests. The verdict rules report exactly that.
 	var res ScenarioResult
-	if e.onChainRun(c) && sc.LiveCapable() {
+	if e.onChainRun(c) && sc.LiveCapable() && !legacyChainSkips(*sc, srcDir) {
 		res = e.runLiveScenario(ctx, runID, srcDir, *sc)
 	} else {
 		res = e.simulateStaged(ctx, runID, srcDir, *sc, e.onChainRun(c))
@@ -1339,6 +1368,10 @@ func (e *Executor) saveScenarioResult(runID, srcDir string, res ScenarioResult) 
 // live election is never read as the ledger's.
 func (e *Executor) simulateStaged(ctx context.Context, runID, srcDir string, sc Scenario, onChain bool) ScenarioResult {
 	res := e.runOneScenario(ctx, runID, srcDir, sc)
+	if onChain && legacyChainSkips(sc, srcDir) && res.Verdict != "SKIPPED" {
+		res.Actual = "on-chain: not mounted (legacy election, params carry no issuer key: the chaincode skips gate " +
+			sc.ChainGate + ") — " + res.Actual
+	}
 	if onChain && sc.OnChainNote != "" && res.Verdict != "SKIPPED" {
 		note := sc.OnChainNote
 		if res.Verdict == "PASS" {
