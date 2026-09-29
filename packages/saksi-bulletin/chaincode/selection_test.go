@@ -26,7 +26,15 @@ type selectionVector struct {
 
 func loadSelectionVector(t *testing.T) selectionVector {
 	t.Helper()
-	raw, err := os.ReadFile(filepath.Join("..", "..", "saksi-protocol", "test-vectors", "selection-proof-v1.hex"))
+	return loadVector(t, "selection-proof-v1.hex", true)
+}
+
+// loadVector reads a vector in the selection-vector layout from
+// saksi-protocol's test-vectors; withOvervote says it ends in an overvote
+// record.
+func loadVector(t *testing.T, file string, withOvervote bool) selectionVector {
+	t.Helper()
+	raw, err := os.ReadFile(filepath.Join("..", "..", "saksi-protocol", "test-vectors", file))
 	if err != nil {
 		t.Fatalf("read selection vector: %v", err)
 	}
@@ -61,7 +69,9 @@ func loadSelectionVector(t *testing.T) selectionVector {
 		Version:     saksiprotocolv1.WireVersion,
 		CommitmentA: next(32), CommitmentB: next(32), Challenge: next(32), Response: next(32),
 	}
-	v.overvote, v.overCDS = record()
+	if withOvervote {
+		v.overvote, v.overCDS = record()
+	}
 	if off != len(buf) {
 		t.Fatalf("selection vector has %d trailing bytes", len(buf)-off)
 	}
@@ -188,12 +198,12 @@ func TestSubmitBallotRefusesAnEmptyPositionOnAPositionedElection(t *testing.T) {
 	if err := sc.SubmitBallot(ctx, mustMarshal(t, selectionBallot(t, v, false, v.proof))); err != nil {
 		t.Fatalf("the per-position record must be accepted: %v", err)
 	}
-	// The same voter's whole-ballot record, under its own (unspent) nullifier.
-	whole := selectionBallot(t, v, false, v.proof)
-	whole.PositionId = ""
-	whole.CredentialPresentation.Nullifier.Value = bytes.Repeat([]byte{0x42}, 32)
-	if got := gateIDOf(sc.SubmitBallot(ctx, mustMarshal(t, whole))); got != "shape" {
-		t.Errorf("empty-position record after a per-position one: refused at %q, want shape", got)
+	// The exploit: the same voter's fully valid whole-ballot record. Its
+	// nullifier is the one a presentation for position "" derives (distinct
+	// from the per-position one, so the nullifier gate passes), its CDS proofs
+	// are bound to it, and its selection proof over both contests verifies.
+	if got := gateIDOf(sc.SubmitBallot(ctx, mustMarshal(t, wholeBallot(t)))); got != "shape" {
+		t.Errorf("whole-ballot record after a per-position one: refused at %q, want shape", got)
 	}
 
 	// A position that matches no contest was already refused at shape.
@@ -204,14 +214,29 @@ func TestSubmitBallotRefusesAnEmptyPositionOnAPositionedElection(t *testing.T) {
 		t.Errorf("unknown position: refused at %q, want shape", got)
 	}
 
-	// Legacy control: without an issuer key, the whole-ballot record over the
-	// same contests is accepted as before (its CDS proofs bind contest ids and
-	// the nullifier, not the position).
+	// Legacy control: without an issuer key the same record is accepted
+	// after the per-position one, as before.
 	sc2, ctx2 := &SmartContract{}, newContext()
 	withSelectionElection(t, sc2, ctx2, v, nil)
-	legacy := selectionBallot(t, v, false, v.proof)
-	legacy.PositionId = ""
-	if err := sc2.SubmitBallot(ctx2, mustMarshal(t, legacy)); err != nil {
+	if err := sc2.SubmitBallot(ctx2, mustMarshal(t, selectionBallot(t, v, false, v.proof))); err != nil {
+		t.Fatalf("legacy election: the per-position record must be accepted: %v", err)
+	}
+	if err := sc2.SubmitBallot(ctx2, mustMarshal(t, wholeBallot(t))); err != nil {
 		t.Errorf("legacy election: the whole-ballot record must still be accepted: %v", err)
 	}
+}
+
+// wholeBallot is the whole-ballot-record vector (Rust
+// whole_ballot_record_vector) as a ballot with an empty position_id, carrying
+// the credential-sig vector's issuer signature like selectionBallot.
+func wholeBallot(t *testing.T) *saksiprotocolv1.Ballot {
+	t.Helper()
+	w := loadVector(t, "whole-ballot-record-v1.hex", false)
+	if w.positionID != "" {
+		t.Fatalf("whole-ballot vector names position %q", w.positionID)
+	}
+	w.positionID = "p0" // selectionBallot takes the record's fields from w
+	b := selectionBallot(t, w, false, w.proof)
+	b.PositionId = ""
+	return b
 }

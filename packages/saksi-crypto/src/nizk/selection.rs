@@ -205,11 +205,37 @@ mod tests {
     /// selection_golden_vector`, then rerun the Go tests.
     #[test]
     fn selection_golden_vector() {
-        let mut rng = CountRng(0x5341_4b53_495f_5345); // "SAKSI_SE"
+        let hex = golden_vector(0x5341_4b53_495f_5345, b"p0", 43, true); // "SAKSI_SE"
+        pin(&hex, "selection-proof-v1.hex");
+    }
+
+    /// The second-vote exploit vector: a fully valid **whole-ballot record**
+    /// (empty position_id) over the same election and contests `p0/0`, `p0/1`
+    /// as the selection vector. Its nullifier (44·G) stands for the one a
+    /// presentation for position "" derives, distinct from the selection
+    /// vector's per-position nullifier (43·G); its CDS proofs are bound to it;
+    /// its selection proof (position "") shows the sum over both contests is 1.
+    /// Same layout as the selection vector, without the overvote record. The
+    /// Go chaincode test loads it to replay the exploit and must refuse it at
+    /// `shape` on an issuer-bound election.
+    ///
+    /// Regenerate with `SAKSI_WRITE_VECTORS=1 cargo test -p saksi-crypto
+    /// whole_ballot_record_vector`, then rerun the Go tests.
+    #[test]
+    fn whole_ballot_record_vector() {
+        let hex = golden_vector(0x5341_4b53_495f_5742, b"", 44, false); // "SAKSI_WB"
+        pin(&hex, "whole-ballot-record-v1.hex");
+    }
+
+    /// Builds a golden vector for election "election-2026", pk = 7·G,
+    /// nullifier = `nullifier_k`·G, contests `p0/0`, `p0/1`: the header, an
+    /// honest record selecting candidate 1, its selection proof bound to
+    /// `position_id`, and, with `overvote`, an all-ones record.
+    fn golden_vector(seed: u64, position_id: &[u8], nullifier_k: u64, overvote: bool) -> String {
+        let mut rng = CountRng(seed);
         let election_id: &[u8] = b"election-2026";
-        let position_id: &[u8] = b"p0";
         let pk = PublicKey::from_point(Scalar::from(7u64) * basepoint());
-        let nullifier = compress_point(&(Scalar::from(43u64) * basepoint()));
+        let nullifier = compress_point(&(Scalar::from(nullifier_k) * basepoint()));
         let n = 2usize;
         let choice_set = [Scalar::ZERO, Scalar::ONE];
 
@@ -220,7 +246,7 @@ mod tests {
                 let r = Scalar::from(11u64 + k as u64 + 10 * m);
                 sum += r;
                 let ct = encrypt(&pk, Plaintext::from_small_integer(m), r);
-                let contest = format!("{}/{k}", std::str::from_utf8(position_id).unwrap());
+                let contest = format!("p0/{k}");
                 let cds_ctx = binding_context(election_id, contest.as_bytes(), &nullifier);
                 let cds = CDSProof::prove(&pk, &ct, &choice_set, m as usize, &r, &cds_ctx, rng)
                     .expect("CDS prove");
@@ -259,22 +285,28 @@ mod tests {
         ] {
             v.extend_from_slice(field);
         }
-        let (over, _) = encode(&[1, 1], &mut v, &mut rng);
-        assert!(verify_selection(&proof, &pk, &over, &ctx).is_err());
+        if overvote {
+            let (over, _) = encode(&[1, 1], &mut v, &mut rng);
+            assert!(verify_selection(&proof, &pk, &over, &ctx).is_err());
+        }
+        v.iter().map(|b| format!("{b:02x}")).collect()
+    }
 
-        let hex: String = v.iter().map(|b| format!("{b:02x}")).collect();
-        let path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../saksi-protocol/test-vectors/selection-proof-v1.hex"
+    /// Checks `hex` against the pinned vector `file` in saksi-protocol's
+    /// test-vectors, writing it first under `SAKSI_WRITE_VECTORS`.
+    fn pin(hex: &str, file: &str) {
+        let path = format!(
+            "{}/../saksi-protocol/test-vectors/{file}",
+            env!("CARGO_MANIFEST_DIR")
         );
         if std::env::var_os("SAKSI_WRITE_VECTORS").is_some() {
-            std::fs::write(path, format!("{hex}\n")).expect("write vector");
+            std::fs::write(&path, format!("{hex}\n")).expect("write vector");
         }
-        let pinned = std::fs::read_to_string(path).expect("read selection vector");
+        let pinned = std::fs::read_to_string(&path).expect("read pinned vector");
         assert_eq!(
             hex,
             pinned.trim(),
-            "selection golden vector drifted; regenerate and rerun the Go tests"
+            "{file} drifted; regenerate and rerun the Go tests"
         );
     }
 }

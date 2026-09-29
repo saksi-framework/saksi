@@ -9,7 +9,8 @@ use saksi_credentials::IssuerSecretKey;
 use saksi_protocol::Ballot;
 
 use crate::fixtures::{
-    happy_path_fixture, multi_position_fixture, ElectionFixture, GenParams, SelectionProfile,
+    happy_path_fixture, multi_position_fixture, second_vote_fixture, ElectionFixture, GenParams,
+    SelectionProfile,
 };
 use crate::{audit, AuditReport, AuditStatus};
 
@@ -652,57 +653,53 @@ fn legacy_params_skip_selection_sum() {
     assert!(report.finding("ballot.selection_sum").is_none());
 }
 
-/// A whole-ballot record (empty position_id) appended to a per-position
-/// election under a fresh nullifier: on an issuer-bound election it is a second
-/// vote in the position, and must be refused as `ballot.shape` and kept out of
-/// the tally.
-fn with_empty_position_record(fixture: &mut ElectionFixture) -> usize {
-    let mut whole = fixture.ballots[0].clone();
-    whole.position_id.clear();
-    whole
-        .credential_presentation
-        .as_mut()
-        .unwrap()
-        .nullifier
-        .as_mut()
-        .unwrap()
-        .value = vec![0x42; 32];
-    fixture.ballots.push(whole);
-    fixture.ballots.len() - 1
-}
-
+/// The second-vote exploit: voter 0 casts their per-position record, then a
+/// fully valid whole-ballot record (empty position_id) under the same
+/// credential — its own nullifier, CDS proofs bound to it, a selection proof
+/// over every contest — and the published tally counts it. On an issuer-bound
+/// election with per-position contests it is refused as `ballot.shape` and
+/// kept out of the tally, so the aggregate no longer matches the tally that
+/// counted it.
 #[test]
-fn empty_position_record_on_a_positioned_election_is_refused() {
-    let mut fixture =
-        multi_position_fixture(&GenParams::simple(3, 1, 2, SelectionProfile::Uniform));
-    let idx = with_empty_position_record(&mut fixture);
+fn second_vote_through_a_whole_ballot_record_is_refused() {
+    let (fixture, idx) =
+        second_vote_fixture(&GenParams::simple(3, 1, 2, SelectionProfile::Uniform), 1);
     let report = audit(fixture.artifacts());
     assert_eq!(
         failed_ballots(&report, "ballot.shape"),
         [idx],
         "{report:#?}"
     );
-    // Kept out of the tally: every tally and decryption check still holds.
-    let failed: Vec<&str> = report
-        .findings
-        .iter()
-        .filter(|f| f.status == AuditStatus::Fail)
-        .map(|f| f.check)
-        .collect();
-    assert_eq!(failed, ["ballot.shape"], "{report:#?}");
+    for check in [
+        "ballot.cds_proof",
+        "ballot.selection_sum",
+        "ballot.credential",
+    ] {
+        assert!(
+            failed_ballots(&report, check).is_empty(),
+            "{check}: {report:#?}"
+        );
+    }
+    assert!(
+        only_failures(&report)
+            .iter()
+            .any(|c| c.starts_with("tally.")),
+        "the refused record must be left out of the aggregate: {report:#?}"
+    );
 }
 
-/// Legacy control: without an issuer key the whole-ballot record is not
-/// refused for its missing position (today's behaviour).
+/// Legacy control: without an issuer key the same record passes every ballot
+/// check and is counted (today's behaviour); only the downgrade itself is
+/// flagged.
 #[test]
-fn empty_position_record_on_legacy_params_is_not_a_shape_failure() {
-    let mut fixture =
-        multi_position_fixture(&GenParams::simple(3, 1, 2, SelectionProfile::Uniform));
+fn second_vote_on_legacy_params_is_counted() {
+    let (mut fixture, _) =
+        second_vote_fixture(&GenParams::simple(3, 1, 2, SelectionProfile::Uniform), 1);
     fixture.parameters.issuer_public_key.clear();
-    with_empty_position_record(&mut fixture);
     let report = audit(fixture.artifacts());
-    assert!(
-        failed_ballots(&report, "ballot.shape").is_empty(),
+    assert_eq!(
+        only_failures(&report),
+        ["parameters.issuer_binding"],
         "{report:#?}"
     );
 }
