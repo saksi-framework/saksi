@@ -16,7 +16,7 @@ a panel asks while watching it.
 | 4 | Encrypt | Build the cryptographic bundle; record the lifecycle on the ledger | [4-encrypt.md](4-encrypt.md) |
 | 5 | Trustees | Threshold decryption ceremony — *t* of *n* must act | [5-trustees.md](5-trustees.md) |
 | 6 | Verify | Independent audit, the declared result, and E = 0 | [6-verify.md](6-verify.md) |
-| 7 | Attacks | Seven attacks, one step each, each run live | [7-attacks.md](7-attacks.md) |
+| 7 | Attacks | Nine attacks, one step each, each run live | [7-attacks.md](7-attacks.md) |
 
 **In depth:** [`deep-dive.md`](deep-dive.md) covers all seven steps in one
 document, naming the functions each one runs, the artifacts each writes, and
@@ -31,7 +31,7 @@ randomness, so it is reproducible from those parameters alone. It is then
 data-validation gate. Only then is it encrypted, closed, and decrypted by a
 threshold of trustees. An independent verifier re-derives the result from the
 published record and compares it to the ground truth seeded at the start; the
-total disagreement `E` must be zero. Finally the run is attacked seven ways, and
+total disagreement `E` must be zero. Finally the run is attacked nine ways, and
 each attack must be rejected.
 
 ## Where the guarantees live

@@ -294,7 +294,7 @@ proof rather than an assertion.
 
 ## Step 7 — Attacks
 
-**Operator:** walks seven steps; each briefs, then runs live.
+**Operator:** walks nine steps, one per attack; each briefs, then runs live.
 
 **Path:** `POST /scenarios` with a one-element list;
 `GET /api/scenarios/<runID>` for briefings and verdicts.

@@ -292,9 +292,9 @@ nothing about the selection.
 ## 7. What works offline vs. network-gated
 
 - **Offline (fully working, no network):** Generate → Verify → correctness.csv,
-  and 6 of 7 scenarios (CDS-proof tamper, nullifier reuse, dropped ballot,
-  corrupted bytes, tampered partial-decryption, tampered DKG) — each proven
-  rejected by the real auditor.
+  and 8 of 9 scenarios (CDS-proof tamper, nullifier reuse, dropped ballot,
+  corrupted bytes, tampered partial-decryption, tampered DKG, self-issued
+  credential, overvote) — each proven rejected by the real auditor.
 - **Network-gated (needs a live Fabric network):** on-chain `Submit` + perf
   numbers. These error clearly when no network/driver is present — never a
   silent hang.
@@ -1128,6 +1128,8 @@ carries no campaign repetition tag, so the refit skips it.
    | **During ballots (paused at 50 %)** | `tamper-ballot-proof` | real submission | chaincode `cds` |
    | | `reused-nullifier` | real submission | chaincode `nullifier` |
    | | `corrupted-ballot-bytes` | real submission | chaincode `decode` |
+   | | `self-issued-credential` | real submission (ballot built by `saksi-demo forge-ballot`) | chaincode `issuer` |
+   | | `overvote` | real submission (ballot built by `saksi-demo overvote-ballot`) | chaincode `selection` |
    | **After ballots (sealed box)** | `dropped-ballot` | simulated | auditor `stream.completeness` |
    | | `reordered-ballots` | never mounted | none |
    | **During tally (ceremony)** | `tamper-partial-decryption` | simulated | auditor `decryption.cp_proof` |

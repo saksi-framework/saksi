@@ -4,7 +4,7 @@ Step 6 shows that an untouched election decrypts correctly. This step shows that
 a *tampered* one is rejected — the negative half of the argument, and the one a
 verifiability claim actually rests on.
 
-Seven attacks, each its own wizard step, each briefed before it runs and run
+Nine attacks, each its own wizard step, each briefed before it runs and run
 live.
 
 > **Attacks also happen during the election.** An attacker does not wait for the
@@ -66,9 +66,24 @@ makes the verdict mean something.
 | 5 | `corrupted-ballot-bytes` | wire integrity | offline |
 | 6 | `tamper-partial-decryption` | threshold-decryption integrity | offline |
 | 7 | `tamper-dkg-transcript` | DKG transcript integrity | offline |
+| 8 | `self-issued-credential` | eligibility (credential issuer binding) | offline |
+| 9 | `overvote` | one selection per position (sum-to-one proof) | offline |
 
 Each is grounded in an existing auditor tamper test, so the offline auditor is
 independently proven to reject it.
+
+Attacks 8 and 9 need a new encryption or credential, which the Go console cannot
+make, so saksi-demo builds their ballot (`forge-ballot`, `overvote-ballot`):
+
+- `self-issued-credential` replaces a ballot with one whose credential comes from
+  an issuer key the attacker generated. Every proof in it is genuine (CDS and
+  selection under the election key, the signature under the ballot's own issuer
+  key), so only the issuer binding refuses it: chaincode gate `issuer`, auditor
+  `ballot.issuer_binding`.
+- `overvote` is a voter's own not-yet-cast ballot with two candidate slots
+  re-encrypted to 1, each with a valid CDS proof bound to the same nullifier, and
+  its old selection proof kept. Only the sum-to-one check refuses it: chaincode
+  gate `selection`, auditor `ballot.selection_sum`.
 
 ## Attack 4 never runs: no gate exists
 
@@ -91,7 +106,7 @@ and the wizard says so rather than colouring it neutrally.
 
 Each attack copies the run's ballot file and runs the auditor twice. At demo
 scale that is seconds. At the capstone tier it is not viable — the copy alone
-reads the entire ballot file into memory, and there are seven of them.
+reads the entire ballot file into memory, and there are nine of them.
 
 **Attack a small election.** Twenty voters is plenty; the mutations target
 specific ballots and proofs, and nothing about the result improves with
@@ -101,7 +116,7 @@ population size.
 
 Verdicts accumulate in `scenarios.json`, and `negative-tests.csv` is regenerated
 in full from it after every run. Running attacks one at a time therefore leaves a
-complete export — the CSV holds all seven, in registry order, regardless of the
+complete export — the CSV holds all nine, in registry order, regardless of the
 sequence that produced them.
 
 
@@ -116,7 +131,7 @@ Each attack therefore also appears at its own lifecycle stage, in an
 | Stage | Wizard step | Attacks |
 |---|---|---|
 | `dkg` — before any ballot is cast | 4 | `tamper-dkg-transcript` |
-| `ballots` — during submission | 4 | `tamper-ballot-proof`, `reused-nullifier`, `corrupted-ballot-bytes` |
+| `ballots` — during submission | 4 | `tamper-ballot-proof`, `reused-nullifier`, `corrupted-ballot-bytes`, `self-issued-credential`, `overvote` |
 | `close` — on the sealed ballot box | 4 | `dropped-ballot`, `reordered-ballots` |
 | `ceremony` — during decryption | 5 | `tamper-partial-decryption` |
 
@@ -150,7 +165,10 @@ a pass. A security run's throughput is marked perturbed (`perf.csv`
 behind are submitted to the live election, at the `ballots` pause: a tampered
 copy of the first ballot not yet sent (`tamper-ballot-proof`, gate `cds`;
 `corrupted-ballot-bytes`, gate `decode`), and that ballot carrying the
-nullifier of one already committed (`reused-nullifier`, gate `nullifier`). The
+nullifier of one already committed (`reused-nullifier`, gate `nullifier`). Two
+more replace that ballot with one saksi-demo builds: a ballot under a
+self-issued credential (`self-issued-credential`, gate `issuer`) and the voter's
+own ballot overvoted (`overvote`, gate `selection`). The
 refused copy leaves nothing on the ledger, and the real ballot is submitted
 when the window resumes. The chaincode's error names its gate (`gate=cds: …`).
 
