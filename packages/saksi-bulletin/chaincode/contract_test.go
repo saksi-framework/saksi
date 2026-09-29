@@ -275,9 +275,12 @@ func TestSubmitBallotIssuerBinding(t *testing.T) {
 		t.Errorf("self-issued credential with a bad signature: refused at %q, want issuer (issuer before credential)", got)
 	}
 
+	// A bound election also requires the selection proof, so the honest case
+	// uses the selection vector's one-hot record.
+	sv := loadSelectionVector(t)
 	sc, ctx = &SmartContract{}, newContext()
-	withCDSElectionIssuer(t, sc, ctx, sigPK)
-	if err := sc.SubmitBallot(ctx, mustMarshal(t, validCDSBallot(t))); err != nil {
+	withSelectionElection(t, sc, ctx, sv, sigPK)
+	if err := sc.SubmitBallot(ctx, mustMarshal(t, selectionBallot(t, sv, false, sv.proof))); err != nil {
 		t.Errorf("honest ballot under the bound issuer: %v", err)
 	}
 

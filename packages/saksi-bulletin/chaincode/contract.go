@@ -10,6 +10,7 @@ import (
 	"github.com/hyperledger/fabric-contract-api-go/contractapi"
 	"github.com/saksi-framework/saksi/packages/saksi-bulletin/chaincode/cdsverify"
 	"github.com/saksi-framework/saksi/packages/saksi-bulletin/chaincode/credverify"
+	"github.com/saksi-framework/saksi/packages/saksi-bulletin/chaincode/selectionverify"
 	"github.com/saksi-framework/saksi/packages/saksi-bulletin/chaincode/sigverify"
 	saksiprotocolv1 "github.com/saksi-framework/saksi/packages/saksi-protocol/go/saksiprotocolv1"
 	"google.golang.org/protobuf/proto"
@@ -99,7 +100,10 @@ type SmartContract struct {
 //     (ristretto255 + a Merlin-compatible challenge, byte-identical to the Rust
 //     saksi-credentials signer — see the credverify package);
 //   - the nullifier has not already been spent in this election (no double
-//     vote).
+//     vote);
+//   - each ciphertext's CDS proof shows it encrypts 0 or 1 (gate `cds`);
+//   - the record's selection proof shows its ciphertexts sum to exactly one
+//     (gate `selection`; skipped for a legacy election without an issuer key).
 //
 // The ballot is stored keyed by (electionID, nullifier), and the nullifier is
 // marked spent in the same transaction.
@@ -276,6 +280,15 @@ func (s *SmartContract) SubmitBallot(ctx contractapi.TransactionContextInterface
 		}
 	}
 
+	// The CDS proofs show each ciphertext is 0 or 1; the selection proof shows
+	// the record's ciphertexts sum to exactly one. An election bound to an
+	// issuer requires it; a legacy election without one skips it.
+	if len(params.GetIssuerPublicKey()) > 0 {
+		if err := verifySelection(&ballot, electionPK); err != nil {
+			return rejectAt("selection", "position %q selection proof failed: %w", ballot.GetPositionId(), err)
+		}
+	}
+
 	ballotKey, err := stub.CreateCompositeKey(ballotIndex, []string{ballot.GetElectionId(), nullifier})
 	if err != nil {
 		return fmt.Errorf("build ballot key: %w", err)
@@ -287,6 +300,33 @@ func (s *SmartContract) SubmitBallot(ctx contractapi.TransactionContextInterface
 		return fmt.Errorf("mark nullifier spent: %w", err)
 	}
 	return nil
+}
+
+// verifySelection checks the ballot record's sum-to-one selection proof.
+func verifySelection(ballot *saksiprotocolv1.Ballot, electionPK []byte) error {
+	proofMsg := ballot.GetSelectionProof()
+	if proofMsg == nil {
+		return fmt.Errorf("ballot carries no selection proof")
+	}
+	if proofMsg.GetVersion() != saksiprotocolv1.WireVersion {
+		return fmt.Errorf("unsupported selection proof version %d, want %d", proofMsg.GetVersion(), saksiprotocolv1.WireVersion)
+	}
+	pads := make([][]byte, len(ballot.GetCiphertexts()))
+	datas := make([][]byte, len(ballot.GetCiphertexts()))
+	for k, ct := range ballot.GetCiphertexts() {
+		pads[k], datas[k] = ct.GetPad(), ct.GetData()
+	}
+	return selectionverify.Verify(
+		ballot.GetElectionId(), ballot.GetPositionId(),
+		ballot.GetCredentialPresentation().GetNullifier().GetValue(),
+		electionPK, pads, datas,
+		selectionverify.Proof{
+			CommitmentA: proofMsg.GetCommitmentA(),
+			CommitmentB: proofMsg.GetCommitmentB(),
+			Challenge:   proofMsg.GetChallenge(),
+			Response:    proofMsg.GetResponse(),
+		},
+	)
 }
 
 // maxNullifierPageSize caps a single ListNullifiers page. Fabric peers refuse
@@ -712,7 +752,7 @@ func findElection(stub interface {
 // they are not a verdict on the submission.
 //
 // Gate ids: decode, shape, issuer, credential, election-exists, election-open,
-// election-closed, nullifier, dkg-missing, cds, dkg-consistency, dkg-duplicate,
+// election-closed, nullifier, dkg-missing, cds, selection, dkg-consistency, dkg-duplicate,
 // cp-presence, membership, partial-duplicate.
 func rejectAt(gate, format string, args ...any) error {
 	return fmt.Errorf("gate="+gate+": "+format, args...)
