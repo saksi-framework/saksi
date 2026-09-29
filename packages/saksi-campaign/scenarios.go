@@ -87,7 +87,17 @@ type Scenario struct {
 	// mid-submission mount: target is a ballot the window has not submitted,
 	// committed one it already has. Nil for attacks on anything but a ballot.
 	MutateBallot func(target, committed string) (string, error)
+	// ForgeBallot is the ballot mutation for an attack Go cannot build alone,
+	// because it needs a fresh encryption or credential: it returns a tampered
+	// replacement for ballot `line` of the run in dir, made by a saksi-demo
+	// subcommand run through demo. It serves both mounts, the simulated one
+	// (line 0 of the copy) and the live one (the ballot the window has not
+	// submitted), so a scenario that sets it leaves Mutate and MutateBallot nil.
+	ForgeBallot func(demo demoCmd, dir string, line int) (string, error)
 }
+
+// demoCmd runs one saksi-demo subcommand and returns its stdout.
+type demoCmd func(args ...string) ([]byte, error)
 
 // Lifecycle stages an attack can be mounted at. They map onto wizard steps:
 // dkg/ballots/close are all inside step 4 (Encrypt & record) in submission
@@ -142,9 +152,10 @@ type ScenarioResult struct {
 }
 
 // Registry is the offline-detectable attack catalog. Each entry is grounded in
-// an existing auditor tamper test (independent_verification.rs / tests.rs), so
-// the offline auditor is proven to reject it, except reordered-ballots, which
-// no verifier checks (LayerChaincode, always SKIPPED).
+// an existing auditor tamper test (independent_verification.rs / tests.rs, and
+// demo.rs for the two ballots saksi-demo builds), so the offline auditor is
+// proven to reject it, except reordered-ballots, which no verifier checks
+// (LayerChaincode, always SKIPPED).
 func Registry() []Scenario {
 	return []Scenario{
 		{
@@ -274,6 +285,29 @@ func Registry() []Scenario {
 				})
 			},
 		},
+		{
+			// The attacker issues their own credential under a key the election
+			// never declared. Every proof in the ballot is genuine (CDS and
+			// selection under the election key, the credential signature under
+			// the ballot's own issuer key), so only the issuer binding refuses it.
+			ID: "self-issued-credential", Stage: StageBallots, Property: "eligibility (credential issuer binding)",
+			Layer: LayerOffline, Action: "replace a ballot with one forged under a freshly generated issuer key, every proof genuine",
+			Expected:    "rejected as issued by a key the election never declared (chaincode gate issuer live, auditor ballot.issuer_binding simulated)",
+			ChainGate:   "issuer",
+			AuditGate:   "ballot.issuer_binding",
+			ForgeBallot: forgeSelfIssued,
+		},
+		{
+			// The attacker owns a legitimate ballot and re-encrypts two of its
+			// candidate slots to 1, each with a genuine CDS proof bound to the
+			// same nullifier, and keeps the old selection proof.
+			ID: "overvote", Stage: StageBallots, Property: "one selection per position (sum-to-one proof)",
+			Layer: LayerOffline, Action: "re-encrypt two of a ballot's candidate slots to 1 with valid CDS proofs, keeping its old selection proof",
+			Expected:    "rejected as selecting more than one candidate (chaincode gate selection live, auditor ballot.selection_sum simulated)",
+			ChainGate:   "selection",
+			AuditGate:   "ballot.selection_sum",
+			ForgeBallot: overvoteBallot,
+		},
 	}
 }
 
@@ -299,7 +333,7 @@ func (e *Executor) RunScenarios(ctx context.Context, runID string, list []string
 	}
 
 	// Merge into the accumulated set before exporting: a caller running a
-	// single scenario must not erase the verdicts of the other six.
+	// single scenario must not erase the verdicts of the others.
 	merged, held, err := mergeScenarioResults(srcDir, results)
 	if err != nil {
 		return err
@@ -350,6 +384,15 @@ func (e *Executor) runOneScenario(ctx context.Context, runID, srcDir string, sc 
 		e.publish(runID, "scenarios", "info", sc.ID+": skipped (no gate exists to test)")
 		return res
 	}
+	// ballot.selection_sum only runs when the params carry an issuer key, so on
+	// an election created before the issuer binding an overvote audits clean:
+	// a false FAIL, not a finding.
+	if sc.AuditGate == "ballot.selection_sum" && legacyElection(srcDir) {
+		res.Verdict, res.Actual = "SKIPPED", "legacy election (params carry no issuer key): "+
+			"neither the chaincode nor the auditor checks the selection proof, so there is no gate to test"
+		e.publish(runID, "scenarios", "info", sc.ID+": skipped (legacy election, no selection gate)")
+		return res
+	}
 
 	// A trial that could not be set up faithfully is INCONCLUSIVE, never FAIL:
 	// FAIL is the claim that a gate let an attack through, and nothing was
@@ -367,7 +410,7 @@ func (e *Executor) runOneScenario(ctx context.Context, runID, srcDir string, sc 
 		return res
 	}
 
-	if err := sc.Mutate(scenDir); err != nil {
+	if err := e.mutateCopy(ctx, sc, scenDir); err != nil {
 		res.Verdict, res.Actual = "INCONCLUSIVE", "not mounted: mutation error: "+err.Error()
 		return res
 	}
@@ -437,7 +480,36 @@ func (e *Executor) auditStream(ctx context.Context, dir string) (StreamAudit, bo
 	if json.Unmarshal(out, &sa) != nil {
 		return StreamAudit{}, false
 	}
+	if legacyElection(dir) {
+		sa = withoutLegacyFinding(sa)
+	}
 	return sa, true
+}
+
+// legacyFinding is the check a legacy election's audit always fails: its
+// params carry no issuer key, so the chain's issuer and selection gates were
+// off. The finding is about the election, not about any attack on it.
+const legacyFinding = "parameters.issuer_binding"
+
+// withoutLegacyFinding drops legacyFinding from a legacy election's audit, so
+// the positive control and the verdict judge only what the mutation changed:
+// an unmutated legacy copy then passes, and a mutation that nothing else
+// catches is still a FAIL.
+func withoutLegacyFinding(sa StreamAudit) StreamAudit {
+	if sa.Overall != "fail" || len(sa.FailedChecks) == 0 {
+		return sa
+	}
+	kept := sa.FailedChecks[:0:0]
+	for _, f := range sa.FailedChecks {
+		if f.Check != legacyFinding {
+			kept = append(kept, f)
+		}
+	}
+	sa.FailedChecks = kept
+	if len(kept) == 0 {
+		sa.Overall = "pass"
+	}
+	return sa
 }
 
 func selectScenarios(list []string) []Scenario {
@@ -459,6 +531,65 @@ func selectScenarios(list []string) []Scenario {
 }
 
 // --- ballot / header mutation helpers --------------------------------------
+
+// demo runs saksi-demo subcommands under ctx, for ForgeBallot.
+func (e *Executor) demo(ctx context.Context) demoCmd {
+	return func(args ...string) ([]byte, error) { return e.run(ctx, e.demoBin, args...) }
+}
+
+// mutateCopy applies sc's mutation to the run copy in dir. A ForgeBallot
+// attack replaces ballot line 0 with what saksi-demo builds from it.
+func (e *Executor) mutateCopy(ctx context.Context, sc Scenario, dir string) error {
+	if sc.ForgeBallot == nil {
+		return sc.Mutate(dir)
+	}
+	forged, err := sc.ForgeBallot(e.demo(ctx), dir, 0)
+	if err != nil {
+		return err
+	}
+	return editBallotLines(dir, func(lines []string) error {
+		lines[0] = forged
+		return nil
+	})
+}
+
+// forgeSelfIssued asks saksi-demo for a ballot in the same position as ballot
+// `line`, under a credential from a freshly generated issuer key.
+func forgeSelfIssued(demo demoCmd, dir string, line int) (string, error) {
+	lines, err := ballotLinesAt(dir, line)
+	if err != nil {
+		return "", err
+	}
+	var target pb.Ballot
+	if err := decodeHexProto(lines[line], &target); err != nil {
+		return "", fmt.Errorf("ballot %d: %w", line, err)
+	}
+	if target.GetPositionId() == "" {
+		return "", fmt.Errorf("ballot %d names no position to forge a ballot for", line)
+	}
+	return demoBallot(demo("forge-ballot", dir, "--position", target.GetPositionId(), "--candidate", "0"))
+}
+
+// overvoteBallot asks saksi-demo for ballot `line` with two slots re-encrypted
+// to 1 and its old selection proof kept.
+func overvoteBallot(demo demoCmd, dir string, line int) (string, error) {
+	return demoBallot(demo("overvote-ballot", dir, strconv.Itoa(line)))
+}
+
+// demoBallot takes a saksi-demo helper's stdout as a ballot, refusing anything
+// that is not one: submitting it would test the decode gate, not the one the
+// attack declares.
+func demoBallot(out []byte, err error) (string, error) {
+	if err != nil {
+		return "", err
+	}
+	h := strings.TrimSpace(string(out))
+	var b pb.Ballot
+	if err := decodeHexProto(h, &b); err != nil {
+		return "", fmt.Errorf("saksi-demo printed no ballot: %w", err)
+	}
+	return h, nil
+}
 
 // readBallotLines scans the stream rather than slurping it, so one oversized
 // line fails by number instead of the whole file arriving as one string. The
@@ -1033,7 +1164,7 @@ func (e *Executor) mountLiveAttack(
 		res.Verdict, res.Actual = "INCONCLUSIVE", "not mounted: could not copy run: "+err.Error()
 		return res
 	}
-	if err := sc.Mutate(scenDir); err != nil {
+	if err := e.mutateCopy(context.Background(), sc, scenDir); err != nil {
 		res.Verdict, res.Actual = "INCONCLUSIVE", "not mounted: mutation error: "+err.Error()
 		return res
 	}
@@ -1176,6 +1307,26 @@ func headerList(dir, field string) ([]string, error) {
 	return out, nil
 }
 
+// legacyElection reports whether the run's election parameters carry no
+// issuer key: an election created before the issuer binding, on which the
+// chaincode skips its issuer and selection gates. An unreadable header is not
+// called legacy; the mount then fails on its own and says why.
+func legacyElection(dir string) bool {
+	h, err := headerField(dir, "params")
+	if err != nil {
+		return false
+	}
+	var p pb.ElectionParameters
+	return decodeHexProto(h, &p) == nil && len(p.GetIssuerPublicKey()) == 0
+}
+
+// legacyChainSkips reports whether sc's chain gate is one a legacy election
+// skips. Mounted live there, the attack would be committed to the ledger, so it
+// runs simulated instead.
+func legacyChainSkips(sc Scenario, dir string) bool {
+	return (sc.ChainGate == "issuer" || sc.ChainGate == "selection") && legacyElection(dir)
+}
+
 func headerField(dir, field string) (string, error) {
 	h, err := headerMap(dir)
 	if err != nil {
@@ -1212,7 +1363,7 @@ func (e *Executor) RunStagedAttack(ctx context.Context, runID string, c Election
 	// ballot attack is refused by the closed-election gate before the gate it
 	// tests. The verdict rules report exactly that.
 	var res ScenarioResult
-	if e.onChainRun(c) && sc.LiveCapable() {
+	if e.onChainRun(c) && sc.LiveCapable() && !legacyChainSkips(*sc, srcDir) {
 		res = e.runLiveScenario(ctx, runID, srcDir, *sc)
 	} else {
 		res = e.simulateStaged(ctx, runID, srcDir, *sc, e.onChainRun(c))
@@ -1246,6 +1397,10 @@ func (e *Executor) saveScenarioResult(runID, srcDir string, res ScenarioResult) 
 // live election is never read as the ledger's.
 func (e *Executor) simulateStaged(ctx context.Context, runID, srcDir string, sc Scenario, onChain bool) ScenarioResult {
 	res := e.runOneScenario(ctx, runID, srcDir, sc)
+	if onChain && legacyChainSkips(sc, srcDir) && res.Verdict != "SKIPPED" {
+		res.Actual = "on-chain: not mounted (legacy election, params carry no issuer key: the chaincode skips gate " +
+			sc.ChainGate + ") — " + res.Actual
+	}
 	if onChain && sc.OnChainNote != "" && res.Verdict != "SKIPPED" {
 		note := sc.OnChainNote
 		if res.Verdict == "PASS" {

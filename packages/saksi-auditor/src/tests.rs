@@ -9,7 +9,8 @@ use saksi_credentials::IssuerSecretKey;
 use saksi_protocol::Ballot;
 
 use crate::fixtures::{
-    happy_path_fixture, multi_position_fixture, ElectionFixture, GenParams, SelectionProfile,
+    happy_path_fixture, multi_position_fixture, second_vote_fixture, ElectionFixture, GenParams,
+    SelectionProfile,
 };
 use crate::{audit, AuditReport, AuditStatus};
 
@@ -459,6 +460,247 @@ fn wrong_issuer_pk_is_caught() {
         }),
         "expected ballot.issuer_binding or ballot.credential Fail in {:#?}",
         report
+    );
+}
+
+/// The generator binds its issuer into the election parameters: the params'
+/// `issuer_public_key` is the same compressed point as the fixture's issuer key
+/// (the header's `issuer_pk`), on both generator paths.
+#[test]
+fn generator_binds_issuer_key_into_parameters() {
+    let happy = happy_path_fixture();
+    let multi = multi_position_fixture(&GenParams::simple(2, 1, 2, SelectionProfile::Uniform));
+    for fixture in [&happy, &multi] {
+        let expected = fixture.issuer_public_key.as_point().compress().to_bytes();
+        assert_eq!(fixture.parameters.issuer_public_key, expected.to_vec());
+    }
+}
+
+/// Params that name a different issuer than the one the auditor is given
+/// (the header's `issuer_pk`) fail `parameters.issuer_binding`.
+#[test]
+fn parameters_issuer_mismatch_is_caught() {
+    let mut fixture = happy_path_fixture();
+    let other_pk = IssuerSecretKey::generate(&mut OsRng).public_key();
+    fixture.parameters.issuer_public_key = other_pk.as_point().compress().to_bytes().to_vec();
+
+    let report = audit(fixture.artifacts());
+    assert_eq!(report.overall, AuditStatus::Fail);
+    assert!(
+        report.findings.iter().any(
+            |f| f.check == "parameters.issuer_binding" && matches!(f.status, AuditStatus::Fail)
+        ),
+        "expected parameters.issuer_binding Fail in {report:#?}"
+    );
+}
+
+/// Legacy params with no issuer key are a downgrade (the chain's issuer and
+/// selection gates were off): `parameters.issuer_binding` fails, and nothing
+/// else does.
+#[test]
+fn parameters_without_issuer_key_are_flagged() {
+    let mut fixture = happy_path_fixture();
+    fixture.parameters.issuer_public_key.clear();
+    let report = audit(fixture.artifacts());
+    assert_eq!(
+        only_failures(&report),
+        ["parameters.issuer_binding"],
+        "{report:#?}"
+    );
+    assert!(report
+        .finding("parameters.issuer_binding")
+        .unwrap()
+        .detail
+        .contains("carry no issuer key"));
+}
+
+/// The checks the report fails, in order.
+fn only_failures(report: &AuditReport) -> Vec<&str> {
+    report
+        .findings
+        .iter()
+        .filter(|f| f.status == AuditStatus::Fail)
+        .map(|f| f.check)
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
+// 11b. Sum-to-one selection proof
+// ---------------------------------------------------------------------------
+
+fn selection_fails(report: &AuditReport) -> Vec<usize> {
+    failed_ballots(report, "ballot.selection_sum")
+}
+
+/// Rewrites `fixture.ballots[idx]` as an overvote: every candidate of its
+/// position encrypted as 1, each with a valid CDS proof bound to the record's
+/// nullifier. The selection proof is left as it was (the honest one).
+fn make_overvote(fixture: &mut ElectionFixture, idx: usize) {
+    use curve25519_dalek::scalar::Scalar;
+    use saksi_crypto::elgamal::{encrypt, Plaintext};
+    use saksi_crypto::nizk::cds::{binding_context, CDSProof};
+
+    let pk = crate::fixtures::joint_public_key_from_transcript(&fixture.dkg_transcript);
+    let ballot = &mut fixture.ballots[idx];
+    let nullifier = ballot
+        .credential_presentation
+        .as_ref()
+        .unwrap()
+        .nullifier
+        .as_ref()
+        .unwrap()
+        .value
+        .clone();
+    let contests =
+        crate::contest_indices_for_position(&fixture.parameters.contest_ids, &ballot.position_id);
+    for (local, &global) in contests.iter().enumerate() {
+        let r = Scalar::random(&mut OsRng);
+        let ct = encrypt(&pk, Plaintext::from_small_integer(1), r);
+        let ctx = binding_context(
+            fixture.parameters.election_id.as_bytes(),
+            fixture.parameters.contest_ids[global].as_bytes(),
+            &nullifier,
+        );
+        let cds = CDSProof::prove(
+            &pk,
+            &ct,
+            &[Scalar::ZERO, Scalar::ONE],
+            1,
+            &r,
+            &ctx,
+            &mut OsRng,
+        )
+        .expect("CDS prove");
+        let (pad, data) = ct.to_compressed_bytes();
+        ballot.ciphertexts[local].pad = pad.to_vec();
+        ballot.ciphertexts[local].data = data.to_vec();
+        ballot.well_formedness_proofs[local] = cds.to_wire();
+    }
+}
+
+/// Honest generator output carries a verifying selection proof on every record.
+#[test]
+fn honest_ballots_pass_selection_sum() {
+    for fixture in [
+        happy_path_fixture(),
+        multi_position_fixture(&GenParams::simple(3, 2, 3, SelectionProfile::Uniform)),
+    ] {
+        let report = audit(fixture.artifacts());
+        assert!(report.passed(), "{report:#?}");
+        let pass = report
+            .finding("ballot.selection_sum")
+            .expect("selection rollup");
+        assert_eq!(pass.status, AuditStatus::Pass);
+        assert!(
+            pass.detail
+                .starts_with(&format!("{} ", fixture.ballots.len())),
+            "every record counted: {pass:#?}"
+        );
+    }
+}
+
+/// An overvote (two or more candidates at 1, every CDS proof valid) is flagged
+/// `ballot.selection_sum` and kept out of the tally, whether it reuses the
+/// honest selection proof or carries none.
+#[test]
+fn overvote_is_caught_by_selection_sum() {
+    let mut fixture =
+        multi_position_fixture(&GenParams::simple(3, 2, 3, SelectionProfile::Uniform));
+    make_overvote(&mut fixture, 1);
+    make_overvote(&mut fixture, 4);
+    fixture.ballots[4].selection_proof = None;
+
+    let report = audit(fixture.artifacts());
+    assert_eq!(report.overall, AuditStatus::Fail);
+    assert_eq!(selection_fails(&report), [1, 4]);
+    assert!(
+        failed_ballots(&report, "ballot.cds_proof").is_empty(),
+        "CDS alone passes an overvote"
+    );
+}
+
+/// A tampered selection proof on an otherwise honest record is caught.
+#[test]
+fn tampered_selection_proof_is_caught() {
+    let mut fixture = happy_path_fixture();
+    fixture.ballots[2]
+        .selection_proof
+        .as_mut()
+        .unwrap()
+        .response[0] ^= 0x01;
+    let report = audit(fixture.artifacts());
+    assert_eq!(report.overall, AuditStatus::Fail);
+    assert_eq!(selection_fails(&report), [2]);
+}
+
+/// Legacy params without an issuer key skip the selection check entirely, so
+/// an overvote without a proof raises no `ballot.selection_sum` finding.
+#[test]
+fn legacy_params_skip_selection_sum() {
+    let mut fixture =
+        multi_position_fixture(&GenParams::simple(2, 1, 3, SelectionProfile::Uniform));
+    fixture.parameters.issuer_public_key.clear();
+    for b in &mut fixture.ballots {
+        b.selection_proof = None;
+    }
+    let report = audit(fixture.artifacts());
+    // Only the downgrade itself is flagged.
+    assert_eq!(
+        only_failures(&report),
+        ["parameters.issuer_binding"],
+        "{report:#?}"
+    );
+    assert!(report.finding("ballot.selection_sum").is_none());
+}
+
+/// The second-vote exploit: voter 0 casts their per-position record, then a
+/// fully valid whole-ballot record (empty position_id) under the same
+/// credential — its own nullifier, CDS proofs bound to it, a selection proof
+/// over every contest — and the published tally counts it. On an issuer-bound
+/// election with per-position contests it is refused as `ballot.shape` and
+/// kept out of the tally, so the aggregate no longer matches the tally that
+/// counted it.
+#[test]
+fn second_vote_through_a_whole_ballot_record_is_refused() {
+    let (fixture, idx) =
+        second_vote_fixture(&GenParams::simple(3, 1, 2, SelectionProfile::Uniform), 1);
+    let report = audit(fixture.artifacts());
+    assert_eq!(
+        failed_ballots(&report, "ballot.shape"),
+        [idx],
+        "{report:#?}"
+    );
+    for check in [
+        "ballot.cds_proof",
+        "ballot.selection_sum",
+        "ballot.credential",
+    ] {
+        assert!(
+            failed_ballots(&report, check).is_empty(),
+            "{check}: {report:#?}"
+        );
+    }
+    assert!(
+        only_failures(&report)
+            .iter()
+            .any(|c| c.starts_with("tally.")),
+        "the refused record must be left out of the aggregate: {report:#?}"
+    );
+}
+
+/// Legacy control: without an issuer key the same record passes every ballot
+/// check and is counted (today's behaviour); only the downgrade itself is
+/// flagged.
+#[test]
+fn second_vote_on_legacy_params_is_counted() {
+    let (mut fixture, _) =
+        second_vote_fixture(&GenParams::simple(3, 1, 2, SelectionProfile::Uniform), 1);
+    fixture.parameters.issuer_public_key.clear();
+    let report = audit(fixture.artifacts());
+    assert_eq!(
+        only_failures(&report),
+        ["parameters.issuer_binding"],
+        "{report:#?}"
     );
 }
 

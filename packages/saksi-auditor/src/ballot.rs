@@ -10,6 +10,9 @@
 //! 4. That the embedded `issuer_public_key` field on the presentation matches
 //!    the trust-anchor key passed at the artifacts boundary (single-issuer
 //!    assumption for v1).
+//! 5. The record's sum-to-one selection proof (`ballot.selection_sum`): its
+//!    ciphertexts encrypt exactly one selection. Required when the parameters
+//!    carry an issuer key; skipped for legacy parameters without one.
 //!
 //! Nullifier *uniqueness* is enforced in [`crate::audit`] across the whole
 //! ballot stream, not here.
@@ -22,7 +25,15 @@
 use curve25519_dalek::{ristretto::RistrettoPoint, scalar::Scalar};
 
 use saksi_credentials::{verify_presentation, IssuerPublicKey};
-use saksi_crypto::{elgamal, group::point_from_compressed, nizk::cds::CDSProof};
+use saksi_crypto::{
+    elgamal,
+    group::point_from_compressed,
+    nizk::{
+        cds::CDSProof,
+        chaum_pedersen::ChaumPedersenProof,
+        selection::{selection_context, verify_selection},
+    },
+};
 use saksi_protocol::{Ballot, ElectionParameters, WIRE_VERSION};
 
 use crate::report::ReportBuilder;
@@ -42,6 +53,7 @@ use crate::report::ReportBuilder;
 pub(crate) struct BallotPassCounts {
     shape: usize,
     cds_proof: usize,
+    selection_sum: usize,
     issuer_binding: usize,
     credential: usize,
 }
@@ -51,6 +63,7 @@ impl BallotPassCounts {
     pub(crate) fn add(&mut self, other: &Self) {
         self.shape += other.shape;
         self.cds_proof += other.cds_proof;
+        self.selection_sum += other.selection_sum;
         self.issuer_binding += other.issuer_binding;
         self.credential += other.credential;
     }
@@ -70,6 +83,11 @@ impl BallotPassCounts {
                 "ballot.cds_proof",
                 self.cds_proof,
                 "ballot ciphertexts carry a verifying CDS OR-proof",
+            ),
+            (
+                "ballot.selection_sum",
+                self.selection_sum,
+                "ballot records carry a verifying sum-to-one selection proof",
             ),
             (
                 "ballot.issuer_binding",
@@ -107,8 +125,8 @@ pub(crate) struct DecodedCiphertext {
 /// `passes` and reported once for the whole population (see
 /// [`BallotPassCounts`]).
 ///
-/// Returns the ballot's decoded ciphertexts iff its CDS proofs **and** its
-/// credential presentation both passed — i.e. iff it is eligible to be folded
+/// Returns the ballot's decoded ciphertexts iff its CDS proofs, its selection
+/// proof (when required) **and** its credential presentation all passed — i.e. iff it is eligible to be folded
 /// into the homomorphic tally. `None` for every ineligible ballot.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn verify_ballot(
@@ -146,6 +164,23 @@ pub(crate) fn verify_ballot(
             format!(
                 "ballot[{}] version {} != supported {}",
                 idx, ballot.version, WIRE_VERSION
+            ),
+        );
+        return None;
+    }
+    // An empty position_id is the legacy whole-ballot record. Its nullifier is
+    // no position's, and its selection proof only bounds the sum over every
+    // contest, so on per-position contests it would be a second vote in one of
+    // them. Refused when the params carry an issuer key (the chaincode's
+    // `shape` gate); legacy params keep the old behaviour.
+    if ballot.position_id.is_empty()
+        && !parameters.issuer_public_key.is_empty()
+        && parameters.contest_ids.iter().any(|c| c.contains('/'))
+    {
+        builder.fail(
+            "ballot.shape",
+            format!(
+                "ballot[{idx}] names no position, but the election's contests are per position"
             ),
         );
         return None;
@@ -275,6 +310,43 @@ pub(crate) fn verify_ballot(
         });
     }
 
+    // -- sum-to-one selection -----------------------------------------
+
+    // Only meaningful once every ciphertext decoded and passed CDS; a record
+    // that failed CDS is already ineligible. Legacy parameters without an
+    // issuer key skip the check (the chaincode's `selection` gate rule).
+    let mut selection_ok = true;
+    if all_cds_ok && !parameters.issuer_public_key.is_empty() {
+        let result = match ballot.selection_proof.as_ref() {
+            None => Err("no selection proof".to_string()),
+            Some(wire) => ChaumPedersenProof::from_wire(wire)
+                .map_err(|err| format!("selection proof failed to decode: {err}"))
+                .and_then(|proof| {
+                    let cts: Vec<elgamal::Ciphertext> = decoded
+                        .iter()
+                        .map(|d| elgamal::Ciphertext::new(d.pad, d.data))
+                        .collect();
+                    let context = selection_context(
+                        parameters.election_id.as_bytes(),
+                        ballot.position_id.as_bytes(),
+                        &nullifier_bytes,
+                    );
+                    verify_selection(&proof, election_public_key, &cts, &context)
+                        .map_err(|err| format!("selection verification failed: {err}"))
+                }),
+        };
+        match result {
+            Ok(()) => passes.selection_sum += 1,
+            Err(why) => {
+                builder.fail(
+                    "ballot.selection_sum",
+                    format!("ballot[{idx}] (position {:?}): {why}", ballot.position_id),
+                );
+                selection_ok = false;
+            }
+        }
+    }
+
     // -- credential presentation --------------------------------------
 
     let presentation = match ballot.credential_presentation.as_ref() {
@@ -329,7 +401,7 @@ pub(crate) fn verify_ballot(
         }
     };
 
-    if all_cds_ok && cred_ok && issuer_ok {
+    if all_cds_ok && selection_ok && cred_ok && issuer_ok {
         Some(decoded)
     } else {
         None

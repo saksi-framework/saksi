@@ -186,13 +186,21 @@ func validCDSBallot(t *testing.T) *saksiprotocolv1.Ballot {
 // the matching DKG transcript, so validCDSBallot's CDS proof verifies on-chain.
 func withCDSElection(t *testing.T, sc *SmartContract, ctx *fakeContext) {
 	t.Helper()
+	withCDSElectionIssuer(t, sc, ctx, nil)
+}
+
+// withCDSElectionIssuer is withCDSElection with the election's bound issuer key
+// (ElectionParameters.issuer_public_key); nil is a legacy election without one.
+func withCDSElectionIssuer(t *testing.T, sc *SmartContract, ctx *fakeContext, issuerPK []byte) {
+	t.Helper()
 	_, contestID, _, pk, _, _, _ := loadCDSVector(t)
 	params := &saksiprotocolv1.ElectionParameters{
-		Version:    saksiprotocolv1.WireVersion,
-		ElectionId: "election-2026",
-		ContestIds: []string{contestID},
-		TrusteeIds: []string{"t1"},
-		Threshold:  1,
+		Version:         saksiprotocolv1.WireVersion,
+		ElectionId:      "election-2026",
+		ContestIds:      []string{contestID},
+		TrusteeIds:      []string{"t1"},
+		Threshold:       1,
+		IssuerPublicKey: issuerPK,
 	}
 	if err := sc.CreateElection(ctx, mustMarshalParams(t, params)); err != nil {
 		t.Fatalf("CreateElection: %v", err)
@@ -243,6 +251,43 @@ func TestSubmitBallotThenGetBallotRoundTrips(t *testing.T) {
 	}
 	if got != ballotHex {
 		t.Fatalf("GetBallot returned a different ballot\n got: %s\nwant: %s", got, ballotHex)
+	}
+}
+
+// The issuer gate: an election bound to one issuer refuses a ballot whose
+// credential was signed (validly) under any other issuer key, before the
+// signature is even checked; the bound issuer's own ballot is accepted; and a
+// legacy election with no bound key keeps accepting as before.
+func TestSubmitBallotIssuerBinding(t *testing.T) {
+	sigPK, _, _, _ := loadSigVector(t)
+	// Any other valid point stands in for the election's real issuer: the
+	// ballot's credential is then self-issued under sigPK.
+	_, _, _, otherPK, _, _, _ := loadCDSVector(t)
+
+	sc, ctx := &SmartContract{}, newContext()
+	withCDSElectionIssuer(t, sc, ctx, otherPK)
+	if got := gateIDOf(sc.SubmitBallot(ctx, mustMarshal(t, validCDSBallot(t)))); got != "issuer" {
+		t.Errorf("self-issued credential: refused at %q, want issuer", got)
+	}
+	badSig := validCDSBallot(t)
+	badSig.CredentialPresentation.PresentationProof[40] ^= 0x01
+	if got := gateIDOf(sc.SubmitBallot(ctx, mustMarshal(t, badSig))); got != "issuer" {
+		t.Errorf("self-issued credential with a bad signature: refused at %q, want issuer (issuer before credential)", got)
+	}
+
+	// A bound election also requires the selection proof, so the honest case
+	// uses the selection vector's one-hot record.
+	sv := loadSelectionVector(t)
+	sc, ctx = &SmartContract{}, newContext()
+	withSelectionElection(t, sc, ctx, sv, sigPK)
+	if err := sc.SubmitBallot(ctx, mustMarshal(t, selectionBallot(t, sv, false, sv.proof))); err != nil {
+		t.Errorf("honest ballot under the bound issuer: %v", err)
+	}
+
+	sc, ctx = &SmartContract{}, newContext()
+	withCDSElectionIssuer(t, sc, ctx, nil)
+	if err := sc.SubmitBallot(ctx, mustMarshal(t, validCDSBallot(t))); err != nil {
+		t.Errorf("legacy election without an issuer key: %v", err)
 	}
 }
 
@@ -1266,5 +1311,32 @@ func TestLiveAttackMutationsMeetTheirDeclaredGateFirst(t *testing.T) {
 	}
 	if got := gateIDOf(sc2.SubmitBallot(ctx2, editBallotHex(t, donorHex, tamperProof))); got != "election-open" {
 		t.Errorf("tamper-ballot-proof after close: refused at %q, want election-open", got)
+	}
+}
+
+// CreateElection refuses an issuer key the issuer gate could never match
+// honestly: not 32 bytes, or not a canonical ristretto255 encoding. An empty
+// key (a legacy election) and a real point are accepted.
+func TestCreateElectionValidatesTheIssuerKey(t *testing.T) {
+	sigPK, _, _, _ := loadSigVector(t)
+	for _, c := range []struct {
+		name string
+		key  []byte
+		ok   bool
+	}{
+		{"empty (legacy)", nil, true},
+		{"a real point", sigPK, true},
+		{"31 bytes", sigPK[:31], false},
+		{"33 bytes", append(append([]byte{}, sigPK...), 0), false},
+		{"non-canonical", bytes.Repeat([]byte{0xFF}, 32), false},
+	} {
+		sc, ctx := &SmartContract{}, newContext()
+		err := sc.CreateElection(ctx, mustMarshalParams(t, &saksiprotocolv1.ElectionParameters{
+			Version: saksiprotocolv1.WireVersion, ElectionId: "e", ContestIds: []string{"p/0"},
+			TrusteeIds: []string{"t1"}, Threshold: 1, IssuerPublicKey: c.key,
+		}))
+		if (err == nil) != c.ok {
+			t.Errorf("%s: err = %v, want ok=%v", c.name, err, c.ok)
+		}
 	}
 }

@@ -292,9 +292,9 @@ nothing about the selection.
 ## 7. What works offline vs. network-gated
 
 - **Offline (fully working, no network):** Generate → Verify → correctness.csv,
-  and 6 of 7 scenarios (CDS-proof tamper, nullifier reuse, dropped ballot,
-  corrupted bytes, tampered partial-decryption, tampered DKG) — each proven
-  rejected by the real auditor.
+  and 8 of 9 scenarios (CDS-proof tamper, nullifier reuse, dropped ballot,
+  corrupted bytes, tampered partial-decryption, tampered DKG, self-issued
+  credential, overvote) — each proven rejected by the real auditor.
 - **Network-gated (needs a live Fabric network):** on-chain `Submit` + perf
   numbers. These error clearly when no network/driver is present — never a
   silent hang.
@@ -440,7 +440,15 @@ never written where nothing was measured. `perf-schema.md` is written into the
 run folder alongside, so a downloaded CSV carries its own definitions;
 `perf.csv` itself has no comment lines and loads straight into a spreadsheet.
 
-Three caveats worth knowing before quoting a number:
+Caveats worth knowing before quoting a number:
+
+- The proof columns include the sum-to-one selection proof on each ballot
+  record: `proof_gen_cpu_ms` its proving (about 79 µs per record),
+  `proof_verify_inproc_ms` its verification (about 132 µs per record, beside
+  about 1.2 ms of CDS verification for four candidates). On-chain, endorsement
+  of an issuer-bound election verifies it too (about 200 µs per record), which
+  lands in `latency_*_ms` and `committed_tps`. Figures from before the selection
+  proof are not directly comparable.
 
 - `proof_verify_inproc_ms` is the **wall-clock** time of the auditor's parallel
   ballot verification on `verify_threads` threads (every core by default), not
@@ -1128,6 +1136,8 @@ carries no campaign repetition tag, so the refit skips it.
    | **During ballots (paused at 50 %)** | `tamper-ballot-proof` | real submission | chaincode `cds` |
    | | `reused-nullifier` | real submission | chaincode `nullifier` |
    | | `corrupted-ballot-bytes` | real submission | chaincode `decode` |
+   | | `self-issued-credential` | real submission (ballot built by `saksi-demo forge-ballot`) | chaincode `issuer` |
+   | | `overvote` | real submission (ballot built by `saksi-demo overvote-ballot`) | chaincode `selection` |
    | **After ballots (sealed box)** | `dropped-ballot` | simulated | auditor `stream.completeness` |
    | | `reordered-ballots` | never mounted | none |
    | **During tally (ceremony)** | `tamper-partial-decryption` | simulated | auditor `decryption.cp_proof` |

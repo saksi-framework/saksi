@@ -61,6 +61,7 @@ trustees → **Publish tally** → **Verify →** (**E = 0 · PASS**) → export
 | ________ | ☐ DKG ☐ ballots ☐ close ☐ ceremony | ☐ | ☐ | ☐ | ☐ |
 | ________ | ☐ DKG ☐ ballots ☐ close ☐ ceremony | ☐ | ☐ | ☐ | ☐ |
 
+- [ ] During-ballots verdicts read for all five: `tamper-ballot-proof` (`cds`), `reused-nullifier` (`nullifier`), `corrupted-ballot-bytes` (`decode`), `self-issued-credential` (`issuer`), `overvote` (`selection`)
 - [ ] Security-run throughput kept out of RQ3
 - [ ] On-chain limitations stated beside the verdicts (DKG, partial-decryption proofs, reordering, front-running)
 

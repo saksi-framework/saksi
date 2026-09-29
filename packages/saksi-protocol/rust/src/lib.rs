@@ -110,6 +110,7 @@ mod tests {
                 }),
             }),
             position_id: "president".to_owned(),
+            selection_proof: None,
         }
     }
 

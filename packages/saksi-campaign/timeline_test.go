@@ -1,6 +1,7 @@
 package campaign
 
 import (
+	"bytes"
 	"context"
 	"encoding/hex"
 	"encoding/json"
@@ -12,6 +13,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -87,6 +89,9 @@ func fakeAuditor(failed func(scenario string) string) Runner {
 	var mu sync.Mutex
 	calls := map[string]int{}
 	return func(_ context.Context, _ string, args ...string) ([]byte, error) {
+		if args[0] != "audit-stream" {
+			return fakeHelper(args)
+		}
 		dir := args[1]
 		mu.Lock()
 		calls[dir]++
@@ -98,6 +103,37 @@ func fakeAuditor(failed func(scenario string) string) Runner {
 		}
 		return []byte(fmt.Sprintf(`{"overall":"fail","failed_checks":[{"check":%q,"detail":"fake detail"}]}`, check)), nil
 	}
+}
+
+// fakeHelper stands in for saksi-demo's forge-ballot and overvote-ballot. It
+// prints the named ballot of the run (line 0 for forge-ballot, which takes a
+// position instead) with a marker the gated ledger reads as the broken
+// property: a foreign issuer key, or a nonzero first pad (an overvote).
+func fakeHelper(args []string) ([]byte, error) {
+	line := 0
+	switch args[0] {
+	case "forge-ballot":
+	case "overvote-ballot":
+		var err error
+		if line, err = strconv.Atoi(args[2]); err != nil {
+			return nil, err
+		}
+	default:
+		return nil, fmt.Errorf("fake saksi-demo has no %q", args[0])
+	}
+	lines, err := ballotLinesAt(args[1], line)
+	if err != nil {
+		return nil, err
+	}
+	h, err := editBallot(lines[line], func(b *pb.Ballot) error {
+		if args[0] == "forge-ballot" {
+			b.CredentialPresentation.IssuerPublicKey = bytes.Repeat([]byte{0xEE}, 32)
+		} else {
+			b.Ciphertexts[0].Pad[0] = 0x0E
+		}
+		return nil
+	})
+	return []byte(h + "\n"), err
 }
 
 // declaredAuditGate makes the fake auditor name each scenario's own check.
@@ -119,7 +155,8 @@ func fakeSignature() []byte {
 }
 
 // gatedLedger is fakeLedger with SubmitBallot's gates in the chaincode's order
-// (decode, shape, credential, election open, nullifier unspent, CDS), each
+// (decode, shape, issuer, credential, election open, nullifier unspent, CDS,
+// selection), each
 // refusing with its "gate=<id>:" prefix, so a live mount can be classified end
 // to end. The shape and credential gates are stand-ins (ciphertexts and a
 // nullifier present; a marker signature) that no live mutation should trip:
@@ -168,6 +205,9 @@ func (g *gatedLedger) ballotGates(h string) error {
 	if len(b.GetCiphertexts()) == 0 || len(cp.GetNullifier().GetValue()) == 0 {
 		return errors.New("gate=shape: ballot has no ciphertexts or no nullifier")
 	}
+	if k := cp.GetIssuerPublicKey(); len(k) > 0 && k[0] == 0xEE {
+		return errors.New("gate=issuer: credential issuer key is not the election's issuer key")
+	}
 	if p := cp.GetPresentationProof(); len(p) < 64 || p[0] != 0xC5 {
 		return errors.New("gate=credential: credential signature verification failed")
 	}
@@ -182,6 +222,9 @@ func (g *gatedLedger) ballotGates(h string) error {
 	}
 	if b.WellFormednessProofs[0].Branches[0].Response[0] != 0 {
 		return errors.New(`gate=cds: contest "president/cand0" CDS well-formedness proof failed`)
+	}
+	if b.Ciphertexts[0].Pad[0] != 0 {
+		return errors.New(`gate=selection: position "president" selection proof failed`)
 	}
 	g.spent[nul] = true
 	return nil
@@ -270,7 +313,9 @@ func TestEveryScenarioIsJudgedByItsDeclaredGate(t *testing.T) {
 				dir := t.TempDir()
 				attackRun(t, dir, 3)
 				sub := &fakeSubmitter{err: tc.err}
-				res := testExec(t).mountLiveAttack("run-1", dir, sc, sub, "run-1")
+				e := testExec(t)
+				e.run = fakeAuditor(func(string) string { return "" })
+				res := e.mountLiveAttack("run-1", dir, sc, sub, "run-1")
 				if res.Verdict != tc.want || res.GateExpected != sc.ChainGate || !res.OnChain {
 					t.Errorf("live, ledger said %v: verdict %q expected %q (%s), want %s",
 						tc.err, res.Verdict, res.GateExpected, res.Actual, tc.want)
@@ -303,6 +348,14 @@ func assertCarriesMutation(t *testing.T, id, h string) {
 	case "reused-nullifier":
 		if err != nil || string(b.CredentialPresentation.Nullifier.Value) != string(testNullifier(0)) {
 			t.Errorf("nullifier not reused from ballot 0 (decode err %v)", err)
+		}
+	case "self-issued-credential":
+		if err != nil || len(b.CredentialPresentation.IssuerPublicKey) == 0 || b.CredentialPresentation.IssuerPublicKey[0] != 0xEE {
+			t.Errorf("not the forged ballot saksi-demo printed (decode err %v)", err)
+		}
+	case "overvote":
+		if err != nil || b.Ciphertexts[0].Pad[0] != 0x0E {
+			t.Errorf("not the overvote saksi-demo printed (decode err %v)", err)
 		}
 	}
 }
@@ -408,7 +461,8 @@ func TestSecurityRunPausesAtEachDeclaredMoment(t *testing.T) {
 	}
 
 	got := resultsByID(t, runDir)
-	for id, gate := range map[string]string{"tamper-ballot-proof": "cds", "reused-nullifier": "nullifier", "corrupted-ballot-bytes": "decode"} {
+	for id, gate := range map[string]string{"tamper-ballot-proof": "cds", "reused-nullifier": "nullifier", "corrupted-ballot-bytes": "decode",
+		"self-issued-credential": "issuer", "overvote": "selection"} {
 		r := got[id]
 		if r.Verdict != "PASS" || !r.OnChain || r.GateObserved != gate || r.Mount.Stage != StageBallots ||
 			r.Mount.ElectionStatus != "open" || *r.Mount.BallotsCommitted != 5 {

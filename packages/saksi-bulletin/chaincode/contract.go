@@ -1,14 +1,18 @@
 package main
 
 import (
+	"bytes"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"slices"
 	"strings"
 
+	"github.com/gtank/ristretto255"
 	"github.com/hyperledger/fabric-contract-api-go/contractapi"
 	"github.com/saksi-framework/saksi/packages/saksi-bulletin/chaincode/cdsverify"
 	"github.com/saksi-framework/saksi/packages/saksi-bulletin/chaincode/credverify"
+	"github.com/saksi-framework/saksi/packages/saksi-bulletin/chaincode/selectionverify"
 	"github.com/saksi-framework/saksi/packages/saksi-bulletin/chaincode/sigverify"
 	saksiprotocolv1 "github.com/saksi-framework/saksi/packages/saksi-protocol/go/saksiprotocolv1"
 	"google.golang.org/protobuf/proto"
@@ -39,6 +43,12 @@ func contestIndicesForPosition(contestIDs []string, positionID string) []int {
 		}
 	}
 	return idxs
+}
+
+// positionedContests reports whether any contest id is "<position>/<candidate>",
+// the per-position layout.
+func positionedContests(contestIDs []string) bool {
+	return slices.ContainsFunc(contestIDs, func(c string) bool { return strings.Contains(c, "/") })
 }
 
 const (
@@ -91,11 +101,17 @@ type SmartContract struct {
 //   - an election id is present;
 //   - at least one ciphertext, each with a correctly shaped pad and data;
 //   - a credential-presentation nullifier is present;
+//   - the presentation's issuer key is byte-equal to the election's bound
+//     ElectionParameters.issuer_public_key (gate `issuer`; skipped for a legacy
+//     election stored without one), so a self-issued credential is refused;
 //   - the issuer Schnorr signature on the credential commitment verifies
 //     (ristretto255 + a Merlin-compatible challenge, byte-identical to the Rust
 //     saksi-credentials signer — see the credverify package);
 //   - the nullifier has not already been spent in this election (no double
-//     vote).
+//     vote);
+//   - each ciphertext's CDS proof shows it encrypts 0 or 1 (gate `cds`);
+//   - the record's selection proof shows its ciphertexts sum to exactly one
+//     (gate `selection`; skipped for a legacy election without an issuer key).
 //
 // The ballot is stored keyed by (electionID, nullifier), and the nullifier is
 // marked spent in the same transaction.
@@ -146,6 +162,20 @@ func (s *SmartContract) SubmitBallot(ctx contractapi.TransactionContextInterface
 			len(proof), signaturePrefixLen,
 		)
 	}
+
+	stub := ctx.GetStub()
+
+	// Bind the credential to the election's issuer before checking its
+	// signature: a valid signature under a key the voter chose proves nothing.
+	// A missing election is left to the election-exists gate below.
+	params, err := findElection(stub, ballot.GetElectionId())
+	if err != nil {
+		return err
+	}
+	if want := params.GetIssuerPublicKey(); len(want) > 0 && !bytes.Equal(want, presentation.GetIssuerPublicKey()) {
+		return rejectAt("issuer", "credential issuer key is not the issuer bound to election %q", ballot.GetElectionId())
+	}
+
 	if err := credverify.VerifyIssuerSignature(
 		presentation.GetIssuerPublicKey(),
 		presentation.GetCredentialCommitment(),
@@ -154,8 +184,6 @@ func (s *SmartContract) SubmitBallot(ctx contractapi.TransactionContextInterface
 	); err != nil {
 		return rejectAt("credential", "credential signature verification failed: %w", err)
 	}
-
-	stub := ctx.GetStub()
 
 	// The election must exist and be open for ballots.
 	statusKey, err := stub.CreateCompositeKey(statusIndex, []string{ballot.GetElectionId()})
@@ -190,14 +218,24 @@ func (s *SmartContract) SubmitBallot(ctx contractapi.TransactionContextInterface
 	// derived from the published DKG transcript; the CDS Fiat-Shamir context is
 	// bound to (election_id, contest_id, nullifier) — all reconstructible here
 	// at endorsement, so verification is deterministic and order-independent.
-	params, err := loadElection(stub, ballot.GetElectionId())
-	if err != nil {
-		return err
+	if params == nil {
+		return fmt.Errorf("election %q has a status but no stored parameters", ballot.GetElectionId())
 	}
 	contestIDs := params.GetContestIds()
 	// The contests this record's position covers (ADR-0007 one-record-per-
 	// position; empty position_id = legacy whole-ballot). Ciphertexts/proofs
 	// align in order to these indices.
+	// An empty position_id is the legacy whole-ballot record. Its nullifier is
+	// no position's, and its selection proof only bounds the sum over every
+	// contest, so on an election with per-position contests it would be a
+	// second vote in one of them. An issuer-bound election refuses it; a legacy
+	// one keeps the old behaviour.
+	if ballot.GetPositionId() == "" && len(params.GetIssuerPublicKey()) > 0 && positionedContests(contestIDs) {
+		return rejectAt("shape",
+			"ballot names no position, but election %q's contests are per position",
+			ballot.GetElectionId(),
+		)
+	}
 	contestIdxs := contestIndicesForPosition(contestIDs, ballot.GetPositionId())
 	if len(contestIdxs) == 0 {
 		return rejectAt("shape",
@@ -261,6 +299,15 @@ func (s *SmartContract) SubmitBallot(ctx contractapi.TransactionContextInterface
 		}
 	}
 
+	// The CDS proofs show each ciphertext is 0 or 1; the selection proof shows
+	// the record's ciphertexts sum to exactly one. An election bound to an
+	// issuer requires it; a legacy election without one skips it.
+	if len(params.GetIssuerPublicKey()) > 0 {
+		if err := verifySelection(&ballot, electionPK); err != nil {
+			return rejectAt("selection", "position %q selection proof failed: %w", ballot.GetPositionId(), err)
+		}
+	}
+
 	ballotKey, err := stub.CreateCompositeKey(ballotIndex, []string{ballot.GetElectionId(), nullifier})
 	if err != nil {
 		return fmt.Errorf("build ballot key: %w", err)
@@ -272,6 +319,33 @@ func (s *SmartContract) SubmitBallot(ctx contractapi.TransactionContextInterface
 		return fmt.Errorf("mark nullifier spent: %w", err)
 	}
 	return nil
+}
+
+// verifySelection checks the ballot record's sum-to-one selection proof.
+func verifySelection(ballot *saksiprotocolv1.Ballot, electionPK []byte) error {
+	proofMsg := ballot.GetSelectionProof()
+	if proofMsg == nil {
+		return fmt.Errorf("ballot carries no selection proof")
+	}
+	if proofMsg.GetVersion() != saksiprotocolv1.WireVersion {
+		return fmt.Errorf("unsupported selection proof version %d, want %d", proofMsg.GetVersion(), saksiprotocolv1.WireVersion)
+	}
+	pads := make([][]byte, len(ballot.GetCiphertexts()))
+	datas := make([][]byte, len(ballot.GetCiphertexts()))
+	for k, ct := range ballot.GetCiphertexts() {
+		pads[k], datas[k] = ct.GetPad(), ct.GetData()
+	}
+	return selectionverify.Verify(
+		ballot.GetElectionId(), ballot.GetPositionId(),
+		ballot.GetCredentialPresentation().GetNullifier().GetValue(),
+		electionPK, pads, datas,
+		selectionverify.Proof{
+			CommitmentA: proofMsg.GetCommitmentA(),
+			CommitmentB: proofMsg.GetCommitmentB(),
+			Challenge:   proofMsg.GetChallenge(),
+			Response:    proofMsg.GetResponse(),
+		},
+	)
 }
 
 // maxNullifierPageSize caps a single ListNullifiers page. Fabric peers refuse
@@ -470,6 +544,13 @@ func (s *SmartContract) CreateElection(ctx contractapi.TransactionContextInterfa
 	if threshold < 1 || threshold > trustees {
 		return fmt.Errorf("election threshold %d is out of range 1..%d", threshold, trustees)
 	}
+	// A non-empty issuer key binds every ballot's credential to it (the issuer
+	// gate), so it must be a real point: 32 bytes, canonical ristretto255.
+	if k := params.GetIssuerPublicKey(); len(k) > 0 {
+		if _, err := new(ristretto255.Element).SetCanonicalBytes(k); err != nil {
+			return fmt.Errorf("election issuer_public_key is not a canonical 32-byte ristretto255 point: %w", err)
+		}
+	}
 
 	stub := ctx.GetStub()
 	key, err := stub.CreateCompositeKey(electionIndex, []string{electionID})
@@ -658,6 +739,18 @@ func loadElection(stub interface {
 	CreateCompositeKey(string, []string) (string, error)
 	GetState(string) ([]byte, error)
 }, electionID string) (*saksiprotocolv1.ElectionParameters, error) {
+	params, err := findElection(stub, electionID)
+	if err == nil && params == nil {
+		err = fmt.Errorf("no election found with id %q", electionID)
+	}
+	return params, err
+}
+
+// findElection is loadElection that returns (nil, nil) for a missing election.
+func findElection(stub interface {
+	CreateCompositeKey(string, []string) (string, error)
+	GetState(string) ([]byte, error)
+}, electionID string) (*saksiprotocolv1.ElectionParameters, error) {
 	key, err := stub.CreateCompositeKey(electionIndex, []string{electionID})
 	if err != nil {
 		return nil, fmt.Errorf("build election key: %w", err)
@@ -667,7 +760,7 @@ func loadElection(stub interface {
 		return nil, fmt.Errorf("read election state: %w", err)
 	}
 	if raw == nil {
-		return nil, fmt.Errorf("no election found with id %q", electionID)
+		return nil, nil
 	}
 	var params saksiprotocolv1.ElectionParameters
 	if err := proto.Unmarshal(raw, &params); err != nil {
@@ -684,8 +777,8 @@ func loadElection(stub interface {
 // still matches. Internal failures (state reads, key building) carry no gate:
 // they are not a verdict on the submission.
 //
-// Gate ids: decode, shape, credential, election-exists, election-open,
-// election-closed, nullifier, dkg-missing, cds, dkg-consistency, dkg-duplicate,
+// Gate ids: decode, shape, issuer, credential, election-exists, election-open,
+// election-closed, nullifier, dkg-missing, cds, selection, dkg-consistency, dkg-duplicate,
 // cp-presence, membership, partial-duplicate.
 func rejectAt(gate, format string, args ...any) error {
 	return fmt.Errorf("gate="+gate+": "+format, args...)

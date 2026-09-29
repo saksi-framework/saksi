@@ -392,11 +392,12 @@ func (e *Executor) pausedWindow(ctx context.Context, runID string, c ElectionCon
 	committed := first.Committed
 	mc := MountContext{ElectionStatus: "open", BallotsCommitted: &committed, BlockHeight: chainHeight(led)}
 	simulate := e.simulatedMount(ctx, runID, true)
+	runDir, _ := e.store.Dir(runID)
 	e.pauseForAttacks(ctx, runID, c, StageBallots, mc, true, func(sc Scenario) ScenarioResult {
-		if !sc.LiveCapable() || sc.MutateBallot == nil {
+		if !sc.LiveCapable() || (sc.MutateBallot == nil && sc.ForgeBallot == nil) || legacyChainSkips(sc, runDir) {
 			return simulate(sc)
 		}
-		return e.mountBallotLive(runID, sc, at, donor, func(h string) error {
+		return e.mountBallotLive(ctx, runID, sc, at, donor, func(h string) error {
 			_, _, err := led.Submit("SubmitBallot", h)
 			return err
 		})
@@ -445,7 +446,7 @@ func joinWindows(n, at int, a, b bench.RunResult) bench.RunResult {
 // ballots pause. target is a ballot the window has not sent; donor one that
 // committed (-1 if none did). A refused ballot leaves no state, and the real
 // target ballot is submitted normally when the window resumes.
-func (e *Executor) mountBallotLive(runID string, sc Scenario, target, donor int, submit func(string) error) ScenarioResult {
+func (e *Executor) mountBallotLive(ctx context.Context, runID string, sc Scenario, target, donor int, submit func(string) error) ScenarioResult {
 	res := newLiveResult(sc)
 	dir, err := e.store.Dir(runID)
 	if err != nil {
@@ -457,7 +458,12 @@ func (e *Executor) mountBallotLive(runID string, sc Scenario, target, donor int,
 		res.Verdict, res.Actual = "INCONCLUSIVE", "not mounted: "+err.Error()
 		return res
 	}
-	tampered, err := sc.MutateBallot(lines[target], lines[donor])
+	var tampered string
+	if sc.ForgeBallot != nil {
+		tampered, err = sc.ForgeBallot(e.demo(ctx), dir, target)
+	} else {
+		tampered, err = sc.MutateBallot(lines[target], lines[donor])
+	}
 	if err != nil {
 		res.Verdict, res.Actual = "INCONCLUSIVE", "not mounted: "+err.Error()
 		return res

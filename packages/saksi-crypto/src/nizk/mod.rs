@@ -3,3 +3,4 @@
 pub mod cds;
 pub mod chaum_pedersen;
 pub mod schnorr;
+pub mod selection;

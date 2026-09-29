@@ -28,11 +28,18 @@ ledger; the threshold gate is enforced by this console."*
 
 ## What the encryption actually is
 
-Each ballot carries, per candidate, an ElGamal ciphertext under the joint
-election key on ristretto255, plus a **CDS OR-proof** that the encrypted value is
-either 0 or 1 and that the whole ballot sums to exactly one selection. The
-chaincode verifies that proof at endorsement (ADR-0007); the offline auditor
-verifies it too.
+Each ballot record (one per voter per position) carries, per candidate, an
+ElGamal ciphertext under the joint election key on ristretto255, plus a **CDS
+OR-proof** that the encrypted value is either 0 or 1. A CDS proof speaks for one
+ciphertext only, so the record also carries a **selection proof** that the
+position's ciphertexts sum to exactly one selection: with `A = Σ A_k` and
+`B = Σ B_k − G`, a Chaum-Pedersen proof that `log_G(A) = log_Y(B)` (Y the joint
+key), which holds only when exactly one candidate is 1. Its Fiat-Shamir context
+is `saksi.ballot.selection.v1` followed by the length-prefixed election id,
+position id and nullifier. The chaincode verifies both at endorsement (ADR-0007;
+gates `cds`, then `selection`), and the offline auditor verifies them too
+(`ballot.cds_proof`, `ballot.selection_sum`). An election created without an
+issuer key (before this proof existed) skips the selection check.
 
 Voter eligibility rides on a blind-signed anonymous credential, and each ballot
 carries a **per-position nullifier** derived by PRF, which is what makes double

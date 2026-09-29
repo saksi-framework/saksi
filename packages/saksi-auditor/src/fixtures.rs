@@ -31,7 +31,12 @@ use saksi_crypto::{
     dkg::{run_in_memory, Dealer, DkgConfig, TrusteeShare},
     elgamal::{self, encrypt, Plaintext, PublicKey},
     group::{basepoint, compress_point},
-    nizk::{cds::CDSProof, chaum_pedersen::ChaumPedersenProof, schnorr::SchnorrProof},
+    nizk::{
+        cds::CDSProof,
+        chaum_pedersen::ChaumPedersenProof,
+        schnorr::SchnorrProof,
+        selection::{prove_selection, selection_context},
+    },
 };
 use saksi_protocol::{
     Ballot, Ciphertext as WireCiphertext, DKGTranscript, ElectionParameters, PartialDecryption,
@@ -125,12 +130,14 @@ pub(crate) fn happy_path_fixture() -> ElectionFixture {
     let trustee_ids: Vec<String> = (1..=5).map(|i: u32| i.to_string()).collect();
     let contest_ids: Vec<String> = vec!["contest-1".into(), "contest-2".into()];
     let threshold: u32 = 3;
-    let parameters = ElectionParameters {
+    let mut parameters = ElectionParameters {
         version: WIRE_VERSION,
         election_id: "election-2026".into(),
         contest_ids: contest_ids.clone(),
         trustee_ids: trustee_ids.clone(),
         threshold,
+        // Filled below once the issuer keypair exists.
+        issuer_public_key: Vec::new(),
     };
 
     // -- DKG --------------------------------------------------------------
@@ -145,6 +152,9 @@ pub(crate) fn happy_path_fixture() -> ElectionFixture {
 
     let issuer_sk = IssuerSecretKey::generate(&mut rng);
     let issuer_pk = issuer_sk.public_key();
+    // Bind the issuer on-chain: the params carry the same key as the header's
+    // `issuer_pk`, so SubmitBallot's `issuer` gate refuses any other issuer.
+    parameters.issuer_public_key = issuer_pk.as_point().compress().to_bytes().to_vec();
 
     let mut credentials: Vec<Credential> = Vec::with_capacity(6);
     for _ in 0..6 {
@@ -168,6 +178,8 @@ pub(crate) fn happy_path_fixture() -> ElectionFixture {
     for (voter_idx, credential) in credentials.iter().enumerate() {
         let mut ciphertexts: Vec<WireCiphertext> = Vec::with_capacity(contest_ids.len());
         let mut proofs = Vec::with_capacity(contest_ids.len());
+        let mut cts = Vec::with_capacity(contest_ids.len());
+        let mut r_sum = Scalar::ZERO;
 
         // Present the credential first so the CDS proofs can bind to the
         // ballot's nullifier (ADR-0007: the same context the chaincode
@@ -197,6 +209,8 @@ pub(crate) fn happy_path_fixture() -> ElectionFixture {
             let r = Scalar::random(&mut rng);
             let plaintext = Plaintext::from_small_integer(choice as u64);
             let ct = encrypt(&election_public_key, plaintext, r);
+            r_sum += r;
+            cts.push(ct);
             let (pad_bytes, data_bytes) = ct.to_compressed_bytes();
             ciphertexts.push(WireCiphertext {
                 version: WIRE_VERSION,
@@ -224,6 +238,15 @@ pub(crate) fn happy_path_fixture() -> ElectionFixture {
             proofs.push(cds.to_wire());
         }
 
+        // The whole-ballot record selects exactly one of the contests.
+        let selection = prove_selection(
+            &election_public_key,
+            &cts,
+            &r_sum,
+            &selection_context(parameters.election_id.as_bytes(), b"", &nullifier_bytes),
+            &mut rng,
+        );
+
         ballots.push(Ballot {
             version: WIRE_VERSION,
             election_id: parameters.election_id.clone(),
@@ -235,6 +258,7 @@ pub(crate) fn happy_path_fixture() -> ElectionFixture {
             // all contests (the pre-R2 model). The multi-position generator
             // (`multi_position_fixture`) emits one record per position instead.
             position_id: String::new(),
+            selection_proof: Some(selection.to_wire()),
         });
     }
 
@@ -736,12 +760,14 @@ pub(crate) fn gen_prologue(params: &GenParams) -> GenPrologue {
             contest_ids.push(format!("{}/cand{k}", ph_position_id(p)));
         }
     }
-    let parameters = ElectionParameters {
+    let mut parameters = ElectionParameters {
         version: WIRE_VERSION,
         election_id: params.election_id.clone(),
         contest_ids,
         trustee_ids,
         threshold: params.threshold as u32,
+        // Filled below once the issuer keypair exists.
+        issuer_public_key: Vec::new(),
     };
 
     // -- DKG (t-of-n; every dealer polynomial drawn from OsRng) --------------
@@ -755,6 +781,8 @@ pub(crate) fn gen_prologue(params: &GenParams) -> GenPrologue {
 
     let issuer_secret_key = IssuerSecretKey::generate(&mut rng);
     let issuer_public_key = issuer_secret_key.public_key();
+    // Bind the issuer on-chain (see `happy_path_fixture`).
+    parameters.issuer_public_key = issuer_public_key.as_point().compress().to_bytes().to_vec();
 
     GenPrologue {
         parameters,
@@ -781,95 +809,55 @@ pub(crate) fn gen_prologue(params: &GenParams) -> GenPrologue {
 /// chunk.
 pub(crate) fn build_voter(pro: &GenPrologue, params: &GenParams, voter_idx: usize) -> VoterWork {
     let mut rng = OsRng;
-    let candidates = params.candidates;
-    let contest_count = params.positions * candidates;
-    let choice_set = [Scalar::ZERO, Scalar::ONE];
     let mut cpu = CpuTimes::default();
-
     let started = Instant::now();
-    let (request, blind_state) = voter_begin_issuance(&mut rng);
-    let (pre_sig, session) = issuer_pre_sign(&pro.issuer_secret_key, &request, &mut rng);
-    let (blinded, finalize_state) =
-        voter_blind_challenge(blind_state, &pre_sig, &pro.issuer_public_key, &mut rng);
-    let response = issuer_sign(&pro.issuer_secret_key, session, &blinded);
-    let credential = voter_finalize_issuance(finalize_state, &response, &pro.issuer_public_key)
-        .expect("issuance happy path");
+    let credential = issue_credential(pro, &mut rng);
     cpu.credential += started.elapsed();
+    build_voter_records(pro, params, voter_idx, &credential, &mut rng, cpu)
+}
 
+/// Issues one credential from the election's issuer (blind-signature
+/// issuance, happy path).
+fn issue_credential(pro: &GenPrologue, rng: &mut OsRng) -> Credential {
+    let (request, blind_state) = voter_begin_issuance(rng);
+    let (pre_sig, session) = issuer_pre_sign(&pro.issuer_secret_key, &request, rng);
+    let (blinded, finalize_state) =
+        voter_blind_challenge(blind_state, &pre_sig, &pro.issuer_public_key, rng);
+    let response = issuer_sign(&pro.issuer_secret_key, session, &blinded);
+    voter_finalize_issuance(finalize_state, &response, &pro.issuer_public_key)
+        .expect("issuance happy path")
+}
+
+/// [`build_voter`] after issuance: one record per position under `credential`.
+fn build_voter_records(
+    pro: &GenPrologue,
+    params: &GenParams,
+    voter_idx: usize,
+    credential: &Credential,
+    rng: &mut OsRng,
+    mut cpu: CpuTimes,
+) -> VoterWork {
+    let candidates = params.candidates;
     let mut ballots = Vec::with_capacity(params.positions);
     let mut selections = Vec::with_capacity(params.positions);
-    let mut pads = vec![RistrettoPoint::identity(); contest_count];
+    let mut pads = vec![RistrettoPoint::identity(); params.positions * candidates];
 
     for p in 0..params.positions {
-        let position_id = ph_position_id(p);
         // Deterministic 1-of-C selection under the chosen profile.
         let selected = pro.plan.select(voter_idx, p);
         selections.push((p, selected));
-
-        let started = Instant::now();
-        let presentation = credential.present(
-            &pro.issuer_public_key,
-            pro.parameters.election_id.as_bytes(),
-            position_id.as_bytes(),
-            BINDING_CONTEXT,
-            &mut rng,
+        let slots = p * candidates..(p + 1) * candidates;
+        let (ballot, record_pads) = build_record(
+            pro,
+            credential,
+            &ph_position_id(p),
+            slots.clone(),
+            p * candidates + selected,
+            rng,
+            &mut cpu,
         );
-        cpu.credential += started.elapsed();
-        let nullifier_bytes = presentation
-            .nullifier
-            .as_ref()
-            .expect("presentation has a nullifier")
-            .value
-            .clone();
-
-        let mut ciphertexts: Vec<WireCiphertext> = Vec::with_capacity(candidates);
-        let mut proofs = Vec::with_capacity(candidates);
-        for k in 0..candidates {
-            let global_c = p * candidates + k;
-            let choice: u8 = u8::from(k == selected);
-
-            let started = Instant::now();
-            let r = Scalar::random(&mut rng);
-            let plaintext = Plaintext::from_small_integer(choice as u64);
-            let ct = encrypt(&pro.election_public_key, plaintext, r);
-            cpu.encrypt += started.elapsed();
-            let (pad_bytes, data_bytes) = ct.to_compressed_bytes();
-            ciphertexts.push(WireCiphertext {
-                version: WIRE_VERSION,
-                pad: pad_bytes.to_vec(),
-                data: data_bytes.to_vec(),
-            });
-            pads[global_c] = ct.pad;
-
-            let context = cds_context_for_test(
-                pro.parameters.election_id.as_bytes(),
-                pro.parameters.contest_ids[global_c].as_bytes(),
-                &nullifier_bytes,
-            );
-            let started = Instant::now();
-            let cds = CDSProof::prove(
-                &pro.election_public_key,
-                &ct,
-                &choice_set,
-                choice as usize,
-                &r,
-                &context,
-                &mut rng,
-            )
-            .expect("CDS prove ok");
-            cpu.cds_prove += started.elapsed();
-            proofs.push(cds.to_wire());
-        }
-
-        ballots.push(Ballot {
-            version: WIRE_VERSION,
-            election_id: pro.parameters.election_id.clone(),
-            voter_credential_commitment: presentation.credential_commitment.clone(),
-            ciphertexts,
-            well_formedness_proofs: proofs,
-            credential_presentation: Some(presentation),
-            position_id,
-        });
+        pads[slots].copy_from_slice(&record_pads);
+        ballots.push(ballot);
     }
 
     VoterWork {
@@ -878,6 +866,180 @@ pub(crate) fn build_voter(pro: &GenPrologue, params: &GenParams, voter_idx: usiz
         pads,
         cpu,
     }
+}
+
+/// One ballot record: `credential` presented for `position_id`, then one
+/// encrypted, CDS-proved bit per contest slot in `slots` (1 at `selected`, a
+/// global contest index), and the record's sum-to-one selection proof.
+/// Returns the record and its per-slot pads, in slot order.
+fn build_record(
+    pro: &GenPrologue,
+    credential: &Credential,
+    position_id: &str,
+    slots: std::ops::Range<usize>,
+    selected: usize,
+    rng: &mut OsRng,
+    cpu: &mut CpuTimes,
+) -> (Ballot, Vec<RistrettoPoint>) {
+    let choice_set = [Scalar::ZERO, Scalar::ONE];
+    let election_id = pro.parameters.election_id.as_bytes();
+
+    let started = Instant::now();
+    let presentation = credential.present(
+        &pro.issuer_public_key,
+        election_id,
+        position_id.as_bytes(),
+        BINDING_CONTEXT,
+        rng,
+    );
+    cpu.credential += started.elapsed();
+    let nullifier_bytes = presentation
+        .nullifier
+        .as_ref()
+        .expect("presentation has a nullifier")
+        .value
+        .clone();
+
+    let mut ciphertexts: Vec<WireCiphertext> = Vec::with_capacity(slots.len());
+    let mut proofs = Vec::with_capacity(slots.len());
+    let mut cts = Vec::with_capacity(slots.len());
+    let mut pads = Vec::with_capacity(slots.len());
+    let mut r_sum = Scalar::ZERO;
+    for global_c in slots {
+        let choice: u8 = u8::from(global_c == selected);
+
+        let started = Instant::now();
+        let r = Scalar::random(&mut *rng);
+        let plaintext = Plaintext::from_small_integer(choice as u64);
+        let ct = encrypt(&pro.election_public_key, plaintext, r);
+        r_sum += r;
+        cts.push(ct);
+        cpu.encrypt += started.elapsed();
+        let (pad_bytes, data_bytes) = ct.to_compressed_bytes();
+        ciphertexts.push(WireCiphertext {
+            version: WIRE_VERSION,
+            pad: pad_bytes.to_vec(),
+            data: data_bytes.to_vec(),
+        });
+        pads.push(ct.pad);
+
+        let context = cds_context_for_test(
+            election_id,
+            pro.parameters.contest_ids[global_c].as_bytes(),
+            &nullifier_bytes,
+        );
+        let started = Instant::now();
+        let cds = CDSProof::prove(
+            &pro.election_public_key,
+            &ct,
+            &choice_set,
+            choice as usize,
+            &r,
+            &context,
+            rng,
+        )
+        .expect("CDS prove ok");
+        cpu.cds_prove += started.elapsed();
+        proofs.push(cds.to_wire());
+    }
+
+    // One sum-to-one proof per record; timed with the CDS proofs.
+    let started = Instant::now();
+    let selection = prove_selection(
+        &pro.election_public_key,
+        &cts,
+        &r_sum,
+        &selection_context(election_id, position_id.as_bytes(), &nullifier_bytes),
+        rng,
+    );
+    cpu.cds_prove += started.elapsed();
+
+    let ballot = Ballot {
+        version: WIRE_VERSION,
+        election_id: pro.parameters.election_id.clone(),
+        voter_credential_commitment: presentation.credential_commitment.clone(),
+        ciphertexts,
+        well_formedness_proofs: proofs,
+        credential_presentation: Some(presentation),
+        position_id: position_id.to_string(),
+        selection_proof: Some(selection.to_wire()),
+    };
+    (ballot, pads)
+}
+
+/// Test-only: [`multi_position_fixture`], except voter 0 also casts a
+/// **whole-ballot record** (empty `position_id`) under the same credential,
+/// selecting global contest `extra_contest`. The record is fully valid: its
+/// presentation is for position "", so its nullifier is derived from
+/// (election_id, "") and differs from the voter's per-position ones, its CDS
+/// proofs are bound to that nullifier, and its selection proof shows the sum
+/// over every contest is 1. The published tally counts it, as trustees would
+/// decrypt a chain that accepted it. Returns the fixture and the record's
+/// index — the second-vote exploit an issuer-bound election must refuse.
+#[cfg(test)]
+pub(crate) fn second_vote_fixture(
+    params: &GenParams,
+    extra_contest: usize,
+) -> (ElectionFixture, usize) {
+    let pro = gen_prologue(params);
+    let contest_count = params.positions * params.candidates;
+    let mut rng = OsRng;
+
+    let mut ballots = Vec::new();
+    let mut selections = Vec::new();
+    let mut aggregate_pads = vec![RistrettoPoint::identity(); contest_count];
+    let mut extra = None;
+    for voter_idx in 0..params.voters {
+        let credential = issue_credential(&pro, &mut rng);
+        let work = build_voter_records(
+            &pro,
+            params,
+            voter_idx,
+            &credential,
+            &mut rng,
+            CpuTimes::default(),
+        );
+        for (c, pad) in work.pads.iter().enumerate() {
+            aggregate_pads[c] += pad;
+        }
+        selections.extend(work.selections);
+        ballots.extend(work.ballots);
+        if voter_idx == 0 {
+            let (whole, pads) = build_record(
+                &pro,
+                &credential,
+                "",
+                0..contest_count,
+                extra_contest,
+                &mut rng,
+                &mut CpuTimes::default(),
+            );
+            for (c, pad) in pads.iter().enumerate() {
+                aggregate_pads[c] += pad;
+            }
+            extra = Some(ballots.len());
+            ballots.push(whole);
+        }
+    }
+
+    let voter_ids = (0..ballots.len()).map(|i| format!("voter-{i}")).collect();
+    let mut ground_truth = tally_selections(&selections, contest_count, params.candidates);
+    ground_truth[extra_contest] += 1;
+    let partial_decryptions = build_partial_decryptions(&pro, &aggregate_pads);
+    let tally = build_tally(&pro, ground_truth.clone(), partial_decryptions.clone());
+    let fixture = ElectionFixture {
+        parameters: pro.parameters,
+        dkg_transcript: pro.dkg_transcript,
+        ballots,
+        partial_decryptions,
+        tally,
+        issuer_public_key: pro.issuer_public_key,
+        ground_truth,
+        voter_ids,
+        election_name: params.election_name.clone(),
+        trustee_names: params.trustee_names.clone(),
+    };
+    (fixture, extra.expect("voters >= 1"))
 }
 
 /// Runs the trustee ceremony over a finished per-contest aggregate: one
@@ -1040,16 +1202,15 @@ pub(crate) fn multi_position_fixture(params: &GenParams) -> ElectionFixture {
 /// two contests have different totals (catches off-by-one or contest-mixing
 /// bugs in the auditor).
 fn voter_choice(voter_idx: usize, contest_idx: usize) -> u8 {
-    match (voter_idx, contest_idx) {
-        // Contest 0: voters 0, 2, 4 vote yes -> total 3
-        (v, 0) if v % 2 == 0 => 1,
-        (_, 0) => 0,
-        // Contest 1: voters 0, 1 vote yes -> total 2
-        (0, 1) => 1,
-        (1, 1) => 1,
-        (_, 1) => 0,
-        _ => 0,
-    }
+    // One-hot: the whole-ballot record selects exactly one contest, as its
+    // selection proof requires. Voters 1 and 3 pick contest 1, everyone else
+    // contest 0 -> totals (4, 2).
+    let pick = if voter_idx == 1 || voter_idx == 3 {
+        1
+    } else {
+        0
+    };
+    u8::from(contest_idx == pick)
 }
 
 // Re-export the joint public key as an `elgamal::PublicKey` helper for tests

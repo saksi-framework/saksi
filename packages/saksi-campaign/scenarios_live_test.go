@@ -1,12 +1,15 @@
 package campaign
 
 import (
+	"context"
 	"encoding/hex"
 	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	pb "github.com/saksi-framework/saksi/packages/saksi-protocol/go/saksiprotocolv1"
 )
 
 // fakeSubmitter stands in for the bulletin client so the live attack path can
@@ -317,3 +320,153 @@ func TestChangedHeaderHelpersDetectNoChange(t *testing.T) {
 type errString string
 
 func (e errString) Error() string { return string(e) }
+
+// The two attacks saksi-demo builds are mounted at the ballots pause against
+// the ballot the window has not sent: the helper is asked for THAT ballot, what
+// it prints is what reaches the ledger, and a refusal at the declared gate
+// (issuer, selection) is a PASS.
+func TestHelperBuiltBallotAttacksMountLiveAtTheirGate(t *testing.T) {
+	for id, gate := range map[string]string{"self-issued-credential": "issuer", "overvote": "selection"} {
+		t.Run(id, func(t *testing.T) {
+			dir := t.TempDir()
+			e := newTestExecutor(t, dir)
+			attackRun(t, filepath.Join(dir, "run-1"), 4)
+			var calls [][]string
+			e.run = func(_ context.Context, _ string, args ...string) ([]byte, error) {
+				calls = append(calls, args)
+				return fakeHelper(args)
+			}
+			var sc Scenario
+			for _, s := range Registry() {
+				if s.ID == id {
+					sc = s
+				}
+			}
+			var submitted []string
+			res := e.mountBallotLive(context.Background(), "run-1", sc, 2, 0, func(h string) error {
+				submitted = append(submitted, h)
+				return errString("chaincode response 500, gate=" + gate + ": refused")
+			})
+
+			if res.Verdict != "PASS" || res.GateObserved != gate || !res.OnChain {
+				t.Fatalf("verdict %q observed %q (%s), want a live PASS at %s", res.Verdict, res.GateObserved, res.Actual, gate)
+			}
+			if len(calls) != 1 || len(submitted) != 1 {
+				t.Fatalf("helper calls %v, submissions %d; want one of each", calls, len(submitted))
+			}
+			runDir := filepath.Join(dir, "run-1")
+			want := map[string][]string{
+				"self-issued-credential": {"forge-ballot", runDir, "--position", "president", "--candidate", "0"},
+				"overvote":               {"overvote-ballot", runDir, "2"},
+			}[id]
+			if strings.Join(calls[0], " ") != strings.Join(want, " ") {
+				t.Errorf("helper called with %v, want %v", calls[0], want)
+			}
+			assertCarriesMutation(t, id, submitted[0])
+		})
+	}
+}
+
+// On an election created before the issuer binding (params with no issuer
+// key) the chaincode skips the issuer and selection gates, so the two attacks
+// saksi-demo builds would be committed if mounted live. Neither is: the forged
+// credential runs simulated, where the header-based ballot.issuer_binding still
+// catches it, and the overvote is SKIPPED, since ballot.selection_sum is
+// skipped on such params too and a clean audit would be a false FAIL.
+func TestLegacyElectionNeverMountsTheIssuerBoundAttacksLive(t *testing.T) {
+	setParams := func(t *testing.T, runDir string, p *pb.ElectionParameters) {
+		t.Helper()
+		if err := mutateHeader(runDir, func(h map[string]any) error {
+			h["params"] = hexProto(t, p)
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, tc := range []struct{ id, verdict, actual string }{
+		{"self-issued-credential", "PASS", "on-chain: not mounted (legacy election, params carry no issuer key: the chaincode skips gate issuer) — rejected by auditor check ballot.issuer_binding"},
+		{"overvote", "SKIPPED", "legacy election (params carry no issuer key)"},
+	} {
+		t.Run(tc.id, func(t *testing.T) {
+			dir := t.TempDir()
+			e := newTestExecutor(t, dir)
+			runDir := filepath.Join(dir, "run-1")
+			attackRun(t, runDir, 3)
+			setParams(t, runDir, &pb.ElectionParameters{ElectionId: "run-1"})
+			e.run = fakeAuditor(declaredAuditGate)
+			// Enabled, but nothing answers: a live mount would come back
+			// SKIPPED "connect to Fabric".
+			e.fabric = FabricConfig{PeerEndpoint: "127.0.0.1:1", GatewayPeer: "p", TLSCert: "x", MSPID: "m",
+				Cert: "x", Key: "x", Channel: "c", Chaincode: "cc"}
+
+			if err := e.RunStagedAttack(context.Background(), "run-1", ElectionConfig{Mode: "onchain"}, tc.id); err != nil {
+				t.Fatal(err)
+			}
+			r := resultsByID(t, runDir)[tc.id]
+			if r.Verdict != tc.verdict || r.OnChain || !strings.HasPrefix(r.Actual, tc.actual) {
+				t.Errorf("verdict %q onChain %v actual %q; want %s, simulated, actual starting %q",
+					r.Verdict, r.OnChain, r.Actual, tc.verdict, tc.actual)
+			}
+		})
+	}
+
+	// The same attacks on an election with an issuer key stay live.
+	runDir := t.TempDir()
+	attackRun(t, runDir, 1)
+	setParams(t, runDir, &pb.ElectionParameters{ElectionId: "run-1", IssuerPublicKey: make([]byte, 32)})
+	for _, sc := range Registry() {
+		if legacyChainSkips(sc, runDir) {
+			t.Errorf("%s treated as legacy on an election with an issuer key", sc.ID)
+		}
+	}
+}
+
+// A legacy election's audit always fails parameters.issuer_binding (no issuer
+// key in its params). The scenario audit sets that one finding aside, so the
+// unmutated copy is still a clean positive control, a mutation caught by its
+// declared check is a PASS, and one nothing else catches is still a FAIL.
+func TestLegacyElectionFindingIsSetAsideByTheScenarioAudit(t *testing.T) {
+	for _, tc := range []struct {
+		legacy  bool
+		mutated string // failed checks after mutation, beside the legacy finding
+		want    string
+	}{
+		{true, "ballot.issuer_binding", "PASS"},
+		{true, "", "FAIL"},
+		// On an election with an issuer key the finding is real: the control fails.
+		{false, "ballot.issuer_binding", "INCONCLUSIVE"},
+	} {
+		dir := t.TempDir()
+		attackRun(t, dir, 3)
+		p := &pb.ElectionParameters{ElectionId: "run-1"}
+		if !tc.legacy {
+			p.IssuerPublicKey = make([]byte, 32)
+		}
+		if err := mutateHeader(dir, func(h map[string]any) error { h["params"] = hexProto(t, p); return nil }); err != nil {
+			t.Fatal(err)
+		}
+		audits := 0
+		e := testExec(t)
+		e.run = func(_ context.Context, _ string, args ...string) ([]byte, error) {
+			if args[0] != "audit-stream" {
+				return fakeHelper(args)
+			}
+			audits++
+			checks := `{"check":"parameters.issuer_binding","detail":"no issuer key"}`
+			if audits%2 == 0 && tc.mutated != "" {
+				checks += `,{"check":"` + tc.mutated + `","detail":"d"}`
+			}
+			return []byte(`{"overall":"fail","failed_checks":[` + checks + `]}`), nil
+		}
+		var sc Scenario
+		for _, s := range Registry() {
+			if s.ID == "self-issued-credential" {
+				sc = s
+			}
+		}
+		res := e.runOneScenario(context.Background(), "run-1", dir, sc)
+		if res.Verdict != tc.want {
+			t.Errorf("legacy=%v mutated=%q: verdict %q (%s), want %s", tc.legacy, tc.mutated, res.Verdict, res.Actual, tc.want)
+		}
+	}
+}
