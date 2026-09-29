@@ -377,8 +377,8 @@ window) — it is never a measured zero.
 | ` + "`profile`" + ` | uniform\|skewed\|realistic | run config (` + "`distribution`" + `) |
 | ` + "`gen_wall_ms`" + ` | ms | ` + "`gen-timings.json` `wall_ms`" + ` — generator wall time |
 | ` + "`gen_cpu_ms`" + ` | ms | ` + "`gen-timings.json`" + `: credential + encrypt + CDS-prove CPU, summed across worker threads (may exceed wall) |
-| ` + "`proof_gen_cpu_ms`" + ` | ms | ` + "`gen-timings.json` `cds_prove_cpu_ms`" + ` |
-| ` + "`proof_verify_inproc_ms`" + ` | ms | ` + "`timings.json` `verify_ballots`" + ` — in-auditor-process CDS + credential verification of every ballot. **Wall-clock** time of the parallel verify phase on ` + "`verify_threads`" + ` threads, not CPU time summed across them; compare runs only at the same thread count |
+| ` + "`proof_gen_cpu_ms`" + ` | ms | ` + "`gen-timings.json` `cds_prove_cpu_ms`" + ` — CDS proving plus each record's sum-to-one selection proof (about 79 µs per record) |
+| ` + "`proof_verify_inproc_ms`" + ` | ms | ` + "`timings.json` `verify_ballots`" + ` — in-auditor-process CDS + selection-proof (about 132 µs per record) + credential verification of every ballot. **Wall-clock** time of the parallel verify phase on ` + "`verify_threads`" + ` threads, not CPU time summed across them; compare runs only at the same thread count |
 | ` + "`aggregate_inproc_ms`" + ` | ms | ` + "`timings.json` `aggregate`" + ` |
 | ` + "`combine_inproc_ms`" + ` | ms | ` + "`timings.json` `combine`" + ` — Lagrange recombination |
 | ` + "`decrypt_inproc_ms`" + ` | ms | ` + "`timings.json` `decode`" + ` — discrete-log tally recovery |
@@ -386,7 +386,7 @@ window) — it is never a measured zero.
 | ` + "`committed`, `dropped`" + ` | count | ballot window outcome |
 | ` + "`committed_tps`" + ` | tx/s | committed ÷ window |
 | ` + "`driver_ceiling_tps`" + ` | tx/s | concurrency ÷ median submit latency — the harness's own ceiling. A ` + "`committed_tps`" + ` near it means the driver, not the network, was the limit |
-| ` + "`latency_*_ms`" + ` | ms | per-ballot submit→commit latency stats (nearest-rank percentiles, population stddev) |
+| ` + "`latency_*_ms`" + ` | ms | per-ballot submit→commit latency stats (nearest-rank percentiles, population stddev). On an issuer-bound election endorsement verifies each record's selection proof too (about 200 µs per record) |
 | ` + "`peak_cpu_pct_{peer,orderer,client}`" + ` | % | ` + "`docker stats`" + ` sampler peak (` + "`client`" + ` is this console's own process). On a security run the sampler also ran through the attack pause |
 | ` + "`peak_mem_mb_{peer,orderer,client}`" + ` | MB | same sampler |
 | ` + "`ledger_bytes_delta`" + ` | bytes | on-disk ledger growth over the ballot window; empty unless a peer volume path is configured |

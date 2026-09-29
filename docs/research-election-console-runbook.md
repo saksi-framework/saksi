@@ -440,7 +440,15 @@ never written where nothing was measured. `perf-schema.md` is written into the
 run folder alongside, so a downloaded CSV carries its own definitions;
 `perf.csv` itself has no comment lines and loads straight into a spreadsheet.
 
-Three caveats worth knowing before quoting a number:
+Caveats worth knowing before quoting a number:
+
+- The proof columns include the sum-to-one selection proof on each ballot
+  record: `proof_gen_cpu_ms` its proving (about 79 µs per record),
+  `proof_verify_inproc_ms` its verification (about 132 µs per record, beside
+  about 1.2 ms of CDS verification for four candidates). On-chain, endorsement
+  of an issuer-bound election verifies it too (about 200 µs per record), which
+  lands in `latency_*_ms` and `committed_tps`. Figures from before the selection
+  proof are not directly comparable.
 
 - `proof_verify_inproc_ms` is the **wall-clock** time of the auditor's parallel
   ballot verification on `verify_threads` threads (every core by default), not
