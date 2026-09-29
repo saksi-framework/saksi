@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -91,6 +92,9 @@ type SmartContract struct {
 //   - an election id is present;
 //   - at least one ciphertext, each with a correctly shaped pad and data;
 //   - a credential-presentation nullifier is present;
+//   - the presentation's issuer key is byte-equal to the election's bound
+//     ElectionParameters.issuer_public_key (gate `issuer`; skipped for a legacy
+//     election stored without one), so a self-issued credential is refused;
 //   - the issuer Schnorr signature on the credential commitment verifies
 //     (ristretto255 + a Merlin-compatible challenge, byte-identical to the Rust
 //     saksi-credentials signer — see the credverify package);
@@ -146,6 +150,20 @@ func (s *SmartContract) SubmitBallot(ctx contractapi.TransactionContextInterface
 			len(proof), signaturePrefixLen,
 		)
 	}
+
+	stub := ctx.GetStub()
+
+	// Bind the credential to the election's issuer before checking its
+	// signature: a valid signature under a key the voter chose proves nothing.
+	// A missing election is left to the election-exists gate below.
+	params, err := findElection(stub, ballot.GetElectionId())
+	if err != nil {
+		return err
+	}
+	if want := params.GetIssuerPublicKey(); len(want) > 0 && !bytes.Equal(want, presentation.GetIssuerPublicKey()) {
+		return rejectAt("issuer", "credential issuer key is not the issuer bound to election %q", ballot.GetElectionId())
+	}
+
 	if err := credverify.VerifyIssuerSignature(
 		presentation.GetIssuerPublicKey(),
 		presentation.GetCredentialCommitment(),
@@ -154,8 +172,6 @@ func (s *SmartContract) SubmitBallot(ctx contractapi.TransactionContextInterface
 	); err != nil {
 		return rejectAt("credential", "credential signature verification failed: %w", err)
 	}
-
-	stub := ctx.GetStub()
 
 	// The election must exist and be open for ballots.
 	statusKey, err := stub.CreateCompositeKey(statusIndex, []string{ballot.GetElectionId()})
@@ -190,9 +206,8 @@ func (s *SmartContract) SubmitBallot(ctx contractapi.TransactionContextInterface
 	// derived from the published DKG transcript; the CDS Fiat-Shamir context is
 	// bound to (election_id, contest_id, nullifier) — all reconstructible here
 	// at endorsement, so verification is deterministic and order-independent.
-	params, err := loadElection(stub, ballot.GetElectionId())
-	if err != nil {
-		return err
+	if params == nil {
+		return fmt.Errorf("election %q has a status but no stored parameters", ballot.GetElectionId())
 	}
 	contestIDs := params.GetContestIds()
 	// The contests this record's position covers (ADR-0007 one-record-per-
@@ -658,6 +673,18 @@ func loadElection(stub interface {
 	CreateCompositeKey(string, []string) (string, error)
 	GetState(string) ([]byte, error)
 }, electionID string) (*saksiprotocolv1.ElectionParameters, error) {
+	params, err := findElection(stub, electionID)
+	if err == nil && params == nil {
+		err = fmt.Errorf("no election found with id %q", electionID)
+	}
+	return params, err
+}
+
+// findElection is loadElection that returns (nil, nil) for a missing election.
+func findElection(stub interface {
+	CreateCompositeKey(string, []string) (string, error)
+	GetState(string) ([]byte, error)
+}, electionID string) (*saksiprotocolv1.ElectionParameters, error) {
 	key, err := stub.CreateCompositeKey(electionIndex, []string{electionID})
 	if err != nil {
 		return nil, fmt.Errorf("build election key: %w", err)
@@ -667,7 +694,7 @@ func loadElection(stub interface {
 		return nil, fmt.Errorf("read election state: %w", err)
 	}
 	if raw == nil {
-		return nil, fmt.Errorf("no election found with id %q", electionID)
+		return nil, nil
 	}
 	var params saksiprotocolv1.ElectionParameters
 	if err := proto.Unmarshal(raw, &params); err != nil {
@@ -684,7 +711,7 @@ func loadElection(stub interface {
 // still matches. Internal failures (state reads, key building) carry no gate:
 // they are not a verdict on the submission.
 //
-// Gate ids: decode, shape, credential, election-exists, election-open,
+// Gate ids: decode, shape, issuer, credential, election-exists, election-open,
 // election-closed, nullifier, dkg-missing, cds, dkg-consistency, dkg-duplicate,
 // cp-presence, membership, partial-duplicate.
 func rejectAt(gate, format string, args ...any) error {
