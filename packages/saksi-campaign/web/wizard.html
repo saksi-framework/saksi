@@ -135,6 +135,10 @@
 
   .note { border:1px solid var(--line); border-left:3px solid var(--warn); background:var(--warn-weak);
           border-radius:var(--radius-sm); padding:10px 12px; font-size:12px; margin-top:14px; color:var(--ink) }
+  .refusal { border:1px solid var(--bad); border-left-width:4px; background:var(--bad-weak); color:var(--ink);
+             border-radius:var(--radius-sm); padding:10px 12px; margin-top:14px; font-size:12px }
+  .refusal h3 { margin:0 0 6px; font-size:13px; color:var(--bad) }
+  .refusal li { margin:4px 0 }
   .locked { text-align:center; padding:28px 18px; color:var(--muted); border:1px dashed var(--line);
             border-radius:var(--radius); margin-top:14px }
 
@@ -556,6 +560,7 @@
     <div class="quorum"><div class="bar" id="qbar"><i></i></div><span class="small muted tnum" id="qtext"></span></div>
     <div class="cards" id="cards"></div>
     <div class="note" id="gateNote"></div>
+    <div id="refusalBox" role="status" aria-live="polite"></div>
     <div id="tallyBox"></div>
     <div class="stagebox" id="stage4" style="display:none"></div>
     <div class="err" id="err3"></div>
@@ -1316,12 +1321,18 @@ async function refreshCeremony() {
        endorsement.`
     : `Local ceremony — real cryptographic shares, no ledger. The threshold gate is enforced here.`;
 
-  $("btnPublish").disabled = !st.unlocked || st.published || !!st.busy || publishing;
-  $("btnPublish").textContent = st.published ? "Tally published" : publishing ? "Publishing…" : "Publish tally";
+  // Below the threshold the button stays live as "Attempt decryption": the
+  // click sends the real request and the server's refusal is shown in the
+  // refusal panel, so the demo shows the system refusing, not a grey button.
+  lastCeremony = st;
+  $("btnPublish").disabled = st.published || !!st.busy || publishing;
+  $("btnPublish").textContent = st.published ? "Tally published" : publishing ? "Publishing…"
+    : st.unlocked ? "Publish tally" : "Attempt decryption";
   $("btnPublish").title = st.published ? "the tally is already published"
     : publishing ? "the tally is being published"
     : st.busy ? "a trustee's share is being recorded; this unlocks when it finishes"
-    : !st.unlocked ? `needs ${t} of ${n} trustee shares; ${k} contributed so far` : "";
+    : !st.unlocked ? `needs ${t} of ${n} trustee shares; ${k} contributed so far. Click to attempt decryption anyway: the server refuses and says why` : "";
+  renderRefusals(st);
   $("next3").title = st.published ? "" : "publish the tally first";
 
   // Poll faster while a trustee's shares are being recorded (the trustee app
@@ -2557,11 +2568,35 @@ $("back3").onclick = () => { stopTimers(); go(3); };
 // The ceremony state carries no "publishing" flag, so the page holds one from
 // the click until the run is idle again (whenIdle), then asks the server.
 let publishing = false;
+// Refused decryption attempts, per run, kept for the page's lifetime so the
+// refusal stays on screen as a record of the attempt after the poll moves on.
+let lastCeremony = null;
+const refusals = {};
+function renderRefusals(st) {
+  const list = refusals[runID] || [];
+  if (!list.length) { $("refusalBox").innerHTML = ""; return; }
+  $("refusalBox").innerHTML = `<div class="refusal">
+    <h3>Decryption refused below the threshold</h3>
+    <ul>${list.map((r) => `<li><span class="tnum muted">${esc(r.at.toLocaleTimeString())}</span> · <b>${
+      esc(r.k)} of ${esc(r.n)} shares</b> (threshold ${esc(r.t)}) · HTTP 409 · ${esc(r.msg)}</li>`).join("")}</ul>
+    ${st && st.unlocked ? `<div style="margin-top:6px;color:var(--ok)"><b>Threshold now met (${esc(st.submitted)} of ${
+      esc(st.threshold)}).</b> The tally can be published.</div>` : ""}</div>`;
+}
 $("btnPublish").onclick = async () => {
   publishing = true;
   $("btnPublish").disabled = true; $("btnPublish").textContent = "Publishing…";
   try { await post("/ceremony/publish", { run_id: runID }, "err3"); }
-  catch (_) { publishing = false; refreshCeremony(); return; }
+  catch (e) {
+    // The server's below-threshold refusal goes to the refusal panel, in its
+    // own words; any other failure stays in err3.
+    if (e.status === 409 && /^Decryption refused:/.test(e.message)) {
+      const st = lastCeremony || { submitted: "?", trustees: [], threshold: "?" };
+      (refusals[runID] = refusals[runID] || []).push({ at: new Date(), k: st.submitted,
+        n: st.trustees.length, t: st.threshold, msg: e.message });
+      $("err3").textContent = "";
+    }
+    publishing = false; refreshCeremony(); return;
+  }
   // The ceremony stage holds the publish until its attacks are decided.
   if (cfg.attack_plan && cfg.attack_plan.stages.includes("ceremony")) watchPauses(["ceremony"], "stage4", "err3", null);
   const id = runID;

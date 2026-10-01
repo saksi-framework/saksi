@@ -10,12 +10,20 @@ party can read the result.**
 
 One card per trustee institution, each with its own **Submit partial
 decryption** button, and a quorum meter reading *k of t*. Below the threshold the
-tally is hidden and **Publish tally** is disabled. On reaching *t* it unlocks and
-the result is revealed.
+tally is hidden and the publish button reads **Attempt decryption**. It stays
+clickable: a click sends the real `POST /ceremony/publish`, and the server's
+`409` refusal appears in a red **Decryption refused below the threshold** panel,
+in the server's own words, with the time of the attempt and the share count, for
+example *"Decryption refused: 2 of 5 shares recorded, the threshold is 3. The
+tally cannot be decrypted until a third trustee submits."* On-chain the message
+adds that a chaincode with the signature gate would refuse it too: `PublishTally` rejects a tally endorsed by fewer than
+*t* trustee signatures. The panel keeps every attempt. On reaching *t* the button
+becomes **Publish tally**, the panel notes the threshold is now met, and the
+publish proceeds.
 
-Submitting from fewer trustees than the threshold and watching publish stay
-locked is the demonstration. It is worth doing deliberately rather than clicking
-straight through.
+The refusal demo: submit two of five shares, click **Attempt decryption** and
+show the refusal, then submit the third share and publish. It is worth doing
+deliberately rather than clicking straight through.
 
 ## What runs
 
@@ -23,7 +31,7 @@ straight through.
 |---|---|---|
 | Page load / poll | `GET /api/ceremony/<runID>` | Roster and submission counts |
 | Trustee submits | `POST /ceremony/submit` | That trustee's partials, one per contest |
-| Publish | `POST /ceremony/publish` | **409 unless `submitted >= threshold`**, then `PublishTally` |
+| Publish / attempt decryption | `POST /ceremony/publish` | **409 `Decryption refused: k of n shares recorded, the threshold is t. …` unless `submitted >= threshold`**, then `PublishTally` |
 
 Each click is its own short dispatch, so a ceremony spanning many clicks never
 holds the run's busy lock between them.
@@ -50,9 +58,14 @@ Chaum-Pedersen proof must be present, the election must be closed, and a repeat
 submission from the same trustee for the same contest is rejected.
 
 The chaincode **does not** count how many partial decryptions exist before
-accepting `PublishTally`. Its checks there are status-closed, tally version,
-election id, totals length, and no-existing-tally. **So the *t*-of-*n* gate in
-this ceremony is enforced by the console, not by the ledger.**
+accepting `PublishTally`. It **does** count signatures: `PublishTally` verifies
+each trustee's Schnorr signature over the totals and refuses a tally fewer than
+*t* distinct trustees endorsed (`tally has k valid trustee signatures, threshold
+is t`; `TestPublishTallyRejectsBelowThreshold` in the chaincode). The console
+sends only the submitted trustees' signatures, so on a chaincode with that gate
+the ledger refuses a below-threshold tally too. The console refuses first, with
+a `409`, so nothing is sent. A chaincode built before the signature gate accepts
+any tally; there the *t*-of-*n* gate is the console's alone.
 
 That does not make the property unproven. The **independent auditor verifies it
 at audit time**: it counts distinct verified trustees per contest and fails below
@@ -60,10 +73,8 @@ threshold, and Lagrange-interpolates only over the submitted subset. The
 manuscript's own verifier checklist carries this as item 8 — *"that at least
 three of the five trustees contributed."*
 
-So threshold integrity is a **verification-time guarantee, not an
-endorsement-time one**. Adding an endorsement-time check to `PublishTally` is a
-genuine improvement and is recommended; it needs a chaincode redeploy and is
-tracked as out of scope rather than done.
+So threshold integrity is a **verification-time guarantee**, and on a
+chaincode with the signature gate an **endorsement-time** one as well.
 
 ## One more honest scope note
 

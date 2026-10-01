@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -123,6 +124,41 @@ func TestPublishRefusedBelowThresholdAndAllowedAtIt(t *testing.T) {
 	// that is the assertion worth making, and it also stops the background
 	// goroutine from writing into the temp dir during cleanup.
 	waitPublished(t, exec, runID, c)
+}
+
+// The adviser's demo: with 2 of 5 trustees in, an attempted decryption is a
+// real request that fails with a 409 and says why, in the server's own words.
+func TestPublishAtTwoOfFiveIsRefusedWithReason(t *testing.T) {
+	s, h, exec := testServer(t, nil)
+	c := good()
+	c.Trustees = mk(5)
+	c.Threshold = 3
+	runID, dir, err := s.store.Create(c, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeBundle(t, dir, runID, 4, 5)
+	if err := exec.writeCeremony(runID, c, nil); err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{"1", "2"} {
+		if err := exec.CeremonySubmit(context.Background(), runID, c, id); err != nil {
+			t.Fatalf("trustee %s: %v", id, err)
+		}
+	}
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, postJSON("/ceremony/publish", map[string]string{"run_id": runID}))
+	if w.Code != http.StatusConflict {
+		t.Fatalf("publish at 2 of 5: got %d, want %d", w.Code, http.StatusConflict)
+	}
+	want := "Decryption refused: 2 of 5 shares recorded, the threshold is 3. " +
+		"The tally cannot be decrypted until a third trustee submits."
+	if got := strings.TrimSpace(w.Body.String()); !strings.HasPrefix(got, want) {
+		t.Fatalf("refusal text: got %q, want prefix %q", got, want)
+	}
+	if st, _ := exec.CeremonyStatus(runID, c); st.Published {
+		t.Fatal("a refused publish must not publish")
+	}
 }
 
 // waitPublished polls the ceremony until the tally is published, failing if it
