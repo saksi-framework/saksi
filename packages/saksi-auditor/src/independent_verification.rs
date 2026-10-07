@@ -15,8 +15,10 @@
 //! The tamper matrix covers every class of public-record mutation (matrix F5):
 //! ballot ciphertext/proof, tally total, dropped ballot, partial-decryption
 //! share, and DKG transcript are each detected. Reordered ballots are the
-//! exception: **not detected** — the tally is order-independent, so reordering
-//! cannot change the result; ordering integrity is not claimed.
+//! exception: the stateless audit of one record does **not** detect them — the
+//! tally is order-independent, so reordering cannot change the result. Order is
+//! checked only against the chain's read-back (`ledger.order`, see
+//! [`crate::ledger`]), which an on-chain run folder carries.
 
 use crate::fixtures::{multi_position_fixture, GenParams, SelectionProfile};
 use crate::{audit, AuditStatus};
@@ -100,8 +102,8 @@ fn dropped_ballot_detected() {
 }
 
 /// A pure reorder is NOT detected: the verifier accepts it, with the identical
-/// decoded tally, because the homomorphic tally is order-independent. Ordering
-/// integrity is not claimed (no verifier runs `ledger::ledger_digest`).
+/// decoded tally, because the homomorphic tally is order-independent. Order is
+/// checked only against a ledger dump (`ledger.order`, [`crate::ledger`]).
 #[test]
 fn reordered_ballots_pass_audit_with_identical_tally() {
     let tally_findings = |r: &crate::report::AuditReport| -> Vec<String> {
