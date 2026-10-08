@@ -1380,15 +1380,26 @@ async function loadResults() {
       if (!$("err4").textContent) $("err4").textContent = `correctness.csv is not available (${res.status}): verify has not produced it.`;
       return;
     }
-    const rows = (await res.text()).trim().split("\n").slice(1).map((r) => r.split(","));
+    const [header, ...all] = (await res.text()).trim().split("\n").map((r) => r.split(","));
+    // An on-chain run's file holds the local audit and the ledger audit as two
+    // blocks of rows for the SAME contests. Each contest is one row here, with
+    // the ledger as a second source; the board reads the local rows only.
+    const src = header.indexOf("source");
+    const isLedger = (r) => src >= 0 && r[src] === "ledger";
+    const rows = all.filter((r) => !isLedger(r));
+    const ledger = new Map(all.filter(isLedger).map((r) => [r[0], r]));
     let pass = true;
     const body = rows.map(([c, gt, dec, e, p]) => {
-      const ok = p === "true"; pass = pass && ok;
+      const l = ledger.get(c);
+      const ok = p === "true" && (!l || l[4] === "true"); pass = pass && ok;
+      const ledgerCells = ledger.size
+        ? `<td class="num">${l ? esc(l[2]) : "—"}</td><td class="num">${l ? esc(l[3]) : "—"}</td>` : "";
       return `<tr><td>${esc(c)}</td><td class="num">${esc(gt)}</td><td class="num">${esc(dec)}</td>
-              <td class="num">${esc(e)}</td><td class="${ok ? "res-pass" : "res-fail"}">${ok ? "PASS" : "FAIL"}</td></tr>`;
+              <td class="num">${esc(e)}</td>${ledgerCells}<td class="${ok ? "res-pass" : "res-fail"}">${ok ? "PASS" : "FAIL"}</td></tr>`;
     }).join("");
+    const ledgerHead = ledger.size ? `<th class="num">Ledger decoded</th><th class="num">Ledger E</th>` : "";
     $("results").innerHTML = `<table><thead><tr><th>Contest</th><th class="num">Ground truth</th>
-      <th class="num">Decoded</th><th class="num">E</th><th>Result</th></tr></thead><tbody>${body}</tbody></table>`;
+      <th class="num">Decoded</th><th class="num">E</th>${ledgerHead}<th>Result</th></tr></thead><tbody>${body}</tbody></table>`;
     $("results").style.display = "block";
     $("overallChip").className = "verdict " + (pass ? "pass" : "fail");
     $("overallChip").innerHTML = `<span class="dot2"></span>${pass ? "E = 0 · PASS" : "FAIL"}`;

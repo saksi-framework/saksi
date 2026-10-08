@@ -268,6 +268,56 @@ func TestBoardChecksReflectArtifacts(t *testing.T) {
 	}
 }
 
+// An on-chain run's correctness.csv holds the local audit and the ledger audit
+// as two blocks of rows for the SAME contests. They are two sources for one
+// contest each, so the count must not double.
+func TestBoardCountsEachContestOnceAcrossSources(t *testing.T) {
+	s, h, exec := testServer(t, nil)
+	runID, dir := seedRun(t, s, nil)
+	body := "contest,ground_truth,decoded,E,pass,published_tally,recovered_point," +
+		"aggregate_ciphertext,dkg_sha256,tally_sha256,ballots_sha256,source,ledger_matches_local\n" +
+		"president/cand0,7,7,0,true,7,,,,,,local,true\n" +
+		"president/cand1,3,3,0,true,3,,,,,,local,true\n" +
+		"president/cand0,7,7,0,true,7,,,,,,ledger,true\n" +
+		"president/cand1,3,3,0,true,3,,,,,,ledger,true\n"
+	writeFile(t, dir, CorrectnessFile, body)
+	if err := exec.markPublished(runID, good()); err != nil {
+		t.Fatal(err)
+	}
+
+	_, board := getBoard(t, h, runID)
+	var eCheck Check
+	for _, c := range board.Checks {
+		if c.Name == "Every contest decodes to the seeded ground truth" {
+			eCheck = c
+		}
+	}
+	if !eCheck.Pass || !strings.Contains(eCheck.Detail, "all 2 contests") {
+		t.Errorf("E check = %+v, want a pass over all 2 contests", eCheck)
+	}
+	if !strings.Contains(eCheck.Detail, "ledger") {
+		t.Errorf("E check detail %q should say the ledger's record audits to the same result", eCheck.Detail)
+	}
+	if len(board.Contests) != 1 || board.Contests[0].TotalVotes != 10 {
+		t.Errorf("contests = %+v, want one race of 10 votes", board.Contests)
+	}
+
+	// A ledger row that fails must still fail the check, and say which source.
+	writeFile(t, dir, CorrectnessFile, strings.Replace(body,
+		"president/cand1,3,3,0,true,3,,,,,,ledger,true", "president/cand1,3,2,-1,false,3,,,,,,ledger,false", 1))
+	_, board = getBoard(t, h, runID)
+	for _, c := range board.Checks {
+		if c.Name == "Every contest decodes to the seeded ground truth" {
+			if c.Pass || !strings.Contains(c.Detail, "ledger") {
+				t.Errorf("a failing ledger row must fail the check and name the ledger, got %+v", c)
+			}
+		}
+	}
+	if board.Verified {
+		t.Error("a failing ledger row must not be reported as verified")
+	}
+}
+
 // A ground-truth run has no ciphertexts, no ceremony and no tally. It must say
 // so rather than looking like a failed encrypted run.
 func TestBoardExplainsGroundTruthRuns(t *testing.T) {
@@ -344,6 +394,39 @@ func TestVerifyCodeFindsNullifierPrefix(t *testing.T) {
 	}
 	if v.CommittedOnChain {
 		t.Error("nothing is on-chain without a configured network")
+	}
+}
+
+// An on-chain run records each ballot's commit receipt in receipts.csv only;
+// trail.ndjson carries the lifecycle events. The lookup must read the ballot's
+// receipt from there, with no network needed, rather than reporting no ledger
+// timestamp for a ballot that has one.
+func TestVerifyCodeReadsTheBallotsReceipt(t *testing.T) {
+	s, h, _ := testServer(t, nil)
+	runID, dir := seedRun(t, s, func(c *ElectionConfig) { c.Mode = "onchain" })
+	writeBallotsCSVFixture(t, dir,
+		[3]string{"0", "president", nullA},
+		[3]string{"1", "senator", nullB})
+	hash := strings.Repeat("ab", 32)
+	writeFile(t, dir, "receipts.csv", receiptsCSVHeader+"\n"+
+		"CreateElection,,tx-create,421,"+hash+","+hash+","+hash+",2026-10-08T12:59:21Z\n"+
+		"SubmitBallot,1,tx-b1,423,"+hash+","+hash+","+hash+",2026-10-08T13:04:26Z\n"+
+		"SubmitBallot,0,tx-b0,424,"+hash+","+hash+","+hash+",2026-10-08T13:04:27Z\n")
+	writeFile(t, dir, trailNDJSONFile,
+		`{"event":"CreateElection","ref":"","receipt":{"TxID":"tx-create","BlockNumber":421,"Timestamp":"2026-10-08T12:59:21Z"}}`+"\n")
+
+	_, v := getCode(t, h, runID, "BC-BEEF-0002")
+	if !v.Found {
+		t.Fatalf("want a match, got %+v", v)
+	}
+	if v.RecordedAt == nil || !v.RecordedAt.Equal(time.Date(2026, 10, 8, 13, 4, 26, 0, time.UTC)) {
+		t.Errorf("recorded_at = %v, want the ballot's receipt time 2026-10-08T13:04:26Z", v.RecordedAt)
+	}
+	if v.BlockNumber != 423 || v.TxID != "tx-b1" {
+		t.Errorf("block/tx = %d/%q, want 423/tx-b1", v.BlockNumber, v.TxID)
+	}
+	if !v.CommittedOnChain {
+		t.Error("a commit receipt is evidence the ballot is on-chain; committed_on_chain must be true")
 	}
 }
 

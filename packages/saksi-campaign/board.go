@@ -19,6 +19,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	clientsdk "github.com/saksi-framework/saksi/packages/saksi-bulletin/client-sdk"
 )
 
 // The public bulletin board and the trustee console, served as JSON.
@@ -292,6 +294,7 @@ func readCorrectness(dir string) ([]ContestCorrectness, error) {
 		c.Decoded, _ = strconv.ParseUint(field(r, idx, "decoded"), 10, 64)
 		c.E, _ = strconv.ParseInt(field(r, idx, "E"), 10, 64)
 		c.Pass = field(r, idx, "pass") == "true"
+		c.Source = field(r, idx, "source")
 		out = append(out, c)
 	}
 	return out, nil
@@ -586,7 +589,11 @@ func (s *Server) boardContests(
 	if len(correctness) > 0 {
 		totals := make(map[string]uint64, len(correctness))
 		for _, row := range correctness {
-			totals[row.Contest] = row.Decoded
+			// The ledger block re-audits the same contests; the local audit's
+			// decoded values are the board's result.
+			if row.Source != "ledger" {
+				totals[row.Contest] = row.Decoded
+			}
 		}
 		return groupContests(c, totals)
 	}
@@ -650,20 +657,30 @@ func boardChecks(
 	if !audited {
 		checks = append(checks, fail(eName, "this run has not been audited yet — run Verify"))
 	} else {
-		worst := int64(0)
+		// An on-chain run carries a local and a ledger block of rows for the
+		// same contests: count contests, not rows.
+		contests := map[string]bool{}
+		ledger := false
 		bad := ""
 		for _, row := range correctness {
+			contests[row.Contest] = true
+			if row.Source == "ledger" {
+				ledger = true
+			}
 			if !row.Pass && bad == "" {
 				bad = fmt.Sprintf("%s: ground truth %d, decoded %d (E = %d)",
 					row.Contest, row.GroundTruth, row.Decoded, row.E)
-			}
-			if row.E > worst || -row.E > worst {
-				worst = row.E
+				if row.Source == "ledger" {
+					bad += ", in the ledger's record"
+				}
 			}
 		}
 		if bad == "" {
-			checks = append(checks, pass(eName,
-				fmt.Sprintf("E = 0 on all %d contests, recovered by threshold decryption", len(correctness))))
+			detail := fmt.Sprintf("E = 0 on all %d contests, recovered by threshold decryption", len(contests))
+			if ledger {
+				detail += "; the ledger's record audits to the same result"
+			}
+			checks = append(checks, pass(eName, detail))
 		} else {
 			checks = append(checks, fail(eName, bad))
 		}
@@ -802,6 +819,8 @@ type VerifyCodeResponse struct {
 	Nullifier        string     `json:"nullifier,omitempty"`
 	BallotSHA256     string     `json:"ballot_sha256,omitempty"`
 	RecordedAt       *time.Time `json:"recorded_at,omitempty"`
+	BlockNumber      uint64     `json:"block_number,omitempty"`
+	TxID             string     `json:"tx_id,omitempty"`
 	CommittedOnChain bool       `json:"committed_on_chain"`
 }
 
@@ -890,8 +909,17 @@ func (s *Server) handleVerifyCode(w http.ResponseWriter, r *http.Request) {
 		Nullifier:     m.Nullifier,
 		BallotSHA256:  m.SHA256,
 	}
-	resp.RecordedAt = submitBallotTime(dir, m.Index)
-	if s.fabric.Enabled() {
+	if rc := submitBallotReceipt(dir, m.Index); rc != nil {
+		// A SubmitBallot receipt is written only once the transaction has
+		// committed, so it is evidence on its own, with no network needed.
+		resp.CommittedOnChain = true
+		resp.BlockNumber, resp.TxID = rc.BlockNumber, rc.TxID
+		if !rc.Timestamp.IsZero() {
+			t := rc.Timestamp
+			resp.RecordedAt = &t
+		}
+	}
+	if !resp.CommittedOnChain && s.fabric.Enabled() {
 		if reader, _, err := s.dial(); err == nil {
 			if br, ok := reader.(ballotGetter); ok {
 				if _, err := br.GetBallot(runID, m.Nullifier); err == nil {
@@ -960,19 +988,42 @@ func scanBallotsForPrefix(dir, prefix string) ([]ballotRow, error) {
 	return out, nil
 }
 
-// submitBallotTime finds the ledger receipt for one ballot. Offline there is no
-// trail.json and no timestamp exists — nil, and the UI says so, rather than
-// substituting the run's creation time as if it were a commit time.
-func submitBallotTime(dir string, index int) *time.Time {
+// submitBallotReceipt finds the ledger receipt for one ballot. The executor
+// writes SubmitBallot receipts to receipts.csv only; runs recorded before that
+// split kept them in the trail, which is read as a fallback. Offline there is
+// no receipt — nil, and the UI says so, rather than substituting the run's
+// creation time as if it were a commit time.
+//
+// receipts.csv is streamed, not loaded: it holds one row per ballot. A torn
+// last row (a crash mid-append) ends the scan like EOF.
+func submitBallotReceipt(dir string, index int) *clientsdk.Receipt {
+	ref := strconv.Itoa(index)
+	if f, err := os.Open(filepath.Join(dir, "receipts.csv")); err == nil {
+		defer f.Close()
+		rd := csv.NewReader(f)
+		rd.FieldsPerRecord = -1
+		rd.ReuseRecord = true
+		for {
+			row, err := rd.Read()
+			if err != nil {
+				break
+			}
+			if len(row) < receiptsCSVFields || row[0] != "SubmitBallot" || row[1] != ref {
+				continue
+			}
+			if ev, err := parseReceiptRow(row); err == nil {
+				return &ev.Receipt
+			}
+		}
+	}
 	events, err := readTrailEvents(dir)
 	if err != nil {
 		return nil
 	}
-	ref := strconv.Itoa(index)
 	for _, ev := range events {
-		if ev.Event == "SubmitBallot" && ev.Ref == ref && !ev.Receipt.Timestamp.IsZero() {
-			t := ev.Receipt.Timestamp
-			return &t
+		if ev.Event == "SubmitBallot" && ev.Ref == ref {
+			rc := ev.Receipt
+			return &rc
 		}
 	}
 	return nil
