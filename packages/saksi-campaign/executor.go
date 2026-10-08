@@ -38,6 +38,9 @@ type ContestCorrectness struct {
 	PublishedTally      uint64 `json:"published_tally"`
 	AggregateCiphertext string `json:"aggregate_ciphertext"`
 	RecoveredPoint      string `json:"recovered_point"`
+	// Source is correctness.csv's source column (local or ledger); the
+	// auditor's own document does not carry it.
+	Source string `json:"source,omitempty"`
 }
 
 // StreamAudit mirrors the Rust `audit-stream --json` document.

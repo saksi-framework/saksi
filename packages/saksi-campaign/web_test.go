@@ -372,3 +372,22 @@ func TestWizardCeremonyShowsSubthresholdRefusal(t *testing.T) {
 		t.Errorf("server refusal %q no longer starts with the prefix the wizard matches", msg)
 	}
 }
+
+// An on-chain run's correctness.csv carries a local and a ledger block of rows
+// for the same contests. The wizard's results step once rendered both blocks as
+// contests and fed both to the board, which doubled every count ("2,000 votes
+// counted" for 1,000 voters) and showed false ties.
+func TestWizardResultsCountEachContestOnce(t *testing.T) {
+	body := webBlock(t, readWeb(t, "wizard.html"), "async function loadResults()")
+	for clause, rule := range map[string]string{
+		`header.indexOf("source")`:                     "the source column is located by name",
+		`r[src] === "ledger"`:                          "ledger rows are told apart from local ones",
+		`const rows = all.filter((r) => !isLedger(r))`: "the table and the board take one row per contest",
+		"Ledger decoded":                               "the ledger shows as a second source of the same contest",
+		"renderBoard(rows)":                            "the board reads the local rows only",
+	} {
+		if !strings.Contains(body, clause) {
+			t.Errorf("loadResults lost %q (%s)", clause, rule)
+		}
+	}
+}
