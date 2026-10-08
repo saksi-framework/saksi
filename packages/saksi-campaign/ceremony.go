@@ -423,8 +423,7 @@ func (e *Executor) CeremonyPublish(ctx context.Context, runID string, c Election
 		return err
 	}
 	if !state.Unlocked {
-		return fmt.Errorf("tally needs %d of %d trustees; %d have contributed",
-			state.Threshold, len(state.Trustees), state.Submitted)
+		return errors.New(belowThresholdRefusal(state))
 	}
 	b, err := e.readBundle(runID)
 	if err != nil {
@@ -485,6 +484,29 @@ func (e *Executor) CeremonyPublish(ctx context.Context, runID string, c Election
 		fmt.Sprintf("threshold met (%d of %d) — tally published on-chain", state.Submitted, state.Threshold))
 	return e.markPublished(runID, c)
 }
+
+// belowThresholdRefusal is the reason a publish below the threshold is
+// refused. The wizard shows it verbatim in its refusal panel, so it names the
+// share count, the threshold and what unlocks the tally.
+func belowThresholdRefusal(st CeremonyState) string {
+	until := fmt.Sprintf("%d more trustees submit", st.Threshold-st.Submitted)
+	if st.Threshold-st.Submitted == 1 {
+		until = "one more trustee submits"
+		if w, ok := ordinals[st.Threshold]; ok {
+			until = "a " + w + " trustee submits"
+		}
+	}
+	msg := fmt.Sprintf("Decryption refused: %d of %d shares recorded, the threshold is %d. "+
+		"The tally cannot be decrypted until %s.", st.Submitted, len(st.Trustees), st.Threshold, until)
+	if st.OnChain {
+		msg += fmt.Sprintf(" Nothing was sent to the ledger; a chaincode with the signature gate would refuse it "+
+			"too, since PublishTally rejects a tally endorsed by fewer than %d trustee signatures.", st.Threshold)
+	}
+	return msg
+}
+
+var ordinals = map[int]string{2: "second", 3: "third", 4: "fourth", 5: "fifth", 6: "sixth",
+	7: "seventh", 8: "eighth", 9: "ninth", 10: "tenth"}
 
 // tallyToPublish re-encodes the bundle's tally carrying only the signatures of
 // the trustees that actually submitted, and returns it hex-encoded.

@@ -910,9 +910,7 @@ func (s *Server) handleCeremonyPublish(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !state.Unlocked {
-		http.Error(w, fmt.Sprintf(
-			"the tally needs %d of %d trustees; %d have contributed so far",
-			state.Threshold, len(state.Trustees), state.Submitted), http.StatusConflict)
+		http.Error(w, belowThresholdRefusal(state), http.StatusConflict)
 		return
 	}
 	s.dispatch(w, rec.RunID, func(ctx context.Context) {

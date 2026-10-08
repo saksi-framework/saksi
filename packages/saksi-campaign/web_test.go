@@ -333,3 +333,42 @@ func TestConsoleErrorsOfferRetry(t *testing.T) {
 		t.Error("trail.html's error no longer offers a retry")
 	}
 }
+
+// Below the threshold the wizard must show the system refusing, not a grey
+// button: "Attempt decryption" stays clickable, the real request goes out, and
+// the server's 409 text lands in a persistent refusal panel with the time and
+// share count. The panel keys on the server's own prefix, so the two must agree.
+func TestWizardCeremonyShowsSubthresholdRefusal(t *testing.T) {
+	wiz := readWeb(t, "wizard.html")
+	if !strings.Contains(wiz, `id="refusalBox"`) {
+		t.Error("the ceremony step lost its refusal panel")
+	}
+	refresh := webBlock(t, wiz, "async function refreshCeremony()")
+	for _, want := range []string{
+		`$("btnPublish").disabled = st.published || !!st.busy || publishing;`,
+		`"Attempt decryption"`, "renderRefusals(st)",
+	} {
+		if !strings.Contains(refresh, want) {
+			t.Errorf("refreshCeremony lost %q", want)
+		}
+	}
+	if strings.Contains(refresh, `disabled = !st.unlocked`) {
+		t.Error("publish is disabled below the threshold again; the refusal demo needs it clickable")
+	}
+	panel := webBlock(t, wiz, "function renderRefusals(st)")
+	for _, want := range []string{"Decryption refused below the threshold", "toLocaleTimeString()", "shares</b> (threshold", "r.msg"} {
+		if !strings.Contains(panel, want) {
+			t.Errorf("renderRefusals lost %q", want)
+		}
+	}
+	click := webBlock(t, wiz, `$("btnPublish").onclick = async () =>`)
+	for _, want := range []string{`post("/ceremony/publish"`, `e.status === 409 && /^Decryption refused:/.test(e.message)`, "msg: e.message"} {
+		if !strings.Contains(click, want) {
+			t.Errorf("the Publish handler lost %q", want)
+		}
+	}
+	msg := belowThresholdRefusal(CeremonyState{Threshold: 3, Submitted: 2, Trustees: make([]CeremonyTrustee, 5)})
+	if !strings.HasPrefix(msg, "Decryption refused:") {
+		t.Errorf("server refusal %q no longer starts with the prefix the wizard matches", msg)
+	}
+}
