@@ -16,7 +16,7 @@
 //! | 3 | Sub-threshold trustees       | [`crate::tests::under_threshold_decryptions_are_caught`] (+ positive control below) |
 //! | 4 | Malicious admin (params)     | [`crate::tests::bad_parameters_version_is_caught`], [`crate::tests::wrong_issuer_pk_is_caught`], [`crate::tests::dkg_transcript_trustee_count_mismatch_is_caught`] (+ control below) |
 //! | 5 | Malicious BB node (drop)     | [`malicious_bb_node_dropping_a_committed_ballot_is_detected`] (this module) |
-//! | 5 | Malicious BB node (reorder)  | not detected — the tally is order-independent, so reordering cannot change the result; ordering integrity is not claimed ([`malicious_bb_node_reordering_ballots_is_not_detected_and_leaves_the_tally_unchanged`]) |
+//! | 5 | Malicious BB node (reorder)  | detected only against the chain's read-back: `ledger.order` ([`crate::ledger`]) needs the ledger dump; the stateless audit alone passes a reorder, and the tally is order-independent ([`malicious_bb_node_reordering_ballots_is_not_detected_and_leaves_the_tally_unchanged`]) |
 //! | 6 | Network replay               | [`crate::tests::reused_nullifier_is_caught`] (replay == duplicate nullifier) |
 //!
 //! The chaincode-side rejections for classes 1/2/6 (on-chain, at endorsement)
@@ -71,11 +71,12 @@ fn malicious_bb_node_dropping_a_committed_ballot_is_detected() {
 
 #[test]
 fn malicious_bb_node_reordering_ballots_is_not_detected_and_leaves_the_tally_unchanged() {
-    // Ordering integrity is NOT claimed: no verifier checks ballot order (the
-    // `ledger::ledger_digest` hash chain exists but nothing runs it), and the
-    // chaincode has no ordering gate. What this test proves is why that is safe
-    // for correctness: the homomorphic tally is order-independent, so a pure
-    // reorder audits clean with the identical decoded tally.
+    // The stateless audit of one record does not check ballot order, and the
+    // chaincode has no ordering gate; order is checked only against the chain's
+    // read-back (`ledger.order` in `audit-stream`, see `crate::ledger`). What
+    // this test proves is why that is safe for correctness: the homomorphic
+    // tally is order-independent, so a pure reorder audits clean with the
+    // identical decoded tally.
     let tally_findings = |r: &crate::report::AuditReport| -> Vec<String> {
         r.findings
             .iter()

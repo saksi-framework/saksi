@@ -145,6 +145,10 @@ pub struct StreamAudit {
     /// absent (read as empty) from older documents.
     #[serde(default)]
     pub failed_checks: Vec<FailedCheck>,
+    /// The `ledger.order` check's verdict and detail (`"pass: ..."` or
+    /// `"fail: ..."`) when the folder held a ledger dump; absent otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ledger_order: Option<String>,
 }
 
 /// One failed audit check as `audit-stream --json` reports it.
@@ -774,6 +778,11 @@ pub fn overvote_ballot(dir: &std::path::Path, line: usize) -> Result<String, Str
     Ok(hex::encode(ballot.encode_to_vec()))
 }
 
+/// The run-folder subdirectory holding the chain's own read-back of a run
+/// (written by the campaign's ledger dump). When it holds ballots,
+/// [`audit_stream_dir`] adds the `ledger.order` check.
+pub const LEDGER_DIR: &str = "ledger";
+
 /// Audits a **stream run folder** (`header.json` + `ballots.ndjson`, the shape
 /// [`write_election_stream_params`] writes) and projects the result into
 /// [`StreamAudit`] — structured per-contest correctness the console's Verify
@@ -785,6 +794,9 @@ pub fn overvote_ballot(dir: &std::path::Path, line: usize) -> Result<String, Str
 /// contest `{ground_truth, decoded, E, pass}`. `decoded` is the published tally
 /// the audit verified equals the homomorphic decode; a divergence fails the
 /// audit, so `pass` (= overall clean AND `E == 0`) never reports a false green.
+///
+/// A folder that also holds a [`LEDGER_DIR`] dump gets the `ledger.order`
+/// check ([`crate::ledger::check_ledger_order`]).
 pub fn audit_stream_dir(dir: &std::path::Path) -> Result<StreamAudit, String> {
     audit_stream_dir_full(dir).map(|(sa, _)| sa)
 }
@@ -826,7 +838,7 @@ pub(crate) fn audit_stream_dir_full(
     let pool = audit_pool_from_env()?;
 
     let ground_truth = header.ground_truth.clone();
-    let (report, evidence, timings) = crate::audit_streaming(
+    let (mut report, evidence, timings) = crate::audit_streaming(
         crate::AuditInputs {
             parameters: &parameters,
             dkg_transcript: &dkg_transcript,
@@ -840,6 +852,20 @@ pub(crate) fn audit_stream_dir_full(
         ballots,
         pool.as_ref(),
     );
+    // An on-chain run folder also holds the chain's own read-back in
+    // `ledger/`; hold it to the chain's order and to this record.
+    let ledger_dir = dir.join(LEDGER_DIR);
+    let mut ledger_order = None;
+    if ledger_dir.join(crate::stream::BALLOTS_FILE).exists() {
+        let finding = crate::ledger::check_ledger_order(dir, &ledger_dir);
+        let fail = finding.status == AuditStatus::Fail;
+        if fail {
+            report.overall = AuditStatus::Fail;
+        }
+        let verdict = if fail { "fail" } else { "pass" };
+        ledger_order = Some(format!("{verdict}: {}", finding.detail));
+        report.findings.push(finding);
+    }
     let overall_pass = report.overall == AuditStatus::Pass;
 
     // Index the per-contest crypto evidence by contest id.
@@ -889,6 +915,7 @@ pub(crate) fn audit_stream_dir_full(
             contests,
             timings_ms: timings.into(),
             failed_checks: failed_checks(&report),
+            ledger_order,
         },
         report,
     ))
@@ -1086,6 +1113,61 @@ mod tests {
         assert!(
             sa.failed_checks.is_empty(),
             "clean run names no failed check: {sa:#?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn audit_stream_dir_checks_the_ledger_dump_order() {
+        let dir = std::env::temp_dir().join("saksi-audit-stream-ledger-order");
+        let _ = std::fs::remove_dir_all(&dir);
+        write_election_stream_params(&dir, &GenParams::simple(5, 2, 2, SelectionProfile::Uniform))
+            .expect("write stream");
+
+        // The chain's read-back: the same records, in ascending nullifier order.
+        let mut chain: Vec<(Vec<u8>, String)> = crate::stream::BallotLines::open(&dir)
+            .expect("open")
+            .map(|b| {
+                let b = b.expect("decodes");
+                let nul = b
+                    .credential_presentation
+                    .as_ref()
+                    .unwrap()
+                    .nullifier
+                    .as_ref()
+                    .unwrap();
+                (nul.value.clone(), hex::encode(b.encode_to_vec()))
+            })
+            .collect();
+        chain.sort();
+        let ledger = dir.join(LEDGER_DIR);
+        std::fs::create_dir_all(&ledger).expect("mkdir ledger");
+        let dump = |rows: &[(Vec<u8>, String)]| {
+            let body: String = rows.iter().map(|(_, l)| format!("{l}\n")).collect();
+            std::fs::write(ledger.join(crate::stream::BALLOTS_FILE), body).expect("write dump");
+        };
+
+        dump(&chain);
+        let sa = audit_stream_dir(&dir).expect("audits");
+        assert_eq!(sa.overall, "pass", "{sa:#?}");
+        assert!(
+            sa.ledger_order
+                .as_deref()
+                .is_some_and(|d| d.starts_with("pass")),
+            "{sa:#?}"
+        );
+
+        // A serving node swaps two records: the crypto audit still passes, the
+        // order check does not.
+        chain.swap(0, 1);
+        dump(&chain);
+        let sa = audit_stream_dir(&dir).expect("audits");
+        assert_eq!(sa.overall, "fail", "{sa:#?}");
+        let ids: Vec<&str> = sa.failed_checks.iter().map(|f| f.check.as_str()).collect();
+        assert_eq!(ids, vec!["ledger.order"], "{sa:#?}");
+        assert!(
+            sa.contests.iter().all(|c| c.e == 0),
+            "the tally is unchanged"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
