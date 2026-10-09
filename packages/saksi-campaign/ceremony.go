@@ -42,9 +42,15 @@ import (
 // (saksi-auditor/src/decryption.rs), and verifies the same signatures
 // (saksi-auditor/src/tally.rs, finding `tally.signatures`).
 //
-// Note also that the published tally is the generator's seeded result, not a
-// recomputation from the shares that happened to be submitted. The ceremony
-// gates publication; the auditor is what proves enough trustees contributed.
+// Note also where the published totals come from. The generator computes them
+// by threshold decryption: it Lagrange-combines the first t verified partial
+// decryptions per contest (the subset the auditor uses), decodes each total,
+// refuses to emit a tally that differs from the seeded ground truth, and only
+// then has the trustees sign it (saksi-auditor/src/fixtures.rs, build_tally).
+// This console publishes that pre-built tally; it does not recompute it from
+// the shares that happened to be submitted here, but any t valid shares decrypt
+// to the same totals. The ceremony gates publication; the auditor is what
+// proves enough trustees contributed.
 
 // CeremonyFile records ceremony progress inside the run folder. It is the
 // authority in offline mode; on-chain the ledger is the authority and this file

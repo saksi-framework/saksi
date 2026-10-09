@@ -33,7 +33,7 @@ import (
 // reads the run folder first and treats every chain read as best-effort, with
 // the same Partial/PartialReason honesty flag buildTrail uses.
 //
-// SCOPE. The published tally is the generator's seeded result, not a
+// SCOPE. The published tally is the generator's threshold decryption, not a
 // recomputation from whichever shares were submitted (see the header comment in
 // ceremony.go). Nothing here implies otherwise: Verified reports what the
 // independent auditor found, and the trustee counts report who contributed.
