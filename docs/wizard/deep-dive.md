@@ -247,9 +247,11 @@ audit time, counting distinct verified trustees per contest and Lagrange-
 interpolating only over the submitted subset. Threshold integrity is a
 **verification-time** guarantee, not an endorsement-time one.
 
-**Also honest:** the published tally is the generator's seeded result, not a
-recomputation from whichever shares were clicked. The ceremony gates
-*publication*; the auditor proves enough trustees contributed.
+**Also honest:** the published tally is the threshold decryption the generator
+performed (a verified `t`-subset of the trustees' shares, combined and decoded,
+checked against ground truth, then signed), not a live recomputation from
+whichever shares were clicked. Any `t` valid shares give the same totals. The
+ceremony gates *publication*; the auditor proves enough trustees contributed.
 
 ---
 

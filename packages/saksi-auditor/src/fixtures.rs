@@ -29,7 +29,7 @@ use saksi_credentials::{
 };
 use saksi_crypto::{
     dkg::{run_in_memory, Dealer, DkgConfig, TrusteeShare},
-    elgamal::{self, encrypt, Plaintext, PublicKey},
+    elgamal::{self, encrypt, Ciphertext, Plaintext, PublicKey},
     group::{basepoint, compress_point},
     nizk::{
         cds::CDSProof,
@@ -317,14 +317,43 @@ pub(crate) fn happy_path_fixture() -> ElectionFixture {
 
     // -- published tally -------------------------------------------------
 
+    // The published totals are what the trustees' shares decrypt to.
+    let aggregate: Vec<Ciphertext> = aggregate_pads
+        .iter()
+        .zip(&aggregate_data)
+        .map(|(&pad, &data)| Ciphertext { pad, data })
+        .collect();
+    let share_publics: Vec<RistrettoPoint> = (1..=trustee_count)
+        .map(|id| {
+            dkg_output
+                .trustee_shares
+                .iter()
+                .find(|s| s.trustee_id == id)
+                .expect("DKG produced share for every trustee")
+                .value
+                * basepoint()
+        })
+        .collect();
+    let decrypted = decrypt_totals(
+        &parameters,
+        &aggregate,
+        &partial_decryptions,
+        &share_publics,
+        ballots.len() as u64,
+    )
+    .expect("happy-path shares decrypt");
+    assert_eq!(
+        decrypted, plaintext_tallies,
+        "generator bug: decrypted tally differs from ground truth"
+    );
     let tally = TallyResult {
         version: WIRE_VERSION,
         election_id: parameters.election_id.clone(),
-        totals: plaintext_tallies.clone(),
+        totals: decrypted.clone(),
         partial_decryptions: partial_decryptions.clone(),
         signatures: sign_tally(
             &parameters.election_id,
-            &plaintext_tallies,
+            &decrypted,
             &trustee_ids,
             &dkg_output.trustee_shares,
             &mut rng,
@@ -718,15 +747,15 @@ pub(crate) struct GenPrologue {
 }
 
 /// One voter's contribution: their per-position ballot records (in position
-/// order), the selections behind them, this voter's per-contest ciphertext pads
+/// order), the selections behind them, this voter's per-contest ciphertexts
 /// for the running homomorphic aggregate, and the CPU spent producing them.
 pub(crate) struct VoterWork {
     pub(crate) ballots: Vec<Ballot>,
     pub(crate) selections: Vec<(usize, usize)>,
-    /// `pads[p * candidates + k]` — this voter's pad for that contest slot. Kept
-    /// as a decompressed point so the aggregate never re-decompresses the wire
+    /// `cts[p * candidates + k]` — this voter's ciphertext for that contest
+    /// slot. Kept decompressed so the aggregate never re-decompresses the wire
     /// bytes it just wrote.
-    pub(crate) pads: Vec<RistrettoPoint>,
+    pub(crate) cts: Vec<Ciphertext>,
     #[cfg_attr(not(feature = "demo"), allow(dead_code))]
     pub(crate) cpu: CpuTimes,
 }
@@ -840,14 +869,14 @@ fn build_voter_records(
     let candidates = params.candidates;
     let mut ballots = Vec::with_capacity(params.positions);
     let mut selections = Vec::with_capacity(params.positions);
-    let mut pads = vec![RistrettoPoint::identity(); params.positions * candidates];
+    let mut cts = empty_aggregate(params.positions * candidates);
 
     for p in 0..params.positions {
         // Deterministic 1-of-C selection under the chosen profile.
         let selected = pro.plan.select(voter_idx, p);
         selections.push((p, selected));
         let slots = p * candidates..(p + 1) * candidates;
-        let (ballot, record_pads) = build_record(
+        let (ballot, record_cts) = build_record(
             pro,
             credential,
             &ph_position_id(p),
@@ -856,14 +885,14 @@ fn build_voter_records(
             rng,
             &mut cpu,
         );
-        pads[slots].copy_from_slice(&record_pads);
+        cts[slots].copy_from_slice(&record_cts);
         ballots.push(ballot);
     }
 
     VoterWork {
         ballots,
         selections,
-        pads,
+        cts,
         cpu,
     }
 }
@@ -871,7 +900,7 @@ fn build_voter_records(
 /// One ballot record: `credential` presented for `position_id`, then one
 /// encrypted, CDS-proved bit per contest slot in `slots` (1 at `selected`, a
 /// global contest index), and the record's sum-to-one selection proof.
-/// Returns the record and its per-slot pads, in slot order.
+/// Returns the record and its per-slot ciphertexts, in slot order.
 fn build_record(
     pro: &GenPrologue,
     credential: &Credential,
@@ -880,7 +909,7 @@ fn build_record(
     selected: usize,
     rng: &mut OsRng,
     cpu: &mut CpuTimes,
-) -> (Ballot, Vec<RistrettoPoint>) {
+) -> (Ballot, Vec<Ciphertext>) {
     let choice_set = [Scalar::ZERO, Scalar::ONE];
     let election_id = pro.parameters.election_id.as_bytes();
 
@@ -903,7 +932,6 @@ fn build_record(
     let mut ciphertexts: Vec<WireCiphertext> = Vec::with_capacity(slots.len());
     let mut proofs = Vec::with_capacity(slots.len());
     let mut cts = Vec::with_capacity(slots.len());
-    let mut pads = Vec::with_capacity(slots.len());
     let mut r_sum = Scalar::ZERO;
     for global_c in slots {
         let choice: u8 = u8::from(global_c == selected);
@@ -921,7 +949,6 @@ fn build_record(
             pad: pad_bytes.to_vec(),
             data: data_bytes.to_vec(),
         });
-        pads.push(ct.pad);
 
         let context = cds_context_for_test(
             election_id,
@@ -964,7 +991,7 @@ fn build_record(
         position_id: position_id.to_string(),
         selection_proof: Some(selection.to_wire()),
     };
-    (ballot, pads)
+    (ballot, cts)
 }
 
 /// Test-only: [`multi_position_fixture`], except voter 0 also casts a
@@ -987,7 +1014,7 @@ pub(crate) fn second_vote_fixture(
 
     let mut ballots = Vec::new();
     let mut selections = Vec::new();
-    let mut aggregate_pads = vec![RistrettoPoint::identity(); contest_count];
+    let mut aggregate = empty_aggregate(contest_count);
     let mut extra = None;
     for voter_idx in 0..params.voters {
         let credential = issue_credential(&pro, &mut rng);
@@ -999,13 +1026,13 @@ pub(crate) fn second_vote_fixture(
             &mut rng,
             CpuTimes::default(),
         );
-        for (c, pad) in work.pads.iter().enumerate() {
-            aggregate_pads[c] += pad;
+        for (c, ct) in work.cts.iter().enumerate() {
+            aggregate[c] += *ct;
         }
         selections.extend(work.selections);
         ballots.extend(work.ballots);
         if voter_idx == 0 {
-            let (whole, pads) = build_record(
+            let (whole, whole_cts) = build_record(
                 &pro,
                 &credential,
                 "",
@@ -1014,8 +1041,8 @@ pub(crate) fn second_vote_fixture(
                 &mut rng,
                 &mut CpuTimes::default(),
             );
-            for (c, pad) in pads.iter().enumerate() {
-                aggregate_pads[c] += pad;
+            for (c, ct) in whole_cts.iter().enumerate() {
+                aggregate[c] += *ct;
             }
             extra = Some(ballots.len());
             ballots.push(whole);
@@ -1025,8 +1052,15 @@ pub(crate) fn second_vote_fixture(
     let voter_ids = (0..ballots.len()).map(|i| format!("voter-{i}")).collect();
     let mut ground_truth = tally_selections(&selections, contest_count, params.candidates);
     ground_truth[extra_contest] += 1;
-    let partial_decryptions = build_partial_decryptions(&pro, &aggregate_pads);
-    let tally = build_tally(&pro, ground_truth.clone(), partial_decryptions.clone());
+    let partial_decryptions = build_partial_decryptions(&pro, &aggregate);
+    let tally = build_tally(
+        &pro,
+        &aggregate,
+        partial_decryptions.clone(),
+        &ground_truth,
+        ballots.len() as u64,
+    )
+    .expect("generator bug: decrypted tally differs from ground truth");
     let fixture = ElectionFixture {
         parameters: pro.parameters,
         dkg_transcript: pro.dkg_transcript,
@@ -1045,11 +1079,11 @@ pub(crate) fn second_vote_fixture(
 /// Runs the trustee ceremony over a finished per-contest aggregate: one
 /// Chaum-Pedersen-proved [`PartialDecryption`] per (contest, trustee).
 ///
-/// Takes only the aggregate pads, never the ballots — so the chunked writer can
-/// call it after streaming every ballot to disk and dropping it.
+/// Takes only the per-contest aggregate, never the ballots — so the chunked
+/// writer can call it after streaming every ballot to disk and dropping it.
 pub(crate) fn build_partial_decryptions(
     pro: &GenPrologue,
-    aggregate_pads: &[RistrettoPoint],
+    aggregate: &[Ciphertext],
 ) -> Vec<PartialDecryption> {
     let mut rng = OsRng;
     let g = basepoint();
@@ -1057,7 +1091,7 @@ pub(crate) fn build_partial_decryptions(
     let mut out = Vec::with_capacity(pro.parameters.contest_ids.len() * trustee_ids.len());
 
     for (c, contest_id) in pro.parameters.contest_ids.iter().enumerate() {
-        let aggregate_pad = aggregate_pads[c];
+        let aggregate_pad = aggregate[c].pad;
         for (t, trustee_id_str) in trustee_ids.iter().enumerate() {
             let trustee_share: &TrusteeShare = pro
                 .trustee_shares
@@ -1124,13 +1158,41 @@ pub(crate) fn sign_tally(
         .collect()
 }
 
-/// Assembles the published [`TallyResult`] from the seeded totals + the
-/// ceremony, signed by every trustee.
+/// Assembles the published [`TallyResult`]: the totals are recovered from the
+/// trustees' partial decryptions of `aggregate` (see [`decrypt_totals`]), then
+/// signed by every trustee. Fails closed — returns an error instead of a tally —
+/// if a share does not verify, a total does not decode in `[0, max]`, or the
+/// decrypted totals differ from the seeded `ground_truth` (a generator bug), so
+/// a run never publishes a mismatched tally.
 pub(crate) fn build_tally(
     pro: &GenPrologue,
-    totals: Vec<u64>,
+    aggregate: &[Ciphertext],
     partial_decryptions: Vec<PartialDecryption>,
-) -> TallyResult {
+    ground_truth: &[u64],
+    max: u64,
+) -> Result<TallyResult, String> {
+    let trustee_share_publics: Vec<RistrettoPoint> = (1..=pro.parameters.trustee_ids.len())
+        .map(|id| {
+            pro.trustee_shares
+                .iter()
+                .find(|s| s.trustee_id == id)
+                .expect("DKG produced share for every trustee")
+                .value
+                * basepoint()
+        })
+        .collect();
+    let totals = decrypt_totals(
+        &pro.parameters,
+        aggregate,
+        &partial_decryptions,
+        &trustee_share_publics,
+        max,
+    )?;
+    if totals != ground_truth {
+        return Err(format!(
+            "decrypted totals {totals:?} differ from ground truth {ground_truth:?}"
+        ));
+    }
     let signatures = sign_tally(
         &pro.parameters.election_id,
         &totals,
@@ -1138,13 +1200,87 @@ pub(crate) fn build_tally(
         &pro.trustee_shares,
         &mut OsRng,
     );
-    TallyResult {
+    Ok(TallyResult {
         version: WIRE_VERSION,
         election_id: pro.parameters.election_id.clone(),
         totals,
         partial_decryptions,
         signatures,
+    })
+}
+
+/// An all-identity aggregate (the encryption of 0 under randomness 0), one
+/// ciphertext per contest, to fold ballots into.
+pub(crate) fn empty_aggregate(contest_count: usize) -> Vec<Ciphertext> {
+    let zero = Ciphertext {
+        pad: RistrettoPoint::identity(),
+        data: RistrettoPoint::identity(),
+    };
+    vec![zero; contest_count]
+}
+
+/// Recovers each contest's total from the trustees' partial decryptions, the
+/// way the auditor does: verify every share's Chaum-Pedersen proof
+/// ([`crate::decryption::verify_partial_decryptions`]), Lagrange-combine the
+/// first `threshold` verified shares at zero (the subset
+/// [`crate::tally::verify_tally`] uses), subtract from the aggregate's data
+/// component, and decode `T·G` to `T` in `[0, max]`
+/// ([`crate::tally::decode_tally`]). A failed proof, a missing threshold or an
+/// undecodable point is an error.
+pub(crate) fn decrypt_totals(
+    parameters: &ElectionParameters,
+    aggregate: &[Ciphertext],
+    partial_decryptions: &[PartialDecryption],
+    trustee_share_publics: &[RistrettoPoint],
+    max: u64,
+) -> Result<Vec<u64>, String> {
+    let pads: Vec<RistrettoPoint> = aggregate.iter().map(|ct| ct.pad).collect();
+    let data: Vec<RistrettoPoint> = aggregate.iter().map(|ct| ct.data).collect();
+    let mut builder = crate::report::ReportBuilder::new();
+    let decryption = crate::decryption::verify_partial_decryptions(
+        parameters,
+        &pads,
+        data,
+        partial_decryptions,
+        trustee_share_publics,
+        BINDING_CONTEXT,
+        &mut builder,
+    );
+    let report = builder.finish();
+    if !report.passed() || !decryption.threshold_satisfied {
+        let failures: Vec<String> = report
+            .findings
+            .iter()
+            .filter(|f| f.status == crate::report::AuditStatus::Fail)
+            .map(|f| format!("{}: {}", f.check, f.detail))
+            .collect();
+        return Err(format!(
+            "partial decryptions do not verify: {}",
+            failures.join("; ")
+        ));
     }
+
+    let threshold = parameters.threshold as usize;
+    let mut totals = Vec::with_capacity(parameters.contest_ids.len());
+    for (c, contest_id) in parameters.contest_ids.iter().enumerate() {
+        let subset = &decryption.verified_shares[c][..threshold];
+        let indices: Vec<usize> = subset.iter().map(|s| s.trustee_index).collect();
+        let mut shared_secret = RistrettoPoint::identity();
+        for share in subset {
+            let lambda =
+                crate::decryption::lagrange_coefficient_at_zero(share.trustee_index, &indices)
+                    .ok_or_else(|| {
+                        format!("contest {contest_id}: duplicate trustee in Lagrange subset")
+                    })?;
+            shared_secret += lambda * share.share_point;
+        }
+        let point = decryption.aggregate_data[c] - shared_secret;
+        let total = crate::tally::decode_tally(point, max).ok_or_else(|| {
+            format!("contest {contest_id}: decrypted point does not decode in [0, {max}]")
+        })?;
+        totals.push(total);
+    }
+    Ok(totals)
 }
 
 /// Synthetic voter id for ballot record `ballot_idx` when each voter casts
@@ -1162,12 +1298,12 @@ pub(crate) fn multi_position_fixture(params: &GenParams) -> ElectionFixture {
     // Recorded selections drive the INDEPENDENT ground-truth tally (see
     // `tally_selections`) — never accumulated inline with the ciphertexts.
     let mut selections: Vec<(usize, usize)> = Vec::with_capacity(params.voters * params.positions);
-    let mut aggregate_pads = vec![RistrettoPoint::identity(); contest_count];
+    let mut aggregate = empty_aggregate(contest_count);
 
     for voter_idx in 0..params.voters {
         let work = build_voter(&pro, params, voter_idx);
-        for (c, pad) in work.pads.iter().enumerate() {
-            aggregate_pads[c] += pad;
+        for (c, ct) in work.cts.iter().enumerate() {
+            aggregate[c] += *ct;
         }
         selections.extend(work.selections);
         ballots.extend(work.ballots);
@@ -1181,8 +1317,17 @@ pub(crate) fn multi_position_fixture(params: &GenParams) -> ElectionFixture {
 
     // -- independent ground truth (NOT accumulated in the crypto loop) ------
     let ground_truth = tally_selections(&selections, contest_count, params.candidates);
-    let partial_decryptions = build_partial_decryptions(&pro, &aggregate_pads);
-    let tally = build_tally(&pro, ground_truth.clone(), partial_decryptions.clone());
+    let partial_decryptions = build_partial_decryptions(&pro, &aggregate);
+    // The published totals are what the trustees' shares decrypt to; a
+    // mismatch with the independent ground truth is a generator bug, so stop.
+    let tally = build_tally(
+        &pro,
+        &aggregate,
+        partial_decryptions.clone(),
+        &ground_truth,
+        ballots.len() as u64,
+    )
+    .expect("generator bug: decrypted tally differs from ground truth");
 
     ElectionFixture {
         parameters: pro.parameters,
@@ -1784,5 +1929,151 @@ mod tally_signature_vector {
                 .is_ok(),
             "the negative vector is a real signature over the other totals"
         );
+    }
+}
+
+#[cfg(test)]
+mod decrypted_tally_tests {
+    use super::*;
+
+    /// One small election through the generator's own steps, stopping just
+    /// before the tally so a test can tamper with what goes into it.
+    fn small_election() -> (
+        GenPrologue,
+        Vec<Ciphertext>,
+        Vec<PartialDecryption>,
+        Vec<u64>,
+        u64,
+    ) {
+        let params = GenParams::simple(7, 3, 3, SelectionProfile::Uniform);
+        let pro = gen_prologue(&params);
+        let contest_count = params.positions * params.candidates;
+        let mut aggregate = empty_aggregate(contest_count);
+        let mut selections = Vec::new();
+        for voter_idx in 0..params.voters {
+            let work = build_voter(&pro, &params, voter_idx);
+            for (c, ct) in work.cts.iter().enumerate() {
+                aggregate[c] += *ct;
+            }
+            selections.extend(work.selections);
+        }
+        let truth = tally_selections(&selections, contest_count, params.candidates);
+        let partials = build_partial_decryptions(&pro, &aggregate);
+        let max = (params.voters * params.positions) as u64;
+        (pro, aggregate, partials, truth, max)
+    }
+
+    fn share_publics(pro: &GenPrologue) -> Vec<RistrettoPoint> {
+        (1..=pro.parameters.trustee_ids.len())
+            .map(|id| {
+                pro.trustee_shares
+                    .iter()
+                    .find(|s| s.trustee_id == id)
+                    .unwrap()
+                    .value
+                    * basepoint()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn published_totals_are_the_decrypted_totals_and_equal_ground_truth() {
+        let (pro, aggregate, partials, truth, max) = small_election();
+        let decrypted = decrypt_totals(
+            &pro.parameters,
+            &aggregate,
+            &partials,
+            &share_publics(&pro),
+            max,
+        )
+        .expect("honest shares decrypt");
+        let tally = build_tally(&pro, &aggregate, partials, &truth, max).expect("tally builds");
+        assert_eq!(tally.totals, decrypted);
+        assert_eq!(tally.totals, truth);
+        // The signatures cover exactly the published (decrypted) totals.
+        let context = crate::tally::tally_sig_context(&tally.election_id, &tally.totals);
+        let g = basepoint();
+        for (sig, public) in tally.signatures.iter().zip(share_publics(&pro)) {
+            let bytes: [u8; 64] = sig.signature.as_slice().try_into().unwrap();
+            SchnorrProof::from_bytes(&bytes)
+                .unwrap()
+                .verify(&g, &public, &context)
+                .expect("trustee signed the decrypted totals");
+        }
+    }
+
+    #[test]
+    fn a_tampered_partial_decryption_fails_generation() {
+        let (pro, aggregate, mut partials, truth, max) = small_election();
+        // Trustee 1's share for contest 0 replaced by trustee 2's: a real point
+        // with a proof that no longer matches it.
+        partials[0].share = partials[1].share.clone();
+        let err = build_tally(&pro, &aggregate, partials, &truth, max)
+            .expect_err("a tampered share must not produce a tally");
+        assert!(err.contains("partial decryptions do not verify"), "{err}");
+    }
+
+    #[test]
+    fn decrypted_totals_that_differ_from_ground_truth_fail_generation() {
+        let (pro, aggregate, partials, mut truth, max) = small_election();
+        truth[0] += 1;
+        let err = build_tally(&pro, &aggregate, partials, &truth, max)
+            .expect_err("a mismatch with ground truth must not produce a tally");
+        assert!(err.contains("differ from ground truth"), "{err}");
+    }
+}
+
+#[cfg(test)]
+mod decrypted_tally_timing {
+    use super::*;
+
+    /// Times what this change adds to generation: verifying, combining and
+    /// decoding the partial decryptions inside `build_tally`. The aggregate is
+    /// encrypted directly (an aggregate of `count` one-bits is `Enc(count)`), so
+    /// large electorates cost nothing to set up. Run with
+    /// `cargo test --release -p saksi-auditor --lib decrypted_tally_timing -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn time_decrypted_tally() {
+        for &voters in &[1_000usize, 10_000, 100_000, 1_000_000] {
+            let params = GenParams::simple(voters, 3, 4, SelectionProfile::Uniform);
+            let pro = gen_prologue(&params);
+            let mut truth = Vec::new();
+            let mut aggregate = Vec::new();
+            for _p in 0..params.positions {
+                // Most votes on the first candidate: the worst case for decode.
+                let counts = [voters - 3, 1, 1, 1];
+                for &n in &counts {
+                    truth.push(n as u64);
+                    let r = Scalar::random(&mut OsRng);
+                    aggregate.push(encrypt(
+                        &pro.election_public_key,
+                        Plaintext::from_small_integer(n as u64),
+                        r,
+                    ));
+                }
+            }
+            let partials = build_partial_decryptions(&pro, &aggregate);
+            let max = (voters * params.positions) as u64;
+            let started = Instant::now();
+            build_tally(&pro, &aggregate, partials, &truth, max).expect("decrypts");
+            let with = started.elapsed();
+            let started = Instant::now();
+            sign_tally(
+                &pro.parameters.election_id,
+                &truth,
+                &pro.parameters.trustee_ids,
+                &pro.trustee_shares,
+                &mut OsRng,
+            );
+            let sign_only = started.elapsed();
+            println!(
+                "voters={voters} positions=3 candidates=4 trustees={}: build_tally {:.3}s, sign-only {:.3}s, added {:.3}s",
+                params.trustees,
+                with.as_secs_f64(),
+                sign_only.as_secs_f64(),
+                (with - sign_only).as_secs_f64()
+            );
+        }
     }
 }

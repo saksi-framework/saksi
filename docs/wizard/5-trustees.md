@@ -78,8 +78,13 @@ chaincode with the signature gate an **endorsement-time** one as well.
 
 ## One more honest scope note
 
-The published tally is the generator's **seeded** result. It is not recomputed
-from whichever shares happened to be submitted.
+The published totals are the **decrypted** result: at generation time the
+generator Lagrange-combines a threshold set of the trustees' partial
+decryptions (the first `t` whose Chaum-Pedersen proofs verify, the same subset
+the auditor uses), decodes each contest, checks the result against the seeded
+ground truth (a mismatch fails the run), and only then has the trustees sign
+those totals. They are not recomputed live from whichever shares happened to be
+clicked in the console; any `t` valid shares decrypt to the same numbers.
 
 The ceremony gates *publication*; the auditor is what proves enough trustees
 actually contributed. The UI is written not to imply the displayed numbers were

@@ -32,7 +32,6 @@ use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use curve25519_dalek::{ristretto::RistrettoPoint, traits::Identity};
 use prost::Message;
 use rayon::prelude::*;
 
@@ -40,8 +39,8 @@ use saksi_crypto::group::compress_point;
 use saksi_protocol::Ballot;
 
 use crate::fixtures::{
-    build_partial_decryptions, build_tally, build_voter, gen_prologue, tally_selections,
-    voter_id_for_ballot, CpuTimes, ElectionFixture, GenParams, VoterWork,
+    build_partial_decryptions, build_tally, build_voter, empty_aggregate, gen_prologue,
+    tally_selections, voter_id_for_ballot, CpuTimes, ElectionFixture, GenParams, VoterWork,
 };
 
 /// Filename of the small metadata document.
@@ -301,7 +300,7 @@ pub(crate) fn write_election_stream_chunked(
     fs::create_dir_all(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
     let pro = gen_prologue(params);
 
-    let mut aggregate_pads = vec![RistrettoPoint::identity(); contest_count];
+    let mut aggregate = empty_aggregate(contest_count);
     let mut counts = vec![0u64; contest_count];
     let mut cpu = CpuTimes::default();
     let mut lines = 0usize;
@@ -334,8 +333,8 @@ pub(crate) fn write_election_stream_chunked(
                         .map_err(|e| format!("write ballot line: {e}"))?;
                     lines += 1;
                 }
-                for (c, pad) in voter.pads.iter().enumerate() {
-                    aggregate_pads[c] += pad;
+                for (c, ct) in voter.cts.iter().enumerate() {
+                    aggregate[c] += *ct;
                 }
                 selections.extend(voter.selections.iter().copied());
                 cpu.add(&voter.cpu);
@@ -364,8 +363,16 @@ pub(crate) fn write_election_stream_chunked(
 
     // -- trustee ceremony over the running aggregate ------------------------
 
-    let partial_decryptions = build_partial_decryptions(&pro, &aggregate_pads);
-    let tally = build_tally(&pro, counts.clone(), partial_decryptions.clone());
+    let partial_decryptions = build_partial_decryptions(&pro, &aggregate);
+    // The published totals are what the trustees' shares decrypt to; a
+    // mismatch with the seeded counts fails the run instead of publishing.
+    let tally = build_tally(
+        &pro,
+        &aggregate,
+        partial_decryptions.clone(),
+        &counts,
+        lines as u64,
+    )?;
 
     let header = StreamHeader {
         election_id: pro.parameters.election_id.clone(),
