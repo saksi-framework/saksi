@@ -543,7 +543,14 @@ pub fn precinct_ranges(
         return Err("--precincts must be >= 1".to_string());
     }
     let size = precinct_size.unwrap_or(voters / precincts);
-    if size < 1 || size * (precincts - 1) >= voters {
+    // Checked: a huge --precinct-size must be refused, not wrap into a wrong
+    // partition. Once `size * (precincts - 1) < voters` holds, every product
+    // below is at most that and cannot overflow.
+    let fits = size >= 1
+        && size
+            .checked_mul(precincts - 1)
+            .is_some_and(|before_last| before_last < voters);
+    if !fits {
         return Err(format!(
             "{voters} voters cannot fill {precincts} precincts of {size} (every precinct needs at least one voter)"
         ));
@@ -1186,6 +1193,23 @@ mod tests {
             "last precinct empty"
         );
         assert!(precinct_ranges(10, 0, None).is_err());
+        assert!(
+            precinct_ranges(10, 3, Some(usize::MAX)).is_err(),
+            "an overflowing size is refused, not wrapped"
+        );
+    }
+
+    /// Voter indices (0-based) of the rows in a ground-truth ballots CSV.
+    fn csv_voter_indices(dir: &Path) -> Vec<usize> {
+        fs::read_to_string(dir.join(crate::ground_truth::GROUND_TRUTH_BALLOTS_CSV))
+            .expect("ballots csv")
+            .lines()
+            .skip(1)
+            .map(|line| {
+                let id = line.split(',').next().expect("voter id");
+                id.trim_start_matches("V-").parse::<usize>().expect("index") - 1
+            })
+            .collect()
     }
 
     /// 20 voters x 2 positions x 2 precincts: every precinct folder is an
@@ -1196,10 +1220,28 @@ mod tests {
     /// authority key is the only secret on disk.
     #[test]
     fn precinct_generation_partitions_one_election_into_auditable_folders() {
-        let dir = scratch("precincts");
-        let mut params = GenParams::simple(20, 2, 3, SelectionProfile::Realistic);
+        check_precinct_generation("precincts", 20, 2, None, &[0..10, 10..20]);
+    }
+
+    /// 23 voters x 3 precincts: the last precinct takes the remainder through
+    /// the writer, not only in `precinct_ranges`.
+    #[test]
+    fn precinct_generation_gives_the_last_precinct_the_remainder() {
+        check_precinct_generation("precincts-rem", 23, 3, None, &[0..7, 7..14, 14..23]);
+    }
+
+    fn check_precinct_generation(
+        name: &str,
+        voters: usize,
+        precincts: usize,
+        size: Option<usize>,
+        expected: &[std::ops::Range<usize>],
+    ) {
+        let positions = 2;
+        let dir = scratch(name);
+        let mut params = GenParams::simple(voters, positions, 3, SelectionProfile::Realistic);
         params.election_id = "pm-test".into();
-        write_precinct_streams(&dir, &params, 2, None, 4).expect("precinct generation");
+        write_precinct_streams(&dir, &params, precincts, size, 4).expect("precinct generation");
 
         let ndir = dir.join(NATIONAL_DIR);
         let national_header = read_header(&ndir).expect("national header");
@@ -1211,16 +1253,17 @@ mod tests {
         );
 
         let mut product: Option<Vec<Ciphertext>> = None;
-        let mut gt_sum = vec![0u64; 6];
+        let mut gt_sum = vec![0u64; positions * 3];
         let mut csv_sum: Vec<(String, u64)> = Vec::new();
-        for k in 0..2 {
+        assert!(!dir.join(precinct_dir_name(precincts)).exists());
+        for (k, range) in expected.iter().enumerate() {
             let pdir = dir.join(precinct_dir_name(k));
             let header = read_header(&pdir).expect("precinct header");
 
             // (c) an ordinary run folder that audits clean.
             assert_eq!(header.election_id, format!("pm-test-{}", precinct_id(k)));
-            assert_eq!(header.n, 10 * 2);
-            assert_eq!(verify_stream(&pdir).expect("gate"), 20);
+            assert_eq!(header.n, range.len() * positions, "precinct {k} size");
+            assert_eq!(verify_stream(&pdir).expect("gate"), range.len() * positions);
             let sa = crate::demo::audit_stream_dir(&pdir).expect("audits");
             assert_eq!(sa.overall, "pass", "precinct {k}: {sa:#?}");
             assert!(sa.contests.iter().all(|c| c.e == 0 && c.pass));
@@ -1236,8 +1279,18 @@ mod tests {
             assert_eq!(dkg.trustee_commitments, ndkg.trustee_commitments);
             assert_eq!(dkg.election_id, header.election_id);
 
-            // Voter ids stay global: precinct 1 starts at voter 10.
-            assert_eq!(header.voter_ids[0], format!("voter-{}", 10 * k));
+            // Voter ids stay global: each precinct starts at its range start.
+            assert_eq!(header.voter_ids[0], format!("voter-{}", range.start));
+
+            // The CSVs describe exactly this precinct's voters, and their
+            // totals are this precinct's header ground truth (contest order).
+            assert_eq!(
+                csv_voter_indices(&pdir),
+                range.clone().collect::<Vec<_>>(),
+                "precinct {k} CSV rows"
+            );
+            let csv_counts: Vec<u64> = summary_counts(&pdir).iter().map(|(_, n)| *n).collect();
+            assert_eq!(csv_counts, header.ground_truth, "precinct {k} CSV totals");
 
             let agg = aggregate_points(&read_aggregate(&pdir));
             product = Some(match product {
@@ -1283,7 +1336,7 @@ mod tests {
         // (b) precinct ground truths add up to the national ground truth.
         assert_eq!(gt_sum, national_header.ground_truth);
         assert_eq!(csv_sum, summary_counts(&ndir));
-        assert_eq!(gt_sum.iter().sum::<u64>(), 20 * 2);
+        assert_eq!(gt_sum.iter().sum::<u64>(), (voters * positions) as u64);
 
         // National partials + tally verify against the national aggregate (the
         // non-ballot half of audit-stream: DKG, partial-decryption proofs,
@@ -1306,7 +1359,7 @@ mod tests {
             &national_agg,
             &partials,
             &dkg_v.trustee_share_publics,
-            40,
+            (voters * positions) as u64,
         )
         .expect("national partials verify and decode");
         assert_eq!(totals, tally.totals);
@@ -1324,7 +1377,7 @@ mod tests {
         let registry: Vec<RegistryEntry> =
             serde_json::from_str(&fs::read_to_string(ndir.join(REGISTRY_FILE)).expect("registry"))
                 .expect("registry parses");
-        assert_eq!(registry.len(), 2);
+        assert_eq!(registry.len(), precincts);
         for (k, entry) in registry.iter().enumerate() {
             assert_eq!(entry.precinct_id, precinct_id(k));
             let public = point(&entry.authority_pubkey_hex);
@@ -1341,6 +1394,14 @@ mod tests {
             assert_eq!(secret * basepoint(), public);
         }
         assert_ne!(registry[0], registry[1]);
+        assert_eq!(
+            expected.last().map(|r| r.len()),
+            precinct_ranges(voters, precincts, size)
+                .unwrap()
+                .last()
+                .map(|r| r.len()),
+            "last precinct takes the remainder"
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }
