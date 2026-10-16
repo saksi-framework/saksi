@@ -743,8 +743,13 @@ pub struct BallotLines {
 impl BallotLines {
     /// Opens `<dir>/ballots.ndjson` for streaming.
     pub fn open(dir: &Path) -> Result<Self, String> {
-        let path = dir.join(BALLOTS_FILE);
-        let file = fs::File::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;
+        Self::open_file(&dir.join(BALLOTS_FILE))
+    }
+
+    /// Opens one ndjson ballot file by path (a ledger read-back such as
+    /// `<run>/ledger/ballots.ndjson`, or a copy of one under another name).
+    pub fn open_file(path: &Path) -> Result<Self, String> {
+        let file = fs::File::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
         Ok(Self {
             reader: BufReader::new(file),
             line_no: 0,

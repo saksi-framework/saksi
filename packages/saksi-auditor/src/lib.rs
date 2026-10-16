@@ -69,6 +69,9 @@ pub mod ground_truth;
 #[cfg(feature = "demo")]
 pub mod stream;
 
+#[cfg(feature = "demo")]
+pub mod precinct_return;
+
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 

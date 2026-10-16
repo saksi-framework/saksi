@@ -37,6 +37,8 @@
 use std::path::Path;
 use std::process::ExitCode;
 
+mod precinct;
+
 use saksi_auditor::demo::{
     audit_bundle_json, audit_stream_dir, election_bundle_json, election_bundle_json_params,
     forge_self_issued_ballot, overvote_ballot, write_election_stream_params,
@@ -56,6 +58,9 @@ fn main() -> ExitCode {
         Some("audit-stream") => cmd_audit_stream(&args[2..]),
         Some("forge-ballot") => cmd_forge_ballot(&args[2..]),
         Some("overvote-ballot") => cmd_overvote_ballot(&args[2..]),
+        Some("ledger-digest") => precinct::cmd_ledger_digest(&args[2..]),
+        Some("sign-return") => precinct::cmd_sign_return(&args[2..]),
+        Some("verify-return") => precinct::cmd_verify_return(&args[2..]),
         _ => {
             eprintln!(
                 "usage: saksi-demo <gen [--voters N] [--positions P] [--candidates C] \
