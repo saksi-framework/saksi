@@ -52,7 +52,7 @@ fn audit_canvass_cli_fails_closed_without_returns() {
         .find(|c| c["check"] == "canvass.completeness")
         .unwrap();
     assert_eq!(completeness["verdict"], "fail");
-    assert_eq!(completeness["reason"], "no return from p01, p02");
+    assert_eq!(completeness["reason"], "no accepted return from p01, p02");
     assert!(dir.join("canvass.json").exists() && dir.join("canvass-checks.csv").exists());
     let _ = std::fs::remove_dir_all(&dir);
 }

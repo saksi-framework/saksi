@@ -22,14 +22,15 @@
 //!
 //! - `canvass.registry`: every received return names a registered precinct,
 //!   carries the election id `<base>-<precinct_id>`, and no precinct has two.
-//! - `canvass.completeness`: every registered precinct has a return.
+//! - `canvass.completeness`: every registered precinct has an accepted return
+//!   (received, election id `<base>-<precinct_id>`, signature verifies).
 //! - `canvass.signature`: every return verifies under its precinct's
 //!   registered authority key.
 //! - `canvass.precinct_recompute`: every return's record count, ledger digest
 //!   and per-contest `(Σc1, Σc2)` equal the values recomputed from that
 //!   precinct's ledger read-back, and its close block and tip hash equal
 //!   `close.json`.
-//! - `canvass.national_sum`: the product of the returned aggregates equals the
+//! - `canvass.national_sum`: the product of the accepted aggregates equals the
 //!   national aggregate the national tally was decrypted from.
 //! - `canvass.accuracy`: every precinct passes the stream audit (ledger checks
 //!   on) with `E = 0`, and the national partial decryptions verify against the
@@ -294,6 +295,7 @@ pub fn canvass(dir: &Path) -> Result<Canvass, String> {
     // The first return (file-name order) naming a registered precinct is the
     // one counted for it; any further one is a duplicate.
     let mut received: Vec<Option<(String, PrecinctReturn)>> = vec![None; registry.len()];
+    let mut id_ok = vec![false; registry.len()];
     let mut registry_problems = Vec::new();
     for path in &files {
         let name = path
@@ -326,7 +328,10 @@ pub fn canvass(dir: &Path) -> Result<Canvass, String> {
                 "{name}: second return for {} (first: {first})",
                 ret.precinct_id
             )),
-            None => received[k] = Some((name, ret)),
+            None => {
+                id_ok[k] = ret.election_id == want;
+                received[k] = Some((name, ret));
+            }
         }
     }
     let mut checks = vec![CanvassCheck::new(
@@ -337,24 +342,6 @@ pub fn canvass(dir: &Path) -> Result<Canvass, String> {
             files.len()
         ),
     )];
-
-    // -- completeness -------------------------------------------------------
-    let missing: Vec<&str> = registry
-        .iter()
-        .zip(&received)
-        .filter(|(_, r)| r.is_none())
-        .map(|(e, _)| e.precinct_id.as_str())
-        .collect();
-    let problems = if missing.is_empty() {
-        vec![]
-    } else {
-        vec![format!("no return from {}", missing.join(", "))]
-    };
-    checks.push(CanvassCheck::new(
-        CHECKS[1],
-        &problems,
-        format!("all {} registered precincts returned", registry.len()),
-    ));
 
     // -- signature ----------------------------------------------------------
     let mut sig_ok: Vec<Option<bool>> = vec![None; registry.len()];
@@ -368,11 +355,43 @@ pub fn canvass(dir: &Path) -> Result<Canvass, String> {
             problems.push(format!("{name} ({}): {e}", ret.precinct_id));
         }
     }
-    checks.push(CanvassCheck::new(
+    let signature_check = CanvassCheck::new(
         CHECKS[2],
         &problems,
         "every return verifies under its registered authority key",
+    );
+    // Accepted: received for a registered precinct, election id
+    // `<base>-<pid>`, signature verifies under the registered key.
+    let accepted: Vec<bool> = (0..registry.len())
+        .map(|k| received[k].is_some() && id_ok[k] && sig_ok[k] == Some(true))
+        .collect();
+
+    // -- completeness -------------------------------------------------------
+    let missing: Vec<String> = (0..registry.len())
+        .filter(|&k| !accepted[k])
+        .map(|k| match &received[k] {
+            Some((file, _)) => format!(
+                "{} (received but rejected: {file})",
+                registry[k].precinct_id
+            ),
+            None => registry[k].precinct_id.clone(),
+        })
+        .collect();
+    let problems = if missing.is_empty() {
+        vec![]
+    } else {
+        vec![format!("no accepted return from {}", missing.join(", "))]
+    };
+    checks.push(CanvassCheck::new(
+        CHECKS[1],
+        &problems,
+        format!(
+            "all {} registered precincts have an accepted return",
+            registry.len()
+        ),
     ));
+
+    checks.push(signature_check);
 
     // -- precinct recompute -------------------------------------------------
     let mut rec_ok: Vec<Option<bool>> = vec![None; registry.len()];
@@ -439,7 +458,11 @@ pub fn canvass(dir: &Path) -> Result<Canvass, String> {
         let n = contest_ids.len();
         let mut c1 = vec![RistrettoPoint::identity(); n];
         let mut c2 = vec![RistrettoPoint::identity(); n];
-        for (_, ret) in received.iter().flatten() {
+        for (_, ret) in received
+            .iter()
+            .zip(&accepted)
+            .filter_map(|(r, &a)| r.as_ref().filter(|_| a))
+        {
             if ret.contests.len() != n {
                 return Err(format!(
                     "{}: {} contests, want {n}",
@@ -481,8 +504,8 @@ pub fn canvass(dir: &Path) -> Result<Canvass, String> {
         CHECKS[4],
         &problems,
         format!(
-            "product of {} returned aggregates equals the national aggregate",
-            received.iter().flatten().count()
+            "product of {} accepted aggregates equals the national aggregate",
+            accepted.iter().filter(|&&a| a).count()
         ),
     ));
 
@@ -882,7 +905,7 @@ mod tests {
     fn fixture() -> &'static PathBuf {
         static DIR: OnceLock<PathBuf> = OnceLock::new();
         DIR.get_or_init(|| {
-            let dir = std::env::temp_dir().join(format!("saksi-canvass-{}", std::process::id()));
+            let dir = std::env::temp_dir().join("saksi-canvass-fixture");
             let _ = std::fs::remove_dir_all(&dir);
             let mut params = GenParams::simple(30, 2, 3, SelectionProfile::Realistic);
             params.election_id = BASE.into();
@@ -984,6 +1007,7 @@ mod tests {
         let r = expect_failed(
             &dir,
             &[
+                "canvass.completeness",
                 "canvass.signature",
                 "canvass.precinct_recompute",
                 "canvass.national_sum",
@@ -1023,6 +1047,7 @@ mod tests {
         expect_failed(
             &dir,
             &[
+                "canvass.completeness",
                 "canvass.signature",
                 "canvass.precinct_recompute",
                 "canvass.national_sum",
@@ -1035,7 +1060,10 @@ mod tests {
         let dir = fresh("t13");
         std::fs::remove_file(dir.join(NATIONAL_DIR).join(RETURNS_DIR).join("p02.json")).unwrap();
         let r = expect_failed(&dir, &["canvass.completeness", "canvass.national_sum"]);
-        assert_eq!(reason(&r, "canvass.completeness"), "no return from p02");
+        assert_eq!(
+            reason(&r, "canvass.completeness"),
+            "no accepted return from p02"
+        );
         assert_eq!(r.precincts[1].signature_ok, None);
     }
 
@@ -1046,8 +1074,16 @@ mod tests {
         ret.election_id = "other-p02".into();
         ret.sign(&key(&dir, "p02"), &mut OsRng);
         put_return(&dir, "p02.json", &ret);
-        let r = expect_failed(&dir, &["canvass.registry"]);
+        let r = expect_failed(
+            &dir,
+            &[
+                "canvass.registry",
+                "canvass.completeness",
+                "canvass.national_sum",
+            ],
+        );
         assert!(reason(&r, "canvass.registry").contains("election id"));
+        assert!(reason(&r, "canvass.completeness").contains("no accepted return from p02"));
     }
 
     #[test]
@@ -1100,7 +1136,18 @@ mod tests {
         let mut ret = get_return(&dir, "p02");
         ret.sign(&key(&dir, "p01"), &mut OsRng);
         put_return(&dir, "p02.json", &ret);
-        expect_failed(&dir, &["canvass.signature"]);
+        let r = expect_failed(
+            &dir,
+            &[
+                "canvass.completeness",
+                "canvass.signature",
+                "canvass.national_sum",
+            ],
+        );
+        assert_eq!(
+            reason(&r, "canvass.completeness"),
+            "no accepted return from p02 (received but rejected: p02.json)"
+        );
     }
 
     #[test]
@@ -1143,5 +1190,40 @@ mod tests {
         );
         // Recorded but not summed under p02's election.
         assert_eq!((r.precincts[1].records, r.precincts[1].verified), (21, 20));
+    }
+
+    #[test]
+    fn t20_tally_replayed_across_precincts() {
+        // p01's trustee-signed tally published as p02's.
+        let dir = fresh("t20");
+        let h1 = read_header(&precinct_dir(&dir, "p01")).unwrap();
+        let p2 = precinct_dir(&dir, "p02");
+        let mut h2 = read_header(&p2).unwrap();
+        h2.tally = h1.tally;
+        std::fs::write(
+            p2.join(crate::stream::HEADER_FILE),
+            serde_json::to_string(&h2).unwrap(),
+        )
+        .unwrap();
+        let r = expect_failed(&dir, &["canvass.accuracy"]);
+        assert!(reason(&r, "canvass.accuracy").starts_with("p02: audit fail"));
+    }
+
+    #[test]
+    fn t24_national_partial_altered() {
+        let dir = fresh("t24c");
+        let nd = dir.join(NATIONAL_DIR);
+        let mut h = read_header(&nd).unwrap();
+        let mut raw = hex::decode(&h.partial_decryptions[0]).unwrap();
+        let last = raw.len() - 1;
+        raw[last] ^= 0x01;
+        h.partial_decryptions[0] = hex::encode(raw);
+        std::fs::write(
+            nd.join(crate::stream::HEADER_FILE),
+            serde_json::to_string(&h).unwrap(),
+        )
+        .unwrap();
+        let r = expect_failed(&dir, &["canvass.accuracy"]);
+        assert!(reason(&r, "canvass.accuracy").contains("national:"));
     }
 }
