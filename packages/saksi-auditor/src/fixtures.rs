@@ -1252,6 +1252,26 @@ pub(crate) fn decrypt_totals(
     trustee_share_publics: &[RistrettoPoint],
     max: u64,
 ) -> Result<Vec<u64>, String> {
+    decrypt_totals_bound(
+        parameters,
+        aggregate,
+        partial_decryptions,
+        trustee_share_publics,
+        BINDING_CONTEXT,
+        max,
+    )
+}
+
+/// [`decrypt_totals`] under an explicit binding context (a verifier reads it
+/// from the published header instead of assuming the generator's).
+pub(crate) fn decrypt_totals_bound(
+    parameters: &ElectionParameters,
+    aggregate: &[Ciphertext],
+    partial_decryptions: &[PartialDecryption],
+    trustee_share_publics: &[RistrettoPoint],
+    binding_context: &[u8],
+    max: u64,
+) -> Result<Vec<u64>, String> {
     let pads: Vec<RistrettoPoint> = aggregate.iter().map(|ct| ct.pad).collect();
     let data: Vec<RistrettoPoint> = aggregate.iter().map(|ct| ct.data).collect();
     let mut builder = crate::report::ReportBuilder::new();
@@ -1261,7 +1281,7 @@ pub(crate) fn decrypt_totals(
         data,
         partial_decryptions,
         trustee_share_publics,
-        BINDING_CONTEXT,
+        binding_context,
         &mut builder,
     );
     let report = builder.finish();

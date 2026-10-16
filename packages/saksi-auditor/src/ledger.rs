@@ -39,7 +39,7 @@ fn ballot_leaf(ballot: &Ballot) -> [u8; 32] {
     domain_hash(b"saksi.auditor.ledger.leaf.v2", &parts)
 }
 
-fn nullifier_of(ballot: &Ballot) -> &[u8] {
+pub(crate) fn nullifier_of(ballot: &Ballot) -> &[u8] {
     ballot
         .credential_presentation
         .as_ref()

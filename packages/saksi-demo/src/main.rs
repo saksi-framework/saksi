@@ -62,6 +62,7 @@ fn main() -> ExitCode {
         Some("sign-return") => precinct::cmd_sign_return(&args[2..]),
         Some("verify-return") => precinct::cmd_verify_return(&args[2..]),
         Some("precinct-aggregate") => saksi_auditor::precinct_aggregate::cli(&args[2..]),
+        Some("audit-canvass") => saksi_auditor::canvass::cli(&args[2..]),
         _ => {
             eprintln!(
                 "usage: saksi-demo <gen [--voters N] [--positions P] [--candidates C] \
@@ -71,7 +72,7 @@ fn main() -> ExitCode {
                  | gen-ground-truth [--voters N] [--positions P] [--candidates C] \
                  [--distribution uniform|skewed|realistic] [--election-id S] --out-dir DIR \
                  | audit <bundle.json> | audit-stream <dir> [--json] \
-                 | forge-ballot <dir> --position P --candidate K | overvote-ballot <dir> <line>>"
+                 | forge-ballot <dir> --position P --candidate K | overvote-ballot <dir> <line> \n                 | audit-canvass <dir> [--json] [--out DIR]>"
             );
             ExitCode::FAILURE
         }
