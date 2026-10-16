@@ -7,7 +7,22 @@
 //
 //	saksi-canvass-demo --dir <gen dir> --demo <saksi-demo> --out <run folder> \
 //	    --fabric-tls-cert … --fabric-cert … --fabric-key … \
-//	    [--attack <id> --attack-script <cmd> --attack-pre-close-script <cmd>]
+//	    [--attack <id> --attack-script <cmd> --attack-pre-close-script <cmd>
+//	     --attack-pre-tally-script <cmd> [--attack-pre-tally-tolerate]]
+//	    [--distribution <name>]
+//
+// Flags beyond the Fabric ones:
+//
+//	--attack-pre-tally-script   command run in every precinct after the partial
+//	                            decryptions and before PublishTally
+//	                            (<precinct dir> <election id>); needs --attack.
+//	--attack-pre-tally-tolerate with the script: a refusal of the precinct's own
+//	                            PublishTally (the replayed tally committed
+//	                            first, T20) is recorded as the precinct's tally
+//	                            outcome instead of failing the run.
+//	--distribution              the generator's --distribution; fills the
+//	                            precinct perf.csv distribution column and is
+//	                            recorded in canvass-run.json.
 //
 // It is a standalone driver: the console (/wizard) and its Executor runs are
 // untouched. The network is NOT reset between precincts; reset it once before

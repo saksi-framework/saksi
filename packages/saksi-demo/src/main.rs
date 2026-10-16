@@ -72,7 +72,14 @@ fn main() -> ExitCode {
                  | gen-ground-truth [--voters N] [--positions P] [--candidates C] \
                  [--distribution uniform|skewed|realistic] [--election-id S] --out-dir DIR \
                  | audit <bundle.json> | audit-stream <dir> [--json] \
-                 | forge-ballot <dir> --position P --candidate K | overvote-ballot <dir> <line> \n                 | audit-canvass <dir> [--json] [--out DIR]>"
+                 | forge-ballot <dir> --position P --candidate K | overvote-ballot <dir> <line> \
+                 | precinct-aggregate <run dir> --precinct-size K [--out DIR] [--json] \
+                 (re-aggregate a run by precinct and check it combines to the region) \
+                 | ledger-digest <ledger ballots.ndjson> (digest of a ledger read-back) \
+                 | sign-return <precinct dir> --ledger F --close-block N --tip-hash HEX --key F \
+                 (sign a precinct return) \
+                 | verify-return <return.json> --pubkey HEX (verify a return signature) \
+                 | audit-canvass <dir> [--json] [--out DIR] (national canvass over precinct returns)>"
             );
             ExitCode::FAILURE
         }

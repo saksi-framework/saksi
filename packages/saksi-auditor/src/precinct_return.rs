@@ -50,7 +50,9 @@ pub struct PrecinctReturn {
     pub election_id: String,
     /// The precinct id (`pNN`), as in `registry.json`.
     pub precinct_id: String,
-    /// Block number of the chain state the read-back was taken at, after close.
+    /// The channel height as reported by Fabric `ChainInfo` after the
+    /// precinct's tally was published and its ledger dumped. The verifier
+    /// compares it with `close.json`, written by the driver at that same moment.
     pub close_block: u64,
     /// Hash of that block.
     #[serde(with = "hex_bytes")]

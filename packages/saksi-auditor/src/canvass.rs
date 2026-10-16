@@ -79,12 +79,14 @@ pub const CHECKS: [&str; 7] = [
     "canvass.nullifier_unique",
 ];
 
-/// `precinct-NN/close.json`: the chain state the read-back was taken at. The
-/// driver writes it from Fabric `ChainInfo` right after `CloseElection` and the
-/// ledger dump: `close_block` is `ChainInfo.Height` (the block count, i.e. one
-/// more than the number of the last block) and `close_tip_hash` is
-/// `ChainInfo.CurrentBlockHash` (hex, 32 bytes). The same two values are what
-/// the driver passes to `sign-return`.
+/// `precinct-NN/close.json`: the close reference the driver recorded for the
+/// precinct. The driver reads it from Fabric `ChainInfo` after the precinct's
+/// tally is published and its ledger dumped (not right after `CloseElection`):
+/// `close_block` is the channel height as reported (`ChainInfo.Height`, the
+/// block count, shared by every election on the channel) and `close_tip_hash`
+/// is `ChainInfo.CurrentBlockHash` (hex, 32 bytes). The same two values are
+/// what the driver passes to `sign-return`; the verifier compares the return
+/// with this file, written at that same moment, and does not re-read the chain.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CloseRef {
     /// `ChainInfo.Height` at close.
