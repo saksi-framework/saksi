@@ -23,8 +23,8 @@ type readBackChain struct {
 	height uint64
 }
 
-func (c *readBackChain) Lifecycle(ctx context.Context, _ string, beforeClose func(context.Context) error) error {
-	return beforeClose(ctx)
+func (c *readBackChain) Lifecycle(ctx context.Context, _ string, h Hooks) (string, error) {
+	return "published", h.BeforeClose(ctx)
 }
 
 func (c *readBackChain) Verify(_ context.Context, folder string) (string, error) {

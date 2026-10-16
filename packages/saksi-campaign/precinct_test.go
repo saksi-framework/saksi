@@ -48,13 +48,13 @@ func newPrecinctFolder(t *testing.T, n int) (*Executor, string, *fakeLedger) {
 
 func TestPrecinctLifecycleRunsTheHookBetweenBallotsAndClose(t *testing.T) {
 	e, dir, led := newPrecinctFolder(t, 3)
-	var atHook []string
-	err := e.PrecinctLifecycle(context.Background(), "precinct-01", func(context.Context) error {
-		atHook = led.callNames()
-		return nil
+	var atHook, atTally []string
+	tally, err := e.PrecinctLifecycle(context.Background(), "precinct-01", PrecinctHooks{
+		BeforeClose: func(context.Context) error { atHook = led.callNames(); return nil },
+		BeforeTally: func(context.Context) error { atTally = led.callNames(); return nil },
 	})
-	if err != nil {
-		t.Fatal(err)
+	if err != nil || tally != TallyPublished {
+		t.Fatal(tally, err)
 	}
 	want := []string{"CreateElection", "PublishDKGTranscript", "SubmitBallot", "SubmitBallot", "SubmitBallot",
 		"CloseElection", "SubmitPartialDecryption", "PublishTally"}
@@ -63,6 +63,9 @@ func TestPrecinctLifecycleRunsTheHookBetweenBallotsAndClose(t *testing.T) {
 	}
 	if strings.Join(atHook, ",") != strings.Join(want[:5], ",") {
 		t.Fatalf("hook ran after %v, want after the ballots and before CloseElection", atHook)
+	}
+	if strings.Join(atTally, ",") != strings.Join(want[:7], ",") {
+		t.Fatalf("tally hook ran after %v, want after the partials and before PublishTally", atTally)
 	}
 	for _, f := range []string{"latencies.csv", submitMetricsFile, "receipts.csv", "bundle.json", JournalFile} {
 		if _, err := os.Stat(filepath.Join(dir, f)); err != nil {
@@ -77,8 +80,8 @@ func TestPrecinctLifecycleRunsTheHookBetweenBallotsAndClose(t *testing.T) {
 
 func TestPrecinctLifecycleStopsWhenTheHookFails(t *testing.T) {
 	e, _, led := newPrecinctFolder(t, 2)
-	err := e.PrecinctLifecycle(context.Background(), "precinct-01", func(context.Context) error {
-		return os.ErrPermission
+	_, err := e.PrecinctLifecycle(context.Background(), "precinct-01", PrecinctHooks{
+		BeforeClose: func(context.Context) error { return os.ErrPermission },
 	})
 	if err == nil || !strings.Contains(err.Error(), "before close") {
 		t.Fatalf("err = %v, want a before-close failure", err)
@@ -92,7 +95,8 @@ func TestPrecinctLifecycleStopsWhenTheHookFails(t *testing.T) {
 
 func TestPrecinctVerifyDumpsThePrecinctElection(t *testing.T) {
 	e, dir, _ := newPrecinctFolder(t, 3)
-	if err := e.PrecinctLifecycle(context.Background(), "precinct-01", nil); err != nil {
+	e.SetPrecinctDistribution("realistic")
+	if _, err := e.PrecinctLifecycle(context.Background(), "precinct-01", PrecinctHooks{}); err != nil {
 		t.Fatal(err)
 	}
 	sa, err := e.PrecinctVerify(context.Background(), "precinct-01")
@@ -114,7 +118,7 @@ func TestPrecinctVerifyDumpsThePrecinctElection(t *testing.T) {
 		t.Fatalf("ledger header election id = %v, want the precinct election base-p01", lh["election_id"])
 	}
 	perf, err := os.ReadFile(filepath.Join(dir, PerfCSV))
-	if err != nil || !strings.Contains(string(perf), "\nprecinct-01,onchain,3,1,2,") {
+	if err != nil || !strings.Contains(string(perf), "\nprecinct-01,onchain,3,1,2,realistic,") {
 		t.Fatalf("perf.csv row missing (%v):\n%s", err, perf)
 	}
 	if got := readRunEnd(t, dir)["ledger_matches_local"]; got != true {
@@ -132,5 +136,24 @@ func TestPrecinctChainInfoAndConsoleElectionID(t *testing.T) {
 	// A run the driver never registered keeps its run id as its election id.
 	if got := e.electionID("run-xyz"); got != "run-xyz" {
 		t.Fatalf("electionID(run-xyz) = %q", got)
+	}
+}
+
+// T20 shape: the replayed tally took the slot, so the precinct's own
+// PublishTally fails; tolerated only when asked for and only after the hook.
+func TestPrecinctLifecycleToleratesTallyRefusalAfterTheHook(t *testing.T) {
+	e, _, led := newPrecinctFolder(t, 2)
+	led.failOn, led.failText = "PublishTally", "tally already published"
+	hook := func(context.Context) error { return nil }
+	tally, err := e.PrecinctLifecycle(context.Background(), "precinct-01",
+		PrecinctHooks{BeforeTally: hook, TolerateTallyRefusal: true})
+	if err != nil || !strings.Contains(tally, "refused: ") || !strings.Contains(tally, "already published") {
+		t.Fatalf("tally %q, err %v", tally, err)
+	}
+	e2, _, led2 := newPrecinctFolder(t, 2)
+	led2.failOn = "PublishTally"
+	if _, err := e2.PrecinctLifecycle(context.Background(), "precinct-01",
+		PrecinctHooks{TolerateTallyRefusal: true}); err == nil {
+		t.Fatal("a refusal without a pre-tally hook must still fail")
 	}
 }

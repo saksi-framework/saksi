@@ -23,7 +23,8 @@ type fakeWorld struct {
 	height   uint64
 	pass     bool // audit-canvass verdict
 	failOn   string
-	verified int // what sign-return reports verified (3 records)
+	replayed bool // a pre-tally replay committed, so PublishTally is refused
+	verified int  // what sign-return reports verified (3 records)
 	// onScript, when set, runs for each attack-hook call (hook, args).
 	onScript func(hook string, args []string)
 }
@@ -34,16 +35,30 @@ func (w *fakeWorld) log(format string, a ...any) {
 	w.events = append(w.events, fmt.Sprintf(format, a...))
 }
 
-func (w *fakeWorld) Lifecycle(ctx context.Context, folder string, beforeClose func(context.Context) error) error {
+func (w *fakeWorld) Lifecycle(ctx context.Context, folder string, h Hooks) (string, error) {
 	w.log("lifecycle %s", folder)
 	if w.failOn == "lifecycle" {
-		return errors.New("peer gone")
+		return "", errors.New("peer gone")
 	}
-	if err := beforeClose(ctx); err != nil {
-		return err
+	if err := h.BeforeClose(ctx); err != nil {
+		return "", err
 	}
 	w.log("close %s", folder)
-	return nil
+	w.log("partials %s", folder)
+	if h.BeforeTally != nil {
+		if err := h.BeforeTally(ctx); err != nil {
+			return "", err
+		}
+	}
+	w.log("tally %s", folder)
+	// A replayed tally committed first: the precinct's own one is refused.
+	if w.replayed && h.BeforeTally != nil {
+		if !h.TolerateTallyRefusal {
+			return "", errors.New("PublishTally: tally already published")
+		}
+		return "refused: PublishTally: tally already published", nil
+	}
+	return "published", nil
 }
 
 func (w *fakeWorld) Verify(_ context.Context, folder string) (string, error) {
@@ -159,11 +174,11 @@ func TestCleanRunSequenceAndLayout(t *testing.T) {
 	}
 	p := func(f string) string { return filepath.Join(o.Dir, f) }
 	want := []string{
-		"lifecycle precinct-01", "close precinct-01", "verify precinct-01", "chaininfo",
+		"lifecycle precinct-01", "close precinct-01", "partials precinct-01", "tally precinct-01", "verify precinct-01", "chaininfo",
 		"sign-return " + p("precinct-01") + " --ledger " + p("precinct-01/ledger/ballots.ndjson") +
 			" --close-block 1 --tip-hash " + strings.Repeat("01", 32) +
 			" --key " + p("precinct-01/authority.key") + " --out " + p("precinct-01/return.json"),
-		"lifecycle precinct-02", "close precinct-02", "verify precinct-02", "chaininfo",
+		"lifecycle precinct-02", "close precinct-02", "partials precinct-02", "tally precinct-02", "verify precinct-02", "chaininfo",
 		"sign-return " + p("precinct-02") + " --ledger " + p("precinct-02/ledger/ballots.ndjson") +
 			" --close-block 2 --tip-hash " + strings.Repeat("02", 32) +
 			" --key " + p("precinct-02/authority.key") + " --out " + p("precinct-02/return.json"),
@@ -193,7 +208,7 @@ func TestCleanRunSequenceAndLayout(t *testing.T) {
 		t.Fatalf("precinct rows = %+v", rec.Precincts)
 	}
 	r := rec.Precincts[0]
-	if r.Records != 3 || r.Verified != 3 || !r.Copied || r.Audit != "pass" || r.CloseBlock != 1 {
+	if r.Records != 3 || r.Verified != 3 || !r.Copied || r.Audit != "pass" || r.CloseBlock != 1 || r.Tally != "published" {
 		t.Fatalf("row = %+v", r)
 	}
 	if rec.CanvassPass == nil || !*rec.CanvassPass || len(rec.FailedChecks) != 0 || rec.ExitCode != ExitPass {
@@ -235,6 +250,9 @@ func TestAttackRunHooksInOrderAndExitsZeroOnDetection(t *testing.T) {
 	o.Attack = "T13"
 	o.AttackScript = "python3 mutate.py"
 	o.PreCloseScript = "raw.sh"
+	o.PreTallyScript = "replay.sh"
+	o.PreTallyTolerate = true
+	w.replayed = true
 	// T13: the hook drops precinct 01's return on the path.
 	w.onScript = func(hook string, args []string) {
 		n := len(args) // ... <precinct dir> <return path> <national dir>
@@ -251,11 +269,15 @@ func TestAttackRunHooksInOrderAndExitsZeroOnDetection(t *testing.T) {
 	want := []string{
 		"lifecycle precinct-01",
 		"script raw.sh pre-close [SAKSI_ATTACK=T13] " + p("precinct-01") + " base-p01",
-		"close precinct-01", "verify precinct-01", "chaininfo", "sign-return",
+		"close precinct-01", "partials precinct-01",
+		"script replay.sh pre-tally [SAKSI_ATTACK=T13] " + p("precinct-01") + " base-p01",
+		"tally precinct-01", "verify precinct-01", "chaininfo", "sign-return",
 		"script python3 return [SAKSI_ATTACK=T13] mutate.py " + p("precinct-01") + " " + p("precinct-01/return.json") + " " + nat,
 		"lifecycle precinct-02",
 		"script raw.sh pre-close [SAKSI_ATTACK=T13] " + p("precinct-02") + " base-p02",
-		"close precinct-02", "verify precinct-02", "chaininfo", "sign-return",
+		"close precinct-02", "partials precinct-02",
+		"script replay.sh pre-tally [SAKSI_ATTACK=T13] " + p("precinct-02") + " base-p02",
+		"tally precinct-02", "verify precinct-02", "chaininfo", "sign-return",
 		"script python3 return [SAKSI_ATTACK=T13] mutate.py " + p("precinct-02") + " " + p("precinct-02/return.json") + " " + nat,
 		"script python3 national [SAKSI_ATTACK=T13] mutate.py " + nat,
 		"audit-canvass",
@@ -274,6 +296,9 @@ func TestAttackRunHooksInOrderAndExitsZeroOnDetection(t *testing.T) {
 		t.Fatal("a dropped return was transmitted")
 	}
 	rec := readRecord(t, o)
+	if rec.Precincts[0].Tally != "refused: PublishTally: tally already published" {
+		t.Fatalf("tolerated refusal not recorded: %q", rec.Precincts[0].Tally)
+	}
 	if rec.Precincts[0].Copied || !rec.Precincts[1].Copied || rec.Attack != "T13" ||
 		strings.Join(rec.FailedChecks, ",") != "canvass.signature" {
 		t.Fatalf("record = %+v", rec)
@@ -294,7 +319,10 @@ func TestAttackRunUndetectedStillExitsZero(t *testing.T) {
 func TestRunErrors(t *testing.T) {
 	cases := map[string]func(*fakeWorld, *Options){
 		"lifecycle fails": func(w *fakeWorld, _ *Options) { w.failOn = "lifecycle" },
-		"no ledger dump":  func(w *fakeWorld, _ *Options) { w.failOn = "dump" },
+		"refused tally, not tolerated": func(w *fakeWorld, o *Options) {
+			w.replayed, o.Attack, o.PreTallyScript = true, "T20", "replay.sh"
+		},
+		"no ledger dump": func(w *fakeWorld, _ *Options) { w.failOn = "dump" },
 		"no registry": func(_ *fakeWorld, o *Options) {
 			_ = os.Remove(filepath.Join(o.Dir, "national", "registry.json"))
 		},
@@ -327,5 +355,25 @@ func TestPrecinctsSkipsNationalAndStrays(t *testing.T) {
 	got, err := Precincts(genDir(t))
 	if err != nil || strings.Join(got, ",") != "precinct-01,precinct-02" {
 		t.Fatalf("Precincts = %v, %v", got, err)
+	}
+}
+
+func TestMidRunFailureCarriesTheRecoveryAdvice(t *testing.T) {
+	w, o := newWorld(t)
+	w.failOn = "lifecycle"
+	_, err := Run(context.Background(), o)
+	if err == nil || !strings.Contains(err.Error(), PartialRunAdvice) {
+		t.Fatalf("err = %v, want the partial-run advice", err)
+	}
+}
+
+func TestDistributionIsRecorded(t *testing.T) {
+	_, o := newWorld(t)
+	o.Distribution = "realistic"
+	if _, err := Run(context.Background(), o); err != nil {
+		t.Fatal(err)
+	}
+	if rec := readRecord(t, o); rec.Distribution != "realistic" {
+		t.Fatalf("distribution = %q", rec.Distribution)
 	}
 }

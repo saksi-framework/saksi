@@ -52,10 +52,15 @@ func (e *Executor) precinctRun(folder string) (ElectionConfig, error) {
 	c := ElectionConfig{
 		Name: h.ElectionName, Mode: "onchain",
 		Positions: h.Positions, Candidates: h.Candidates, Voters: h.N / h.Positions,
+		Distribution: e.precinctDistribution,
 	}
 	c.applyDefaults()
 	return c, nil
 }
+
+// SetPrecinctDistribution records the generator's --distribution for the
+// precinct runs' perf.csv rows; header.json does not carry it.
+func (e *Executor) SetPrecinctDistribution(d string) { e.precinctDistribution = d }
 
 // PrecinctLifecycle runs the console's on-chain lifecycle for one precinct
 // folder on the configured channel: CreateElection, PublishDKGTranscript, the
@@ -63,23 +68,30 @@ func (e *Executor) precinctRun(folder string) (ElectionConfig, error) {
 // latencies.csv and submit-metrics.json as a console run), CloseElection, the
 // partial decryptions and PublishTally.
 //
-// beforeClose, when non-nil, runs after the ballot window and before
-// CloseElection; an error from it stops the lifecycle there. It is the hook
-// for chain-level attacks on an open election (T19/T20).
+// The hooks (all optional) are where chain-level attacks are mounted:
+// BeforeClose runs after the ballot window and before CloseElection (an open
+// election: T19), BeforeTally after the partial decryptions and before
+// PublishTally (a closed election with no tally yet: T20). An error from
+// either stops the lifecycle there.
+//
+// The returned outcome is "published" when the precinct's own tally
+// committed. With TolerateTallyRefusal set and BeforeTally run, a failing
+// PublishTally (the replayed tally already took the slot) is not an error:
+// the outcome is "refused: <reason>" and the lifecycle ends normally.
 //
 // The composition is setupOnChain + submitOnChain's tail with no attack-plan
 // pauses (a precinct run has no AttackPlan, so those pauses would not fire
-// anyway) and the beforeClose call inserted between the window and the close.
+// anyway) and the two hook calls inserted.
 // The journal opens with run.start and brackets the lifecycle with
 // stage.submit.start/end, as Generate and Submit do for a console run.
-func (e *Executor) PrecinctLifecycle(ctx context.Context, folder string, beforeClose func(context.Context) error) error {
+func (e *Executor) PrecinctLifecycle(ctx context.Context, folder string, h PrecinctHooks) (string, error) {
 	c, err := e.precinctRun(folder)
 	if err != nil {
-		return err
+		return "", err
 	}
 	dir, err := e.store.Dir(folder)
 	if err != nil {
-		return err
+		return "", err
 	}
 	j, jerr := OpenJournal(dir, CollectEnv(e.demoBin))
 	if jerr != nil {
@@ -92,47 +104,74 @@ func (e *Executor) PrecinctLifecycle(ctx context.Context, folder string, beforeC
 		"precinct": true,
 	})
 	_ = j.Stamp("stage.submit.start", nil)
-	err = e.precinctLifecycle(ctx, folder, c, beforeClose)
-	_ = j.Stamp("stage.submit.end", stageEnd(err))
-	return err
+	tally, err := e.precinctLifecycle(ctx, folder, c, h)
+	end := stageEnd(err)
+	if err == nil {
+		end["tally"] = tally
+	}
+	_ = j.Stamp("stage.submit.end", end)
+	return tally, err
 }
 
-func (e *Executor) precinctLifecycle(ctx context.Context, folder string, c ElectionConfig, beforeClose func(context.Context) error) error {
+// PrecinctHooks are PrecinctLifecycle's attack mount points.
+type PrecinctHooks struct {
+	BeforeClose          func(context.Context) error
+	BeforeTally          func(context.Context) error
+	TolerateTallyRefusal bool
+}
+
+// TallyPublished is PrecinctLifecycle's outcome when the precinct's own
+// tally committed.
+const TallyPublished = "published"
+
+func (e *Executor) precinctLifecycle(ctx context.Context, folder string, c ElectionConfig, h PrecinctHooks) (string, error) {
 	bundlePath, err := e.generateBundle(folder)
 	if err != nil {
-		return fmt.Errorf("bundle: %w", err)
+		return "", fmt.Errorf("bundle: %w", err)
 	}
 	led, closeLedger, err := e.openLedger()
 	if err != nil {
-		return fmt.Errorf("connect to Fabric: %w", err)
+		return "", fmt.Errorf("connect to Fabric: %w", err)
 	}
 	defer closeLedger()
 	b, step, err := e.lifecycle(folder, led, bundlePath, "submit")
 	if err != nil {
-		return err
+		return "", err
 	}
 	defer e.closeReceipts(folder)
 	if err := step(ctx, "CreateElection", "", "CreateElection", b.Params); err != nil {
-		return err
+		return "", err
 	}
 	if err := step(ctx, "PublishDKGTranscript", "", "PublishDKGTranscript", b.DKG); err != nil {
-		return err
+		return "", err
 	}
 	if err := e.submitBallots(ctx, folder, c, b, led); err != nil {
-		return err
+		return "", err
 	}
-	if beforeClose != nil {
-		if err := beforeClose(ctx); err != nil {
-			return fmt.Errorf("before close: %w", err)
+	if h.BeforeClose != nil {
+		if err := h.BeforeClose(ctx); err != nil {
+			return "", fmt.Errorf("before close: %w", err)
 		}
 	}
 	if err := e.closeElection(ctx, folder, c, b, led, step); err != nil {
-		return err
+		return "", err
 	}
 	if err := submitPartials(ctx, b, step); err != nil {
-		return err
+		return "", err
 	}
-	return step(ctx, "PublishTally", "", "PublishTally", b.Tally)
+	if h.BeforeTally != nil {
+		if err := h.BeforeTally(ctx); err != nil {
+			return "", fmt.Errorf("before tally: %w", err)
+		}
+	}
+	err = step(ctx, "PublishTally", "", "PublishTally", b.Tally)
+	switch {
+	case err == nil:
+		return TallyPublished, nil
+	case h.TolerateTallyRefusal && h.BeforeTally != nil && ctx.Err() == nil:
+		return "refused: " + err.Error(), nil
+	}
+	return "", err
 }
 
 // PrecinctVerify is Verify for one precinct folder: the chain's record of the

@@ -137,6 +137,9 @@ type Executor struct {
 	// <base>-pNN (precinct.go). Nil on the console, where the election id IS
 	// the run id, so electionID(runID) == runID there.
 	precinctIDs map[string]string
+	// precinctDistribution is the precinct runs' perf.csv distribution
+	// column (SetPrecinctDistribution). Unused on the console.
+	precinctDistribution string
 }
 
 // ceremonyChain is what the trustee ceremony reads back from the chain.

@@ -41,6 +41,9 @@ func main() {
 	out := fs.String("out", "", "run folder for canvass-run.json, canvass.json, canvass-checks.csv (default --dir)")
 	attack := fs.String("attack", "", "attack id this run mounts (e.g. T9); a failed canvass then exits 0")
 	attackScript := fs.String("attack-script", "", "command run after each return is built (<precinct dir> <return.json> <national dir>) and once before the canvass (<national dir>)")
+	preTally := fs.String("attack-pre-tally-script", "", "command run after each precinct's partial decryptions, before PublishTally (<precinct dir> <election id>)")
+	preTallyTolerate := fs.Bool("attack-pre-tally-tolerate", false, "with --attack-pre-tally-script: a refused PublishTally of the precinct's own tally (the replayed one committed first, T20) is recorded, not fatal")
+	distribution := fs.String("distribution", "", "the generator's --distribution, written into the precinct perf.csv rows and canvass-run.json")
 	preClose := fs.String("attack-pre-close-script", "", "command run after each precinct's ballots, before CloseElection (<precinct dir> <election id>)")
 	// The console's Fabric flags, same names and defaults
 	// (cmd/saksi-campaign/main.go).
@@ -66,8 +69,11 @@ func main() {
 	if !fabric.Enabled() {
 		fatal("a live Fabric network is required: pass --fabric-tls-cert, --fabric-cert and --fabric-key")
 	}
-	if (*attackScript != "" || *preClose != "") && *attack == "" {
-		fatal("--attack-script and --attack-pre-close-script need --attack <id>")
+	if (*attackScript != "" || *preClose != "" || *preTally != "") && *attack == "" {
+		fatal("--attack-script, --attack-pre-close-script and --attack-pre-tally-script need --attack <id>")
+	}
+	if *preTallyTolerate && *preTally == "" {
+		fatal("--attack-pre-tally-tolerate needs --attack-pre-tally-script")
 	}
 	abs, err := filepath.Abs(*dir)
 	if err != nil {
@@ -87,13 +93,18 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	exe := campaign.NewExecutor(campaign.NewRunStore(abs), nil, *demoBin, "", fabric)
+	exe.SetPrecinctDistribution(*distribution)
 	code, err := canvass.Run(ctx, canvass.Options{
 		Dir: abs, Out: *out, DemoBin: *demoBin,
 		Attack: *attack, AttackScript: *attackScript, PreCloseScript: *preClose,
+		PreTallyScript: *preTally, PreTallyTolerate: *preTallyTolerate, Distribution: *distribution,
 		Chain: execChain{exe}, Run: runCmd, Log: os.Stdout,
 	})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "saksi-canvass-demo: %v\n", err)
+		if !strings.Contains(err.Error(), canvass.PartialRunAdvice) {
+			fmt.Fprintf(os.Stderr, "  if any precinct had started: %s\n", canvass.PartialRunAdvice)
+		}
 	}
 	fmt.Printf("record: %s (exit %d)\n", filepath.Join(*out, canvass.RunFile), code)
 	os.Exit(code)
@@ -102,8 +113,10 @@ func main() {
 // execChain is canvass.Chain over the console's own Executor.
 type execChain struct{ e *campaign.Executor }
 
-func (c execChain) Lifecycle(ctx context.Context, folder string, beforeClose func(context.Context) error) error {
-	return c.e.PrecinctLifecycle(ctx, folder, beforeClose)
+func (c execChain) Lifecycle(ctx context.Context, folder string, h canvass.Hooks) (string, error) {
+	return c.e.PrecinctLifecycle(ctx, folder, campaign.PrecinctHooks{
+		BeforeClose: h.BeforeClose, BeforeTally: h.BeforeTally, TolerateTallyRefusal: h.TolerateTallyRefusal,
+	})
 }
 
 func (c execChain) Verify(ctx context.Context, folder string) (string, error) {

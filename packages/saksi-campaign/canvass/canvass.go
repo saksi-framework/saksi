@@ -30,14 +30,23 @@ import (
 // campaign.Executor's precinct seam (PrecinctLifecycle, PrecinctVerify,
 // PrecinctChainInfo); folder is the precinct-NN folder name.
 type Chain interface {
-	// Lifecycle runs CreateElection through PublishTally, calling beforeClose
-	// after the ballot window and before CloseElection.
-	Lifecycle(ctx context.Context, folder string, beforeClose func(context.Context) error) error
+	// Lifecycle runs CreateElection through PublishTally, calling the hooks
+	// at their mount points. It returns the precinct's own tally outcome:
+	// "published", or "refused: <reason>" when Hooks.TolerateTallyRefusal let
+	// a refusal after BeforeTally through.
+	Lifecycle(ctx context.Context, folder string, h Hooks) (string, error)
 	// Verify dumps the chain's record into <folder>/ledger/ and audits it,
 	// returning the precinct's local audit verdict ("pass" or "fail").
 	Verify(ctx context.Context, folder string) (string, error)
 	// ChainInfo is the channel height (ChainInfo.Height) and tip block hash.
 	ChainInfo(ctx context.Context) (uint64, []byte, error)
+}
+
+// Hooks are the lifecycle's attack mount points (campaign.PrecinctHooks).
+type Hooks struct {
+	BeforeClose          func(context.Context) error // after the ballots, before CloseElection
+	BeforeTally          func(context.Context) error // after the partials, before PublishTally
+	TolerateTallyRefusal bool                        // a PublishTally refusal after BeforeTally is an outcome, not an error
 }
 
 // Runner runs a child process with extra environment entries and returns its
@@ -54,12 +63,21 @@ type Options struct {
 	// AttackScript runs after each return is built and before it is copied
 	// to national/returns/, and once more after every precinct, before the
 	// canvass. PreCloseScript runs inside each lifecycle after the ballots
-	// and before CloseElection. Each is a command line split on spaces.
+	// and before CloseElection; PreTallyScript after the partial decryptions
+	// and before PublishTally. Each is a command line split on spaces.
 	AttackScript   string
 	PreCloseScript string
-	Chain          Chain
-	Run            Runner
-	Log            io.Writer
+	PreTallyScript string
+	// PreTallyTolerate lets the precinct's own PublishTally fail after the
+	// pre-tally hook ran (a replayed tally committed first, T20); the
+	// refusal is recorded in the precinct row's tally field.
+	PreTallyTolerate bool
+	Chain            Chain
+	Run              Runner
+	Log              io.Writer
+	// Distribution is the generator's --distribution, recorded in the run
+	// record (the precinct perf.csv rows get it from the Chain).
+	Distribution string
 }
 
 // Exit codes.
@@ -68,6 +86,10 @@ const (
 	ExitFail  = 1 // clean run whose canvass failed a check
 	ExitError = 2 // the run itself could not complete
 )
+
+// PartialRunAdvice is said on every mid-run failure: the elections already
+// on the chain block a re-run of the same generation.
+const PartialRunAdvice = "partial run: elections already created on the chain cannot be resumed; regenerate and reset the network once"
 
 // RunFile is the driver's own record of the run.
 const RunFile = "canvass-run.json"
@@ -87,8 +109,11 @@ type PrecinctRow struct {
 	SignMs           int64  `json:"sign_ms"`
 	CloseToReturnMs  int64  `json:"close_to_return_ms"`
 	Audit            string `json:"audit"`
-	CloseBlock       uint64 `json:"close_block"`
-	CloseTipHash     string `json:"close_tip_hash"`
+	// Tally is the precinct's own PublishTally outcome: "published", or
+	// "refused: <reason>" on a tolerated refusal after the pre-tally hook.
+	Tally        string `json:"tally"`
+	CloseBlock   uint64 `json:"close_block"`
+	CloseTipHash string `json:"close_tip_hash"`
 	// Records and Verified are sign-return's own count of the ledger
 	// read-back. sign-return exits 0 when some records fail verification, so
 	// the gap is recorded here rather than inferred from its exit code.
@@ -105,6 +130,7 @@ type PrecinctRow struct {
 type RunRecord struct {
 	Dir          string          `json:"dir"`
 	Attack       string          `json:"attack,omitempty"`
+	Distribution string          `json:"distribution,omitempty"`
 	Started      string          `json:"started"`
 	Precincts    []PrecinctRow   `json:"precincts"`
 	CanvassMs    int64           `json:"canvass_ms"`
@@ -151,7 +177,7 @@ func Run(ctx context.Context, o Options) (int, error) {
 		return ExitError, err
 	}
 	start := time.Now()
-	rec := RunRecord{Dir: o.Dir, Attack: o.Attack, Started: start.UTC().Format(time.RFC3339), FailedChecks: []string{}}
+	rec := RunRecord{Dir: o.Dir, Attack: o.Attack, Distribution: o.Distribution, Started: start.UTC().Format(time.RFC3339), FailedChecks: []string{}}
 	code, err := run(ctx, o, &rec)
 	if err != nil {
 		code = ExitError
@@ -190,7 +216,7 @@ func run(ctx context.Context, o Options, rec *RunRecord) (int, error) {
 		row, err := o.precinct(ctx, f, national)
 		rec.Precincts = append(rec.Precincts, row)
 		if err != nil {
-			return ExitError, fmt.Errorf("%s: %w", f, err)
+			return ExitError, fmt.Errorf("%s: %w (%s)", f, err, PartialRunAdvice)
 		}
 	}
 	if o.AttackScript != "" {
@@ -252,7 +278,7 @@ func (o Options) precinct(ctx context.Context, folder, national string) (Precinc
 
 	t0 := time.Now()
 	var closeAt time.Time
-	beforeClose := func(ctx context.Context) error {
+	hooks := Hooks{BeforeClose: func(ctx context.Context) error {
 		if o.PreCloseScript != "" {
 			if err := o.script(ctx, o.PreCloseScript, "pre-close", pdir, h.ElectionID); err != nil {
 				return err
@@ -260,9 +286,20 @@ func (o Options) precinct(ctx context.Context, folder, national string) (Precinc
 		}
 		closeAt = time.Now()
 		return nil
+	}}
+	if o.PreTallyScript != "" {
+		hooks.BeforeTally = func(ctx context.Context) error {
+			return o.script(ctx, o.PreTallyScript, "pre-tally", pdir, h.ElectionID)
+		}
+		hooks.TolerateTallyRefusal = o.PreTallyTolerate
 	}
-	if err := o.Chain.Lifecycle(ctx, folder, beforeClose); err != nil {
+	tally, err := o.Chain.Lifecycle(ctx, folder, hooks)
+	row.Tally = tally
+	if err != nil {
 		return row, fmt.Errorf("lifecycle: %w", err)
+	}
+	if tally != "published" {
+		fmt.Fprintf(o.Log, "%s: own PublishTally %s (tolerated after the pre-tally hook)\n", folder, tally)
 	}
 	row.LifecycleMs = time.Since(t0).Milliseconds()
 	if raw, err := os.ReadFile(filepath.Join(pdir, "submit-metrics.json")); err == nil && json.Valid(raw) {
