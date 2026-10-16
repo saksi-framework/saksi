@@ -79,3 +79,62 @@ fn gen_stream_then_audit_stream_json_is_clean() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// `gen --stream <dir> --precincts 2` through the real binary: both precinct
+/// folders audit clean with `audit-stream`, and the national folder carries
+/// the registry and no ballots.
+#[test]
+fn gen_precincts_writes_auditable_precinct_folders_and_a_registry() {
+    let dir = std::env::temp_dir().join("saksi-demo-it-gen-precincts");
+    let _ = std::fs::remove_dir_all(&dir);
+
+    let gen = Command::new(BIN)
+        .args([
+            "gen",
+            "--voters",
+            "20",
+            "--positions",
+            "2",
+            "--candidates",
+            "2",
+            "--election-id",
+            "it-pm",
+            "--precincts",
+            "2",
+            "--stream",
+        ])
+        .arg(&dir)
+        .status()
+        .expect("run gen");
+    assert!(gen.success(), "gen --precincts should succeed");
+
+    for p in ["precinct-01", "precinct-02"] {
+        let out = Command::new(BIN)
+            .args(["audit-stream"])
+            .arg(dir.join(p))
+            .arg("--json")
+            .output()
+            .expect("run audit-stream");
+        assert!(out.status.success(), "{p} should audit clean");
+        let json: serde_json::Value = serde_json::from_slice(&out.stdout).expect("json");
+        assert_eq!(json["overall"], "pass", "{p}: {json}");
+    }
+
+    let national = dir.join("national");
+    assert!(national.join("header.json").is_file());
+    assert!(national.join("aggregate.json").is_file());
+    assert!(!national.join("ballots.ndjson").exists());
+    let registry: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(national.join("registry.json")).expect("registry"),
+    )
+    .expect("registry json");
+    let ids: Vec<&str> = registry
+        .as_array()
+        .expect("array")
+        .iter()
+        .map(|e| e["precinct_id"].as_str().expect("id"))
+        .collect();
+    assert_eq!(ids, ["p01", "p02"]);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

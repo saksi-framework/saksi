@@ -317,6 +317,24 @@ pub fn write_election_stream_params_chunked(
     crate::ground_truth::write_ground_truth_csvs(dir, params)
 }
 
+/// Precinct generator behind `saksi-demo gen --stream <dir> --precincts N`:
+/// one DKG and one manifest, the population split into `precincts` voter
+/// ranges of `precinct_size` (default `voters / precincts`, the last precinct
+/// taking the remainder), each written as an ordinary run folder
+/// `<dir>/precinct-NN/` under election id `<base>-pNN`, plus `<dir>/national/`.
+/// See [`crate::stream::write_precinct_streams`] for the layout. Runs the same
+/// parameter gate as the whole-population path first.
+pub fn write_precinct_streams_params(
+    dir: &std::path::Path,
+    params: &GenParams,
+    precincts: usize,
+    precinct_size: Option<usize>,
+    chunk_voters: usize,
+) -> Result<(), String> {
+    validate_params(params)?;
+    crate::stream::write_precinct_streams(dir, params, precincts, precinct_size, chunk_voters)
+}
+
 /// Fail-closed validation gate (Phase 1): structural invariants that must hold
 /// before a generated population is allowed onto the network. Returns `Err` with
 /// the first violation found. Catches generator bugs that would otherwise read

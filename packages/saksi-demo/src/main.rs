@@ -9,7 +9,12 @@
 //!   a streamed `header.json` + `ballots.ndjson` run folder instead of a one-blob
 //!   bundle. A stream is generated in chunks of `--chunk N` voters (default
 //!   5000; `--chunk 0` selects the old single-pass writer), and also writes
-//!   `gen-timings.json`. With no flags, emits the legacy happy-path bundle; any
+//!   `gen-timings.json`. `--precincts N [--precinct-size K]` (with `--stream`)
+//!   splits the voters into N index ranges of K (default voters / N, the last
+//!   range taking the remainder) under one DKG and one manifest, writing
+//!   `<dir>/precinct-NN/` run folders (election id `<id>-pNN`) and
+//!   `<dir>/national/` (national aggregate, partials, tally, ground truth,
+//!   `registry.json` of precinct authority public keys). With no flags, emits the legacy happy-path bundle; any
 //!   flag switches to the parameterized generator (after the fail-closed
 //!   validation gate).
 //! - `audit <bundle.json>` — audit a one-blob bundle; exits non-zero on FAIL.
@@ -35,7 +40,8 @@ use std::process::ExitCode;
 use saksi_auditor::demo::{
     audit_bundle_json, audit_stream_dir, election_bundle_json, election_bundle_json_params,
     forge_self_issued_ballot, overvote_ballot, write_election_stream_params,
-    write_election_stream_params_chunked, GenParams, SelectionProfile,
+    write_election_stream_params_chunked, write_precinct_streams_params, GenParams,
+    SelectionProfile,
 };
 use saksi_auditor::ground_truth::write_ground_truth_csvs;
 use saksi_auditor::stream::DEFAULT_CHUNK_VOTERS;
@@ -54,7 +60,8 @@ fn main() -> ExitCode {
             eprintln!(
                 "usage: saksi-demo <gen [--voters N] [--positions P] [--candidates C] \
                  [--distribution uniform|skewed|realistic] [--election-id S] [--election-name S] \
-                 [--threshold T] [--trustees N] [--trustee-names a,b,c] [--stream DIR] [--chunk N] [outfile] \
+                 [--threshold T] [--trustees N] [--trustee-names a,b,c] [--stream DIR] [--chunk N] \
+                 [--precincts N [--precinct-size K]] [outfile] \
                  | gen-ground-truth [--voters N] [--positions P] [--candidates C] \
                  [--distribution uniform|skewed|realistic] [--election-id S] --out-dir DIR \
                  | audit <bundle.json> | audit-stream <dir> [--json] \
@@ -84,6 +91,10 @@ struct ParsedGen {
     /// Voters per generation chunk for `--stream`. `0` selects the single-pass
     /// writer that builds the whole population before writing it.
     chunk: usize,
+    /// `--precincts N`: split the population into N precinct run folders.
+    precincts: Option<usize>,
+    /// `--precinct-size K`: voters per precinct (default voters / N).
+    precinct_size: Option<usize>,
 }
 
 /// Simple majority threshold for `n` trustees (`⌊n/2⌋ + 1`).
@@ -99,6 +110,7 @@ fn parse_gen_args(args: &[String]) -> Result<ParsedGen, String> {
     let mut trustee_names: Option<Vec<String>> = None;
     let mut stream: Option<String> = None;
     let mut chunk: Option<usize> = None;
+    let (mut precincts, mut precinct_size): (Option<usize>, Option<usize>) = (None, None);
     let mut out: Option<String> = None;
 
     let parse_usize = |v: Option<&String>, name: &str| -> Result<usize, String> {
@@ -168,6 +180,14 @@ fn parse_gen_args(args: &[String]) -> Result<ParsedGen, String> {
                 stream = Some(take(args.get(i + 1), "--stream")?);
                 i += 2;
             }
+            "--precincts" => {
+                precincts = Some(parse_usize(args.get(i + 1), "--precincts")?);
+                i += 2;
+            }
+            "--precinct-size" => {
+                precinct_size = Some(parse_usize(args.get(i + 1), "--precinct-size")?);
+                i += 2;
+            }
             "--chunk" => {
                 chunk = Some(
                     args.get(i + 1)
@@ -214,6 +234,13 @@ fn parse_gen_args(args: &[String]) -> Result<ParsedGen, String> {
         profile,
     };
 
+    if precincts.is_some() && stream.is_none() {
+        return Err("--precincts needs --stream <dir>".into());
+    }
+    if precinct_size.is_some() && precincts.is_none() {
+        return Err("--precinct-size needs --precincts".into());
+    }
+
     let target = match stream {
         Some(dir) => {
             if out.is_some() {
@@ -229,6 +256,8 @@ fn parse_gen_args(args: &[String]) -> Result<ParsedGen, String> {
         target,
         parameterized,
         chunk: chunk.unwrap_or(DEFAULT_CHUNK_VOTERS),
+        precincts,
+        precinct_size,
     })
 }
 
@@ -311,6 +340,8 @@ fn cmd_gen(args: &[String]) -> ExitCode {
         target,
         parameterized,
         chunk,
+        precincts,
+        precinct_size,
     } = match parse_gen_args(args) {
         Ok(p) => p,
         Err(e) => {
@@ -324,8 +355,23 @@ fn cmd_gen(args: &[String]) -> ExitCode {
         params.voters, params.positions, params.candidates, params.threshold, params.trustees
     );
 
-    match target {
-        GenTarget::Stream(dir) => {
+    match (target, precincts) {
+        (GenTarget::Stream(dir), Some(n)) => {
+            // The precinct writer is always chunked; `--chunk 0` (one pass)
+            // becomes one chunk per precinct.
+            let chunk = if chunk == 0 { usize::MAX } else { chunk };
+            match write_precinct_streams_params(Path::new(&dir), &params, n, precinct_size, chunk) {
+                Ok(()) => {
+                    eprintln!("wrote {n} precincts + national ({summary}; gate passed) -> {dir}");
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("precinct generation failed: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        (GenTarget::Stream(dir), None) => {
             // Chunked by default (bounded memory, rayon inside a chunk);
             // `--chunk 0` asks for the original single-pass writer.
             let written = if chunk == 0 {
@@ -349,7 +395,7 @@ fn cmd_gen(args: &[String]) -> ExitCode {
                 }
             }
         }
-        GenTarget::Bundle(out) => {
+        (GenTarget::Bundle(out), _) => {
             let json = if parameterized {
                 match election_bundle_json_params(&params) {
                     Ok(json) => {
@@ -604,5 +650,31 @@ mod tests {
         let err = parse_gen_args(&sv(&["--stream", "/tmp/r", "out.json"]))
             .expect_err("mutually exclusive");
         assert!(err.contains("mutually exclusive"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_gen_args_reads_the_precinct_flags() {
+        let p = parse_gen_args(&sv(&[
+            "--stream",
+            "/tmp/r",
+            "--precincts",
+            "10",
+            "--precinct-size",
+            "100",
+        ]))
+        .expect("parses");
+        assert_eq!(p.precincts, Some(10));
+        assert_eq!(p.precinct_size, Some(100));
+        let plain = parse_gen_args(&sv(&["--stream", "/tmp/r"])).expect("parses");
+        assert_eq!(plain.precincts, None, "no flag keeps the Chapter IV path");
+    }
+
+    #[test]
+    fn parse_gen_args_rejects_precincts_without_a_stream_or_count() {
+        let err = parse_gen_args(&sv(&["--precincts", "2"])).expect_err("needs --stream");
+        assert!(err.contains("--stream"), "got: {err}");
+        let err = parse_gen_args(&sv(&["--stream", "/tmp/r", "--precinct-size", "5"]))
+            .expect_err("needs --precincts");
+        assert!(err.contains("--precincts"), "got: {err}");
     }
 }
