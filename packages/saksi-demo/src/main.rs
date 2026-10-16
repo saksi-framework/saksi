@@ -61,6 +61,7 @@ fn main() -> ExitCode {
         Some("ledger-digest") => precinct::cmd_ledger_digest(&args[2..]),
         Some("sign-return") => precinct::cmd_sign_return(&args[2..]),
         Some("verify-return") => precinct::cmd_verify_return(&args[2..]),
+        Some("precinct-aggregate") => saksi_auditor::precinct_aggregate::cli(&args[2..]),
         _ => {
             eprintln!(
                 "usage: saksi-demo <gen [--voters N] [--positions P] [--candidates C] \

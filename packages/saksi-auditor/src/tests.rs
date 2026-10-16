@@ -986,6 +986,7 @@ fn audit_on(
         ballots.iter().cloned(),
         Some(&pool),
         chunk,
+        &mut |_, _| {},
     );
     let evidence: Vec<_> = evidence
         .iter()

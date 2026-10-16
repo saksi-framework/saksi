@@ -67,6 +67,9 @@ pub mod demo;
 pub mod ground_truth;
 
 #[cfg(feature = "demo")]
+pub mod precinct_aggregate;
+
+#[cfg(feature = "demo")]
 pub mod stream;
 
 #[cfg(feature = "demo")]
@@ -245,7 +248,21 @@ pub(crate) fn audit_streaming(
     ballots: impl Iterator<Item = Result<Ballot, String>>,
     pool: Option<&rayon::ThreadPool>,
 ) -> (AuditReport, Vec<crate::tally::ContestEvidence>, Timings) {
-    audit_streaming_chunked(inputs, ballots, pool, VERIFY_CHUNK)
+    audit_streaming_chunked(inputs, ballots, pool, VERIFY_CHUNK, &mut |_, _| {})
+}
+
+/// [`audit_streaming`] that also hands every eligible ballot's decoded
+/// ciphertexts to `observe`, with the ballot's 0-based stream index, in stream
+/// order and only after the ballot passed every per-ballot check. Lets a caller
+/// fold a second aggregate (per precinct) beside the region one in the same
+/// verified pass.
+pub(crate) fn audit_streaming_observed(
+    inputs: AuditInputs<'_>,
+    ballots: impl Iterator<Item = Result<Ballot, String>>,
+    pool: Option<&rayon::ThreadPool>,
+    observe: &mut dyn FnMut(usize, &[crate::ballot::DecodedCiphertext]),
+) -> (AuditReport, Vec<crate::tally::ContestEvidence>, Timings) {
+    audit_streaming_chunked(inputs, ballots, pool, VERIFY_CHUNK, observe)
 }
 
 /// [`audit_streaming`] with the batch size exposed, so tests can put batch
@@ -261,6 +278,7 @@ fn audit_streaming_chunked(
     ballots: impl Iterator<Item = Result<Ballot, String>>,
     pool: Option<&rayon::ThreadPool>,
     chunk_size: usize,
+    observe: &mut dyn FnMut(usize, &[crate::ballot::DecodedCiphertext]),
 ) -> (AuditReport, Vec<crate::tally::ContestEvidence>, Timings) {
     let mut builder = ReportBuilder::new();
     let mut timings = Timings::default();
@@ -375,6 +393,7 @@ fn audit_streaming_chunked(
                     aggregate_data[ct.contest] += ct.data;
                 }
                 timings.aggregate += started.elapsed();
+                observe(idx, &decoded);
                 eligible_count += 1;
             }
             // `ballot` drops here.

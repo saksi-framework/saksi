@@ -825,6 +825,18 @@ pub fn audit_stream_dir(dir: &std::path::Path) -> Result<StreamAudit, String> {
 pub(crate) fn audit_stream_dir_full(
     dir: &std::path::Path,
 ) -> Result<(StreamAudit, AuditReport), String> {
+    audit_stream_dir_observed(dir, true, &mut |_, _| {})
+}
+
+/// [`audit_stream_dir_full`] with every eligible ballot's decoded ciphertexts
+/// handed to `observe` (see [`crate::audit_streaming_observed`]). `ledger`
+/// selects whether a [`LEDGER_DIR`] dump, when present, gets the `ledger.order`
+/// check; callers that work on the console record alone pass `false`.
+pub(crate) fn audit_stream_dir_observed(
+    dir: &std::path::Path,
+    ledger: bool,
+    observe: &mut dyn FnMut(usize, &[crate::ballot::DecodedCiphertext]),
+) -> Result<(StreamAudit, AuditReport), String> {
     let header = crate::stream::read_header(dir)?;
     let hexd = |s: &str, what: &str| hex::decode(s).map_err(|e| format!("{what} not hex: {e}"));
 
@@ -856,7 +868,7 @@ pub(crate) fn audit_stream_dir_full(
     let pool = audit_pool_from_env()?;
 
     let ground_truth = header.ground_truth.clone();
-    let (mut report, evidence, timings) = crate::audit_streaming(
+    let (mut report, evidence, timings) = crate::audit_streaming_observed(
         crate::AuditInputs {
             parameters: &parameters,
             dkg_transcript: &dkg_transcript,
@@ -869,12 +881,13 @@ pub(crate) fn audit_stream_dir_full(
         },
         ballots,
         pool.as_ref(),
+        observe,
     );
     // An on-chain run folder also holds the chain's own read-back in
     // `ledger/`; hold it to the chain's order and to this record.
     let ledger_dir = dir.join(LEDGER_DIR);
     let mut ledger_order = None;
-    if ledger_dir.join(crate::stream::BALLOTS_FILE).exists() {
+    if ledger && ledger_dir.join(crate::stream::BALLOTS_FILE).exists() {
         let finding = crate::ledger::check_ledger_order(dir, &ledger_dir);
         let fail = finding.status == AuditStatus::Fail;
         if fail {
