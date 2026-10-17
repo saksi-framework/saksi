@@ -131,6 +131,15 @@ type Executor struct {
 	submitErr  map[[2]string]string
 	// ceremonyMu serialises every read-change-write of a run's ceremony.json.
 	ceremonyMu sync.Mutex
+
+	// precinctIDs maps a run folder to its on-chain election id where the two
+	// differ: the precinct driver's precinct-NN folders hold elections
+	// <base>-pNN (precinct.go). Nil on the console, where the election id IS
+	// the run id, so electionID(runID) == runID there.
+	precinctIDs map[string]string
+	// precinctDistribution is the precinct runs' perf.csv distribution
+	// column (SetPrecinctDistribution). Unused on the console.
+	precinctDistribution string
 }
 
 // ceremonyChain is what the trustee ceremony reads back from the chain.
@@ -463,7 +472,7 @@ func (e *Executor) auditLedger(ctx context.Context, j *Journal, runID, dir strin
 		return nil
 	}
 	e.publish(runID, "verify", "info", "dumping the chain's own record of this election…")
-	n, readPath, err := dumpLedger(dir, runID, lr)
+	n, readPath, err := dumpLedger(dir, e.electionID(runID), lr)
 	// Which read path served the dump is journalled either way: "per-ballot"
 	// means the deployed chaincode predates GetBallots, which is the difference
 	// between a dump that costs one round trip per 500 ballots and one that

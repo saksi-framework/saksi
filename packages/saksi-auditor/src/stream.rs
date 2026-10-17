@@ -35,12 +35,16 @@ use std::time::Instant;
 use prost::Message;
 use rayon::prelude::*;
 
-use saksi_crypto::group::compress_point;
+use curve25519_dalek::scalar::Scalar;
+use rand_core::OsRng;
+use saksi_crypto::elgamal::Ciphertext;
+use saksi_crypto::group::{basepoint, compress_point};
 use saksi_protocol::Ballot;
 
 use crate::fixtures::{
     build_partial_decryptions, build_tally, build_voter, empty_aggregate, gen_prologue,
-    tally_selections, voter_id_for_ballot, CpuTimes, ElectionFixture, GenParams, VoterWork,
+    tally_selections, voter_id_for_ballot, CpuTimes, ElectionFixture, GenParams, GenPrologue,
+    VoterWork,
 };
 
 /// Filename of the small metadata document.
@@ -292,13 +296,54 @@ pub(crate) fn write_election_stream_chunked(
     chunk_voters: usize,
 ) -> Result<(), String> {
     let started = Instant::now();
-    let chunk_voters = chunk_voters.clamp(1, params.voters.max(1));
+    fs::create_dir_all(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
+    let pro = gen_prologue(params);
+    write_run_folder(
+        dir,
+        &pro,
+        params,
+        0..params.voters,
+        chunk_voters,
+        &params.election_name,
+        started,
+    )
+    .map(|_| ())
+}
+
+/// What one run folder's generation leaves behind for a caller that combines
+/// several run folders (the precinct generator): the folder's per-contest
+/// homomorphic aggregate, its seeded per-contest counts and its line count.
+pub(crate) struct RunTotals {
+    pub(crate) aggregate: Vec<Ciphertext>,
+    pub(crate) counts: Vec<u64>,
+    pub(crate) lines: usize,
+}
+
+/// The body of [`write_election_stream_chunked`], over the voters in `voters`
+/// only and under whatever election id `pro` currently carries.
+///
+/// The whole-population path calls it once with `0..voters`; the precinct
+/// generator calls it once per precinct with that precinct's index range,
+/// after re-stamping `pro` with the precinct's election id. Voter indices stay
+/// global, so selections, `voter_ids` and ground truth for a voter are the same
+/// whichever path generated it.
+fn write_run_folder(
+    dir: &Path,
+    pro: &GenPrologue,
+    params: &GenParams,
+    voters: std::ops::Range<usize>,
+    chunk_voters: usize,
+    election_name: &str,
+    started: Instant,
+) -> Result<RunTotals, String> {
+    let voter_count = voters.len();
+    let first_voter = voters.start;
+    let chunk_voters = chunk_voters.clamp(1, voter_count.max(1));
     let positions = params.positions;
     let candidates = params.candidates;
     let contest_count = positions * candidates;
 
     fs::create_dir_all(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
-    let pro = gen_prologue(params);
 
     let mut aggregate = empty_aggregate(contest_count);
     let mut counts = vec![0u64; contest_count];
@@ -313,15 +358,15 @@ pub(crate) fn write_election_stream_chunked(
             .map_err(|e| format!("create {}: {e}", ballots_tmp.display()))?;
         let mut out = BufWriter::new(file);
 
-        let mut start = 0usize;
-        while start < params.voters {
-            let end = (start + chunk_voters).min(params.voters);
+        let mut start = voters.start;
+        while start < voters.end {
+            let end = (start + chunk_voters).min(voters.end);
             // The only parallel step: every voter is independent, and collecting
             // an indexed parallel iterator preserves voter order, which is what
             // keeps `ballots.ndjson` voter-major.
             let work: Vec<VoterWork> = (start..end)
                 .into_par_iter()
-                .map(|voter_idx| build_voter(&pro, params, voter_idx))
+                .map(|voter_idx| build_voter(pro, params, voter_idx))
                 .collect();
 
             validate_chunk(&work, positions, candidates, lines)?;
@@ -359,15 +404,15 @@ pub(crate) fn write_election_stream_chunked(
 
     // -- fail-closed population gate (what can be checked without the ballots) --
 
-    validate_totals(lines, &counts, params.voters, positions, candidates)?;
+    validate_totals(lines, &counts, voter_count, positions, candidates)?;
 
     // -- trustee ceremony over the running aggregate ------------------------
 
-    let partial_decryptions = build_partial_decryptions(&pro, &aggregate);
+    let partial_decryptions = build_partial_decryptions(pro, &aggregate);
     // The published totals are what the trustees' shares decrypt to; a
     // mismatch with the seeded counts fails the run instead of publishing.
     let tally = build_tally(
-        &pro,
+        pro,
         &aggregate,
         partial_decryptions.clone(),
         &counts,
@@ -376,7 +421,7 @@ pub(crate) fn write_election_stream_chunked(
 
     let header = StreamHeader {
         election_id: pro.parameters.election_id.clone(),
-        election_name: params.election_name.clone(),
+        election_name: election_name.to_string(),
         trustee_names: params.trustee_names.clone(),
         params: hex::encode(pro.parameters.encode_to_vec()),
         dkg: hex::encode(pro.dkg_transcript.encode_to_vec()),
@@ -387,9 +432,9 @@ pub(crate) fn write_election_stream_chunked(
             .map(|p| hex::encode(p.encode_to_vec()))
             .collect(),
         tally: hex::encode(tally.encode_to_vec()),
-        ground_truth: counts,
+        ground_truth: counts.clone(),
         voter_ids: (0..lines)
-            .map(|i| voter_id_for_ballot(i, positions))
+            .map(|i| voter_id_for_ballot(first_voter * positions + i, positions))
             .collect(),
         positions,
         candidates,
@@ -429,7 +474,256 @@ pub(crate) fn write_election_stream_chunked(
     )
     .map_err(|e| format!("write {}: {e}", timings_path.display()))?;
 
-    Ok(())
+    Ok(RunTotals {
+        aggregate,
+        counts,
+        lines,
+    })
+}
+
+/// Subfolder of a precinct generation that holds the whole-population side.
+pub const NATIONAL_DIR: &str = "national";
+/// Precinct registry in [`NATIONAL_DIR`]: one [`RegistryEntry`] per precinct.
+pub const REGISTRY_FILE: &str = "registry.json";
+/// Per-contest homomorphic aggregate of a precinct or national folder.
+pub const AGGREGATE_FILE: &str = "aggregate.json";
+/// A precinct's authority secret key (hex scalar), demo-only material.
+pub const AUTHORITY_KEY_FILE: &str = "authority.key";
+
+/// One row of `registry.json`: a precinct and the public key its returns must
+/// verify under. The precinct's election id is `<base>-<precinct_id>`.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct RegistryEntry {
+    /// `p01`, `p02`, ...
+    pub precinct_id: String,
+    /// Compressed ristretto255 point `x·G`, hex.
+    pub authority_pubkey_hex: String,
+}
+
+/// `aggregate.json`: the per-contest product of every ballot ciphertext in the
+/// folder (componentwise sum of points, i.e. `(Σc1, Σc2)`), compressed and hex.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct AggregateFile {
+    /// Election id the aggregate belongs to.
+    pub election_id: String,
+    /// One entry per contest, in `contest_ids` order.
+    pub contests: Vec<AggregateContest>,
+}
+
+/// One contest of an [`AggregateFile`].
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct AggregateContest {
+    /// Position-qualified contest id (`president/cand0`).
+    pub contest_id: String,
+    /// `Σc1` (sum of pads), compressed point hex.
+    pub c1: String,
+    /// `Σc2` (sum of data components), compressed point hex.
+    pub c2: String,
+}
+
+/// Precinct id for zero-based precinct `k`: `p01`, `p02`, ...
+pub fn precinct_id(k: usize) -> String {
+    format!("p{:02}", k + 1)
+}
+
+/// Folder name for zero-based precinct `k`: `precinct-01`, ...
+pub fn precinct_dir_name(k: usize) -> String {
+    format!("precinct-{:02}", k + 1)
+}
+
+/// Splits voters `0..voters` into `precincts` contiguous index ranges
+/// `[K·k, K·(k+1))`, the last precinct taking the remainder. `K` defaults to
+/// `voters / precincts`. Every precinct must get at least one voter.
+pub fn precinct_ranges(
+    voters: usize,
+    precincts: usize,
+    precinct_size: Option<usize>,
+) -> Result<Vec<std::ops::Range<usize>>, String> {
+    if precincts < 1 {
+        return Err("--precincts must be >= 1".to_string());
+    }
+    let size = precinct_size.unwrap_or(voters / precincts);
+    // Checked: a huge --precinct-size must be refused, not wrap into a wrong
+    // partition. Once `size * (precincts - 1) < voters` holds, every product
+    // below is at most that and cannot overflow.
+    let fits = size >= 1
+        && size
+            .checked_mul(precincts - 1)
+            .is_some_and(|before_last| before_last < voters);
+    if !fits {
+        return Err(format!(
+            "{voters} voters cannot fill {precincts} precincts of {size} (every precinct needs at least one voter)"
+        ));
+    }
+    Ok((0..precincts)
+        .map(|k| {
+            let end = if k + 1 == precincts {
+                voters
+            } else {
+                size * (k + 1)
+            };
+            size * k..end
+        })
+        .collect())
+}
+
+fn write_aggregate(
+    dir: &Path,
+    election_id: &str,
+    contest_ids: &[String],
+    aggregate: &[Ciphertext],
+) -> Result<(), String> {
+    let file = AggregateFile {
+        election_id: election_id.to_string(),
+        contests: contest_ids
+            .iter()
+            .zip(aggregate)
+            .map(|(contest_id, ct)| {
+                let (c1, c2) = ct.to_compressed_bytes();
+                AggregateContest {
+                    contest_id: contest_id.clone(),
+                    c1: hex::encode(c1),
+                    c2: hex::encode(c2),
+                }
+            })
+            .collect(),
+    };
+    let path = dir.join(AGGREGATE_FILE);
+    let json = serde_json::to_string_pretty(&file).map_err(|e| format!("encode aggregate: {e}"))?;
+    fs::write(&path, json).map_err(|e| format!("write {}: {e}", path.display()))
+}
+
+/// Precinct generation: one DKG, one issuer, one manifest, the population split
+/// into `precincts` voter-index ranges (see [`precinct_ranges`]).
+///
+/// Writes `<dir>/precinct-NN/`, each an ordinary run folder (the same
+/// `header.json` v1 + `ballots.ndjson` + `gen-timings.json` + ground-truth CSVs
+/// a whole-population `gen --stream` writes) under election id `<base>-pNN`,
+/// plus its `aggregate.json` and `authority.key`. Then writes
+/// `<dir>/national/`: `header.json` under the base election id with `n = 0`
+/// and no `ballots.ndjson` (every ballot is bound to its precinct's election
+/// id, so the national folder holds none), the national `aggregate.json` (the
+/// per-contest product of the precinct aggregates, which is the
+/// whole-population aggregate), partials and a trustee-signed tally decrypted
+/// from it, the whole-population ground-truth CSVs, and `registry.json`.
+///
+/// Every tally, precinct and national, is decrypted from its aggregate by the
+/// in-memory trustee shares and refused if it differs from the seeded counts
+/// ([`build_tally`]). The shares, the election secret, the issuer secret and
+/// every encryption nonce stay in this process and are dropped when it exits;
+/// the only secrets written are the demo precinct authority keys.
+pub(crate) fn write_precinct_streams(
+    dir: &Path,
+    params: &GenParams,
+    precincts: usize,
+    precinct_size: Option<usize>,
+    chunk_voters: usize,
+) -> Result<(), String> {
+    let ranges = precinct_ranges(params.voters, precincts, precinct_size)?;
+    fs::create_dir_all(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
+
+    let positions = params.positions;
+    let candidates = params.candidates;
+    let contest_count = positions * candidates;
+    let base_id = params.election_id.clone();
+    let mut pro = gen_prologue(params);
+
+    let mut national = empty_aggregate(contest_count);
+    let mut counts = vec![0u64; contest_count];
+    let mut lines = 0usize;
+    let mut registry = Vec::with_capacity(ranges.len());
+
+    for (k, range) in ranges.into_iter().enumerate() {
+        let pid = precinct_id(k);
+        let pdir = dir.join(precinct_dir_name(k));
+        pro.set_election_id(&format!("{base_id}-{pid}"));
+        let totals = write_run_folder(
+            &pdir,
+            &pro,
+            params,
+            range.clone(),
+            chunk_voters,
+            &format!("{} {pid}", params.election_name),
+            Instant::now(),
+        )?;
+        write_aggregate(
+            &pdir,
+            &pro.parameters.election_id,
+            &pro.parameters.contest_ids,
+            &totals.aggregate,
+        )?;
+        crate::ground_truth::write_ground_truth_csvs_range(&pdir, params, range)?;
+
+        // Demo-only: a real precinct machine would generate and hold this key
+        // in hardware (an HSM or smart card) and never write it to disk. The
+        // study writes it so the console can sign precinct returns and so the
+        // compromised-key scenario can be staged. It is the ONLY secret this
+        // generator writes; trustee shares, the election secret, the issuer
+        // secret and encryption nonces never leave memory.
+        let secret = Scalar::random(&mut OsRng);
+        let key_path = pdir.join(AUTHORITY_KEY_FILE);
+        fs::write(&key_path, hex::encode(secret.to_bytes()))
+            .map_err(|e| format!("write {}: {e}", key_path.display()))?;
+        registry.push(RegistryEntry {
+            precinct_id: pid,
+            authority_pubkey_hex: hex::encode(compress_point(&(secret * basepoint()))),
+        });
+
+        for (c, ct) in totals.aggregate.iter().enumerate() {
+            national[c] += *ct;
+        }
+        for (slot, n) in totals.counts.iter().enumerate() {
+            counts[slot] += n;
+        }
+        lines += totals.lines;
+    }
+
+    // -- national: base id, the product of the precinct aggregates ----------
+
+    pro.set_election_id(&base_id);
+    validate_totals(lines, &counts, params.voters, positions, candidates)?;
+    let ndir = dir.join(NATIONAL_DIR);
+    fs::create_dir_all(&ndir).map_err(|e| format!("create {}: {e}", ndir.display()))?;
+    let partial_decryptions = build_partial_decryptions(&pro, &national);
+    let tally = build_tally(
+        &pro,
+        &national,
+        partial_decryptions.clone(),
+        &counts,
+        lines as u64,
+    )?;
+    let header = StreamHeader {
+        election_id: base_id.clone(),
+        election_name: params.election_name.clone(),
+        trustee_names: params.trustee_names.clone(),
+        params: hex::encode(pro.parameters.encode_to_vec()),
+        dkg: hex::encode(pro.dkg_transcript.encode_to_vec()),
+        issuer_pk: hex::encode(compress_point(pro.issuer_public_key.as_point())),
+        binding_context: hex::encode(crate::fixtures::BINDING_CONTEXT),
+        partial_decryptions: partial_decryptions
+            .iter()
+            .map(|p| hex::encode(p.encode_to_vec()))
+            .collect(),
+        tally: hex::encode(tally.encode_to_vec()),
+        ground_truth: counts,
+        voter_ids: Vec::new(),
+        positions,
+        candidates,
+        n: 0,
+    };
+    let header_path = ndir.join(HEADER_FILE);
+    let encoded =
+        serde_json::to_string_pretty(&header).map_err(|e| format!("encode header: {e}"))?;
+    fs::write(&header_path, encoded)
+        .map_err(|e| format!("write {}: {e}", header_path.display()))?;
+    write_aggregate(&ndir, &base_id, &pro.parameters.contest_ids, &national)?;
+    crate::ground_truth::write_ground_truth_csvs(&ndir, params)?;
+    let registry_path = ndir.join(REGISTRY_FILE);
+    fs::write(
+        &registry_path,
+        serde_json::to_string_pretty(&registry).map_err(|e| format!("encode registry: {e}"))?,
+    )
+    .map_err(|e| format!("write {}: {e}", registry_path.display()))
 }
 
 /// Streams `ballots.ndjson` one decoded [`Ballot`] at a time.
@@ -449,8 +743,13 @@ pub struct BallotLines {
 impl BallotLines {
     /// Opens `<dir>/ballots.ndjson` for streaming.
     pub fn open(dir: &Path) -> Result<Self, String> {
-        let path = dir.join(BALLOTS_FILE);
-        let file = fs::File::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;
+        Self::open_file(&dir.join(BALLOTS_FILE))
+    }
+
+    /// Opens one ndjson ballot file by path (a ledger read-back such as
+    /// `<run>/ledger/ballots.ndjson`, or a copy of one under another name).
+    pub fn open_file(path: &Path) -> Result<Self, String> {
+        let file = fs::File::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
         Ok(Self {
             reader: BufReader::new(file),
             line_no: 0,
@@ -841,6 +1140,275 @@ mod tests {
             );
             let _ = fs::remove_dir_all(&dir);
         }
+    }
+
+    fn read_aggregate(dir: &Path) -> AggregateFile {
+        serde_json::from_str(&fs::read_to_string(dir.join(AGGREGATE_FILE)).expect("aggregate"))
+            .expect("aggregate parses")
+    }
+
+    fn point(hex_str: &str) -> curve25519_dalek::ristretto::RistrettoPoint {
+        let bytes: [u8; 32] = hex::decode(hex_str)
+            .expect("hex")
+            .try_into()
+            .expect("32 bytes");
+        saksi_crypto::group::point_from_compressed(bytes).expect("valid point")
+    }
+
+    fn aggregate_points(file: &AggregateFile) -> Vec<Ciphertext> {
+        file.contests
+            .iter()
+            .map(|c| Ciphertext {
+                pad: point(&c.c1),
+                data: point(&c.c2),
+            })
+            .collect()
+    }
+
+    /// Summary rows `(position, candidate) -> count` of a ground-truth CSV.
+    fn summary_counts(dir: &Path) -> Vec<(String, u64)> {
+        fs::read_to_string(dir.join(crate::ground_truth::GROUND_TRUTH_SUMMARY_CSV))
+            .expect("summary csv")
+            .lines()
+            .skip(1)
+            .map(|line| {
+                let (key, n) = line.rsplit_once(',').expect("row");
+                (key.to_string(), n.parse().expect("count"))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn precinct_ranges_split_by_index_and_give_the_last_the_remainder() {
+        assert_eq!(precinct_ranges(20, 2, None).unwrap(), vec![0..10, 10..20]);
+        assert_eq!(
+            precinct_ranges(23, 3, None).unwrap(),
+            vec![0..7, 7..14, 14..23]
+        );
+        assert_eq!(
+            precinct_ranges(20, 3, Some(4)).unwrap(),
+            vec![0..4, 4..8, 8..20]
+        );
+        assert!(
+            precinct_ranges(5, 6, None).is_err(),
+            "a precinct with no voters"
+        );
+        assert!(
+            precinct_ranges(10, 3, Some(5)).is_err(),
+            "last precinct empty"
+        );
+        assert!(precinct_ranges(10, 0, None).is_err());
+        assert!(
+            precinct_ranges(10, 3, Some(usize::MAX)).is_err(),
+            "an overflowing size is refused, not wrapped"
+        );
+    }
+
+    /// Voter indices (0-based) of the rows in a ground-truth ballots CSV.
+    fn csv_voter_indices(dir: &Path) -> Vec<usize> {
+        fs::read_to_string(dir.join(crate::ground_truth::GROUND_TRUTH_BALLOTS_CSV))
+            .expect("ballots csv")
+            .lines()
+            .skip(1)
+            .map(|line| {
+                let id = line.split(',').next().expect("voter id");
+                id.trim_start_matches("V-").parse::<usize>().expect("index") - 1
+            })
+            .collect()
+    }
+
+    /// 20 voters x 2 positions x 2 precincts: every precinct folder is an
+    /// ordinary run that passes `audit-stream`; the precinct aggregates multiply
+    /// to the national aggregate; precinct ground truths add up to the national
+    /// one; the national partials and signed tally verify against the national
+    /// aggregate; the registry lists both precincts with valid keys; and the
+    /// authority key is the only secret on disk.
+    #[test]
+    fn precinct_generation_partitions_one_election_into_auditable_folders() {
+        check_precinct_generation("precincts", 20, 2, None, &[0..10, 10..20]);
+    }
+
+    /// 23 voters x 3 precincts: the last precinct takes the remainder through
+    /// the writer, not only in `precinct_ranges`.
+    #[test]
+    fn precinct_generation_gives_the_last_precinct_the_remainder() {
+        check_precinct_generation("precincts-rem", 23, 3, None, &[0..7, 7..14, 14..23]);
+    }
+
+    fn check_precinct_generation(
+        name: &str,
+        voters: usize,
+        precincts: usize,
+        size: Option<usize>,
+        expected: &[std::ops::Range<usize>],
+    ) {
+        let positions = 2;
+        let dir = scratch(name);
+        let mut params = GenParams::simple(voters, positions, 3, SelectionProfile::Realistic);
+        params.election_id = "pm-test".into();
+        write_precinct_streams(&dir, &params, precincts, size, 4).expect("precinct generation");
+
+        let ndir = dir.join(NATIONAL_DIR);
+        let national_header = read_header(&ndir).expect("national header");
+        assert_eq!(national_header.election_id, "pm-test");
+        assert_eq!(national_header.n, 0);
+        assert!(
+            !ndir.join(BALLOTS_FILE).exists(),
+            "national holds no ballots"
+        );
+
+        let mut product: Option<Vec<Ciphertext>> = None;
+        let mut gt_sum = vec![0u64; positions * 3];
+        let mut csv_sum: Vec<(String, u64)> = Vec::new();
+        assert!(!dir.join(precinct_dir_name(precincts)).exists());
+        for (k, range) in expected.iter().enumerate() {
+            let pdir = dir.join(precinct_dir_name(k));
+            let header = read_header(&pdir).expect("precinct header");
+
+            // (c) an ordinary run folder that audits clean.
+            assert_eq!(header.election_id, format!("pm-test-{}", precinct_id(k)));
+            assert_eq!(header.n, range.len() * positions, "precinct {k} size");
+            assert_eq!(verify_stream(&pdir).expect("gate"), range.len() * positions);
+            let sa = crate::demo::audit_stream_dir(&pdir).expect("audits");
+            assert_eq!(sa.overall, "pass", "precinct {k}: {sa:#?}");
+            assert!(sa.contests.iter().all(|c| c.e == 0 && c.pass));
+
+            // Shared key material: only the election id differs from national.
+            assert_eq!(header.issuer_pk, national_header.issuer_pk);
+            let dkg = saksi_protocol::DKGTranscript::decode(&hex::decode(&header.dkg).unwrap()[..])
+                .unwrap();
+            let ndkg = saksi_protocol::DKGTranscript::decode(
+                &hex::decode(&national_header.dkg).unwrap()[..],
+            )
+            .unwrap();
+            assert_eq!(dkg.trustee_commitments, ndkg.trustee_commitments);
+            assert_eq!(dkg.election_id, header.election_id);
+
+            // Voter ids stay global: each precinct starts at its range start.
+            assert_eq!(header.voter_ids[0], format!("voter-{}", range.start));
+
+            // The CSVs describe exactly this precinct's voters, and their
+            // totals are this precinct's header ground truth (contest order).
+            assert_eq!(
+                csv_voter_indices(&pdir),
+                range.clone().collect::<Vec<_>>(),
+                "precinct {k} CSV rows"
+            );
+            let csv_counts: Vec<u64> = summary_counts(&pdir).iter().map(|(_, n)| *n).collect();
+            assert_eq!(csv_counts, header.ground_truth, "precinct {k} CSV totals");
+
+            let agg = aggregate_points(&read_aggregate(&pdir));
+            product = Some(match product {
+                None => agg,
+                Some(acc) => acc.iter().zip(&agg).map(|(a, b)| *a + *b).collect(),
+            });
+            for (slot, n) in header.ground_truth.iter().enumerate() {
+                gt_sum[slot] += n;
+            }
+            for (i, (key, n)) in summary_counts(&pdir).into_iter().enumerate() {
+                if k == 0 {
+                    csv_sum.push((key, n));
+                } else {
+                    assert_eq!(csv_sum[i].0, key);
+                    csv_sum[i].1 += n;
+                }
+            }
+
+            // Only the demo authority key is secret, and it matches the registry.
+            let mut files: Vec<String> = fs::read_dir(&pdir)
+                .unwrap()
+                .map(|e| e.unwrap().file_name().into_string().unwrap())
+                .collect();
+            files.sort();
+            assert_eq!(
+                files,
+                [
+                    AGGREGATE_FILE,
+                    AUTHORITY_KEY_FILE,
+                    BALLOTS_FILE,
+                    GEN_TIMINGS_FILE,
+                    crate::ground_truth::GROUND_TRUTH_BALLOTS_CSV,
+                    crate::ground_truth::GROUND_TRUTH_SUMMARY_CSV,
+                    HEADER_FILE,
+                ]
+            );
+        }
+
+        // (a) product of precinct aggregates == national aggregate, per contest.
+        let national_agg = aggregate_points(&read_aggregate(&ndir));
+        assert_eq!(product.expect("two precincts"), national_agg);
+
+        // (b) precinct ground truths add up to the national ground truth.
+        assert_eq!(gt_sum, national_header.ground_truth);
+        assert_eq!(csv_sum, summary_counts(&ndir));
+        assert_eq!(gt_sum.iter().sum::<u64>(), (voters * positions) as u64);
+
+        // National partials + tally verify against the national aggregate (the
+        // non-ballot half of audit-stream: DKG, partial-decryption proofs,
+        // threshold combine, decode, trustee signatures, E = 0).
+        let hexd = |s: &str| hex::decode(s).unwrap();
+        let nparams =
+            saksi_protocol::ElectionParameters::decode(&hexd(&national_header.params)[..]).unwrap();
+        let ndkg = saksi_protocol::DKGTranscript::decode(&hexd(&national_header.dkg)[..]).unwrap();
+        let partials: Vec<saksi_protocol::PartialDecryption> = national_header
+            .partial_decryptions
+            .iter()
+            .map(|p| saksi_protocol::PartialDecryption::decode(&hexd(p)[..]).unwrap())
+            .collect();
+        let tally = saksi_protocol::TallyResult::decode(&hexd(&national_header.tally)[..]).unwrap();
+        let mut builder = crate::report::ReportBuilder::new();
+        let dkg_v = crate::dkg::verify_dkg_transcript(&nparams, &ndkg, &mut builder)
+            .expect("national DKG verifies");
+        let totals = crate::fixtures::decrypt_totals(
+            &nparams,
+            &national_agg,
+            &partials,
+            &dkg_v.trustee_share_publics,
+            (voters * positions) as u64,
+        )
+        .expect("national partials verify and decode");
+        assert_eq!(totals, tally.totals);
+        assert_eq!(totals, national_header.ground_truth, "national E = 0");
+        assert_eq!(tally.election_id, "pm-test");
+        crate::tally::verify_tally_signatures(
+            &nparams,
+            &tally,
+            &dkg_v.trustee_share_publics,
+            &mut builder,
+        );
+        assert!(builder.finish().passed(), "national DKG + signatures pass");
+
+        // (d) registry lists both precincts with keys matching authority.key.
+        let registry: Vec<RegistryEntry> =
+            serde_json::from_str(&fs::read_to_string(ndir.join(REGISTRY_FILE)).expect("registry"))
+                .expect("registry parses");
+        assert_eq!(registry.len(), precincts);
+        for (k, entry) in registry.iter().enumerate() {
+            assert_eq!(entry.precinct_id, precinct_id(k));
+            let public = point(&entry.authority_pubkey_hex);
+            let secret_bytes: [u8; 32] = hex::decode(
+                fs::read_to_string(dir.join(precinct_dir_name(k)).join(AUTHORITY_KEY_FILE))
+                    .unwrap()
+                    .trim(),
+            )
+            .unwrap()
+            .try_into()
+            .unwrap();
+            let secret = Option::<Scalar>::from(Scalar::from_canonical_bytes(secret_bytes))
+                .expect("canonical scalar");
+            assert_eq!(secret * basepoint(), public);
+        }
+        assert_ne!(registry[0], registry[1]);
+        assert_eq!(
+            expected.last().map(|r| r.len()),
+            precinct_ranges(voters, precincts, size)
+                .unwrap()
+                .last()
+                .map(|r| r.len()),
+            "last precinct takes the remainder"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
     }
 
     /// The streaming auditor is the same auditor: run both over one fixture and

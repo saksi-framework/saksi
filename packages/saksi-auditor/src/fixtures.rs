@@ -746,6 +746,24 @@ pub(crate) struct GenPrologue {
     plan: SelectionPlan,
 }
 
+impl GenPrologue {
+    /// Re-stamps the election id on the parameters and the DKG transcript,
+    /// keeping every key unchanged.
+    ///
+    /// The precinct generator runs one DKG and one issuer for the whole
+    /// population, then builds each precinct under its own election id
+    /// (`<base>-pNN`) because the chaincode refuses a second `CreateElection`
+    /// with the same id on one channel. The id is the only thing that changes:
+    /// the transcript's commitments, the joint key, the trustee shares and the
+    /// issuer are shared, which is what lets the precinct aggregates multiply
+    /// into one national aggregate under one key.
+    #[cfg_attr(not(feature = "demo"), allow(dead_code))]
+    pub(crate) fn set_election_id(&mut self, election_id: &str) {
+        self.parameters.election_id = election_id.to_string();
+        self.dkg_transcript.election_id = election_id.to_string();
+    }
+}
+
 /// One voter's contribution: their per-position ballot records (in position
 /// order), the selections behind them, this voter's per-contest ciphertexts
 /// for the running homomorphic aggregate, and the CPU spent producing them.
@@ -1234,6 +1252,26 @@ pub(crate) fn decrypt_totals(
     trustee_share_publics: &[RistrettoPoint],
     max: u64,
 ) -> Result<Vec<u64>, String> {
+    decrypt_totals_bound(
+        parameters,
+        aggregate,
+        partial_decryptions,
+        trustee_share_publics,
+        BINDING_CONTEXT,
+        max,
+    )
+}
+
+/// [`decrypt_totals`] under an explicit binding context (a verifier reads it
+/// from the published header instead of assuming the generator's).
+pub(crate) fn decrypt_totals_bound(
+    parameters: &ElectionParameters,
+    aggregate: &[Ciphertext],
+    partial_decryptions: &[PartialDecryption],
+    trustee_share_publics: &[RistrettoPoint],
+    binding_context: &[u8],
+    max: u64,
+) -> Result<Vec<u64>, String> {
     let pads: Vec<RistrettoPoint> = aggregate.iter().map(|ct| ct.pad).collect();
     let data: Vec<RistrettoPoint> = aggregate.iter().map(|ct| ct.data).collect();
     let mut builder = crate::report::ReportBuilder::new();
@@ -1243,7 +1281,7 @@ pub(crate) fn decrypt_totals(
         data,
         partial_decryptions,
         trustee_share_publics,
-        BINDING_CONTEXT,
+        binding_context,
         &mut builder,
     );
     let report = builder.finish();

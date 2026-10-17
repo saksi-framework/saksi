@@ -67,8 +67,27 @@ fn candidate_label(p: usize, k: usize) -> String {
 /// proofs. Cost is linear in `voters × positions` and dominated by formatting
 /// and I/O, which is why this path carries no voter ceiling.
 pub fn write_ground_truth_csvs(dir: &Path, params: &GenParams) -> Result<(), String> {
+    write_ground_truth_csvs_range(dir, params, 0..params.voters)
+}
+
+/// [`write_ground_truth_csvs`] for the voters in `voters` only (a precinct's
+/// index range). Selections still come from the whole-population plan, and
+/// voter ids and `scale_group` stay global, so the rows are exactly the rows
+/// the whole-population table holds for those voters and the per-precinct
+/// summaries add up to the whole-population summary.
+pub fn write_ground_truth_csvs_range(
+    dir: &Path,
+    params: &GenParams,
+    voters: std::ops::Range<usize>,
+) -> Result<(), String> {
     if params.voters < 1 || params.positions < 1 || params.candidates < 1 {
         return Err("voters, positions, and candidates must each be >= 1".to_string());
+    }
+    if voters.is_empty() || voters.end > params.voters {
+        return Err(format!(
+            "voter range {voters:?} is empty or outside 0..{}",
+            params.voters
+        ));
     }
     std::fs::create_dir_all(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
 
@@ -102,7 +121,7 @@ pub fn write_ground_truth_csvs(dir: &Path, params: &GenParams) -> Result<(), Str
     // is what makes the two tables byte-identical.
     let plan = SelectionPlan::new(params.profile, params.voters, positions, candidates);
 
-    for voter_idx in 0..params.voters {
+    for voter_idx in voters {
         write!(
             out,
             "V-{:06},{},{}",
