@@ -21,7 +21,7 @@ import (
 	clientsdk "github.com/saksi-framework/saksi/packages/saksi-bulletin/client-sdk"
 )
 
-//go:embed web/index.html web/trail.html web/wizard.html
+//go:embed web/index.html web/trail.html web/wizard.html web/canvass.html
 var webFS embed.FS
 
 // exportOrder is the downloadable run artifacts, in display order. exportAllowlist
@@ -114,6 +114,10 @@ type Server struct {
 	// runScript runs it (reset.go). Tests override both.
 	tierScript func() (string, error)
 	runScript  scriptRunner
+
+	// cv is the offline canvass attack console (canvassconsole.go), with its
+	// own single-flight slot.
+	cv *canvassConsole
 }
 
 // NewServer returns the console HTTP handler. fabric configures the live
@@ -129,6 +133,7 @@ func NewServer(store *RunStore, exec *Executor, hub *Hub, fabric FabricConfig, a
 		timeout:    timeout,
 		allowHosts: make(map[string]bool),
 		busy:       make(map[string]context.CancelFunc),
+		cv:         newCanvassConsole(),
 	}
 	s.dial = s.dialChain
 	s.gitHead = s.consoleHead
@@ -177,6 +182,11 @@ func NewServer(store *RunStore, exec *Executor, hub *Hub, fabric FabricConfig, a
 	mux.HandleFunc("/api/campaigns", s.handleCampaigns)
 	mux.HandleFunc("/api/campaigns/", s.handleCampaign)
 	mux.HandleFunc("/api/network/reset", s.handleNetworkReset)
+	mux.HandleFunc("/canvass", s.handleCanvassPage)
+	mux.HandleFunc("/api/canvass/scenarios", s.handleCanvassScenarios)
+	mux.HandleFunc("/api/canvass/fixture", s.handleCanvassFixture)
+	mux.HandleFunc("/api/canvass/attack", s.handleCanvassAttack)
+	mux.HandleFunc("/api/canvass/attempt/", s.handleCanvassAttempt)
 	// Browsers ask for a favicon on every page; without this route the request
 	// falls through to "/" and, with auth on, logs a 401 on the public board.
 	mux.HandleFunc("/favicon.ico", func(w http.ResponseWriter, r *http.Request) {

@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Canvass Console</title>
+<style>
+  /* Placeholder (Task 2 of the canvass console plan); Task 3 replaces it with
+     the real page. Tokens copied from web/wizard.html. */
+  :root {
+    --bg:#f4f6f8; --panel:#ffffff; --panel-2:#fbfcfd; --ink:#181b20; --muted:#5c6470;
+    --line:#e4e8ec; --line-2:#eef1f4; --accent:#2f6fed; --accent-weak:#e8effe; --accent-ink:#1a4ed0;
+    --ok:#17864a; --ok-weak:#e3f4ea; --bad:#c53434; --bad-weak:#fbe9e9;
+    --warn:#8a6100; --warn-weak:#fdf1dc;
+    --logbg:#0e1116; --logink:#d6dae0;
+    --radius:12px; --radius-sm:8px;
+    --shadow:0 1px 2px rgba(16,24,40,.05), 0 4px 12px rgba(16,24,40,.04);
+    --mono:ui-monospace,"SF Mono",SFMono-Regular,Menlo,Consolas,monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg:#0c0e11; --panel:#15181d; --panel-2:#181c22; --ink:#e8ebef; --muted:#98a1ad;
+      --line:#262b32; --line-2:#20242a; --accent:#5b8bff; --accent-weak:#1a2740; --accent-ink:#a9c4ff;
+      --ok:#4cc47f; --ok-weak:#132a1f; --bad:#f0736f; --bad-weak:#301a1c;
+      --warn:#e0b062; --warn-weak:#2b2312;
+      --logbg:#05070a; --logink:#c8ccd2;
+      --shadow:0 1px 2px rgba(0,0,0,.4), 0 6px 18px rgba(0,0,0,.28);
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg:#0c0e11; --panel:#15181d; --panel-2:#181c22; --ink:#e8ebef; --muted:#98a1ad;
+    --line:#262b32; --line-2:#20242a; --accent:#5b8bff; --accent-weak:#1a2740; --accent-ink:#a9c4ff;
+    --ok:#4cc47f; --ok-weak:#132a1f; --bad:#f0736f; --bad-weak:#301a1c;
+    --warn:#e0b062; --warn-weak:#2b2312;
+    --logbg:#05070a; --logink:#c8ccd2;
+    --shadow:0 1px 2px rgba(0,0,0,.4), 0 6px 18px rgba(0,0,0,.28);
+  }
+  * { box-sizing:border-box }
+  body { margin:0; background:var(--bg); color:var(--ink);
+         font:14px/1.55 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif; padding:16px }
+  main { max-width:880px; margin:0 auto }
+  pre { font-family:var(--mono); font-size:12px; background:var(--panel); border:1px solid var(--line);
+        border-radius:var(--radius-sm); padding:12px; overflow:auto }
+  footer { position:sticky; bottom:0; background:var(--bg); color:var(--muted); font-size:12px;
+           border-top:1px solid var(--line); padding:10px 0; margin-top:16px }
+</style>
+</head>
+<body>
+<main>
+  <h1>Canvass console</h1>
+  <p>The attack console page is not built yet. API: <code>GET /api/canvass/scenarios</code>,
+     <code>POST /api/canvass/fixture</code>, <code>POST /api/canvass/attack</code>,
+     <code>GET /api/canvass/attempt/&lt;n&gt;</code>, progress on <code>GET /events?run=canvass</code>.</p>
+  <pre id="out">loading…</pre>
+</main>
+<footer>Offline replay: one generated election; the ledger read-back is the generated ballots in ledger order; no Fabric. Live runs: Appendix E.</footer>
+<script>
+  fetch("/api/canvass/scenarios").then(r => r.text()).then(t => { document.getElementById("out").textContent = t; });
+</script>
+</body>
+</html>
