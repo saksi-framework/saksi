@@ -391,3 +391,42 @@ func TestWizardResultsCountEachContestOnce(t *testing.T) {
 		}
 	}
 }
+
+// The canvass page is self-contained, talks to exactly the canvass routes,
+// subscribes to the stream before it POSTs (the hub does not replay), and
+// defines every function it wires up.
+func TestCanvassPageWiring(t *testing.T) {
+	page, err := webFS.ReadFile("web/canvass.html")
+	if err != nil {
+		t.Fatalf("read canvass.html: %v", err)
+	}
+	js := string(page)
+	if strings.Contains(js, "<script src") || strings.Contains(js, "<link") {
+		t.Error("canvass.html must not load external scripts or stylesheets")
+	}
+	for _, want := range []string{
+		`new EventSource("/events?run=canvass")`, `"/api/canvass/scenarios"`, `"/api/canvass/fixture"`,
+		`"/api/canvass/attack"`, `"/api/canvass/attempt/"`, `"/api/me"`, `"/api/login"`,
+		"res.status === 409", "res.status === 403", `id="btnBuild"`, `id="btnClean"`,
+		"Offline replay: one generated election; the ledger read-back is the generated ballots in ledger order; no Fabric. Live runs: Appendix E.",
+	} {
+		if !strings.Contains(js, want) {
+			t.Errorf("canvass.html is missing %q", want)
+		}
+	}
+	// post() must await the stream before it fetches.
+	post := js[strings.Index(js, "async function post("):]
+	if i, j := strings.Index(post, "await openStream()"), strings.Index(post, "apiFetch(path"); i < 0 || j < 0 || i > j {
+		t.Error("post() must open the event stream before it POSTs")
+	}
+	for _, fn := range []string{
+		"apiFetch", "errorText", "openStream", "closeStream", "onStream", "newAttempt", "stepOf", "apply",
+		"resync", "loadAttempt", "loadState", "startPoll", "setIdle", "setBusy", "post", "buildElection",
+		"runScenario", "scenarioName", "setStatus", "renderStatus", "renderAttacks", "renderEmptyTiles",
+		"renderAttempt", "renderChecks", "renderVerdict", "log", "checkAuth", "needSignIn", "showApp", "boot",
+	} {
+		if !strings.Contains(js, "function "+fn+"(") {
+			t.Errorf("canvass.html calls %s() but never defines it", fn)
+		}
+	}
+}
