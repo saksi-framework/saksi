@@ -106,6 +106,8 @@ var routeAccess = map[string]access{
 	// The wizard page is static and holds no data; it signs in through
 	// /api/login, and each route it then calls keeps its own role.
 	"/wizard": accessPublic,
+	// The canvass console page is static too; its API below is admin.
+	"/canvass": accessPublic,
 
 	// trustee or admin
 	"/ceremony/publish": accessSignedIn,
@@ -139,6 +141,12 @@ var routeAccess = map[string]access{
 	// and a typed confirmation. (The peer-restart fault is the "fault" action
 	// under /api/runs/, admin above, with the same two handler guards.)
 	"/api/network/reset": accessAdmin,
+	// offline canvass attack console: the scenario table, the fixture build,
+	// replaying an attack and reading an attempt back.
+	"/api/canvass/scenarios": accessAdmin,
+	"/api/canvass/fixture":   accessAdmin,
+	"/api/canvass/attack":    accessAdmin,
+	"/api/canvass/attempt/":  accessAdmin,
 }
 
 // denial returns the HTTP status and reason when sess may not use a route that

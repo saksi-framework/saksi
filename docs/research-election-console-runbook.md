@@ -140,10 +140,10 @@ session; anyone else gets the sealed view.
 
 | Role | Routes |
 | --- | --- |
-| public | `/api/board/`, `/api/verify-code/`, `/trail/`, `/api/trail`, `/api/trail/`, `/api/capabilities`, `/api/ceremony/` (status), `/runs`, the `/board/`, `/trustee/`, `/admin/` apps, the `/wizard` page (it signs in through `/api/login`; the data it shows comes from the routes below), `/api/login`, `/api/logout`, `/api/me` |
+| public | `/api/board/`, `/api/verify-code/`, `/trail/`, `/api/trail`, `/api/trail/`, `/api/capabilities`, `/api/ceremony/` (status), `/runs`, the `/board/`, `/trustee/`, `/admin/` apps, the `/wizard` page (it signs in through `/api/login`; the data it shows comes from the routes below), the `/canvass` page (same; §6c), `/api/login`, `/api/logout`, `/api/me` |
 | trustee or admin | `POST /ceremony/publish`, `GET /events` |
 | trustee, own shares only | `POST /ceremony/submit` — `403` unless the body's `trustee_id` is the session's; an admin cannot submit for a trustee |
-| admin | `/generate`, `/submit`, `/verify`, `/run-all`, `/cancel`, `/scenarios`, `/attack`, `/ceremony/start`, `/api/runs/…`, `/api/check/`, `/api/scenarios/`, `/export/` (exports carry the seeded ground truth), `/api/preflight`, `/api/ladder`, `/api/jobs/`, `/api/campaigns`, `/api/campaigns/…`, `/` (and any unknown path) |
+| admin | `/generate`, `/submit`, `/verify`, `/run-all`, `/cancel`, `/scenarios`, `/attack`, `/ceremony/start`, `/api/runs/…`, `/api/check/`, `/api/scenarios/`, `/export/` (exports carry the seeded ground truth), `/api/preflight`, `/api/ladder`, `/api/jobs/`, `/api/campaigns`, `/api/campaigns/…`, `/api/canvass/…` (§6c), `/` (and any unknown path) |
 
 Stated limits — say so wherever the admin console is shown:
 
@@ -289,6 +289,87 @@ A tracking code `BC-XXXX-XXXX` is the first eight hex characters of a ballot's
 nullifier. Nullifiers are derived **per voter per position**, so a code
 identifies one ballot *record*, not a voter's whole ballot — and it reveals
 nothing about the selection.
+
+## 6c. Canvass attack console on a laptop (`/canvass`)
+
+`/canvass` replays the precinct-canvass attacks one at a time on a single
+generated election, with no Fabric: ten precinct returns arrive at the national
+server one by one, the attack is mounted on the way, and the page shows which
+precinct the canvass flags and which of its seven checks fail. It runs on a
+laptop (an attempt takes about 20 to 30 s on the MacBook).
+
+Prerequisites:
+
+- A release build of `saksi-demo` and the Go console (§3).
+- A checkout of **balotachain** for its attack tools,
+  `<balotachain>/tools/security/canvass/` (`mutate_return.py`,
+  `assert_outcome.py`, `_sort_nullifier.py`). The console runs them as they
+  are; it does not copy or change them.
+- `python3` on `PATH` (the tools use only the standard library).
+
+```bash
+# from the repo root
+cargo build -p saksi-demo --release
+cd packages/saksi-campaign
+go build -o saksi-campaign ./cmd/saksi-campaign
+./saksi-campaign serve \
+  --addr 127.0.0.1:8090 \
+  --demo ../../target/release/saksi-demo \
+  --canvass-tools <balotachain>/tools/security/canvass
+# then open http://127.0.0.1:8090/canvass
+```
+
+- `--canvass-tools` (env `SAKSI_CANVASS_TOOLS`) is required for `/canvass` to
+  replay; without it the start-up banner says `/canvass cannot replay` and the
+  page shows the console as not set up.
+- `--canvass-dir` (default `~/.saksi/canvass`) holds the election at
+  `<dir>/fixture` and each attempt at `<dir>/attempts/<n>-<scenario>/`
+  (`attempt.json`, `events.ndjson`, `canvass.json`, `canvass-checks.csv` and
+  the precinct and national folders). Use a fresh folder for a clean demo.
+- Paths must not contain spaces.
+
+What the page shows:
+
+- **Build election** generates the election once (`saksi-demo gen --stream`, 10
+  precincts, 1,000 voters, 3 positions, 4 candidates, 3-of-5 trustees,
+  realistic distribution, election `cv-ui`) and keeps it only if the baseline
+  canvass passes all seven checks. An attack started with no election builds it
+  first; later clicks reuse it.
+- **Clean run** and one button per live attack: T9, T10, T11, T12, T13, T14a,
+  T14b, T15, T16, T21, T24. Each button carries a tag for where the attack
+  happens (path, precinct, national) and what it does. T19 and T20 need Fabric
+  and are shown greyed out with the outcome recorded on 2026-10-18.
+- The national server: ten precinct tiles (waiting, received, TAMPERED with the
+  failing checks, or not received) plus a tile for each rejected arrival (a
+  duplicate or an unregistered precinct), the seven checks with the canvass's
+  own reasons, and the verdict line `expected … · got … · PASS/FAIL`, where PASS
+  means the canvass failed exactly the checks predicted for that attack.
+- A reload shows the attempt that is running, or the last one. Only one attempt
+  or election build runs at a time; a second request gets `409`. The canvass
+  slot is separate from election runs, so `/wizard` keeps working alongside it.
+
+The page footer states the limit, and so should any write-up of a run from this
+page:
+
+> Offline replay: one generated election; the ledger read-back is the generated
+> ballots in ledger order; no Fabric. Live runs: Appendix E.
+
+**Authentication.** The `/canvass` page itself is static and public; its API
+(`/api/canvass/scenarios`, `/api/canvass/fixture`, `/api/canvass/attack`,
+`/api/canvass/attempt/<n>`) is admin-only, and its progress stream
+(`/events?run=canvass`) needs a session. With `--auth-file` the page asks for an
+admin sign-in and refuses a trustee account. To run it locally without logging
+in, start the console without `--auth-file` (the page then says authentication
+is off) and keep the loopback bind.
+
+The same flow without the page:
+
+```bash
+curl -X POST localhost:8090/api/canvass/fixture                  # 202, build the election
+curl -X POST localhost:8090/api/canvass/attack -d '{"scenario":"T9"}'  # 202 {"attempt":n}
+curl localhost:8090/api/canvass/attempt/<n>                      # running, then result.final.verdict
+curl localhost:8090/api/canvass/scenarios                        # table, busy, last_attempt, T19/T20 record
+```
 
 ## 7. What works offline vs. network-gated
 

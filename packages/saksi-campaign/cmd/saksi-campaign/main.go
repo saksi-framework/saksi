@@ -159,6 +159,10 @@ func serve(args []string) {
 	fabricChannel := fs.String("fabric-channel", "saksi", "Fabric channel the bulletin board runs on")
 	fabricChaincode := fs.String("fabric-chaincode", "saksi-bulletin", "deployed chaincode name")
 	fabricPeerVolume := fs.String("fabric-peer-volume", "", "host path of the peer's ledger volume (enables perf.csv's ledger_bytes_delta)")
+	canvassDir := fs.String("canvass-dir", defaultCanvassDir(),
+		"offline canvass console folder: the fixture at <dir>/fixture, attempts at <dir>/attempts/<n>-<id>/")
+	canvassTools := fs.String("canvass-tools", os.Getenv("SAKSI_CANVASS_TOOLS"),
+		"balotachain tools/security/canvass folder (mutate_return.py, assert_outcome.py, _sort_nullifier.py) (env SAKSI_CANVASS_TOOLS)")
 	var allow multiFlag
 	fs.Var(&allow, "allow-host", "additional accepted Host header (repeatable; for LAN)")
 	_ = fs.Parse(args)
@@ -197,6 +201,7 @@ func serve(args []string) {
 	hub := campaign.NewHub()
 	exec := campaign.NewExecutor(store, hub, *demoBin, *consBin, fabric)
 	handler := campaign.NewServer(store, exec, hub, fabric, allowedHosts(*addr, allow), *timeout)
+	handler.SetCanvass(campaign.CanvassConfig{Dir: *canvassDir, Tools: *canvassTools, Demo: *demoBin})
 	if *authFile != "" {
 		if err := handler.EnableAuth(*authFile); err != nil {
 			fatal("--auth-file %s: %v", *authFile, err)
@@ -210,6 +215,11 @@ func serve(args []string) {
 	fmt.Printf("  saksi-demo %s\n", *demoBin)
 	if *webDir != "" {
 		fmt.Printf("  apps      %s -> http://%s/board/, /trustee/ and /admin/\n", *webDir, displayHost(*addr))
+	}
+	if *canvassTools != "" {
+		fmt.Printf("  canvass   %s -> http://%s/canvass (tools %s)\n", *canvassDir, displayHost(*addr), *canvassTools)
+	} else {
+		fmt.Printf("  canvass   (no --canvass-tools: /canvass cannot replay)\n")
 	}
 	if *authFile != "" {
 		fmt.Printf("  auth      on, users from %s\n", *authFile)
@@ -246,6 +256,13 @@ func restorePeerOnSignal(exec *campaign.Executor) {
 	}
 	fmt.Fprintf(os.Stderr, "console stopped (%v)\n", sig)
 	os.Exit(1)
+}
+
+func defaultCanvassDir() string {
+	if home, err := os.UserHomeDir(); err == nil {
+		return filepath.Join(home, ".saksi", "canvass")
+	}
+	return "saksi-canvass"
 }
 
 func defaultRunsDir() string {

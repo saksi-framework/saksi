@@ -1,0 +1,792 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Canvass Console</title>
+<style>
+  /* Tokens, fonts and light/dark handling copied from web/wizard.html. */
+  :root {
+    --bg:#f4f6f8; --panel:#ffffff; --panel-2:#fbfcfd; --ink:#181b20; --muted:#5c6470;
+    --line:#e4e8ec; --line-2:#eef1f4; --accent:#2f6fed; --accent-weak:#e8effe; --accent-ink:#1a4ed0;
+    --ok:#17864a; --ok-weak:#e3f4ea; --bad:#c53434; --bad-weak:#fbe9e9;
+    --warn:#8a6100; --warn-weak:#fdf1dc;
+    --logbg:#0e1116; --logink:#d6dae0;
+    --radius:12px; --radius-sm:8px;
+    --shadow:0 1px 2px rgba(16,24,40,.05), 0 4px 12px rgba(16,24,40,.04);
+    --mono:ui-monospace,"SF Mono",SFMono-Regular,Menlo,Consolas,monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg:#0c0e11; --panel:#15181d; --panel-2:#181c22; --ink:#e8ebef; --muted:#98a1ad;
+      --line:#262b32; --line-2:#20242a; --accent:#5b8bff; --accent-weak:#1a2740; --accent-ink:#a9c4ff;
+      --ok:#4cc47f; --ok-weak:#132a1f; --bad:#f0736f; --bad-weak:#301a1c;
+      --warn:#e0b062; --warn-weak:#2b2312;
+      --logbg:#05070a; --logink:#c8ccd2;
+      --shadow:0 1px 2px rgba(0,0,0,.4), 0 6px 18px rgba(0,0,0,.28);
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg:#0c0e11; --panel:#15181d; --panel-2:#181c22; --ink:#e8ebef; --muted:#98a1ad;
+    --line:#262b32; --line-2:#20242a; --accent:#5b8bff; --accent-weak:#1a2740; --accent-ink:#a9c4ff;
+    --ok:#4cc47f; --ok-weak:#132a1f; --bad:#f0736f; --bad-weak:#301a1c;
+    --warn:#e0b062; --warn-weak:#2b2312;
+    --logbg:#05070a; --logink:#c8ccd2;
+    --shadow:0 1px 2px rgba(0,0,0,.4), 0 6px 18px rgba(0,0,0,.28);
+  }
+  * { box-sizing:border-box }
+  html { scrollbar-width:thin; scrollbar-color:var(--line) transparent }
+  ::selection { background:var(--accent-weak) }
+  :focus-visible { outline:2px solid var(--accent); outline-offset:2px; border-radius:4px }
+  [hidden] { display:none !important }
+  body { margin:0; background:var(--bg); color:var(--ink);
+         font:14px/1.55 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+         -webkit-font-smoothing:antialiased; padding-bottom:84px }
+  a { color:var(--accent-ink) }
+  code { font-family:var(--mono); font-size:12px }
+
+  header { display:flex; align-items:center; flex-wrap:wrap; gap:8px 12px; padding:16px 28px; border-bottom:1px solid var(--line) }
+  header h1 { font-size:15px; margin:0; font-weight:650; letter-spacing:-.01em }
+  .sub { color:var(--muted); font-size:12px }
+  .tag { margin-left:auto; font-size:11px; text-transform:uppercase; letter-spacing:.06em;
+         color:var(--muted); border:1px solid var(--line); border-radius:999px; padding:3px 10px }
+  .idchip { display:inline-flex; align-items:center; gap:8px; font-size:11px;
+            border:1px solid var(--line); border-radius:999px; padding:3px 6px 3px 11px }
+  .idchip code { font-family:var(--mono); font-size:11px; color:var(--ink) }
+  .idchip button { padding:2px 8px; font-size:10px; border-radius:999px }
+
+  main { max-width:1180px; margin:0 auto; padding:22px 28px 32px }
+  .panel { background:var(--panel); border:1px solid var(--line); border-radius:var(--radius);
+           padding:18px 18px 20px; box-shadow:var(--shadow); min-width:0 }
+  .phead { display:flex; align-items:baseline; justify-content:space-between; flex-wrap:wrap; gap:4px 12px; margin-bottom:12px }
+  h2 { font-size:12px; font-weight:650; text-transform:uppercase; letter-spacing:.08em;
+       color:var(--muted); margin:0 }
+  h3 { font-size:12px; font-weight:650; color:var(--muted); margin:18px 0 8px }
+  .meta { font-size:12px; color:var(--muted); font-family:var(--mono) }
+  .muted { color:var(--muted) } .small { font-size:12px }
+  .err { color:var(--bad); font-size:12px; word-break:break-word }
+  .err:not(:empty) { margin-top:8px }
+
+  .layout { display:grid; grid-template-columns:minmax(290px,350px) minmax(0,1fr); gap:18px; align-items:start }
+  @media (max-width:880px){ .layout { grid-template-columns:minmax(0,1fr) } }
+
+  label { display:block; font-size:12px; color:var(--muted); margin:13px 0 5px }
+  input { width:100%; padding:8px 10px; border:1px solid var(--line); border-radius:var(--radius-sm);
+          background:var(--panel-2); color:var(--ink); font:inherit }
+  input:focus { outline:none; border-color:var(--accent); box-shadow:0 0 0 3px var(--accent-weak) }
+  button { padding:8px 13px; border:1px solid var(--line); background:var(--panel); color:var(--ink);
+           border-radius:var(--radius-sm); font:inherit; cursor:pointer;
+           transition:border-color .12s, background .12s, color .12s }
+  button:hover:not(:disabled) { border-color:var(--accent) }
+  button.primary { background:var(--accent); border-color:var(--accent); color:#fff; font-weight:600 }
+  button:disabled { opacity:.45; cursor:not-allowed }
+  .actions { display:flex; gap:9px; align-items:center; margin-top:16px; flex-wrap:wrap }
+  .actions .right { margin-left:auto; display:flex; gap:9px }
+  #signin { max-width:400px; margin:48px auto }
+  .signwrap { padding:0 16px }
+
+  .pill { display:inline-block; font-size:11px; border:1px solid var(--line); border-radius:999px;
+          padding:1px 8px; color:var(--muted); white-space:nowrap; line-height:1.5 }
+  .pill.ok { background:var(--ok-weak); border-color:transparent; color:var(--ok) }
+  .pill.bad { background:var(--bad); border-color:transparent; color:#fff; font-weight:600 }
+
+  /* ---- attack panel ------------------------------------------------------ */
+  .status { display:flex; align-items:center; gap:9px; font-size:13px; padding:9px 11px; border-radius:var(--radius-sm);
+            background:var(--panel-2); border:1px solid var(--line-2); margin-bottom:12px }
+  .status.warn { background:var(--warn-weak); border-color:transparent; color:var(--warn) }
+  .spin { width:13px; height:13px; border-radius:50%; border:2px solid var(--line);
+          border-top-color:var(--accent); animation:spin .7s linear infinite; flex:none }
+  @keyframes spin { to { transform:rotate(360deg) } }
+  @media (prefers-reduced-motion: reduce) { .spin { animation:none } }
+  .top2 { display:grid; grid-template-columns:1fr 1fr; gap:8px }
+  .top2 button { padding:9px 10px }
+  .atk { display:block; width:100%; text-align:left; padding:9px 11px; margin-top:7px; border-radius:var(--radius-sm) }
+  .atk .l1 { display:flex; align-items:baseline; gap:8px }
+  .atk .id { font-family:var(--mono); font-size:12px; font-weight:650; flex:none; min-width:34px }
+  .atk .lbl { font-weight:600; font-size:13px; line-height:1.35; flex:1; min-width:0 }
+  .atk .mount { display:block; font-size:12px; color:var(--muted); margin-top:2px; padding-left:42px; line-height:1.4 }
+  .atk.cur, #btnClean.cur:not(:disabled) { border-color:var(--accent); background:var(--accent-weak) }
+  #btnClean.cur:not(:disabled) { color:var(--accent-ink) }
+  .where { font-size:10px; text-transform:uppercase; letter-spacing:.06em; flex:none; font-weight:650 }
+  .where.path { color:var(--accent-ink) } .where.precinct { color:var(--warn) }
+  .where.national { color:var(--bad) } .where.chain { color:var(--muted) }
+  details.rec { border:1px dashed var(--line); border-radius:var(--radius-sm); margin-top:7px; padding:8px 11px; color:var(--muted) }
+  details.rec summary { cursor:pointer; list-style:none }
+  details.rec summary::-webkit-details-marker { display:none }
+  details.rec .l1 { display:flex; align-items:baseline; gap:8px }
+  details.rec .id { font-family:var(--mono); font-size:12px; font-weight:650; min-width:34px }
+  details.rec .lbl { font-size:13px; flex:1; min-width:0 }
+  details.rec .note { display:block; font-size:11px; padding-left:42px }
+  details.rec .body { font-size:12px; margin-top:8px; color:var(--ink) }
+  details.rec .body pre { font:11px/1.45 var(--mono); white-space:pre-wrap; word-break:break-word; margin:4px 0 6px;
+                           background:var(--panel-2); border:1px solid var(--line-2); border-radius:6px; padding:6px 8px }
+  details.rec .body code { word-break:break-word }
+  .legend { font-size:12px; color:var(--muted); margin-top:14px; line-height:1.5 }
+
+  /* ---- national server --------------------------------------------------- */
+  .scen { font-size:13px; margin:0 0 12px }
+  .scen b { font-weight:650 }
+  .tiles { display:grid; grid-template-columns:repeat(auto-fill,minmax(98px,1fr)); gap:8px }
+  .tile { border:1px solid var(--line); border-radius:var(--radius-sm); padding:9px 10px; background:var(--panel-2);
+          min-height:74px; display:flex; flex-direction:column; gap:3px; transition:border-color .2s, background .2s; min-width:0 }
+  .tile .pid { font-family:var(--mono); font-size:13px; font-weight:650; word-break:break-all }
+  .tile .st { font-size:12px; color:var(--muted) }
+  .tile .ck { font-family:var(--mono); font-size:10px; line-height:1.35; word-break:normal; overflow-wrap:normal }
+  .tile.received { border-color:var(--ok); background:var(--ok-weak) } .tile.received .st { color:var(--ok); font-weight:600 }
+  .tile.tampered { border-color:var(--bad); background:var(--bad-weak) } .tile.tampered .st { color:var(--bad); font-weight:700; letter-spacing:.03em }
+  .tile.tampered .ck { color:var(--bad) }
+  .tile.missing { border-style:dashed; border-color:var(--warn) } .tile.missing .st { color:var(--warn); font-weight:600 }
+  .tile.rejected { border-style:dashed; border-color:var(--bad) } .tile.rejected .st { color:var(--bad); font-weight:600 }
+  .tile.rejected .ck { color:var(--bad) }
+  .tile.waiting { opacity:.7 }
+  .tile.fresh { box-shadow:0 0 0 3px var(--accent-weak) }
+  .mounted { margin-top:12px; font-size:12px; padding:8px 11px; border-radius:var(--radius-sm);
+             background:var(--warn-weak); color:var(--warn); word-break:break-word }
+  .mounted code { font-size:11px; color:inherit }
+
+  .checks { border:1px solid var(--line); border-radius:var(--radius-sm); overflow:hidden }
+  .crow { padding:8px 11px; border-top:1px solid var(--line-2) }
+  .crow:first-child { border-top:0 }
+  .crow .l1 { display:flex; align-items:baseline; gap:4px 8px; flex-wrap:wrap }
+  .crow .cid { font-family:var(--mono); font-size:12px; font-weight:650; word-break:break-all }
+  .crow .what { font-size:11px; color:var(--muted); flex:1; min-width:150px }
+  .crow .v { margin-left:auto }
+  .crow .why { font-family:var(--mono); font-size:11px; margin-top:3px; word-break:break-word; color:var(--muted) }
+  .crow.fail { background:var(--bad-weak) } .crow.fail .why { color:var(--bad) }
+  .empty { font-size:12px; color:var(--muted); padding:10px 11px }
+
+  .verdict { margin-top:14px; border-radius:var(--radius); padding:13px 15px; border:1px solid var(--line); background:var(--panel-2) }
+  .verdict.pass { border-color:var(--ok) } .verdict.fail { border-color:var(--bad) }
+  .verdict .nat { font-size:14px; font-weight:650; margin:0 }
+  .verdict .line { font-family:var(--mono); font-size:12px; margin-top:7px; word-break:break-word }
+  .verdict .line b { font-size:13px }
+  .verdict .line b.ok, .verdict .acc { color:var(--ok) } .verdict .line b.bad, .verdict .rej { color:var(--bad) }
+  .verdict .plain { font-size:12px; color:var(--muted); margin-top:5px }
+
+  #log { background:var(--logbg); color:var(--logink); border-radius:var(--radius-sm); padding:9px 11px;
+         height:150px; overflow:auto; white-space:pre-wrap; word-break:break-word; font:11px/1.5 var(--mono) }
+  #log div { padding:1px 0 } #log .error { color:#ff9490 } #log .done { color:#79e0a3 } #log .mnt { color:#f3c66b }
+
+  footer { position:fixed; left:0; right:0; bottom:0; background:var(--panel); color:var(--muted); font-size:12px;
+           border-top:1px solid var(--line); padding:9px 28px; z-index:5; line-height:1.45 }
+  @media (max-width:600px){
+    header, main { padding-left:16px; padding-right:16px }
+    footer { padding:8px 16px; font-size:11px }
+    .tag { margin-left:0 }
+    .panel { padding:14px 13px 16px }
+  }
+</style>
+</head>
+<body>
+<header>
+  <h1>Canvass Console</h1>
+  <span class="sub">ten precinct returns reach the national server; attack one and watch the canvass</span>
+  <span class="tag"><a href="/wizard">election wizard</a> · <a href="/trail/">all elections</a></span>
+  <span class="idchip" id="whoChip" hidden><code id="whoName"></code>
+    <button type="button" id="btnSignOut">sign out</button></span>
+  <span class="sub" id="authOff" hidden title="the console was started without --auth-file">authentication off</span>
+</header>
+
+<div class="signwrap">
+  <section class="panel" id="signin" hidden>
+    <div class="phead"><h2>Sign in</h2><span class="meta small">admin account</span></div>
+    <p class="small muted" style="margin-top:0">This console has authentication on. The canvass console
+      builds elections and mounts attacks, so it needs an admin account from the console's users file.</p>
+    <form id="signinForm">
+      <label for="siUser">Username</label>
+      <input id="siUser" autocomplete="username" required />
+      <label for="siPass">Password</label>
+      <input id="siPass" type="password" autocomplete="current-password" required />
+      <div class="err" id="siErr" aria-live="polite"></div>
+      <div class="actions"><div class="right"><button class="primary" type="submit" id="btnSignIn">Sign in</button></div></div>
+    </form>
+  </section>
+</div>
+
+<main id="main" hidden>
+  <div class="layout">
+    <!-- Left: the attack panel ------------------------------------------- -->
+    <section class="panel" id="attackPanel" aria-labelledby="hAtk">
+      <div class="phead"><h2 id="hAtk">Attacks</h2><span class="meta" id="fixtureMeta"></span></div>
+      <div class="status" id="status" aria-live="polite"><span>Loading…</span></div>
+      <div class="top2">
+        <button type="button" id="btnBuild">Build election</button>
+        <button type="button" id="btnClean" class="primary" title="Deliver all ten returns untouched">Clean run</button>
+      </div>
+      <div class="err" id="atkErr" aria-live="polite"></div>
+      <h3>Mount one attack, then deliver the returns</h3>
+      <div id="atkList"></div>
+      <h3>On the chain (not replayed here)</h3>
+      <div id="recList"></div>
+      <div class="legend">
+        Where the attacker acts:
+        <b class="where path">path</b> between the precinct and the national server ·
+        <b class="where precinct">precinct</b> at the precinct, holding its real signing key ·
+        <b class="where national">national</b> on the national server after it accepted the return ·
+        <b class="where chain">chain</b> on Fabric.
+      </div>
+    </section>
+
+    <!-- Right: the national server ---------------------------------------- -->
+    <section class="panel" id="nationalPanel" aria-labelledby="hNat">
+      <div class="phead"><h2 id="hNat">National server</h2><span class="meta" id="attemptMeta">no attempt yet</span></div>
+      <p class="scen" id="scen">Pick <b>Clean run</b> or an attack. The ten precinct returns then arrive one at a time,
+        and the national server re-runs the canvass after each one.</p>
+      <div class="tiles" id="tiles" aria-live="polite"></div>
+      <div class="mounted" id="mounted" hidden></div>
+
+      <h3 id="checksHead">The canvass: seven checks</h3>
+      <div class="checks" id="checks"><div class="empty">No canvass has run yet.</div></div>
+
+      <div class="verdict" id="verdict" hidden></div>
+
+      <h3>What happened, in order</h3>
+      <div id="log"></div>
+    </section>
+  </div>
+</main>
+
+<footer id="footer">Offline replay: one generated election; the ledger read-back is the generated ballots in ledger order; no Fabric. Live runs: Appendix E.</footer>
+
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s == null ? "" : s).replace(/[&<>"']/g,
+  (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+
+// What each check asks, from the module doc of saksi-auditor/src/canvass.rs.
+const CHECKS = [
+  ["canvass.registry", "every return names a registered precinct, carries its election id, and no precinct sent two"],
+  ["canvass.completeness", "every registered precinct has an accepted return"],
+  ["canvass.signature", "every return verifies under its precinct's registered key"],
+  ["canvass.precinct_recompute", "every return's counts, digest and sums match a recount of its precinct ledger, and its close block and tip hash match close.json"],
+  ["canvass.national_sum", "the returns multiply to the national aggregate that was decrypted"],
+  ["canvass.accuracy", "every precinct audit gives E = 0, and the national decryption gives E = 0 and matches the published trustee-signed tally"],
+  ["canvass.nullifier_unique", "no nullifier appears in two precinct ledgers"],
+];
+const CHECK_WHAT = Object.fromEntries(CHECKS);
+// Mid-stream these two fail for every precinct still waiting, so the page
+// holds them as pending until the last return has arrived.
+const SETTLE_LAST = new Set(["canvass.completeness", "canvass.national_sum"]);
+const STEP = { start: 0, national: 900, final: 1000, error: 1001 };
+const PRECINCTS = 10;
+const short = (c) => String(c).replace(/^canvass\./, "");
+const listOr = (xs) => (xs && xs.length ? xs.map(short).join(", ") : "none");
+const failedOf = (checks) => (checks || []).filter((c) => c.verdict !== "pass");
+const unmount = (l) => l.replace(/^\[MOUNTED\]\s*/, "");
+
+let scenarios = [], byID = {};
+let fixture = false, unavailable = "";
+let busyKind = "";   // "" | "fixture" | "attempt"
+let busyText = "";
+let runningN = 0, lastAttempt = 0;
+let es = null, esReady = null, pollTimer = null;
+let cur = null;      // the attempt on screen
+
+/* ---- net -------------------------------------------------------------- */
+// apiFetch is every console call after sign-in. 401 means the session is gone
+// and 403 means the account is not an admin: both go back to the sign-in box,
+// as in the wizard.
+async function apiFetch(path, opts) {
+  const res = await fetch(path, opts);
+  if (res.status === 401 && authOn) needSignIn("Your session ended. Sign in again to continue.");
+  if (res.status === 403 && authOn) needSignIn("This account is not an admin: the canvass console needs an admin account.");
+  return res;
+}
+
+async function errorText(res) {
+  const t = (await res.text()).trim();
+  try { const j = JSON.parse(t); if (j && typeof j.error === "string") return j.error; } catch (_) {}
+  return t || ("HTTP " + res.status);
+}
+
+/* ---- live stream ------------------------------------------------------ */
+// The hub does not replay and drops events when a subscriber's buffer is
+// full, so the stream is open before any POST, and the page rebuilds from
+// GET /api/canvass/attempt/<n> after a reconnect, a gap, or a reload.
+function openStream() {
+  if (es) return esReady;
+  let opened = false;
+  esReady = new Promise((resolve) => {
+    es = new EventSource("/events?run=canvass");
+    es.onopen = () => {
+      resolve();
+      if (opened) resync();   // reconnected: anything may have been missed
+      opened = true;
+    };
+    es.onmessage = (m) => { let d; try { d = JSON.parse(m.data); } catch (_) { return; } onStream(d); };
+    es.onerror = () => { if (!opened) resolve(); };
+  });
+  return esReady;
+}
+function closeStream() { if (es) { es.close(); es = null; esReady = null; } }
+window.addEventListener("beforeunload", closeStream);
+
+function onStream(d) {
+  if (!d || typeof d.phase !== "string" || !d.phase.startsWith("canvass")) return;
+  if (d.phase === "canvass.fixture") {
+    log(d.msg, d.level === "error" ? "error" : d.level === "done" ? "done" : "");
+    if (d.level === "done") { fixture = true; if (busyKind === "fixture") setIdle(); else renderStatus(); }
+    if (d.level === "error") {
+      $("atkErr").textContent = d.msg;
+      if (busyKind === "fixture") setIdle();
+    }
+    return;
+  }
+  const ev = d.canvass;
+  if (!ev) return;
+  if (!cur || ev.attempt !== cur.n) {
+    if (cur && ev.attempt < cur.n) return;
+    newAttempt(ev.attempt, ev.scenario);
+    if (ev.type !== "start" && ev.type !== "error") resync();
+  } else if (ev.type === "arrival" && ev.seq > cur.step + 1) {
+    resync();   // an arrival was dropped
+  }
+  apply(ev, true);
+}
+
+/* ---- attempt state ---------------------------------------------------- */
+function newAttempt(n, scenario) {
+  cur = { n, scenario, step: -1, tiles: [], checks: [], final: null, error: "",
+          mounted: [], fresh: "", running: true, elapsed: 0 };
+  $("log").innerHTML = "";
+}
+
+function stepOf(ev) { return ev.type === "arrival" ? ev.seq : (STEP[ev.type] ?? 0); }
+
+// apply folds one engine event into cur. Every event carries a full tile
+// snapshot, so applying in order is enough; a repeated or stale event (a
+// replay racing the live stream) is dropped by its step.
+function apply(ev, live) {
+  if (ev.type === "error") {
+    if (cur.error === ev.error) return;
+  } else {
+    const st = stepOf(ev);
+    if (st <= cur.step) return;
+    cur.step = st;
+  }
+  cur.elapsed = ev.elapsed_ms || cur.elapsed;
+  if (ev.tiles && ev.tiles.length) cur.tiles = ev.tiles;
+  if (ev.checks && ev.checks.length) cur.checks = ev.checks;
+  cur.fresh = ev.type === "arrival" ? ev.precinct : "";
+  const mnt = (ev.hook || []).filter((l) => l.startsWith("[MOUNTED]"));
+  cur.mounted.push(...mnt);
+  switch (ev.type) {
+    case "start":
+      log(`attempt ${ev.attempt}: ${scenarioName(ev.scenario)}. The national server waits for ${PRECINCTS} returns.`);
+      break;
+    case "arrival": {
+      const t = (ev.tiles || []).find((x) => x.precinct === ev.precinct);
+      let line = ev.delivered === false
+        ? `${ev.precinct}: its return never arrived (${ev.seq} of ${PRECINCTS})`
+        : `${ev.precinct}: return arrived (${ev.seq} of ${PRECINCTS})`;
+      if (t && t.state === "tampered") line += `; the canvass flags it: ${t.checks.map(short).join(", ")}`;
+      log(line, t && t.state === "tampered" ? "error" : "");
+      mnt.forEach((l) => log("  attacker: " + unmount(l), "mnt"));
+      break;
+    }
+    case "national":
+      if (mnt.length) mnt.forEach((l) => log("attacker, on the national server after acceptance: " + unmount(l), "mnt"));
+      else log("national server step: no change for this attack");
+      break;
+    case "final": {
+      cur.final = ev.final; cur.running = false;
+      if (ev.final && ev.final.checks) cur.checks = ev.final.checks;
+      const nf = failedOf(cur.checks).length;
+      log(`final canvass: ${nf ? nf + " of " + CHECKS.length + " checks failed" : "all " + CHECKS.length + " checks passed"}`);
+      if (ev.final) log(`${outcome(cur.scenario, ev.final.verdict)}: expected ${listOr(ev.final.expected)} · got ${listOr(ev.final.got)} · ${ev.final.verdict}`,
+                        ev.final.verdict === "PASS" ? "done" : "error");
+      break;
+    }
+    case "error":
+      cur.error = ev.error || "the attempt stopped"; cur.running = false;
+      log("stopped: " + cur.error, "error");
+      break;
+  }
+  if (live && (ev.type === "final" || ev.type === "error") && busyKind) setIdle();
+  renderAttempt();
+}
+
+// resync rebuilds the screen from the server: the attempt in flight, or the
+// last one. Coalesced, so a burst of gaps costs one fetch.
+let resyncing = null;
+function resync() {
+  if (resyncing) return resyncing;
+  resyncing = (async () => {
+    try {
+      await loadState();
+      const n = runningN || (cur && cur.n) || lastAttempt;
+      if (n) await loadAttempt(n);
+    } finally { resyncing = null; }
+  })();
+  return resyncing;
+}
+
+async function loadAttempt(n) {
+  let res;
+  try { res = await apiFetch("/api/canvass/attempt/" + encodeURIComponent(n)); } catch (_) { return; }
+  if (res.status === 404) {
+    // The attempt never got a folder (the election build failed first). The
+    // SSE error event is the record: keep what is on screen.
+    if (cur && cur.n === n && cur.running && runningN !== n) {
+      cur.running = false;
+      if (!cur.error) cur.error = "The attempt stopped before it started; the reason is in the log below.";
+      renderAttempt();
+    }
+    return;
+  }
+  if (!res.ok) return;
+  const a = await res.json();
+  const keepErr = cur && cur.n === a.n ? cur.error : "";
+  newAttempt(a.n, a.scenario);
+  for (const ev of a.events || []) apply(ev, false);
+  const r = a.result;
+  if (r) {
+    if (r.tiles && r.tiles.length) cur.tiles = r.tiles;
+    if (r.final) { cur.final = r.final; cur.checks = r.final.checks || cur.checks; }
+    if (r.error) cur.error = r.error;
+    cur.elapsed = r.elapsed_ms || cur.elapsed;
+  }
+  if (!cur.error) cur.error = keepErr;
+  cur.running = !!a.running;
+  cur.fresh = "";
+  renderAttempt();
+}
+
+/* ---- console state ---------------------------------------------------- */
+async function loadState() {
+  let res;
+  try { res = await apiFetch("/api/canvass/scenarios"); }
+  catch (err) { setStatus("The console did not answer: " + (err.message || err), "warn"); return; }
+  if (!res.ok) { if (res.status !== 401 && res.status !== 403) setStatus(await errorText(res), "warn"); return; }
+  const s = await res.json();
+  scenarios = s.scenarios || [];
+  byID = Object.fromEntries(scenarios.map((x) => [x.id, x]));
+  fixture = !!s.fixture;
+  unavailable = s.unavailable || "";
+  runningN = s.running || 0;
+  lastAttempt = s.last_attempt || 0;
+  if (s.busy) { busyKind = runningN ? "attempt" : "fixture"; busyText = s.busy; startPoll(); }
+  else if (busyKind) { setIdle(); return; }
+  renderAttacks();
+  renderStatus();
+}
+
+// While something runs, poll the cheap listing as a backstop for a dropped
+// final event: once the slot is free, show the finished attempt.
+function startPoll() {
+  if (pollTimer) return;
+  pollTimer = setInterval(async () => {
+    let res;
+    try { res = await apiFetch("/api/canvass/scenarios"); } catch (_) { return; }
+    if (!res.ok) return;
+    const s = await res.json();
+    fixture = !!s.fixture; lastAttempt = s.last_attempt || 0; runningN = s.running || 0;
+    if (!s.busy) {
+      const was = busyKind;
+      setIdle();
+      if (was === "attempt" && cur && cur.running) await loadAttempt(cur.n);
+    } else { busyText = s.busy; renderStatus(); }
+  }, 2500);
+}
+function setIdle() {
+  busyKind = ""; busyText = "";
+  if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+  renderAttacks(); renderStatus();
+}
+function setBusy(kind, text) { busyKind = kind; busyText = text; startPoll(); renderAttacks(); renderStatus(); }
+
+/* ---- actions ---------------------------------------------------------- */
+async function post(path, body) {
+  $("atkErr").textContent = "";
+  await openStream();   // subscribe before the POST: the hub does not replay
+  let res;
+  try {
+    res = await apiFetch(path, { method: "POST", headers: { "Content-Type": "application/json" },
+                                 body: JSON.stringify(body || {}) });
+  } catch (err) { $("atkErr").textContent = "The console did not answer: " + (err.message || err); return null; }
+  if (res.status === 409) {
+    $("atkErr").textContent = "Busy: " + (await errorText(res)) + ". Wait for it to finish, then try again.";
+    loadState();
+    return null;
+  }
+  if (res.status === 401 || res.status === 403) return null;
+  if (!res.ok) { $("atkErr").textContent = await errorText(res); return null; }
+  return res.json();
+}
+
+async function buildElection() {
+  setBusy("fixture", "building the election");
+  log(`building the election: ${PRECINCTS} precincts, 1000 voters, 3 positions, 4 candidates, 3-of-5 trustees`);
+  if (!(await post("/api/canvass/fixture"))) setIdle();
+}
+
+async function runScenario(id) {
+  setBusy("attempt", "starting " + scenarioName(id));
+  const r = await post("/api/canvass/attack", { scenario: id });
+  if (!r) { setIdle(); return; }
+  if (!cur || cur.n !== r.attempt) { newAttempt(r.attempt, r.scenario); renderAttempt(); }
+  // Single-column layout: the national server sits below the attack list.
+  if (window.matchMedia("(max-width:880px)").matches) $("nationalPanel").scrollIntoView({ behavior: "smooth", block: "start" });
+  if (!fixture) log("no election built yet: building it first (about 5 s)");
+  busyText = `attempt ${r.attempt}: ${scenarioName(id)}`;
+  renderStatus();
+}
+
+/* ---- rendering -------------------------------------------------------- */
+// outcome says what PASS or FAIL means, so "the canvass rejects this result"
+// next to PASS does not read as a contradiction.
+function outcome(scenario, verdict) {
+  if (verdict !== "PASS") return "Outcome differs from expected";
+  return scenario === "clean" ? "Clean run accepted as expected" : "Attack caught as expected";
+}
+
+function scenarioName(id) {
+  if (id === "clean") return "clean run";
+  const s = byID[id];
+  return s ? `${id} ${s.label}` : id;
+}
+
+function setStatus(text, cls, spinning) {
+  $("status").className = "status" + (cls ? " " + cls : "");
+  $("status").innerHTML = (spinning ? '<span class="spin" aria-hidden="true"></span>' : "") + `<span>${esc(text)}</span>`;
+}
+
+function renderStatus() {
+  $("fixtureMeta").textContent = fixture ? "election built" : "no election yet";
+  if (unavailable) { setStatus("The canvass console is not set up on this server: " + unavailable, "warn"); return; }
+  if (busyKind === "fixture") { setStatus("Building the election (about 5 s)…", "", true); return; }
+  if (busyKind === "attempt") { setStatus((busyText || "Running") + ". Returns arriving…", "", true); return; }
+  setStatus(fixture
+    ? "Ready. Each run copies the built election and delivers its ten returns (about 20 s)."
+    : "No election built yet. Build it first, or start any run and it is built for you.");
+}
+
+function renderAttacks() {
+  const off = !!busyKind || !!unavailable;
+  $("btnBuild").disabled = off;
+  $("btnClean").disabled = off;
+  $("btnBuild").title = fixture
+    ? "The election is built and is reused by every run; this checks it is still valid"
+    : "Generate the ten-precinct election the attacks run against";
+  const curID = cur ? cur.scenario : "";
+  $("btnClean").classList.toggle("cur", curID === "clean");
+  $("atkList").innerHTML = scenarios.filter((s) => s.live && s.id !== "clean").map((s) => `
+    <button type="button" class="atk${s.id === curID ? " cur" : ""}" data-scn="${esc(s.id)}" ${off ? "disabled" : ""}
+            title="${esc(s.mount)}. The canvass should fail: ${esc(listOr(s.expected))}.">
+      <span class="l1"><span class="id">${esc(s.id)}</span><span class="lbl">${esc(s.label)}</span>
+        <span class="where ${esc(s.where)}">${esc(s.where)}</span></span>
+      <span class="mount">${esc(s.mount)}</span>
+    </button>`).join("");
+  $("atkList").querySelectorAll("[data-scn]").forEach((b) => { b.onclick = () => runScenario(b.dataset.scn); });
+  const open = new Set([...document.querySelectorAll("details.rec[open]")].map((d) => d.dataset.rec));
+  $("recList").innerHTML = scenarios.filter((s) => !s.live).map((s) => {
+    const r = s.recorded || {};
+    return `<details class="rec" data-rec="${esc(s.id)}"${open.has(s.id) ? " open" : ""}>
+      <summary title="${esc(r.onchain || "")}">
+        <span class="l1"><span class="id">${esc(s.id)}</span><span class="lbl">${esc(s.label)}</span>
+          <span class="where chain">chain</span></span>
+        <span class="note">${esc(r.note || "")} · show result</span>
+      </summary>
+      <div class="body">
+        <div class="muted">${esc(s.mount)}. This attack needs a live Fabric network, so it cannot run here.
+          On the 2026-10-18 desktop run the chaincode refused it:</div>
+        <pre>${esc(r.onchain || "")}</pre>
+        <div><code>expected ${esc(r.expected || "")} · got ${esc(r.got || "")} · ${esc(r.verdict || "")}</code></div>
+        <div class="muted" style="margin-top:4px">Evidence: <code>${esc(r.evidence || "")}</code></div>
+      </div>
+    </details>`;
+  }).join("");
+}
+
+function renderEmptyTiles() {
+  $("tiles").innerHTML = Array.from({ length: PRECINCTS }, (_, i) => {
+    const p = "p" + String(i + 1).padStart(2, "0");
+    return `<div class="tile waiting" data-tile="${p}" data-state="waiting"><span class="pid">${p}</span><span class="st">waiting</span></div>`;
+  }).join("");
+}
+
+function renderAttempt() {
+  if (!cur) return;
+  const sc = byID[cur.scenario];
+  $("attemptMeta").textContent = `attempt ${cur.n} · ${cur.scenario}` +
+    (cur.elapsed ? ` · ${(cur.elapsed / 1000).toFixed(1)} s` : "") + (cur.running ? " · running" : "");
+  if (cur.scenario === "clean") {
+    $("scen").innerHTML = "<b>Clean run.</b> No attack: all ten returns travel untouched. Every check should pass.";
+  } else if (sc) {
+    $("scen").innerHTML = `<b>${esc(sc.id)} · ${esc(sc.label)}.</b> The attacker: ${esc(sc.mount)} ` +
+      `<span class="where ${esc(sc.where)}">(${esc(sc.where)})</span>. ` +
+      `The canvass should fail: <code>${esc(listOr(sc.expected))}</code>.`;
+  }
+  renderAttacks();
+
+  // The ten registered precincts, then any rejected arrivals.
+  if (!cur.tiles.length) renderEmptyTiles();
+  else $("tiles").innerHTML = cur.tiles.map((t) => {
+    const st = { waiting: "waiting", received: "received ✓", tampered: "TAMPERED",
+                 missing: "not received", rejected: "rejected arrival" }[t.state] || t.state;
+    // <wbr> after each underscore: a long check name wraps at "_", not mid-word.
+    const ck = t.state === "tampered" || t.state === "rejected"
+      ? (t.checks || []).map((c) => esc(short(c)).replace(/_/g, "_<wbr>")).join("<br>") : "";
+    return `<div class="tile ${esc(t.state)}${t.precinct === cur.fresh ? " fresh" : ""}" title="${esc((t.reasons || []).join("\n"))}"
+                 data-tile="${esc(t.precinct)}" data-state="${esc(t.state)}">
+      <span class="pid">${esc(t.precinct)}</span><span class="st">${esc(st)}</span>
+      ${ck ? `<span class="ck">${ck}</span>` : ""}</div>`;
+  }).join("");
+
+  $("mounted").hidden = !cur.mounted.length;
+  $("mounted").innerHTML = cur.mounted.length
+    ? "What the attacker did: " + cur.mounted.map((l) => `<code>${esc(unmount(l))}</code>`).join("; ")
+    : "";
+
+  renderChecks();
+  renderVerdict();
+}
+
+function renderChecks() {
+  const final = !!cur.final;
+  const got = Object.fromEntries((cur.checks || []).map((c) => [c.check, c]));
+  const arrived = cur.step > 0 && cur.step <= PRECINCTS ? cur.step : PRECINCTS;
+  $("checksHead").textContent = !cur.checks.length ? "The canvass: seven checks"
+    : final ? "The canvass: seven checks, final (every return in)"
+    : `The canvass: seven checks, after ${arrived} of ${PRECINCTS} returns`;
+  if (!cur.checks.length) {
+    $("checks").innerHTML = `<div class="empty">${cur.error ? "No canvass ran." : "The canvass runs after the first return arrives."}</div>`;
+    return;
+  }
+  const ids = CHECKS.map((c) => c[0]).concat(cur.checks.map((c) => c.check).filter((id) => !CHECK_WHAT[id]));
+  $("checks").innerHTML = ids.filter((id) => got[id]).map((id) => {
+    const c = got[id];
+    const pending = !final && SETTLE_LAST.has(id) && cur.step < PRECINCTS;
+    const pass = c.verdict === "pass";
+    const pill = pending ? '<span class="pill">pending</span>'
+      : pass ? '<span class="pill ok">pass</span>' : '<span class="pill bad">fail</span>';
+    return `<div class="crow${!pending && !pass ? " fail" : ""}" data-check="${esc(id)}" data-verdict="${pending ? "pending" : esc(c.verdict)}">
+      <div class="l1"><span class="cid">${esc(id)}</span><span class="what">${esc(CHECK_WHAT[id] || "")}</span>
+        <span class="v">${pill}</span></div>
+      <div class="why"${pending ? ` title="${esc(c.reason)}"` : ""}>${esc(pending ? "decided once all ten returns are in" : c.reason)}</div></div>`;
+  }).join("");
+}
+
+function renderVerdict() {
+  const v = $("verdict");
+  const f = cur.final;
+  if (cur.error && !f) {
+    v.hidden = false; v.className = "verdict fail";
+    v.innerHTML = `<p class="nat">The attempt stopped before a verdict.</p><div class="line">${esc(cur.error)}</div>`;
+    return;
+  }
+  if (!f) { v.hidden = true; v.innerHTML = ""; return; }
+  v.hidden = false;
+  const failed = failedOf(f.checks);
+  const ok = f.verdict === "PASS";
+  v.className = "verdict " + (ok ? "pass" : "fail");
+  const nat = failed.length
+    ? `National verdict: the canvass <span class="rej">rejects</span> this result. ${failed.length} of ${CHECKS.length} checks failed.`
+    : `National verdict: the canvass <span class="acc">accepts</span> this result. All ${CHECKS.length} checks passed.`;
+  let plain;
+  if (cur.scenario === "clean") {
+    plain = ok ? "Nothing was attacked and nothing failed, as expected."
+               : "Nothing was attacked, yet a check failed: the election or the replay is broken.";
+  } else if (!f.mounted) {
+    plain = "The attack never reported that it was mounted, so this attempt counts as FAIL.";
+  } else {
+    plain = ok ? "PASS: the canvass caught the attack, failing exactly the checks predicted for it."
+               : "FAIL: the failing checks differ from the ones predicted for this attack.";
+  }
+  v.innerHTML = `<p class="nat">${nat}</p>
+    <div class="line" id="verdictLine">${esc(outcome(cur.scenario, f.verdict))} — expected ${esc(listOr(f.expected))} · got ${esc(listOr(f.got))} · <b class="${ok ? "ok" : "bad"}">${esc(f.verdict)}</b></div>
+    <div class="plain">${esc(plain)}</div>`;
+}
+
+function log(msg, cls) {
+  const el = $("log"), d = document.createElement("div");
+  d.className = cls || ""; d.textContent = msg;
+  el.append(d); el.scrollTop = el.scrollHeight;
+}
+
+/* ---- sign-in (the wizard's flow) -------------------------------------- */
+// GET /api/me: 404 means the console runs without authentication; 401 means
+// it has it and this browser is not signed in. Only an admin can use the page.
+let authOn = false, booted = false;
+
+async function checkAuth() {
+  let res;
+  try { res = await fetch("/api/me"); } catch (_) { showApp(null); return; }
+  if (res.status === 404) { authOn = false; showApp(null); return; }
+  authOn = true;
+  if (res.status === 401) { needSignIn(""); return; }
+  let me = {};
+  try { me = await res.json(); } catch (_) {}
+  if (me.role !== "admin") {
+    needSignIn(`Signed in as ${me.username || "?"} (${me.role || "?"}): the canvass console needs an admin account.`);
+    return;
+  }
+  showApp(me);
+}
+
+function needSignIn(msg) {
+  closeStream();
+  if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+  $("main").hidden = true;
+  $("signin").hidden = false;
+  $("whoChip").hidden = true;
+  $("authOff").hidden = true;
+  $("siErr").textContent = msg || "";
+  $("siUser").focus();
+}
+
+function showApp(me) {
+  $("signin").hidden = true;
+  $("main").hidden = false;
+  $("authOff").hidden = authOn;
+  $("whoChip").hidden = !me;
+  if (me) $("whoName").textContent = me.username + " · " + me.role;
+  boot();
+}
+
+$("signinForm").onsubmit = async (e) => {
+  e.preventDefault();
+  $("siErr").textContent = "";
+  $("btnSignIn").disabled = true;
+  let res;
+  try {
+    res = await fetch("/api/login", { method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ username: $("siUser").value, password: $("siPass").value }) });
+  } catch (err) {
+    $("btnSignIn").disabled = false;
+    $("siErr").textContent = String(err.message || err);
+    return;
+  }
+  $("btnSignIn").disabled = false;
+  if (res.status !== 204) { $("siErr").textContent = await errorText(res); return; }
+  $("siPass").value = "";
+  checkAuth();
+};
+
+$("btnSignOut").onclick = async () => {
+  try { await fetch("/api/logout", { method: "POST" }); } catch (_) {}
+  needSignIn("Signed out.");
+};
+
+/* ---- boot ------------------------------------------------------------- */
+// Subscribe first, then read the state, then replay the attempt in flight
+// (or the last one): an event landing between the two is either in the
+// replay or arrives live, and apply() drops the duplicate.
+async function boot() {
+  if (!booted) {
+    booted = true;
+    $("btnBuild").onclick = buildElection;
+    $("btnClean").onclick = () => runScenario("clean");
+    renderEmptyTiles();
+  }
+  await openStream();
+  await loadState();
+  const n = runningN || lastAttempt;
+  if (n) await loadAttempt(n);
+}
+
+checkAuth();
+</script>
+</body>
+</html>

@@ -1,12 +1,19 @@
 package campaign
 
-import "sync"
+import (
+	"sync"
+
+	"github.com/saksi-framework/saksi/packages/saksi-campaign/canvass"
+)
 
 // Event is one server-sent progress line for a run.
 type Event struct {
 	Phase string `json:"phase"`
 	Level string `json:"level"` // info | error | done
 	Msg   string `json:"msg"`
+	// Canvass carries the whole engine event on the canvass console's
+	// channel (run "canvass"); nil on every election run.
+	Canvass *canvass.Event `json:"canvass,omitempty"`
 }
 
 // Hub fans events out to per-run subscribers. Publishers (phase executors) never
