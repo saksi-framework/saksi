@@ -423,7 +423,7 @@ func TestCanvassPageWiring(t *testing.T) {
 		"apiFetch", "errorText", "openStream", "closeStream", "onStream", "newAttempt", "stepOf", "apply",
 		"resync", "loadAttempt", "loadState", "startPoll", "setIdle", "setBusy", "post", "buildElection",
 		"runScenario", "scenarioName", "setStatus", "renderStatus", "renderAttacks", "renderEmptyTiles",
-		"renderAttempt", "renderChecks", "renderVerdict", "log", "checkAuth", "needSignIn", "showApp", "boot",
+		"renderAttempt", "renderChecks", "renderVerdict", "outcome", "log", "checkAuth", "needSignIn", "showApp", "boot",
 	} {
 		if !strings.Contains(js, "function "+fn+"(") {
 			t.Errorf("canvass.html calls %s() but never defines it", fn)

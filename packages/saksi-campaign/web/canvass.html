@@ -131,7 +131,7 @@
           min-height:74px; display:flex; flex-direction:column; gap:3px; transition:border-color .2s, background .2s; min-width:0 }
   .tile .pid { font-family:var(--mono); font-size:13px; font-weight:650; word-break:break-all }
   .tile .st { font-size:12px; color:var(--muted) }
-  .tile .ck { font-family:var(--mono); font-size:10px; line-height:1.35; word-break:break-word; white-space:pre-line }
+  .tile .ck { font-family:var(--mono); font-size:10px; line-height:1.35; word-break:normal; overflow-wrap:normal }
   .tile.received { border-color:var(--ok); background:var(--ok-weak) } .tile.received .st { color:var(--ok); font-weight:600 }
   .tile.tampered { border-color:var(--bad); background:var(--bad-weak) } .tile.tampered .st { color:var(--bad); font-weight:700; letter-spacing:.03em }
   .tile.tampered .ck { color:var(--bad) }
@@ -259,10 +259,10 @@ const CHECKS = [
   ["canvass.registry", "every return names a registered precinct, carries its election id, and no precinct sent two"],
   ["canvass.completeness", "every registered precinct has an accepted return"],
   ["canvass.signature", "every return verifies under its precinct's registered key"],
-  ["canvass.precinct_recompute", "every return equals what that precinct's ledger recomputes to"],
+  ["canvass.precinct_recompute", "every return's counts, digest and sums match a recount of its precinct ledger, and its close block and tip hash match close.json"],
   ["canvass.national_sum", "the returns multiply to the national aggregate that was decrypted"],
-  ["canvass.accuracy", "precinct audits and the national decryption give E = 0"],
-  ["canvass.nullifier_unique", "no ballot appears in two precinct ledgers"],
+  ["canvass.accuracy", "every precinct audit gives E = 0, and the national decryption gives E = 0 and matches the published trustee-signed tally"],
+  ["canvass.nullifier_unique", "no nullifier appears in two precinct ledgers"],
 ];
 const CHECK_WHAT = Object.fromEntries(CHECKS);
 // Mid-stream these two fail for every precinct still waiting, so the page
@@ -387,14 +387,14 @@ function apply(ev, live) {
     }
     case "national":
       if (mnt.length) mnt.forEach((l) => log("attacker, on the national server after acceptance: " + unmount(l), "mnt"));
-      else log("national server step: this attack does nothing here");
+      else log("national server step: no change for this attack");
       break;
     case "final": {
       cur.final = ev.final; cur.running = false;
       if (ev.final && ev.final.checks) cur.checks = ev.final.checks;
       const nf = failedOf(cur.checks).length;
-      log(`final canvass: ${nf ? nf + " of 7 checks failed" : "all 7 checks passed"}`);
-      if (ev.final) log(`verdict ${ev.final.verdict}: expected ${listOr(ev.final.expected)} · got ${listOr(ev.final.got)}`,
+      log(`final canvass: ${nf ? nf + " of " + CHECKS.length + " checks failed" : "all " + CHECKS.length + " checks passed"}`);
+      if (ev.final) log(`${outcome(cur.scenario, ev.final.verdict)}: expected ${listOr(ev.final.expected)} · got ${listOr(ev.final.got)} · ${ev.final.verdict}`,
                         ev.final.verdict === "PASS" ? "done" : "error");
       break;
     }
@@ -526,12 +526,21 @@ async function runScenario(id) {
   const r = await post("/api/canvass/attack", { scenario: id });
   if (!r) { setIdle(); return; }
   if (!cur || cur.n !== r.attempt) { newAttempt(r.attempt, r.scenario); renderAttempt(); }
+  // Single-column layout: the national server sits below the attack list.
+  if (window.matchMedia("(max-width:880px)").matches) $("nationalPanel").scrollIntoView({ behavior: "smooth", block: "start" });
   if (!fixture) log("no election built yet: building it first (about 5 s)");
   busyText = `attempt ${r.attempt}: ${scenarioName(id)}`;
   renderStatus();
 }
 
 /* ---- rendering -------------------------------------------------------- */
+// outcome says what PASS or FAIL means, so "the canvass rejects this result"
+// next to PASS does not read as a contradiction.
+function outcome(scenario, verdict) {
+  if (verdict !== "PASS") return "Outcome differs from expected";
+  return scenario === "clean" ? "Clean run accepted as expected" : "Attack caught as expected";
+}
+
 function scenarioName(id) {
   if (id === "clean") return "clean run";
   const s = byID[id];
@@ -616,11 +625,13 @@ function renderAttempt() {
   else $("tiles").innerHTML = cur.tiles.map((t) => {
     const st = { waiting: "waiting", received: "received ✓", tampered: "TAMPERED",
                  missing: "not received", rejected: "rejected arrival" }[t.state] || t.state;
-    const ck = t.state === "tampered" || t.state === "rejected" ? (t.checks || []).map(short).join("\n") : "";
+    // <wbr> after each underscore: a long check name wraps at "_", not mid-word.
+    const ck = t.state === "tampered" || t.state === "rejected"
+      ? (t.checks || []).map((c) => esc(short(c)).replace(/_/g, "_<wbr>")).join("<br>") : "";
     return `<div class="tile ${esc(t.state)}${t.precinct === cur.fresh ? " fresh" : ""}" title="${esc((t.reasons || []).join("\n"))}"
                  data-tile="${esc(t.precinct)}" data-state="${esc(t.state)}">
       <span class="pid">${esc(t.precinct)}</span><span class="st">${esc(st)}</span>
-      ${ck ? `<span class="ck">${esc(ck)}</span>` : ""}</div>`;
+      ${ck ? `<span class="ck">${ck}</span>` : ""}</div>`;
   }).join("");
 
   $("mounted").hidden = !cur.mounted.length;
@@ -671,8 +682,8 @@ function renderVerdict() {
   const ok = f.verdict === "PASS";
   v.className = "verdict " + (ok ? "pass" : "fail");
   const nat = failed.length
-    ? `National verdict: the canvass <span class="rej">rejects</span> this result. ${failed.length} of 7 checks failed.`
-    : `National verdict: the canvass <span class="acc">accepts</span> this result. All 7 checks passed.`;
+    ? `National verdict: the canvass <span class="rej">rejects</span> this result. ${failed.length} of ${CHECKS.length} checks failed.`
+    : `National verdict: the canvass <span class="acc">accepts</span> this result. All ${CHECKS.length} checks passed.`;
   let plain;
   if (cur.scenario === "clean") {
     plain = ok ? "Nothing was attacked and nothing failed, as expected."
@@ -684,7 +695,7 @@ function renderVerdict() {
                : "FAIL: the failing checks differ from the ones predicted for this attack.";
   }
   v.innerHTML = `<p class="nat">${nat}</p>
-    <div class="line" id="verdictLine">expected ${esc(listOr(f.expected))} · got ${esc(listOr(f.got))} · <b class="${ok ? "ok" : "bad"}">${esc(f.verdict)}</b></div>
+    <div class="line" id="verdictLine">${esc(outcome(cur.scenario, f.verdict))} — expected ${esc(listOr(f.expected))} · got ${esc(listOr(f.got))} · <b class="${ok ? "ok" : "bad"}">${esc(f.verdict)}</b></div>
     <div class="plain">${esc(plain)}</div>`;
 }
 
