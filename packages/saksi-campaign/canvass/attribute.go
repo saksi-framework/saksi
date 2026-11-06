@@ -3,7 +3,6 @@ package canvass
 import (
 	"encoding/json"
 	"fmt"
-	"regexp"
 	"sort"
 	"strings"
 )
@@ -115,14 +114,13 @@ func Attribute(canvassJSON []byte, returns []string) ([]Tile, error) {
 // attribute adds every failing, attributable check whose reason names the
 // tile, with the reason segments ("; "-separated problems) that name it.
 func attribute(t *Tile, checks []CheckResult) {
-	re := nameRE(t.Precinct)
 	for _, c := range checks {
 		if c.Verdict == "pass" || notAttributed[c.Check] {
 			continue
 		}
 		var hit []string
 		for _, seg := range strings.Split(c.Reason, "; ") {
-			if re.MatchString(seg) {
+			if namesToken(seg, t.Precinct) {
 				hit = append(hit, seg)
 			}
 		}
@@ -143,9 +141,27 @@ func (t *Tile) addCheck(id string) {
 	t.Checks = append(t.Checks, id)
 }
 
-// nameRE matches name as a whole token: not preceded by a letter or digit,
-// and not followed by a letter, digit or '-' (so p03 does not match inside
-// p03-dup.json, but does inside "cv-x-p03" or "p03.json").
-func nameRE(name string) *regexp.Regexp {
-	return regexp.MustCompile(`(?:^|[^A-Za-z0-9])` + regexp.QuoteMeta(name) + `(?:[^A-Za-z0-9-]|$)`)
+// namesToken reports whether s names name as a whole token: not preceded by
+// a letter or digit, and not followed by a letter, digit or '-' (so p03 does
+// not match inside p03-dup.json, but does inside "cv-x-p03" or "p03.json").
+// A plain scan, so no pattern is compiled per tile.
+func namesToken(s, name string) bool {
+	for from := 0; ; {
+		i := strings.Index(s[from:], name)
+		if i < 0 {
+			return false
+		}
+		i += from
+		j := i + len(name)
+		before := i == 0 || !isAlnum(s[i-1])
+		after := j == len(s) || !(isAlnum(s[j]) || s[j] == '-')
+		if before && after {
+			return true
+		}
+		from = i + 1
+	}
+}
+
+func isAlnum(c byte) bool {
+	return c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9'
 }
