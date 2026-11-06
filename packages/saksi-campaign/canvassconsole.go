@@ -43,8 +43,10 @@ type canvassConsole struct {
 
 	mu   sync.Mutex
 	busy string // "" when idle, else what is running ("fixture", "attempt 3 (T9)")
-	// running is the attempt number in flight, 0 when none.
-	running int
+	// running is the attempt number in flight, 0 when none, and
+	// runningScenario its scenario ID.
+	running         int
+	runningScenario string
 
 	// Injected by tests so they need neither saksi-demo nor the tools.
 	check func(CanvassConfig) error
@@ -107,7 +109,7 @@ func (cv *canvassConsole) claim(what string) string {
 
 func (cv *canvassConsole) release() {
 	cv.mu.Lock()
-	cv.busy, cv.running = "", 0
+	cv.busy, cv.running, cv.runningScenario = "", 0, ""
 	cv.mu.Unlock()
 }
 
@@ -298,7 +300,7 @@ func (s *Server) handleCanvassAttack(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.cv.mu.Lock()
-	s.cv.busy, s.cv.running = fmt.Sprintf("attempt %d (%s)", n, sc.ID), n
+	s.cv.busy, s.cv.running, s.cv.runningScenario = fmt.Sprintf("attempt %d (%s)", n, sc.ID), n, sc.ID
 	s.cv.mu.Unlock()
 	go func() {
 		defer s.cv.release()
@@ -369,6 +371,18 @@ func (s *Server) handleCanvassAttempt(w http.ResponseWriter, r *http.Request) {
 	}
 	dir, scenario, err := findAttempt(cfg.attemptsDir(), n)
 	if err != nil {
+		// The POST has numbered this attempt, but its folder does not exist
+		// until a missing fixture is built and RunAttempt starts. Answer it as
+		// running so a client that polls right after the POST does not see a
+		// 404. Once the slot is released (an attempt refused before its folder
+		// existed), it is 404 again.
+		s.cv.mu.Lock()
+		pending, pendingScenario := s.cv.running == n, s.cv.runningScenario
+		s.cv.mu.Unlock()
+		if pending {
+			writeJSONResp(w, http.StatusOK, canvassAttempt{N: n, Scenario: pendingScenario, Running: true, Events: []canvass.Event{}})
+			return
+		}
 		http.Error(w, err.Error(), http.StatusNotFound)
 		return
 	}

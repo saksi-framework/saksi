@@ -168,6 +168,20 @@ func TestCanvassAttackBuildsMissingFixture(t *testing.T) {
 		t.Fatalf("want 202, got %d: %s", rec.Code, rec.Body)
 	}
 	<-st.builds
+	// While the fixture builds the attempt has no folder yet, but the number
+	// the POST returned already answers as running, not 404.
+	var mid canvassAttempt
+	rec := cvGet(h, "/api/canvass/attempt/1")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("attempt 1 during the fixture build: want 200, got %d: %s", rec.Code, rec.Body)
+	}
+	_ = json.Unmarshal(rec.Body.Bytes(), &mid)
+	if !mid.Running || mid.Result != nil || mid.N != 1 || mid.Scenario != "T13" || len(mid.Events) != 0 {
+		t.Errorf("attempt 1 during the fixture build = %+v", mid)
+	}
+	if rec := cvGet(h, "/api/canvass/attempt/2"); rec.Code != http.StatusNotFound {
+		t.Errorf("attempt 2 during the build: want 404, got %d", rec.Code)
+	}
 	close(st.gate)
 	<-st.started
 	waitIdle(t, s)
