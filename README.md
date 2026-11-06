@@ -35,6 +35,10 @@ bash tools/saksi-demo.sh        # interactive menu, or `… all` for the whole r
 Full setup for **Windows (WSL)** and **macOS** — Docker, toolchains, Fabric, and
 troubleshooting — is in **[DEMO.md](DEMO.md)**.
 
+The precinct-canvass attacks can also be replayed offline on a laptop, one click
+per attack, at the console's `/canvass` page: see
+[runbook §6c](docs/research-election-console-runbook.md#6c-canvass-attack-console-on-a-laptop-canvass).
+
 ## Status
 
 Saksi is early research-grade software under active development. Most components
