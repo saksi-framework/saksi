@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -14,6 +15,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	pb "github.com/saksi-framework/saksi/packages/saksi-protocol/go/saksiprotocolv1"
 	"google.golang.org/protobuf/proto"
@@ -457,5 +459,121 @@ func TestLiveIssuedWriteFailureWithholdsTheSignature(t *testing.T) {
 	var set map[string]bool
 	if json.Unmarshal(data, &set) != nil || len(set) != 1 || !set["voter1"] {
 		t.Fatalf("issued.json after the retry: %s", data)
+	}
+}
+
+// M4: at most liveMaxSessions open sessions (429), and a session older than
+// liveSessionTTL is gone: it no longer counts, and sign over it is refused.
+func TestLiveSessionCapAndTTL(t *testing.T) {
+	fx := newLiveFixture(t)
+	c := fx.console()
+	runID := c.toState(LiveCeremony)
+	c.ceremony(runID)
+	sessions := filepath.Join(fx.runs, runID, livePrivateDir, liveSessionsDir)
+	var others []string
+	for i := 0; i < liveMaxSessions; i++ {
+		p := filepath.Join(sessions, fmt.Sprintf("%032x.json", i+1))
+		if err := os.WriteFile(p, []byte(`{}`), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		others = append(others, p)
+	}
+	code, out := c.do(http.MethodPost, "/api/live/issue/presign", "voter1", map[string]string{"blinded_commitment": pt(0x10)})
+	if code != http.StatusTooManyRequests {
+		t.Fatalf("presign with %d sessions open: %d %v", liveMaxSessions, code, out)
+	}
+	// Age them past the TTL: they stop counting and are removed.
+	old := time.Now().Add(-liveSessionTTL - time.Minute)
+	for _, p := range others {
+		if err := os.Chtimes(p, old, old); err != nil {
+			t.Fatal(err)
+		}
+	}
+	c.ok(http.MethodPost, "/api/live/issue/presign", "voter1", map[string]string{"blinded_commitment": pt(0x10)})
+	for _, p := range others {
+		if _, err := os.Stat(p); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("a stale session file was kept: %s", filepath.Base(p))
+		}
+	}
+	// voter1's own session expires before sign.
+	c.s.live.now = func() time.Time { return time.Now().Add(liveSessionTTL + time.Minute) }
+	code, out = c.do(http.MethodPost, "/api/live/issue/sign", "voter1", map[string]string{"e_prime": pt(0x11)})
+	c.s.live.now = time.Now
+	if code != http.StatusConflict || !strings.Contains(out["error"].(string), "expired") {
+		t.Fatalf("sign over an expired session: %d %v", code, out)
+	}
+	if c.s.live.snapshot().Issued != 0 {
+		t.Fatal("an expired session was signed")
+	}
+	c.issue("voter1") // a fresh presign then works
+}
+
+// M4: the Go transcript check refuses the identity as the joint key or as
+// any verification key, whatever the CLI said.
+func TestLiveTranscriptCheckRefusesTheIdentity(t *testing.T) {
+	st := &liveState{ElectionID: "e", Trustees: 2, Acks: map[string]liveAck{
+		"1": {VerificationKey: pt(0xc1), JointPublicKey: pt(0xb1)},
+		"2": {VerificationKey: pt(0xc2), JointPublicKey: pt(0xb1)},
+	}}
+	tr := func(joint, vk1, vk2 string) liveTranscript {
+		var t liveTranscript
+		t.ElectionID, t.JointPublicKey = "e", joint
+		t.VerificationKeys = append(t.VerificationKeys,
+			struct {
+				TrusteeID       string `json:"trustee_id"`
+				VerificationKey string `json:"verification_key"`
+				Fingerprint     string `json:"fingerprint"`
+			}{TrusteeID: "1", VerificationKey: vk1},
+			struct {
+				TrusteeID       string `json:"trustee_id"`
+				VerificationKey string `json:"verification_key"`
+				Fingerprint     string `json:"fingerprint"`
+			}{TrusteeID: "2", VerificationKey: vk2})
+		return t
+	}
+	if why := checkTranscript(st, tr(pt(0xb1), pt(0xc1), pt(0xc2))); why != "" {
+		t.Fatalf("a good transcript was refused: %s", why)
+	}
+	if why := checkTranscript(st, tr(identityPoint, pt(0xc1), pt(0xc2))); !strings.Contains(why, "joint public key is the identity") {
+		t.Fatalf("identity joint key: %q", why)
+	}
+	st.Acks["2"] = liveAck{VerificationKey: identityPoint, JointPublicKey: pt(0xb1)}
+	if why := checkTranscript(st, tr(pt(0xb1), pt(0xc1), identityPoint)); !strings.Contains(why, "trustee 2's verification key is the identity") {
+		t.Fatalf("identity verification key: %q", why)
+	}
+}
+
+// M4: the phone's ballot POST, same-origin with no cookie, passes guard; a
+// cross-origin one and a Host off the allowlist (including the right name
+// without its port) do not.
+func TestLiveBallotPostThroughGuard(t *testing.T) {
+	fx := newLiveFixture(t)
+	fx.allowHosts = []string{"example.com", "vote.example:8443"} // example.com: the helpers' own requests
+	c := fx.console()
+	runID := c.toState(LiveCeremony)
+	c.ceremony(runID)
+	c.issue("voter1")
+	post := func(host, origin string, n byte) (int, string) {
+		body, _ := json.Marshal(map[string]string{"ballot": fakeBallot(runID, "president", n, nil)})
+		req := httptest.NewRequest(http.MethodPost, "/api/live/ballot", bytes.NewReader(body))
+		req.Host = host
+		if origin != "" {
+			req.Header.Set("Origin", origin)
+		}
+		rec := httptest.NewRecorder()
+		c.s.ServeHTTP(rec, req)
+		return rec.Code, rec.Body.String()
+	}
+	if code, body := post("vote.example:8443", "https://vote.example:8443", 1); code != http.StatusOK {
+		t.Fatalf("same-origin ballot with no cookie: %d %s", code, body)
+	}
+	if code, body := post("vote.example:8443", "https://evil.example", 2); code != http.StatusForbidden || !strings.Contains(body, "cross-origin") {
+		t.Fatalf("cross-origin ballot: %d %s", code, body)
+	}
+	if code, body := post("vote.example", "https://vote.example", 3); code != http.StatusForbidden || !strings.Contains(body, "forbidden host") {
+		t.Fatalf("Host without its port: %d %s", code, body)
+	}
+	if n := c.s.live.snapshot().Ballots; n != 1 {
+		t.Fatalf("ballots recorded: %d, want 1", n)
 	}
 }

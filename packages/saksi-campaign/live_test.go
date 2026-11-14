@@ -214,6 +214,8 @@ type liveFixture struct {
 	tokens  []string
 	ops     *fakeOps
 	chain   *flakyChain
+	// allowHosts is the console's --allow-host list (none: guard skips Host).
+	allowHosts []string
 }
 
 func newLiveFixture(t *testing.T) *liveFixture {
@@ -251,7 +253,7 @@ func (fx *liveFixture) console() *liveConsole {
 	store := NewRunStore(fx.runs)
 	hub := NewHub()
 	exec := NewExecutor(store, hub, "saksi-demo", "", FabricConfig{})
-	s := NewServer(store, exec, hub, FabricConfig{}, nil, time.Minute)
+	s := NewServer(store, exec, hub, FabricConfig{}, fx.allowHosts, time.Minute)
 	if err := s.EnableAuth(fx.users); err != nil {
 		fx.t.Fatal(err)
 	}
