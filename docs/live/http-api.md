@@ -18,6 +18,7 @@ routes and their output are unchanged.
 saksi-campaign serve --live --auth-file accounts.json --trustee-tokens tokens.json \
     --tls-cert fullchain.pem --tls-key privkey.pem --addr 0.0.0.0:8443 \
     --allow-host vote.vancornelio.dev \
+    --web-dir /path/to/dist-web \
     --demo /path/to/saksi-demo \
     --fabric-tls-cert ... --fabric-cert ... --fabric-key ...
 ```
@@ -30,6 +31,22 @@ saksi-campaign serve --live --auth-file accounts.json --trustee-tokens tokens.js
 - `--live` needs `--trustee-tokens` (env `SAKSI_TRUSTEE_TOKENS`).
 - On start the console loads the newest live election in `--runs` and resumes
   it from disk and the chain (see **Restart**).
+- **`Host` must match the allowlist exactly, port included.** The console
+  joins the `--addr` port to every `--allow-host` given without one, so the
+  line above allows `vote.vancornelio.dev:8443` only. Browsers leave `:443`
+  out of `Host`, so serving or forwarding the default port makes every
+  request `403 forbidden host`. Phones use an explicit port in the URL:
+  `https://vote.vancornelio.dev:8443/vote/`.
+
+### The phone app (`/vote/`)
+
+With `--web-dir <dir>` the console serves `<dir>/vote` at `/vote/` (static,
+public, behind the same `guard` as every route; `/vote` redirects to
+`/vote/`), next to `/board/`, `/trustee/` and `/admin/`. `.wasm` files are
+served as `application/wasm`. **The phone page must be served from the
+console's own origin:** the API sends no CORS headers, and `guard` refuses a
+POST whose `Origin` is another origin. Building and copying the app into
+`<dir>/vote` is not the console's job.
 
 ### Accounts (`--auth-file`)
 
@@ -60,7 +77,14 @@ election with `trustees: n` needs a token for each of `1..n`.
 
 ## Conventions
 
-- JSON in, JSON out. Errors are `{"error": "<plain reason>"}`.
+- JSON in, JSON out. Errors are `{"error": "<plain reason>"}`, with a
+  stable `code` where one is listed (a ballot for another election). Two
+  answers come from `guard`, before any route, and are **plain text, not
+  JSON**: `403 forbidden host` (a `Host` off the allowlist) and
+  `403 cross-origin request rejected` (a POST whose `Origin` is another
+  origin).
+- A 500 carries one generic message; the detail is in the console's log
+  only (issuance errors log a fixed description and no path).
 - A route's access is one of:
   - **public**: anyone.
   - **anonymous**: public, and the console drops the `Cookie` header before
@@ -75,14 +99,15 @@ election with `trustees: n` needs a token for each of `1..n`.
 | Status | Meaning |
 |---|---|
 | 200, 201 | done |
-| 400 | malformed request, or an op refused the input (the op's own message) |
+| 400 | malformed request, or an op refused the input (the op's own message); a ballot for another election (`code: "wrong-election"`) |
 | 401 | no session / no valid trustee token |
 | 403 | wrong role, or a trustee acting for another id |
 | 404 | live mode off, or no live election set up |
-| 409 | the election is in the wrong state for this, or the request conflicts with what is recorded |
+| 409 | the election is in the wrong state for this, or the request conflicts with what is recorded (or with what the chain holds) |
 | 413 | body too large |
 | 422 | **the chaincode refused the transaction**: see below |
 | 429 | rate limit (ballots) or too many open issuance sessions |
+| 500 | an error inside the console (generic message; see the console log) |
 | 502 | the chain did not answer (not a refusal) |
 
 A chaincode refusal (422) is:
@@ -103,27 +128,35 @@ endorser's). `gate` is the chaincode's own `gate=<id>` when it names one
 that does not verify, an unknown or repeated signer), `already-published`,
 `election-closed`. Any other refusal is `refused`.
 
+Two refusals are answered from the chain instead of returned, because they
+mean an earlier submit committed while the console lost its receipt: a
+`partial-duplicate` (see `POST partial`) and an `already-published` tally
+(see `POST tally/publish`).
+
 ## States
 
 ```
 setup -> ceremony -> open -> closed -> tallied -> verified
+  |         |
+  +---------+--> abandoned   (POST abandon; terminal)
 ```
 
 | State | Entered when | Allows |
 |---|---|---|
-| `setup` | `POST elections` made the keys and parameters | nothing; `CreateElection` is being recorded (a restart finishes it) |
-| `ceremony` | `CreateElection` recorded | the key-ceremony routes |
+| `setup` | `POST elections` made the keys and parameters | `POST elections` again (retries `CreateElection`), `abandon`; a restart also retries |
+| `ceremony` | `CreateElection` recorded | the key-ceremony routes, `abandon` |
 | `open` | `PublishDKGTranscript` recorded | issuance, ballots, close |
 | `closed` | `CloseElection` recorded | partials, tally signatures, `tally/publish` |
 | `tallied` | `PublishTally` recorded | `verify` |
-| `verified` | `verify-live` passed over the chain record | a new `POST elections` |
+| `verified` | `verify-live` passed over the chain record | `verify` again (a fail steps back to `tallied`), a new `POST elections` |
+| `abandoned` | `POST abandon` in `setup` or `ceremony` | a new `POST elections`; nothing else. Never shown as tallied or verified |
 
 One live election at a time. A request in the wrong state gets 409 naming
 the state.
 
 ## Admin
 
-### `POST /api/live/elections` (admin; no election, or the last one verified)
+### `POST /api/live/elections` (admin; no election, the last one verified or abandoned, or the current one in setup)
 
 ```json
 {"title": "Student council 2026",
@@ -140,9 +173,34 @@ runs `issuer-keygen` (key file in the run's private folder) and
 `GET /api/live/election` body (state `ceremony`).
 
 Errors: 400 (title, counts, a trustee without a token, no voter accounts, or
-`election-params` refused the positions), 409 (an election is running), 502
-or 422 (the chain; the election stays in `setup` and the next console start
-finishes it).
+`election-params` refused the positions), 409 (an election is running past
+setup), 502 or 422 (the chain; the election stays in `setup`).
+
+**While the current election is in `setup`** (its `CreateElection` did not go
+through), the same call retries that `CreateElection` instead of making a new
+election: the body must still be a valid request, but its fields are not
+used. It answers **200** with the election view (state `ceremony`), or the
+chain's error again. A console restart retries it too.
+
+### `POST /api/live/abandon` (admin; setup or ceremony)
+
+No body. Gives up the current election before any credential or ballot
+exists, so a stuck setup or ceremony (a transcript refused for a mismatched
+acknowledgement, a trustee frozen out of the roster, a chain error at setup)
+can be left without a fresh `--runs` folder. The run moves to the terminal
+state `abandoned`, written atomically, and the answer is the election view.
+Nothing is sent to the chain: the chain keeps its record of the election
+(open, no transcript), which no ballot can use, since no credential was ever
+issued under its issuer key. Then a new `POST elections` may start the next
+election on the same `--runs` folder. A restart while abandoned stays
+abandoned. The board shows an abandoned run with `status: "abandoned"`,
+`sealed: true`, `verified: false`, and never its files. 409 in any other
+state; 404 before any setup.
+
+**Trustee processes** follow the election id in `GET /api/live/election` (or
+the `state` in their roster and inbox polls): when the election they hold
+keys for is abandoned and a new id appears, they start again with a fresh
+receive key for the new election.
 
 ### `POST /api/live/close` (admin; open)
 
@@ -166,6 +224,13 @@ the chain refuses it: **422, gate `threshold`**, and **nothing changes**
 
 409 if the partials on the chain do not combine yet.
 
+If the chain answers that a tally is already published (an earlier
+`PublishTally` committed but the console lost its receipt), the console
+reads the chain's tally: when it carries the totals the held signatures are
+over, it is recorded, the state moves to `tallied`, and the answer is
+`{"published": true, "already_on_chain": true, "totals": [...]}`; other
+totals are 409 naming both.
+
 ### `POST /api/live/verify` (admin; tallied or verified)
 
 No body. Reads the election back from the chain (parameters, transcript,
@@ -180,9 +245,11 @@ every ballot, every partial, the tally), runs `verify-live` with
  "verified_at": "2026-11-14T08:00:00Z"}
 ```
 
-A failed verdict answers 200 with `overall: "fail"` and the state stays
-`tallied`. Read `overall` and `failed_checks`; the verdict's `summary` has 7
-groups.
+A failed verdict answers 200 with `overall: "fail"` and the failed checks
+recorded: the state stays `tallied`, or **steps back from `verified` to
+`tallied`** on a failed re-verify, so the board never shows verified next to
+a failed check. Read `overall` and `failed_checks`; the verdict's `summary`
+has 7 groups.
 
 ## Public
 
@@ -219,6 +286,12 @@ Everything the phone's wasm needs, and the counts:
 `"console"` when the chain did not answer. `trustees_decrypted` counts
 trustees with a partial recorded for every contest. 404 before any setup.
 
+This view, the board, the ledger read, the issuance gate and the ballot
+route's state check read a snapshot of the public state that the console
+republishes at every recorded change. They never wait for a transition in
+progress, so a slow chain block during close or publish does not freeze them;
+for that block wait they show the state from before the transition.
+
 ### `GET /api/live/ledger` (public)
 
 The election read back **from the chain**, not from the console's files.
@@ -251,11 +324,18 @@ One position's ballot record, as the phone's `build_ballot` made it:
 ```
 
 The body is exactly this one field (an unknown field is 400), at most
-256 KiB (413). The console checks only that the election is open (409) and the
-string is hex (400), then submits **that exact string** with `SubmitBallot`.
-It never decodes and re-encodes the record on its way to the chain; it decodes
-a copy only to read the nullifier, reads the record back with `GetBallot`, and
-fingerprints the bytes the chain returned.
+256 KiB (413). The console checks only that the election is open (409), the
+string is hex (400), and, when a copy of the record decodes, that it names
+the live election: a ballot for another election is **400 with
+`code: "wrong-election"`**, relayed nowhere and filed nowhere (the chaincode
+files a ballot under the election named inside it, so without this check the
+console would relay into any open election on the channel). A record that
+does not decode is still relayed unchanged, so the chain's `decode` gate
+answers it. Then the console submits **that exact string** with
+`SubmitBallot`. It never decodes and re-encodes the record on its way to the
+chain; it decodes a copy only for the election check and the nullifier, reads
+the record back with `GetBallot`, and fingerprints the bytes the chain
+returned.
 
 ```json
 {"election_id": "...", "position_id": "president",
@@ -273,6 +353,11 @@ A refusal is 422 with the chain's reason verbatim and its gate: a replayed
 ballot is `nullifier`, a record with one changed proof byte is `cds`, a
 foreign credential is `issuer` or `credential`. The console does not
 pre-check proofs, so the chain's own refusal is what the phone sees.
+
+**Same origin, no cookie.** The phone POSTs from the page the console served
+at `/vote/`, with `fetch(..., {credentials: "omit"})`: its `Origin` equals
+`Host`, so `guard` passes it, and no cookie is sent (the console would drop it
+anyway).
 
 **Anonymity.** The handler reads no session (the `Cookie` header is removed
 before it runs), no address and no other header. The run folder gets the
@@ -315,10 +400,24 @@ same account discards that account's earlier open session.
 Exactly what `finalize_issuance` needs besides the phone's own state. The
 console never receives the credential.
 
+**Never retry `sign`, and never run two issuances for one account at once.**
+The account is recorded as issued before `s_iss` is sent. If that response
+is lost (a dropped connection, a closed tab), or a second tab's presign
+replaces the first tab's session, the account is spent with no credential:
+a retried `sign` is 409, and the voter moves to a spare account. The console
+keeps no copy of `e_prime` or `s_iss` to answer a retry with.
+
 Rules (each tested):
 - At most one signature per account per election, ever. The account is
   recorded in the run's private `issued.json` (atomically, fsynced) before
-  `s_iss` is returned, and a restart keeps it. A second presign or sign for an
+  `s_iss` is returned, and a restart keeps it. The file is the set of issued
+  account names (a JSON object of name to `true`, keys sorted) with **no
+  time**: the ballots are public in arrival order with their commit times, so
+  an issuance time per account would link accounts to ballots. An issuance
+  does not move `updated_at` either. (A file in the earlier name-to-time
+  format from before this change is not read; start such an election
+  afresh.) If the record cannot be written, the signature is withheld (500)
+  and the account may start again. A second presign or sign for an
   issued account is 409; there is no reset route. A phone that loses its
   credential uses a spare account.
 - At most one open session per account; a session lasts 10 minutes; at most 8
@@ -344,7 +443,7 @@ the key just posted (409). Answers the roster status (below).
 ### `GET /api/live/dkg/roster` (trustee token)
 
 ```json
-{"election_id": "...", "trustees": 5, "threshold": 3, "params": "<hex>",
+{"election_id": "...", "state": "ceremony", "trustees": 5, "threshold": 3, "params": "<hex>",
  "complete": true, "received": [1,2,3,4,5],
  "peers": [{"trustee_id": 1, "receive_public_key": "<point>"}, "..."],
  "fingerprints": [{"trustee_id": 1, "receive_public_key": "<point>", "fingerprint": "..."}, "..."],
@@ -365,18 +464,21 @@ The `dkg-deal` output as it is: `{"election_id", "dealer_id", "commitments",
 is the token's (403); the election; `roster_digest` is the published roster's
 (409: the dealer saw a different roster); `threshold` commitments;
 `masked_shares[k]` is from this dealer to `k + 1`, with 32-byte `nonce`,
-`ciphertext` and `tag`. Each masked share is stored exactly as posted and
-returned to its recipient unchanged; the console cannot unmask it. A deal is
+`ciphertext` and `tag`. Each masked share is stored as posted and returned
+to its recipient with an **unchanged JSON value** (the same fields and
+values; JSON whitespace may differ, since it is kept inside `live.json`); the
+console cannot unmask it, and its AEAD tag is what protects its integrity. A deal is
 made once (a different second deal is 409; the same one again is accepted).
 Answers the roster status.
 
 ### `GET /api/live/dkg/inbox` (trustee token)
 
-Until every trustee has dealt: `{"complete": false, "dealt": [...]}`. Then the
-pieces of `dkg-receive`'s input for this trustee:
+Until every trustee has dealt: `{"election_id", "state", "trustee_id",
+"complete": false, "dealt": [...]}`. Then the pieces of `dkg-receive`'s input
+for this trustee:
 
 ```json
-{"election_id": "...", "trustee_id": 2, "complete": true, "dealt": [1,2,3,4,5],
+{"election_id": "...", "state": "ceremony", "trustee_id": 2, "complete": true, "dealt": [1,2,3,4,5],
  "params": "<hex>",
  "peers": [{"trustee_id": 1, "receive_public_key": "<point>"}, "..."],
  "roster_digest": "<32-byte hex>",
@@ -411,7 +513,8 @@ Before the last: `{"acknowledged": [...], "trustees": 5, "published": false}`.
 A mismatch is 409 naming the trustee (it was shown other commitments), the
 election stays in `ceremony` with `ceremony_error` set, and nothing is
 published. Each trustee then compares the published transcript on the chain
-with its own keys (T4-2).
+with its own keys (T4-2). Such an election cannot finish: `POST abandon` it
+and start the next one.
 
 ### `POST /api/live/partial` (trustee token; closed)
 
@@ -423,13 +526,20 @@ records one `SubmitPartialDecryption` per contest (sent together) and answers:
 
 ```json
 {"trustee_id": "2",
- "recorded": [{"contest_id": "president/alice", "tx_id": "...", "block_number": 400}, "..."],
+ "recorded": [{"contest_id": "president/alice", "tx_id": "...", "block_number": 400,
+               "already_on_chain": false}, "..."],
  "trustees_decrypted": 2, "threshold": 3}
 ```
 
 A contest already recorded for this trustee is answered from the record
-without a second transaction, so a retry is safe. A chain refusal is 422
-(e.g. `partial-duplicate`); the contests that went through stay recorded.
+without a second transaction, so a retry is safe. If the chain refuses a
+contest as `partial-duplicate` (an earlier submit committed but the console
+lost its receipt), the console reads the chain's partial for that trustee
+and contest: **byte-equal** to the one posted, it is recorded and answered
+200 with `already_on_chain: true` (and no `tx_id`); **different**, it is 409
+naming the trustee and contest. Any other chain refusal is 422; the contests
+that went through stay recorded. On a restart from `closed` onward the
+console also fills its record from the partials on the chain.
 Read your partial back from `GET /api/live/ledger` and compare bytes (T4-4).
 The console never decrypts and never runs `partial` or `sign-tally`.
 
@@ -464,8 +574,8 @@ For a live run (`mode: "live"`):
 |---|---|
 | `mode` | `"live"` |
 | `on_chain` | `true` |
-| `status` | the live state |
-| `sealed` | `true` until `tallied` |
+| `status` | the live state (`abandoned` included) |
+| `sealed` | `true` until `tallied` (an abandoned run stays sealed) |
 | `verified` | the state is `verified` (verify-live passed over the chain record) |
 | `contests` | the published totals, ranked, once tallied |
 | `integrity.voters` | voter accounts; `ballot_records` the recorded ballots; `turnout_pct` ballot records over voters × positions |
@@ -505,7 +615,7 @@ on a study run and adds `ballot_fingerprint` (live runs only).
 | `ballots.ndjson`, `ballots.csv` | each recorded ballot, as the chain returned it | yes, once tallied (`ballots.ndjson`) |
 | `receipts.csv`, `trail.ndjson` | lifecycle and ballot receipts | yes, once tallied |
 | `live-verify.json` | the last verify-live verdict | no |
-| `private/` (0700) | `issuer.key`, `issued.json`, `sessions/` (all 0600) | never |
+| `private/` (0700) | `issuer.key`, `issued.json` (the set of issued account names, no times), `sessions/` (all 0600) | never |
 
 ## Restart
 
@@ -517,11 +627,18 @@ chain:
   transcript (an existing transcript counts as done);
 - `open` and the chain closed: `closed`;
 - `closed` and a tally on the chain: `tallied`;
+- in every state from `closed`, partials the chain holds but `live.json` does
+  not are recorded (without a transaction id);
 - in every state from `open`, ballots the chain holds but the run folder does
   not are appended (without a receipt; the tracking-code check then confirms
-  them on the chain).
+  them on the chain);
+- `abandoned`: nothing; it stays abandoned.
 
 Issued accounts and open sessions are on disk, so issuance rules survive a
 restart; sign-in sessions do not (log in again). If the chain is unreachable
-at start the console still starts; every transition reads the chain before it
-acts.
+at start the console still starts and logs the failure; nothing reconciles
+until the next restart. The transitions themselves do not re-read the chain
+first: a setup retry and `close` submit directly and take an "already
+exists" or "already closed" answer as done; the ceremony's last
+acknowledgement takes "already published" (`dkg-duplicate`) as done; a
+partial or a tally already on the chain is answered as above.

@@ -336,8 +336,9 @@ func (s *Server) EnableLive(o LiveOptions) error {
 	s.live = L
 	if L.st != nil {
 		if err := L.resume(context.Background()); err != nil {
-			// Not fatal: the chain may come up after the console. Every
-			// transition re-reads the chain before it acts.
+			// Not fatal: the chain may come up after the console. Nothing
+			// reconciles until the next start; a stuck setup is retried by
+			// POST elections.
 			log.Printf("live: resume %s: %v", L.st.RunID, err)
 		}
 	}

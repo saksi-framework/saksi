@@ -14,9 +14,9 @@ import (
 
 // The key-ceremony relay. The console holds no trustee secret: it collects the
 // receive keys into a roster, relays each dealer's commitments to everyone and
-// each masked share to its recipient byte for byte (it cannot unmask them),
-// collects each trustee's public acknowledgement, and then assembles and
-// publishes the transcript.
+// each masked share to its recipient with an unchanged JSON value (it cannot
+// unmask them), collects each trustee's public acknowledgement, and then
+// assembles and publishes the transcript.
 
 var hex64 = func(s string) bool {
 	if len(s) != 64 {
@@ -181,7 +181,7 @@ func (L *liveService) roster(id string) (map[string]any, error) {
 }
 
 // liveMaskedShare is the part of a masked share the relay checks. The share
-// itself is stored and returned as posted.
+// itself is stored and returned with an unchanged JSON value.
 type liveMaskedShare struct {
 	DealerID    int    `json:"dealer_id"`
 	RecipientID int    `json:"recipient_id"`
