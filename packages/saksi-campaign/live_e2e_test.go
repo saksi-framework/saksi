@@ -162,6 +162,9 @@ func (c *oracleChain) apply(fn string, args []string) error {
 		if err := proto.Unmarshal(raw, &tr); err != nil {
 			return oracleRefusal{"decode tally"}
 		}
+		if _, ok := c.tally[tr.ElectionId]; ok {
+			return oracleRefusal{fmt.Sprintf("failed to endorse transaction; a tally is already published for election %q", tr.ElectionId)}
+		}
 		var p pb.ElectionParameters
 		praw, _ := hex.DecodeString(c.params[tr.ElectionId])
 		_ = proto.Unmarshal(praw, &p)

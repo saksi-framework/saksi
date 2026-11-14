@@ -306,6 +306,9 @@ func (L *liveService) postPartials(id string, body LivePartialBody) (map[string]
 	type result struct {
 		rc  clientsdk.Receipt
 		err error
+		// onChain: the chain already held this exact partial (a commit whose
+		// receipt was lost, or a crash before the state write).
+		onChain bool
 	}
 	todo := map[string]string{}
 	for _, p := range body.Partials {
@@ -324,8 +327,13 @@ func (L *liveService) postPartials(id string, body LivePartialBody) (map[string]
 		go func() {
 			defer wg.Done()
 			rc, err := L.chainSubmit("SubmitPartialDecryption", electionID, partial)
+			r := result{rc: rc, err: err}
+			var ref errRefused
+			if errors.As(err, &ref) && ref.Gate == "partial-duplicate" {
+				r.onChain, r.err = L.partialOnChain(electionID, contest, id, partial)
+			}
 			rmu.Lock()
-			results[contest] = result{rc, err}
+			results[contest] = r
 			rmu.Unlock()
 		}()
 	}
@@ -347,6 +355,11 @@ func (L *liveService) postPartials(id string, body LivePartialBody) (map[string]
 			}
 			continue
 		}
+		if r.onChain {
+			// Recorded from the chain: no transaction of this console's.
+			st.Partials[id][p.ContestID] = LiveTx{}
+			continue
+		}
 		st.Partials[id][p.ContestID] = txOf(r.rc)
 		L.appendLifecycleLocked("SubmitPartialDecryption", id+"/"+p.ContestID, r.rc)
 	}
@@ -359,12 +372,68 @@ func (L *liveService) postPartials(id string, body LivePartialBody) (map[string]
 	recorded := []map[string]any{}
 	for _, p := range body.Partials {
 		tx := st.Partials[id][p.ContestID]
-		recorded = append(recorded, map[string]any{"contest_id": p.ContestID, "tx_id": tx.TxID, "block_number": tx.BlockNumber})
+		recorded = append(recorded, map[string]any{"contest_id": p.ContestID, "tx_id": tx.TxID, "block_number": tx.BlockNumber,
+			"already_on_chain": tx.TxID == ""})
 	}
 	return map[string]any{
 		"trustee_id": id, "recorded": recorded,
 		"trustees_decrypted": L.decryptedLocked(), "threshold": st.Threshold,
 	}, nil
+}
+
+// partialOnChain answers a partial-duplicate refusal: the chain already holds
+// a partial from trustee id for contest. Byte-equal to the one posted means it
+// is this very partial (its first submit committed but the console did not
+// learn of it), so it counts as recorded; a different one is a conflict.
+func (L *liveService) partialOnChain(electionID, contest, id, posted string) (bool, error) {
+	c, err := L.getChain()
+	if err != nil {
+		return false, errChain{err}
+	}
+	got, err := c.GetPartialDecryption(electionID, contest, id)
+	if err != nil {
+		return false, errChain{err}
+	}
+	a, errA := hex.DecodeString(got)
+	b, errB := hex.DecodeString(posted)
+	if errA == nil && errB == nil && bytes.Equal(a, b) {
+		return true, nil
+	}
+	return false, conflictf("the chain already holds a different partial decryption from trustee %s for contest %q; "+
+		"the posted one does not match it byte for byte (read the chain's from GET /api/live/ledger)", id, contest)
+}
+
+// reconcilePartialsLocked records every partial the chain holds for this
+// election that live.json lacks (a commit whose state write was cut off), so
+// the decryption count is the chain's. Caller holds mu; the state is closed
+// or later.
+func (L *liveService) reconcilePartialsLocked(c liveChain) error {
+	st := L.st
+	added := 0
+	for _, id := range trusteeIDs(st.Trustees) {
+		for _, contest := range st.ContestIDs {
+			if _, ok := st.Partials[id][contest]; ok {
+				continue
+			}
+			_, err := c.GetPartialDecryption(st.ElectionID, contest, id)
+			if chainAbsent(err) {
+				continue
+			}
+			if err != nil {
+				return err
+			}
+			if st.Partials[id] == nil {
+				st.Partials[id] = map[string]LiveTx{}
+			}
+			st.Partials[id][contest] = LiveTx{}
+			added++
+		}
+	}
+	if added == 0 {
+		return nil
+	}
+	log.Printf("live: %s resumed %d partial decryption(s) from the chain", st.RunID, added)
+	return L.save()
 }
 
 // decryptedLocked counts trustees with a partial recorded for every contest.
@@ -520,6 +589,10 @@ func (L *liveService) publishLocked(ctx context.Context, led *LiveLedger, totals
 		return nil, conflictf("the tally cannot be assembled: %v", err)
 	}
 	rc, err := L.chainSubmit("PublishTally", a.Tally)
+	var ref errRefused
+	if errors.As(err, &ref) && ref.Gate == "already-published" {
+		return L.tallyOnChainLocked(a)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -532,6 +605,36 @@ func (L *liveService) publishLocked(ctx context.Context, led *LiveLedger, totals
 	}
 	return map[string]any{"published": true, "totals": a.Totals, "signatures_used": len(sigs),
 		"tx_id": rc.TxID, "block_number": rc.BlockNumber}, nil
+}
+
+// tallyOnChainLocked answers an already-published refusal: an earlier
+// PublishTally committed but the console did not learn of it. The chain's
+// tally is adopted when it carries the totals the console just assembled
+// (its signature set may differ: a later signer can join the group after the
+// lost receipt); different totals are a conflict. Caller holds mu.
+func (L *liveService) tallyOnChainLocked(a *liveAssembled) (map[string]any, error) {
+	st := L.st
+	c, err := L.getChain()
+	if err != nil {
+		return nil, errChain{err}
+	}
+	tally, err := c.GetTally(st.ElectionID)
+	if err != nil {
+		return nil, errChain{err}
+	}
+	totals, err := decodeTallyTotals(tally)
+	if err != nil {
+		return nil, fmt.Errorf("the chain's tally does not decode: %v", err)
+	}
+	if !slices.Equal(totals, a.Totals) {
+		return nil, conflictf("a different tally is already on the chain: it carries totals %v, the signatures held are over %v", totals, a.Totals)
+	}
+	st.Tally, st.Totals, st.State = tally, totals, LiveTallied
+	log.Printf("live: %s tallied (the tally was already on the chain)", st.RunID)
+	if err := L.save(); err != nil {
+		return nil, err
+	}
+	return map[string]any{"published": true, "already_on_chain": true, "totals": totals}, nil
 }
 
 // publishNow is the presenter's POST /api/live/tally/publish: publication

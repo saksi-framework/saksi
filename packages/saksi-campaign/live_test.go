@@ -185,17 +185,23 @@ func electionOfParams(h string) string {
 	return p.ElectionId
 }
 
-// flakyChain is a chain that can be taken down.
+// flakyChain is a chain that can be taken down, or made to lose the receipt
+// of a transaction that did commit (a commit-status wait that times out).
 type flakyChain struct {
 	*oracleChain
 	down atomic.Bool
+	lose atomic.Value // fn whose receipts are lost after the commit
 }
 
 func (c *flakyChain) Submit(fn string, args ...string) (clientsdk.Receipt, error) {
 	if c.down.Load() {
 		return clientsdk.Receipt{}, errors.New("dial tcp: connection refused")
 	}
-	return c.oracleChain.Submit(fn, args...)
+	rc, err := c.oracleChain.Submit(fn, args...)
+	if lost, _ := c.lose.Load().(string); err == nil && lost == fn {
+		return clientsdk.Receipt{}, errors.New("rpc error: code = DeadlineExceeded desc = waiting for the commit status timed out")
+	}
+	return rc, err
 }
 
 // liveFixture is the files and fakes a live console runs over, kept across

@@ -752,6 +752,11 @@ func (L *liveService) resume(ctx context.Context) error {
 			}
 		}
 	}
+	if st.stateIndex() >= liveStateIndex(LiveClosed) {
+		if err := L.reconcilePartialsLocked(c); err != nil {
+			return err
+		}
+	}
 	if st.stateIndex() >= liveStateIndex(LiveOpen) {
 		return L.reconcileBallotsLocked(c)
 	}
