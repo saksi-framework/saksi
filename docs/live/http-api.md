@@ -4,7 +4,8 @@ The console's routes for one live election: the presenter sets it up, the
 trustee processes run the key ceremony and the decryption through it, the
 phones enrol and vote through it, and anyone reads the record back from the
 chain. The phone app (`apps/vote`) and the trustee process
-(`saksi-campaign trustee --id N`) are written from this file.
+(`saksi-campaign trustee --id N`, documented in `trustee-api.md`) are written
+from this file.
 
 All cryptography is `saksi-demo live <op>` (see `wire-format.md`). The console
 passes the phone's and the trustees' payloads through in the wire-format
@@ -295,7 +296,10 @@ for that block wait they show the state from before the transition.
 ### `GET /api/live/ledger` (public)
 
 The election read back **from the chain**, not from the console's files.
-Trustees, the verifier and anyone else aggregate from this.
+The verifier and anyone else can aggregate from this. The trustee processes do
+not: each reads the chain through its own gateway connection
+(`trustee-api.md`), because a console that relays the partials could show a
+trustee a one-ballot view of the election.
 
 ```json
 {"election_id": "...", "status": "open | closed | published",
@@ -455,7 +459,8 @@ Before every key is in: `complete: false` and `received` only. `peers` is
 `dkg-deal`'s roster input as it is; `roster_digest` is computed by
 `dkg-roster`, exactly as `dkg-deal` and `dkg-receive` compute it. **A trustee
 must still compare the digest with the other trustees' own hosts, never only
-with this relay** (T4-1).
+with this relay** (T4-1): the trustee processes do, through each other's
+`GET /api/trustee/peer`.
 
 ### `POST /api/live/dkg/deal` (trustee token; ceremony, roster complete)
 
@@ -519,7 +524,8 @@ and start the next one.
 ### `POST /api/live/partial` (trustee token; closed)
 
 The `partial` output (only `partials` is read): `{"partials": [{"contest_id",
-"partial"}, "..."]}`, computed over the ballots from `GET /api/live/ledger`.
+"partial"}, "..."]}`, computed over every ballot record on the chain (the
+trustee process reads them itself; `trustee-api.md`).
 Each partial must decode to a `PartialDecryption` of the token's trustee
 (403 otherwise) for a contest of the election, each contest once. The console
 records one `SubmitPartialDecryption` per contest (sent together) and answers:
@@ -540,7 +546,8 @@ and contest: **byte-equal** to the one posted, it is recorded and answered
 naming the trustee and contest. Any other chain refusal is 422; the contests
 that went through stay recorded. On a restart from `closed` onward the
 console also fills its record from the partials on the chain.
-Read your partial back from `GET /api/live/ledger` and compare bytes (T4-4).
+Read your partial back from the chain (`GetPartialDecryption`) and compare
+bytes (T4-4).
 The console never decrypts and never runs `partial` or `sign-tally`.
 
 ### `POST /api/live/tally-sig` (trustee token; closed)
