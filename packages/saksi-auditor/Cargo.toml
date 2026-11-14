@@ -23,6 +23,7 @@ rand_core = { workspace = true, optional = true }
 serde_json = { version = "1", optional = true }
 hex = { version = "0.4", optional = true }
 prost = { version = "0.13", optional = true }
+saksi-live = { path = "../saksi-live", optional = true }
 # Data parallelism: the auditor's per-ballot verification (every build) and the
 # demo generator's per-chunk voter construction.
 rayon = "1.10"
@@ -30,7 +31,7 @@ rayon = "1.10"
 [features]
 # Exposes the happy-path election generator + bundle (de)serialization used by
 # the saksi-demo driver. Reuses the same fixture the auditor's own tests build.
-demo = ["dep:rand_core", "dep:serde_json", "dep:hex", "dep:prost"]
+demo = ["dep:rand_core", "dep:serde_json", "dep:hex", "dep:prost", "dep:saksi-live"]
 
 [dev-dependencies]
 rand_core.workspace = true

@@ -78,6 +78,9 @@ pub mod precinct_return;
 #[cfg(feature = "demo")]
 pub mod canvass;
 
+#[cfg(feature = "demo")]
+pub mod live;
+
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
