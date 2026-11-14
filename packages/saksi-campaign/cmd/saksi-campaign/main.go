@@ -8,6 +8,12 @@
 //	                     [--fabric-tls-cert path] [--fabric-msp-id id]
 //	                     [--fabric-cert path] [--fabric-key path]
 //	                     [--fabric-channel name] [--fabric-chaincode name]
+//	                     [--tls-cert cert.pem --tls-key key.pem]
+//	                     [--live --trustee-tokens tokens.json]
+//
+// --live runs one live election (docs/live/http-api.md): it needs --auth-file
+// (the voter roll and the presenter), --trustee-tokens and, unless the bind is
+// loopback, TLS.
 //
 // The same binary is also the campaign driver for an ALREADY-RUNNING console,
 // over that console's own HTTP API — it never reaches into a run folder:
@@ -21,6 +27,11 @@
 // password from stdin so it never lands in shell history:
 //
 //	saksi-campaign hash-password < password.txt
+//
+// and a trustee process's token and the hash the --trustee-tokens file holds:
+//
+//	saksi-campaign new-token
+//	saksi-campaign hash-token < token.txt
 package main
 
 import (
@@ -29,7 +40,6 @@ import (
 	"flag"
 	"fmt"
 	"net"
-	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -66,11 +76,25 @@ func main() {
 			fatal("hash-password: %v", err)
 		}
 		fmt.Println(h)
+	case "new-token":
+		tok, err := campaign.NewTrusteeToken()
+		if err != nil {
+			fatal("new-token: %v", err)
+		}
+		fmt.Println(tok)
+	case "hash-token":
+		fmt.Fprintln(os.Stderr, "reading one token line from stdin")
+		h, err := campaign.HashTrusteeToken(os.Stdin)
+		if err != nil {
+			fatal("hash-token: %v", err)
+		}
+		fmt.Println(h)
 	default:
 		fmt.Fprintln(os.Stderr, "usage: saksi-campaign serve [flags]")
 		fmt.Fprintln(os.Stderr, "       saksi-campaign --repeat --config run.json [flags]")
 		fmt.Fprintln(os.Stderr, "       saksi-campaign --ladder [flags]")
 		fmt.Fprintln(os.Stderr, "       saksi-campaign hash-password < password")
+		fmt.Fprintln(os.Stderr, "       saksi-campaign new-token | saksi-campaign hash-token < token")
 		os.Exit(2)
 	}
 }
@@ -159,11 +183,21 @@ func serve(args []string) {
 	fabricChannel := fs.String("fabric-channel", "saksi", "Fabric channel the bulletin board runs on")
 	fabricChaincode := fs.String("fabric-chaincode", "saksi-bulletin", "deployed chaincode name")
 	fabricPeerVolume := fs.String("fabric-peer-volume", "", "host path of the peer's ledger volume (enables perf.csv's ledger_bytes_delta)")
+	tlsCert := fs.String("tls-cert", "", "TLS certificate chain (PEM); with --tls-key the console serves HTTPS (TLS 1.2 or later)")
+	tlsKey := fs.String("tls-key", "", "TLS private key (PEM) for --tls-cert")
+	live := fs.Bool("live", false, "enable the live election routes (/api/live/); needs --auth-file and --trustee-tokens")
+	trusteeTokens := fs.String("trustee-tokens", os.Getenv("SAKSI_TRUSTEE_TOKENS"),
+		"live mode: JSON array of {trustee_id, token_sha256}, one token per trustee process (env SAKSI_TRUSTEE_TOKENS)")
 	var allow multiFlag
 	fs.Var(&allow, "allow-host", "additional accepted Host header (repeatable; for LAN)")
 	_ = fs.Parse(args)
 	if *timeout <= 0 {
 		fatal("--phase-timeout must be positive (got %s)", *timeout)
+	}
+	opts := campaign.ServeOptions{Addr: *addr, TLSCert: *tlsCert, TLSKey: *tlsKey, Live: *live, AuthFile: *authFile}
+	warning, err := campaign.CheckServeOptions(opts)
+	if err != nil {
+		fatal("%v", err)
 	}
 
 	fabric := campaign.FabricConfig{
@@ -202,14 +236,23 @@ func serve(args []string) {
 			fatal("--auth-file %s: %v", *authFile, err)
 		}
 	}
+	if *live {
+		if err := handler.EnableLive(campaign.LiveOptions{TrusteeTokens: *trusteeTokens}); err != nil {
+			fatal("--live: %v", err)
+		}
+	}
+	scheme := "http"
+	if opts.TLS() {
+		scheme = "https"
+	}
 
 	fmt.Printf("Research Election Console\n")
-	fmt.Printf("  serving   http://%s\n", displayHost(*addr))
+	fmt.Printf("  serving   %s://%s\n", scheme, displayHost(*addr))
 	fmt.Printf("  runs      %s\n", *runsDir)
 	fmt.Printf("  phase timeout %s\n", *timeout)
 	fmt.Printf("  saksi-demo %s\n", *demoBin)
 	if *webDir != "" {
-		fmt.Printf("  apps      %s -> http://%s/board/, /trustee/ and /admin/\n", *webDir, displayHost(*addr))
+		fmt.Printf("  apps      %s -> %s://%s/board/, /trustee/ and /admin/\n", *webDir, scheme, displayHost(*addr))
 	}
 	if *authFile != "" {
 		fmt.Printf("  auth      on, users from %s\n", *authFile)
@@ -221,8 +264,18 @@ func serve(args []string) {
 	} else if *consBin == "" {
 		fmt.Printf("  on-chain  (no driver configured — offline mode only)\n")
 	}
+	if *live {
+		fmt.Printf("  live      on: /api/live/ (trustee tokens from %s)\n", *trusteeTokens)
+	}
+	if warning != "" {
+		fmt.Fprintln(os.Stderr, warning)
+	}
 	go restorePeerOnSignal(exec)
-	if err := http.ListenAndServe(*addr, handler); err != nil {
+	ln, err := net.Listen("tcp", *addr)
+	if err != nil {
+		fatal("listen %s: %v", *addr, err)
+	}
+	if err := campaign.Serve(ln, opts, handler); err != nil {
 		fmt.Fprintf(os.Stderr, "server error: %v\n", err)
 		os.Exit(1)
 	}

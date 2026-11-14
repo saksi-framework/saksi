@@ -33,6 +33,9 @@ import (
 const (
 	RoleAdmin   = "admin"
 	RoleTrustee = "trustee"
+	// RoleVoter is a live-election voter account (live.go). The voter accounts
+	// are the voter roll: each may obtain one credential per election.
+	RoleVoter = "voter"
 
 	sessionCookie      = "saksi_session"
 	sessionTTL         = 12 * time.Hour // the cookie's Max-Age=43200
@@ -69,8 +72,17 @@ type access int
 const (
 	accessAdmin    access = iota
 	accessPublic          // anyone, signed in or not
-	accessSignedIn        // any trustee or admin
+	accessSignedIn        // any trustee or admin (not a voter)
 	accessTrustee         // trustees only; the handler also checks share ownership
+	accessVoter           // live-election voters only; the handler acts on the caller's own account
+	// accessTrusteeToken is a trustee process calling server to server with
+	// its own bearer token (live_tokens.go). authorize resolves the token to
+	// one trustee id and the handler acts as that trustee only.
+	accessTrusteeToken
+	// accessAnonymous is public, and the session is never resolved: authorize
+	// drops the Cookie header before the handler runs, so nothing downstream
+	// can link the request to an account (the live ballot relay).
+	accessAnonymous
 )
 
 // routeAccess is the single route -> role table, keyed by the ServeMux pattern
@@ -106,6 +118,28 @@ var routeAccess = map[string]access{
 	// The wizard page is static and holds no data; it signs in through
 	// /api/login, and each route it then calls keeps its own role.
 	"/wizard": accessPublic,
+
+	// live election (live_http.go): public reads, and the anonymous ballot
+	// relay, whose authorization is the credential signature inside the ballot.
+	"/api/live/election": accessPublic,
+	"/api/live/ledger":   accessPublic,
+	"/api/live/ballot":   accessAnonymous,
+	// live election: a voter's own credential issuance
+	"/api/live/issue/presign": accessVoter,
+	"/api/live/issue/sign":    accessVoter,
+	// live election: trustee processes, each with its own bearer token
+	"/api/live/dkg/receive-key": accessTrusteeToken,
+	"/api/live/dkg/roster":      accessTrusteeToken,
+	"/api/live/dkg/deal":        accessTrusteeToken,
+	"/api/live/dkg/inbox":       accessTrusteeToken,
+	"/api/live/dkg/ack":         accessTrusteeToken,
+	"/api/live/partial":         accessTrusteeToken,
+	"/api/live/tally-sig":       accessTrusteeToken,
+	// live election: the presenter
+	"/api/live/elections":     accessAdmin,
+	"/api/live/close":         accessAdmin,
+	"/api/live/tally/publish": accessAdmin,
+	"/api/live/verify":        accessAdmin,
 
 	// trustee or admin
 	"/ceremony/publish": accessSignedIn,
@@ -144,14 +178,28 @@ var routeAccess = map[string]access{
 // denial returns the HTTP status and reason when sess may not use a route that
 // needs a; status 0 means allowed.
 func (a access) denial(sess *session) (int, string) {
-	if a == accessPublic {
+	if a == accessPublic || a == accessAnonymous {
 		return 0, ""
+	}
+	if a == accessTrusteeToken {
+		// Resolved by authorize from the bearer token, never from a session.
+		return http.StatusUnauthorized, errTrusteeToken
 	}
 	if sess == nil {
 		return http.StatusUnauthorized, errLoginRequired
 	}
 	switch a {
 	case accessSignedIn:
+		// A voter account is signed in too, but the study's signed-in routes
+		// (the run event stream, the ceremony's publish) were never meant for it.
+		if sess.Role != RoleAdmin && sess.Role != RoleTrustee {
+			return http.StatusForbidden, "trustee or admin role required"
+		}
+		return 0, ""
+	case accessVoter:
+		if sess.Role != RoleVoter {
+			return http.StatusForbidden, "only a voter account may obtain a credential"
+		}
 		return 0, ""
 	case accessTrustee:
 		if sess.Role != RoleTrustee {
@@ -291,14 +339,16 @@ func parseUsers(data []byte) (map[string]User, error) {
 			return nil, fmt.Errorf("user %d: username is empty", i+1)
 		case len(u.Username) > maxUsernameBytes:
 			return nil, fmt.Errorf("user %d: username is longer than %d bytes", i+1, maxUsernameBytes)
-		case u.Role != RoleAdmin && u.Role != RoleTrustee:
-			return nil, fmt.Errorf("%s: unknown role %q (want %q or %q)", where, u.Role, RoleAdmin, RoleTrustee)
+		case u.Role != RoleAdmin && u.Role != RoleTrustee && u.Role != RoleVoter:
+			return nil, fmt.Errorf("%s: unknown role %q (want %q, %q or %q)", where, u.Role, RoleAdmin, RoleTrustee, RoleVoter)
 		case u.Role == RoleTrustee && u.TrusteeID == "":
 			return nil, fmt.Errorf("%s: a trustee needs a trustee_id", where)
 		case u.Role == RoleTrustee && !trusteeIDPattern.MatchString(u.TrusteeID):
 			return nil, fmt.Errorf("%s: trustee_id %q must be the trustee's wire id: digits, no leading zero", where, u.TrusteeID)
 		case u.Role == RoleAdmin && u.TrusteeID != "":
 			return nil, fmt.Errorf("%s: an admin must not have a trustee_id", where)
+		case u.Role == RoleVoter && u.TrusteeID != "":
+			return nil, fmt.Errorf("%s: a voter must not have a trustee_id", where)
 		}
 		if _, dup := users[u.Username]; dup {
 			return nil, fmt.Errorf("%s: duplicate username", where)
@@ -356,6 +406,23 @@ func (s *Server) authorize(mux *routeMux) http.Handler {
 			mux.ServeHTTP(w, r)
 			return
 		}
+		_, pattern := mux.Handler(r)
+		switch routeAccess[pattern] {
+		case accessAnonymous:
+			// Before the auth-off pass-through, so it holds either way.
+			r.Header.Del("Cookie")
+			mux.ServeHTTP(w, r)
+			return
+		case accessTrusteeToken:
+			id, ok := s.trusteeFromToken(r)
+			if !ok {
+				writeJSONResp(w, http.StatusUnauthorized, map[string]string{"error": errTrusteeToken})
+				return
+			}
+			r = r.WithContext(context.WithValue(r.Context(), trusteeTokenKey{}, id))
+			mux.ServeHTTP(w, r)
+			return
+		}
 		if s.auth == nil {
 			mux.ServeHTTP(w, r)
 			return
@@ -364,7 +431,6 @@ func (s *Server) authorize(mux *routeMux) http.Handler {
 		if sess != nil {
 			r = r.WithContext(context.WithValue(r.Context(), sessionKey{}, sess))
 		}
-		_, pattern := mux.Handler(r)
 		if code, reason := routeAccess[pattern].denial(sess); code != 0 {
 			writeJSONResp(w, code, map[string]string{"error": reason})
 			return
