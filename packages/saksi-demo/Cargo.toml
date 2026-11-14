@@ -18,7 +18,18 @@ saksi-auditor = { path = "../saksi-auditor", features = ["demo"] }
 hex = "0.4"
 serde_json = "1"
 rand_core.workspace = true
+# `live` subcommands (the live election's per-party crypto steps).
+saksi-live = { path = "../saksi-live" }
+saksi-crypto = { path = "../saksi-crypto" }
+saksi-protocol = { path = "../saksi-protocol/rust" }
+saksi-ffi-tauri = { path = "../saksi-ffi-tauri" }
+curve25519-dalek.workspace = true
+zeroize.workspace = true
+serde = { version = "1", features = ["derive"] }
 
 [dev-dependencies]
 # The gen→audit-stream integration test parses the --json correctness output.
 serde_json = "1"
+# The live CLI test checks shares, presentations and ballots with the library.
+saksi-credentials = { path = "../saksi-credentials" }
+prost = "0.13"

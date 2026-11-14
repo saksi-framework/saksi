@@ -30,6 +30,9 @@
 //!   proof kept. The chaincode's `selection` gate and the auditor's
 //!   `ballot.selection_sum` refuse it (the `overvote` attack).
 //!
+//! - `live <op>` — one step of a live election (JSON on stdin, JSON on
+//!   stdout); the ops and their wire format are in `docs/live/wire-format.md`.
+//!
 //! Both audit subcommands verify ballots on every core. `SAKSI_AUDIT_THREADS=<n>`
 //! pins the thread count (`1` = the serial path); the output is identical at any
 //! `n`, and an invalid value is an error.
@@ -37,6 +40,7 @@
 use std::path::Path;
 use std::process::ExitCode;
 
+mod live;
 mod precinct;
 
 use saksi_auditor::demo::{
@@ -63,6 +67,7 @@ fn main() -> ExitCode {
         Some("verify-return") => precinct::cmd_verify_return(&args[2..]),
         Some("precinct-aggregate") => saksi_auditor::precinct_aggregate::cli(&args[2..]),
         Some("audit-canvass") => saksi_auditor::canvass::cli(&args[2..]),
+        Some("live") => live::cli(&args[2..]),
         _ => {
             eprintln!(
                 "usage: saksi-demo <gen [--voters N] [--positions P] [--candidates C] \
@@ -79,7 +84,8 @@ fn main() -> ExitCode {
                  | sign-return <precinct dir> --ledger F --close-block N --tip-hash HEX --key F \
                  (sign a precinct return) \
                  | verify-return <return.json> --pubkey HEX (verify a return signature) \
-                 | audit-canvass <dir> [--json] [--out DIR] (national canvass over precinct returns)>"
+                 | audit-canvass <dir> [--json] [--out DIR] (national canvass over precinct returns) \
+                 | live <op> < input.json (live election crypto; see docs/live/wire-format.md)>"
             );
             ExitCode::FAILURE
         }
