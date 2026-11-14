@@ -394,6 +394,19 @@ tracking code but, built with fresh randomness, never the fingerprint. The
 board should show it next to the tracking code, so a voter can see that the
 recorded ballot is the one the phone showed.
 
+Anyone computing the fingerprint from the chain (the board, the console, a
+trustee) must hash the raw stored bytes, the `GetBallot` / `GetBallots` hex
+decoded, and never decode and re-marshal the record first: Go's
+`proto.Marshal` is not guaranteed to reproduce prost's bytes. The chaincode
+checks the parsed fields and stores the submitted bytes, but does not require a
+canonical encoding, so a relay could resubmit a voter's genuine ballot
+re-encoded (an extra unknown field, reordered fields, a non-minimal varint) and
+the chain would accept it under a different fingerprint. A fingerprint on the
+board that differs from the one the phone showed therefore has two possible
+causes: a different ballot was recorded, or the same ballot was re-encoded on
+its way to the chain. Either way the recorded bytes are not the bytes the phone
+built, and the relay altered them.
+
 ### `benaloh-check`
 
 The Benaloh challenge's check, the same function as the phone's
@@ -1028,7 +1041,8 @@ tracking code, which is one more reason the opened values stay on the phone.
 
 The check is only as independent as the code that runs it: a phone whose
 wasm lied could lie in its check too. The demo runs both in the same wasm, to
-show the mechanism; the honest version checks the opened values elsewhere.
+show the mechanism; the honest version checks the opened values elsewhere,
+after the fresh ballot is recorded (step 3).
 
 ### What the phone keeps, and what it drops
 
