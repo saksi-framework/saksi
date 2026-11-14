@@ -140,6 +140,7 @@ var routeAccess = map[string]access{
 	"/api/live/close":         accessAdmin,
 	"/api/live/tally/publish": accessAdmin,
 	"/api/live/verify":        accessAdmin,
+	"/api/live/abandon":       accessAdmin,
 
 	// trustee or admin
 	"/ceremony/publish": accessSignedIn,

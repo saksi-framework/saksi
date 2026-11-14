@@ -19,6 +19,30 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
+// --- abandon -------------------------------------------------------------------
+
+// abandon gives up the current election in setup or ceremony, before any
+// credential or ballot exists, so that a stuck setup or ceremony can be left
+// without a fresh --runs folder. The state is written atomically; the run is
+// terminal, and a new election may then be created. Nothing is sent to the
+// chain: the chain keeps its record of the election (open, with no
+// transcript), which no ballot can ever use, since no credential was issued
+// under its issuer key.
+func (L *liveService) abandon() error {
+	L.mu.Lock()
+	defer L.mu.Unlock()
+	if err := L.inState(LiveSetup, LiveCeremony); err != nil {
+		return err
+	}
+	if L.st.Issued != 0 || L.st.Ballots != 0 {
+		return conflictf("the live election has credentials or ballots; it cannot be abandoned")
+	}
+	from := L.st.State
+	L.st.State = LiveAbandoned
+	log.Printf("live: %s abandoned in %s", L.st.RunID, from)
+	return L.save()
+}
+
 // --- close ---------------------------------------------------------------------
 
 func (L *liveService) close() (*liveState, error) {

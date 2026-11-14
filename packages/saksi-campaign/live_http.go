@@ -30,6 +30,7 @@ func registerLiveRoutes(mux *routeMux, s *Server) {
 	mux.HandleFunc("/api/live/close", s.liveAdmin(s.handleLiveClose))
 	mux.HandleFunc("/api/live/tally/publish", s.liveAdmin(s.handleLivePublish))
 	mux.HandleFunc("/api/live/verify", s.liveAdmin(s.handleLiveVerify))
+	mux.HandleFunc("/api/live/abandon", s.liveAdmin(s.handleLiveAbandon))
 }
 
 // liveOpTimeout bounds one route's CLI ops and chain calls.
@@ -175,19 +176,29 @@ func (s *Server) handleLiveCreate(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx, cancel := liveCtx(r)
 	defer cancel()
-	st, err := s.live.createElection(ctx, req)
-	if err != nil && st == nil {
-		liveFail(w, err)
-		return
-	}
+	status, err := s.live.createElection(ctx, req)
 	if err != nil {
-		// Set up, but CreateElection did not go through: the run stays in setup
-		// and a console restart (or the next start) finishes it.
-		log.Printf("live: CreateElection: %v", err)
+		if status != 0 {
+			// Set up, but CreateElection did not go through: the run stays in
+			// setup, and the next POST elections (or console start) retries it.
+			log.Printf("live: CreateElection: %v", err)
+		}
 		liveFail(w, err)
 		return
 	}
-	writeJSONResp(w, http.StatusCreated, s.live.electionView())
+	writeJSONResp(w, status, s.live.electionView())
+}
+
+func (s *Server) handleLiveAbandon(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSONResp(w, http.StatusMethodNotAllowed, map[string]string{"error": "POST required"})
+		return
+	}
+	if err := s.live.abandon(); err != nil {
+		liveFail(w, err)
+		return
+	}
+	writeJSONResp(w, http.StatusOK, s.live.electionView())
 }
 
 func (s *Server) handleLiveClose(w http.ResponseWriter, r *http.Request) {

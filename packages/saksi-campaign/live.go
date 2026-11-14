@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -54,6 +55,10 @@ const (
 	LiveClosed   = "closed"
 	LiveTallied  = "tallied"
 	LiveVerified = "verified"
+	// LiveAbandoned is terminal and outside the order above: an election the
+	// presenter gave up in setup or ceremony, before any credential or ballot
+	// existed (POST /api/live/abandon). It is never tallied or verified.
+	LiveAbandoned = "abandoned"
 )
 
 const (
@@ -578,16 +583,23 @@ func refusalCode(fn, text string) string {
 
 // createElection runs setup: the issuer key, the parameters, the run folder,
 // then CreateElection. The state is written in setup before the transaction,
-// so a crash in between resumes by finishing setup.
-func (L *liveService) createElection(ctx context.Context, req LiveElectionRequest) (*liveState, error) {
+// so a crash in between resumes by finishing setup. While the current
+// election is still in setup, the call retries its CreateElection instead
+// (the posted fields are not used) and answers 200; a new election answers
+// 201.
+func (L *liveService) createElection(ctx context.Context, req LiveElectionRequest) (int, error) {
 	L.mu.Lock()
 	defer L.mu.Unlock()
-	if L.st != nil && L.st.State != LiveVerified {
-		return nil, conflictf("live election %s is %s; one live election at a time (start the next once it is verified)", L.st.ElectionID, L.st.State)
+	if L.st != nil && L.st.State == LiveSetup {
+		log.Printf("live: %s retrying setup", L.st.RunID)
+		return http.StatusOK, L.finishSetupLocked()
+	}
+	if L.st != nil && L.st.State != LiveVerified && L.st.State != LiveAbandoned {
+		return 0, conflictf("live election %s is %s; one live election at a time (start the next once it is verified, or abandon it in setup or ceremony)", L.st.ElectionID, L.st.State)
 	}
 	req.Title = strings.TrimSpace(req.Title)
 	if req.Title == "" || len(req.Title) > liveMaxTitle {
-		return nil, badRequestf("title must be 1 to %d bytes", liveMaxTitle)
+		return 0, badRequestf("title must be 1 to %d bytes", liveMaxTitle)
 	}
 	if req.Trustees == 0 {
 		req.Trustees = 5
@@ -596,42 +608,42 @@ func (L *liveService) createElection(ctx context.Context, req LiveElectionReques
 		req.Threshold = 3
 	}
 	if req.Trustees < 1 || req.Trustees > MaxTrustees || req.Threshold < 1 || req.Threshold > req.Trustees {
-		return nil, badRequestf("trustees must be 1..%d and threshold 1..trustees (got %d of %d)", MaxTrustees, req.Threshold, req.Trustees)
+		return 0, badRequestf("trustees must be 1..%d and threshold 1..trustees (got %d of %d)", MaxTrustees, req.Threshold, req.Trustees)
 	}
 	for i := 1; i <= req.Trustees; i++ {
 		if !L.tokens.has(strconv.Itoa(i)) {
-			return nil, badRequestf("trustee %d has no token in the trustee tokens file; the ceremony could never finish", i)
+			return 0, badRequestf("trustee %d has no token in the trustee tokens file; the ceremony could never finish", i)
 		}
 	}
 	if len(L.voterRoll()) == 0 {
-		return nil, badRequestf("the accounts file has no voter accounts: nobody could vote")
+		return 0, badRequestf("the accounts file has no voter accounts: nobody could vote")
 	}
 
 	now := L.now().UTC()
 	runID, err := newLiveRunID(now)
 	if err != nil {
-		return nil, err
+		return 0, err
 	}
 	dir, err := L.s.store.Dir(runID)
 	if err != nil {
-		return nil, err
+		return 0, err
 	}
 	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return nil, err
+		return 0, err
 	}
 	priv := filepath.Join(dir, livePrivateDir)
 	if err := os.Mkdir(priv, 0o700); err != nil {
-		return nil, err
+		return 0, err
 	}
 	if err := os.Mkdir(filepath.Join(priv, liveSessionsDir), 0o700); err != nil {
-		return nil, err
+		return 0, err
 	}
 
 	var key struct {
 		PublicKey string `json:"public_key"`
 	}
 	if err := L.opJSON(ctx, "issuer-keygen", map[string]string{"key_file": filepath.Join(priv, liveIssuerKey)}, &key); err != nil {
-		return nil, badRequestf("%v", err)
+		return 0, badRequestf("%v", err)
 	}
 	var params struct {
 		Params     string   `json:"params"`
@@ -646,7 +658,7 @@ func (L *liveService) createElection(ctx context.Context, req LiveElectionReques
 	}, &params); err != nil {
 		// The refused election's folder holds only an unused key; drop it.
 		_ = os.RemoveAll(dir)
-		return nil, badRequestf("%v", err)
+		return 0, badRequestf("%v", err)
 	}
 
 	maxCands := 0
@@ -662,7 +674,7 @@ func (L *liveService) createElection(ctx context.Context, req LiveElectionReques
 		Positions: len(req.Positions), Candidates: maxCands, Voters: len(L.voterRoll()),
 	}}
 	if err := writeJSON(filepath.Join(dir, RunFile), rec); err != nil {
-		return nil, err
+		return 0, err
 	}
 	L.st = &liveState{
 		Schema: liveStateSchema, RunID: runID, ElectionID: params.ElectionID, Title: req.Title,
@@ -675,16 +687,13 @@ func (L *liveService) createElection(ctx context.Context, req LiveElectionReques
 	}
 	L.dir = dir
 	if err := L.save(); err != nil {
-		return nil, err
+		return 0, err
 	}
 	if err := writeFileAtomic(filepath.Join(priv, liveIssuedFile), []byte("{}\n"), 0o600); err != nil {
-		return nil, err
+		return 0, err
 	}
 	log.Printf("live: %s created (setup)", runID)
-	if err := L.finishSetupLocked(); err != nil {
-		return L.st, err
-	}
-	return L.st, nil
+	return http.StatusCreated, L.finishSetupLocked()
 }
 
 // finishSetupLocked records CreateElection and moves to ceremony. Caller holds

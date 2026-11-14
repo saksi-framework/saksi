@@ -285,3 +285,112 @@ func TestLiveBallotForAnotherElectionIsNotRelayed(t *testing.T) {
 		t.Fatalf("the chain got %x, not the posted bytes", last)
 	}
 }
+
+// S5: POST elections while the election is still in setup retries its
+// CreateElection instead of answering 409.
+func TestLiveCreateRetriesAStuckSetup(t *testing.T) {
+	fx := newLiveFixture(t)
+	c := fx.console()
+	req := map[string]any{"title": "x", "positions": livePositions, "trustees": 3, "threshold": 2}
+	fx.chain.down.Store(true)
+	if code, _ := c.do(http.MethodPost, "/api/live/elections", "admin", req); code != http.StatusBadGateway {
+		t.Fatalf("setup with the chain down: %d", code)
+	}
+	runID := c.s.live.snapshot().RunID
+	if code, _ := c.do(http.MethodPost, "/api/live/elections", "admin", req); code != http.StatusBadGateway || c.state() != LiveSetup {
+		t.Fatalf("retry with the chain still down: %d %s", code, c.state())
+	}
+	fx.chain.down.Store(false)
+	code, out := c.do(http.MethodPost, "/api/live/elections", "admin", req)
+	if code != http.StatusOK || out["run_id"] != runID || out["state"] != LiveCeremony {
+		t.Fatalf("retry with the chain up: %d %v (want 200, %s, ceremony)", code, out, runID)
+	}
+	// Now a POST elections is the usual 409.
+	if code, _ := c.do(http.MethodPost, "/api/live/elections", "admin", req); code != http.StatusConflict {
+		t.Fatalf("POST elections in ceremony: %d", code)
+	}
+}
+
+// S5: abandon is allowed in setup and ceremony only, is terminal and
+// durable, never shows as tallied or verified, and lets a new election start
+// on the same runs folder.
+func TestLiveAbandon(t *testing.T) {
+	// Refused before any setup and in every state from open on.
+	fx := newLiveFixture(t)
+	c := fx.console()
+	if code, _ := c.do(http.MethodPost, "/api/live/abandon", "admin", nil); code != http.StatusNotFound {
+		t.Fatalf("abandon with no election: %d", code)
+	}
+	for _, st := range []string{LiveOpen, LiveClosed, LiveTallied, LiveVerified} {
+		fx := newLiveFixture(t)
+		c := fx.console()
+		c.toState(st)
+		if code, _ := c.do(http.MethodPost, "/api/live/abandon", "admin", nil); code != http.StatusConflict || c.state() != st {
+			t.Fatalf("abandon in %s: %d, state %s", st, code, c.state())
+		}
+	}
+	// Admin only.
+	fx = newLiveFixture(t)
+	c = fx.console()
+	c.toState(LiveCeremony)
+	for _, who := range []string{"", "voter1", "t1", c.tok(1)} {
+		if code, _ := c.do(http.MethodPost, "/api/live/abandon", who, nil); code != http.StatusUnauthorized && code != http.StatusForbidden {
+			t.Fatalf("abandon as %q: %d", who, code)
+		}
+	}
+
+	// In ceremony, part-way through: then trustee routes are 409 and the
+	// roster names the state.
+	runID := c.s.live.snapshot().RunID
+	c.ok(http.MethodPost, "/api/live/dkg/receive-key", c.tok(1), map[string]any{"trustee_id": 1, "receive_public_key": pt(0x71)})
+	out := c.ok(http.MethodPost, "/api/live/abandon", "admin", nil)
+	if out["state"] != LiveAbandoned || c.state() != LiveAbandoned {
+		t.Fatalf("abandon in ceremony: %v", out)
+	}
+	var disk liveState
+	if err := readJSON(filepath.Join(fx.runs, runID, liveStateFile), &disk); err != nil || disk.State != LiveAbandoned {
+		t.Fatalf("live.json after abandon: %s %v", disk.State, err)
+	}
+	if code, _ := c.do(http.MethodPost, "/api/live/dkg/receive-key", c.tok(2), map[string]any{"trustee_id": 2, "receive_public_key": pt(0x72)}); code != http.StatusConflict {
+		t.Fatalf("receive-key after abandon: %d", code)
+	}
+	if r := c.ok(http.MethodGet, "/api/live/dkg/roster", c.tok(1), nil); r["state"] != LiveAbandoned {
+		t.Fatalf("roster after abandon: %v", r)
+	}
+	if code, _ := c.do(http.MethodPost, "/api/live/abandon", "admin", nil); code != http.StatusConflict {
+		t.Fatalf("abandon twice: %d", code)
+	}
+	board := c.ok(http.MethodGet, "/api/board/"+runID, "", nil)
+	if board["verified"] != false || board["sealed"] != true || board["status"] != LiveAbandoned || len(board["files"].([]any)) != 0 {
+		t.Fatalf("board of an abandoned run: verified %v sealed %v status %v files %v", board["verified"], board["sealed"], board["status"], board["files"])
+	}
+
+	// A restart while abandoned stays abandoned and touches no chain.
+	submits := len(fx.chain.oracleChain.submits)
+	c2 := fx.console()
+	if c2.state() != LiveAbandoned || len(fx.chain.oracleChain.submits) != submits {
+		t.Fatalf("restart while abandoned: %s, %d new submits", c2.state(), len(fx.chain.oracleChain.submits)-submits)
+	}
+
+	// A new election on the same runs folder, run to the end.
+	next := c2.toState(LiveVerified)
+	if next == runID || c2.state() != LiveVerified {
+		t.Fatalf("new election after abandon: %s %s", next, c2.state())
+	}
+	// The abandoned run keeps its own board, still never verified.
+	board = c2.ok(http.MethodGet, "/api/board/"+runID, "", nil)
+	if board["verified"] != false || board["status"] != LiveAbandoned {
+		t.Fatalf("abandoned run's board after the next election: %v %v", board["verified"], board["status"])
+	}
+
+	// Abandon in setup (CreateElection never went through).
+	fx3 := newLiveFixture(t)
+	c3 := fx3.console()
+	fx3.chain.down.Store(true)
+	c3.do(http.MethodPost, "/api/live/elections", "admin", map[string]any{"title": "x", "positions": livePositions, "trustees": 3, "threshold": 2})
+	c3.ok(http.MethodPost, "/api/live/abandon", "admin", nil)
+	fx3.chain.down.Store(false)
+	if c3.fx.console().state() != LiveAbandoned {
+		t.Fatal("an election abandoned in setup was resumed on restart")
+	}
+}

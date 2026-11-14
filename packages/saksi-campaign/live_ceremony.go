@@ -148,7 +148,7 @@ func sortedIDs[V any](m map[string]V) []int {
 func (L *liveService) rosterStatusLocked() map[string]any {
 	st := L.st
 	out := map[string]any{
-		"election_id": st.ElectionID, "trustees": st.Trustees, "threshold": st.Threshold,
+		"election_id": st.ElectionID, "state": st.State, "trustees": st.Trustees, "threshold": st.Threshold,
 		"complete": st.Roster != nil, "received": sortedIDs(st.ReceiveKeys),
 		"params": st.Params,
 	}
@@ -288,7 +288,7 @@ func (L *liveService) inbox(id string) (map[string]any, error) {
 	}
 	st := L.st
 	out := map[string]any{
-		"election_id": st.ElectionID, "trustee_id": mustAtoi(id),
+		"election_id": st.ElectionID, "state": st.State, "trustee_id": mustAtoi(id),
 		"complete": st.Roster != nil && len(st.Deals) == st.Trustees,
 		"dealt":    sortedIDs(st.Deals),
 	}
