@@ -754,13 +754,22 @@ func (L *liveService) verify(ctx context.Context) (map[string]any, error) {
 	}
 	L.mu.Lock()
 	defer L.mu.Unlock()
+	if err := L.inState(LiveTallied, LiveVerified); err != nil {
+		return nil, err
+	}
 	if err := writeFileAtomic(filepath.Join(L.dir, LiveVerifyFile), verdict, 0o644); err != nil {
 		return nil, err
 	}
 	L.st.Verify, L.st.VerifyOverall = verdict, v.Overall
-	if v.Overall == "pass" {
+	switch {
+	case v.Overall == "pass":
 		L.st.State = LiveVerified
 		log.Printf("live: %s verified", L.st.RunID)
+	case L.st.State == LiveVerified:
+		// A re-verify that fails takes the verified mark away: the board must
+		// never show verified next to a failed check.
+		L.st.State = LiveTallied
+		log.Printf("live: %s re-verify failed; back to tallied", L.st.RunID)
 	}
 	if err := L.save(); err != nil {
 		return nil, err

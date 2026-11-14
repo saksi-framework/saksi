@@ -138,7 +138,7 @@ func (L *liveService) checkIssuable(account string) (*liveSnapshot, error) {
 	}
 	issued, err := readIssued(st.Dir)
 	if err != nil {
-		return nil, err
+		return nil, errInternal{"the issued record could not be read"}
 	}
 	if _, done := issued[account]; done {
 		return nil, conflictf("this account has been issued its credential for this election already; a lost credential cannot be issued again")
@@ -158,16 +158,16 @@ func (L *liveService) presign(ctx context.Context, account, blindedCommitment st
 		return nil, err
 	}
 	if err := sweepClaimed(sessionsDirOf(st.Dir)); err != nil {
-		return nil, err
+		return nil, errInternal{"the issuance sessions could not be swept"}
 	}
 	path := sessionPath(st.Dir, account)
 	// One open session per account: the earlier one is discarded first.
 	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return nil, err
+		return nil, errInternal{"an earlier issuance session could not be removed"}
 	}
 	n, err := openSessions(st.Dir, L.now())
 	if err != nil {
-		return nil, err
+		return nil, errInternal{"the issuance sessions could not be counted"}
 	}
 	if n >= liveMaxSessions {
 		return nil, errTooMany{"too many credential issuances are open at once; try again in a few minutes"}
@@ -218,11 +218,11 @@ func (L *liveService) sign(ctx context.Context, account, ePrime string) (map[str
 	// signature is dropped, and the account may try again.
 	issued, err := readIssued(st.Dir)
 	if err != nil {
-		return nil, err
+		return nil, errInternal{"the issued record could not be read; the signature was not released"}
 	}
 	issued[account] = true
 	if err := writeIssued(st.Dir, issued); err != nil {
-		return nil, fmt.Errorf("cannot record the issuance; the signature was not released: %w", err)
+		return nil, errInternal{"the issuance could not be recorded; the signature was not released"}
 	}
 	L.mu.Lock()
 	if L.st != nil && L.st.RunID == st.RunID {

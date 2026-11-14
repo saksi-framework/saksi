@@ -394,3 +394,68 @@ func TestLiveAbandon(t *testing.T) {
 		t.Fatal("an election abandoned in setup was resumed on restart")
 	}
 }
+
+// M2: a re-verify that fails while verified steps the state back to tallied,
+// with the failed checks recorded; the board then shows no verified mark.
+func TestLiveFailedReverifyStepsBackToTallied(t *testing.T) {
+	fx := newLiveFixture(t)
+	c := fx.console()
+	runID := c.toState(LiveVerified)
+	fx.ops.mu.Lock()
+	fx.ops.verify = "fail"
+	fx.ops.mu.Unlock()
+	out := c.ok(http.MethodPost, "/api/live/verify", "admin", nil)
+	if out["overall"] != "fail" || out["state"] != LiveTallied || c.state() != LiveTallied {
+		t.Fatalf("failed re-verify: %v, state %s", out, c.state())
+	}
+	board := c.ok(http.MethodGet, "/api/board/"+runID, "", nil)
+	live := board["live"].(map[string]any)
+	if board["verified"] != false || live["verify_overall"] != "fail" || live["failed_checks"].([]any)[0] != "tally.homomorphic_sum" {
+		t.Fatalf("board after a failed re-verify: verified %v, %v", board["verified"], live)
+	}
+	// A passing verify brings it back.
+	fx.ops.mu.Lock()
+	fx.ops.verify = ""
+	fx.ops.mu.Unlock()
+	if out := c.ok(http.MethodPost, "/api/live/verify", "admin", nil); out["state"] != LiveVerified {
+		t.Fatalf("verify after the fix: %v", out)
+	}
+}
+
+// M4 and M8: if issued.json cannot be written, the signature is withheld,
+// the 500 names no path, and the account may try again.
+func TestLiveIssuedWriteFailureWithholdsTheSignature(t *testing.T) {
+	logs := captureLog(t)
+	fx := newLiveFixture(t)
+	c := fx.console()
+	runID := c.toState(LiveCeremony)
+	c.ceremony(runID)
+	priv := filepath.Join(fx.runs, runID, livePrivateDir)
+	c.ok(http.MethodPost, "/api/live/issue/presign", "voter1", map[string]string{"blinded_commitment": pt(0x10)})
+	if err := os.Chmod(priv, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Chmod(priv, 0o700) })
+	code, out := c.do(http.MethodPost, "/api/live/issue/sign", "voter1", map[string]string{"e_prime": pt(0x11)})
+	os.Chmod(priv, 0o700)
+	body := c.bodies[len(c.bodies)-1]
+	if code != http.StatusInternalServerError || out["s_iss"] != nil || strings.Contains(body, pt(0x55)) {
+		t.Fatalf("sign with issued.json unwritable: %d %s", code, body)
+	}
+	if out["error"] != liveInternalError || strings.Contains(body, fx.runs) || strings.Contains(body, "private") {
+		t.Fatalf("the 500 is not generic: %s", body)
+	}
+	if strings.Contains(logs.String(), "sessions/") || strings.Contains(logs.String(), "voter1") {
+		t.Fatalf("the log names a session file or the account: %s", logs.String())
+	}
+	if c.s.live.snapshot().Issued != 0 {
+		t.Fatal("a withheld signature was counted")
+	}
+	// Nothing was recorded, so the account starts again.
+	c.issue("voter1")
+	data, _ := os.ReadFile(filepath.Join(priv, liveIssuedFile))
+	var set map[string]bool
+	if json.Unmarshal(data, &set) != nil || len(set) != 1 || !set["voter1"] {
+		t.Fatalf("issued.json after the retry: %s", data)
+	}
+}

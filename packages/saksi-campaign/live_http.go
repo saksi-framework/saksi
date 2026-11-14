@@ -69,9 +69,28 @@ func liveFail(w http.ResponseWriter, err error) {
 	case errors.As(err, &chain):
 		writeJSONResp(w, http.StatusBadGateway, map[string]string{"error": chain.Error()})
 	default:
-		writeJSONResp(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		// A 500 says nothing about the console's files: the detail (which may
+		// name a path in the run folder) goes to the server log only, and an
+		// issuance error carries none (errInternal).
+		var internal errInternal
+		if errors.As(err, &internal) {
+			log.Printf("live: internal error: %s", internal.log)
+		} else {
+			log.Printf("live: internal error: %v", err)
+		}
+		writeJSONResp(w, http.StatusInternalServerError, map[string]string{"error": liveInternalError})
 	}
 }
+
+// liveInternalError is every 500's message.
+const liveInternalError = "internal error in the console; the operator can see the detail in the console log"
+
+// errInternal is a 500 whose log line is log, never the wrapped error: the
+// issuance paths name an account's session file, so their errors are logged
+// without them.
+type errInternal struct{ log string }
+
+func (e errInternal) Error() string { return e.log }
 
 func liveCtx(r *http.Request) (context.Context, context.CancelFunc) {
 	return context.WithTimeout(r.Context(), liveOpTimeout)
