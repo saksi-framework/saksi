@@ -30,7 +30,7 @@ use saksi_crypto::elgamal::{Ciphertext, PublicKey};
 use saksi_live::codec;
 use saksi_protocol::{Ballot, DKGTranscript, ElectionParameters, PartialDecryption, TallyResult};
 
-use crate::report::{AuditReport, AuditStatus, ReportBuilder, Severity};
+use crate::report::{AuditFinding, AuditReport, AuditStatus, ReportBuilder, Severity};
 
 /// The binding context of every live NIZK: the generator's.
 pub const BINDING_CONTEXT: &[u8] = crate::fixtures::BINDING_CONTEXT;
@@ -524,6 +524,56 @@ fn run(
     (report, evidence, positions.len(), verified)
 }
 
+/// The live-only check that the published joint key and every verification
+/// key are not the identity point. Under an identity joint key ElGamal leaves
+/// every vote in the clear (`data = m·G`), yet the shared audit has no reason
+/// to look, so `verify-live` adds this finding without touching
+/// `audit_streaming` or the study's output.
+pub const JOINT_KEY_CHECK: &str = "live.joint_key_nonidentity";
+
+/// [`JOINT_KEY_CHECK`] over the transcript, or `None` when the transcript does
+/// not verify (the audit's own `dkg.*` findings already fail it).
+fn joint_key_finding(d: &Decoded) -> Option<AuditFinding> {
+    let mut scratch = ReportBuilder::new();
+    let dkg = crate::dkg::verify_dkg_transcript(&d.parameters, &d.dkg_transcript, &mut scratch)?;
+    if dkg.joint_public_key == RistrettoPoint::identity() {
+        return Some(AuditFinding::fatal_fail(
+            JOINT_KEY_CHECK,
+            "the published joint public key is the identity: every vote is in the clear",
+        ));
+    }
+    if let Some(k) = dkg
+        .trustee_share_publics
+        .iter()
+        .position(|vk| *vk == RistrettoPoint::identity())
+    {
+        let id = d
+            .parameters
+            .trustee_ids
+            .get(k)
+            .cloned()
+            .unwrap_or_else(|| (k + 1).to_string());
+        return Some(AuditFinding::fatal_fail(
+            JOINT_KEY_CHECK,
+            format!("trustee {id}'s published verification key is the identity"),
+        ));
+    }
+    Some(AuditFinding::fatal_pass(
+        JOINT_KEY_CHECK,
+        "the joint public key and every verification key are not the identity",
+    ))
+}
+
+/// Adds the live-only findings to the shared audit's report.
+fn add_live_findings(report: &mut AuditReport, d: &Decoded) {
+    if let Some(finding) = joint_key_finding(d) {
+        if finding.status == AuditStatus::Fail {
+            report.overall = AuditStatus::Fail;
+        }
+        report.findings.push(finding);
+    }
+}
+
 /// Audits a live election's public record held in memory.
 pub fn verify_live(record: &LiveRecord) -> Result<LiveVerdict, String> {
     let d = decode(
@@ -538,7 +588,8 @@ pub fn verify_live(record: &LiveRecord) -> Result<LiveVerdict, String> {
         .iter()
         .enumerate()
         .map(|(i, b)| codec::message::<Ballot>(b, &format!("ballots[{i}]")));
-    let (report, evidence, n, verified) = run(&d, ballots, record.expected_ballots);
+    let (mut report, evidence, n, verified) = run(&d, ballots, record.expected_ballots);
+    add_live_findings(&mut report, &d);
     Ok(verdict(
         &report,
         &evidence,
@@ -568,6 +619,7 @@ pub fn verify_live_dir(dir: &Path) -> Result<LiveVerdict, String> {
     }
     let ballots = crate::stream::BallotLines::open(dir)?;
     let (mut report, evidence, n, verified) = run(&d, ballots, Some(header.n));
+    add_live_findings(&mut report, &d);
     let ledger_dir = dir.join(crate::demo::LEDGER_DIR);
     let mut ledger_order = None;
     if ledger_dir.join(crate::stream::BALLOTS_FILE).exists() {

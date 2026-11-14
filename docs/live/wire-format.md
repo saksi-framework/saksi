@@ -48,6 +48,18 @@ an invalid point, the identity where a public key is expected, or a value of
 the wrong length is an error naming the field. A value that is not hex at all
 gives `<field> is not valid hex`, without quoting the offending character.
 
+### Fingerprints
+
+Every `*fingerprint` field is the first 16 bytes (128 bits) of a 32-byte
+SHA-256 digest, in upper-case hex, in eight groups of four digits for reading
+aloud: `XXXX-XXXX-XXXX-XXXX-XXXX-XXXX-XXXX-XXXX` (39 characters). Where a
+fingerprint stands for a digest that is also output (`roster_digest`,
+`ballots_digest`), the full 32 bytes are in that field and are what processes
+compare mechanically; the fingerprint is for people. 128 bits keeps a forged
+roster, share or ballot set that shows the genuine fingerprint (or a set of
+forged rosters that all show one fingerprint, which a full relay attack on
+the DKG would need) out of reach even with days of precomputation.
+
 ### Ids
 
 `election_id`, position ids and candidate ids are 1 to 64 bytes of ASCII
@@ -229,7 +241,7 @@ the `dkg-deal` output of that dealer. Output:
  "election_id": "live-2026",
  "joint_public_key": "<point>",
  "verification_keys": [
-   {"trustee_id": "1", "verification_key": "<point>", "fingerprint": "1A2B-3C4D-5E6F-7081"},
+   {"trustee_id": "1", "verification_key": "<point>", "fingerprint": "1A2B-3C4D-5E6F-7081-90A1-B2C3-D4E5-F607"},
    "..."]}
 ```
 
@@ -363,11 +375,11 @@ Input `{"trustee_id": 2, "key_file": "/path/t2/receive.key"}`. Writes the
 receive key file. Output:
 
 ```json
-{"trustee_id": 2, "receive_public_key": "<point>", "fingerprint": "5E6F-7081-1A2B-3C4D"}
+{"trustee_id": 2, "receive_public_key": "<point>", "fingerprint": "5E6F-7081-1A2B-3C4D-0F1E-2D3C-4B5A-6978"}
 ```
 
 `fingerprint` is `SHA-256("saksi.live.receive-key-fingerprint.v1" ||
-compress(X))`, first 8 bytes, upper hex grouped 4-4-4-4. The key is used only
+compress(X))` shown as a fingerprint (see **Fingerprints**). The key is used only
 to receive masked DKG shares.
 
 ### `dkg-deal`
@@ -398,7 +410,7 @@ polynomial, wipes its coefficients after use, and outputs:
     "ciphertext": "<32-byte hex>", "tag": "<32-byte hex>"},
    "... one per recipient 1..=n, including the dealer's own"],
  "roster_digest": "<32-byte hex>",
- "roster_fingerprint": "3C4D-5E6F-7081-1A2B"}
+ "roster_fingerprint": "3C4D-5E6F-7081-1A2B-8E9F-A0B1-C2D3-E4F5"}
 ```
 
 `masked_shares[k]` is for recipient `k + 1`. The relay forwards each one to its
@@ -411,7 +423,7 @@ roster_digest = SHA-256( "saksi.live.dkg-roster.v1"
                          || u64be(len(election_id)) || election_id
                          || u64be(n) || u64be(t)
                          || u64be(1) || compress(X_1) || ... || u64be(n) || compress(X_n) )
-roster_fingerprint = upper_hex(roster_digest[0..8]) grouped 4-4-4-4
+roster_fingerprint = upper_hex(roster_digest[0..16]) in eight groups of four
 ```
 
 #### Share mask
@@ -487,14 +499,14 @@ file, and outputs:
 ```json
 {"election_id": "live-2026", "trustee_id": 2,
  "verification_key": "<point s_2·G>",
- "fingerprint": "1A2B-3C4D-5E6F-7081",
+ "fingerprint": "1A2B-3C4D-5E6F-7081-90A1-B2C3-D4E5-F607",
  "joint_public_key": "<point>",
  "roster_digest": "<32-byte hex>",
- "roster_fingerprint": "3C4D-5E6F-7081-1A2B"}
+ "roster_fingerprint": "3C4D-5E6F-7081-1A2B-8E9F-A0B1-C2D3-E4F5"}
 ```
 
-`fingerprint` is `SHA-256("saksi.live.share-fingerprint.v1" || compress(vk))`,
-first 8 bytes, upper-case hex in four groups of four.
+`fingerprint` is `SHA-256("saksi.live.share-fingerprint.v1" || compress(vk))`
+shown as a fingerprint (see **Fingerprints**).
 
 **The trustee process must compare**:
 - `roster_fingerprint` with every other trustee's (see **What the mask protects, and on what condition**);
@@ -539,7 +551,7 @@ repeated nullifier. Every such op adds these fields to its output:
 ```json
 {"ballot_count": 6,
  "ballots_digest": "<32-byte hex>",
- "ballots_fingerprint": "9C1D-0E2F-3A4B-5C6D",
+ "ballots_fingerprint": "9C1D-0E2F-3A4B-5C6D-7E8F-9A0B-1C2D-3E4F",
  "ballots_by_position": {"president": 3, "secretary": 3}}
 ```
 
@@ -554,8 +566,8 @@ ballots_digest = SHA-256( "saksi.live.ballot-set.v1"
 ```
 
 where `ballot_bytes_i` is each record's protobuf encoding (the bytes the
-`ballots` hex decodes to). `ballots_fingerprint` is its first 8 bytes in upper
-hex, grouped 4-4-4-4. `ballot_count` is also the upper bound every total is
+`ballots` hex decodes to). `ballots_fingerprint` is its first 16 bytes shown as
+a fingerprint (see **Fingerprints**). `ballot_count` is also the upper bound every total is
 decoded within.
 
 ### `partial`
@@ -699,6 +711,11 @@ Output:
 - `contests[].decoded` is what threshold decryption of the recorded partials
   recovered (`null` if the combine could not run); `published_tally` is the
   tally's claim.
+- `checks` also holds one live-only check, `live.joint_key_nonidentity`
+  (fatal): it fails when the published joint key or any verification key is
+  the identity point, because ElGamal under an identity key leaves every vote
+  in the clear. The shared audit and the study's output do not have it; it is
+  absent only when the transcript does not verify at all (then `dkg.*` fails).
 - `ballots` counts the records read; `ballots_verified` counts those that
   passed every per-ballot check and were folded into the tally, in total and
   per `position_id`. It adds no check and changes none.

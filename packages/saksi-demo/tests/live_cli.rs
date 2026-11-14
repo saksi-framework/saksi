@@ -150,7 +150,8 @@ impl Ceremony {
                     json!({ "trustee_id": id, "key_file": c.key(id) }),
                 );
                 assert_eq!(mode(&c.key(id)), 0o600);
-                assert_eq!(out["fingerprint"].as_str().unwrap().len(), 19);
+                // 128 bits shown: eight groups of four hex digits.
+                assert_eq!(out["fingerprint"].as_str().unwrap().len(), 39);
                 json!({ "trustee_id": id, "receive_public_key": out["receive_public_key"] })
             })
             .collect();
@@ -270,6 +271,20 @@ fn dkg_as_five_processes() {
     }
     for d in &c.deals {
         assert_eq!(d["roster_digest"], c.deals[0]["roster_digest"]);
+    }
+    // The roster fingerprint shows the digest's first 128 bits, grouped for
+    // reading aloud; the full 32-byte digest stays in the output.
+    let digest = c.deals[0]["roster_digest"].as_str().unwrap();
+    assert_eq!(digest.len(), 64);
+    let shown: Vec<String> = digest[..32]
+        .to_uppercase()
+        .as_bytes()
+        .chunks(4)
+        .map(|g| String::from_utf8(g.to_vec()).unwrap())
+        .collect();
+    assert_eq!(c.deals[0]["roster_fingerprint"], json!(shown.join("-")));
+    for r in &received {
+        assert_eq!(r["fingerprint"].as_str().unwrap().len(), 39);
     }
     // Each trustee's verification key is the one the transcript derives.
     for (k, r) in received.iter().enumerate() {
@@ -448,6 +463,36 @@ fn an_identity_joint_key_is_refused_by_transcript_and_ballot() {
     )
     .unwrap_err();
     assert!(err.contains("identity"), "{err}");
+
+    // A verifier handed that transcript as the published record says so,
+    // through the live-only check, even with no ballot to look at.
+    let tally = saksi_protocol::TallyResult {
+        election_id: "live-identity".into(),
+        ..Default::default()
+    };
+    let verdict = ok(
+        "verify-live",
+        json!({ "record": {
+            "params": c.params, "dkg": hex::encode(prost::Message::encode_to_vec(&transcript)),
+            "issuer_public_key": c.issuer_pk, "ballots": [], "partial_decryptions": [],
+            "tally": hex::encode(prost::Message::encode_to_vec(&tally)),
+        }}),
+    );
+    assert_eq!(verdict["overall"], "fail");
+    assert!(
+        failed(&verdict).contains(&"live.joint_key_nonidentity".to_string()),
+        "{verdict:#}"
+    );
+    let check = verdict["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["check"] == "live.joint_key_nonidentity")
+        .unwrap();
+    assert!(
+        check["detail"].as_str().unwrap().contains("identity"),
+        "{check}"
+    );
     let _ = std::fs::remove_dir_all(&c.dir);
 }
 
@@ -700,6 +745,15 @@ fn full_pipeline_through_the_cli() {
         assert_eq!(v, "pass", "{k}");
     }
     assert_eq!(verdict["summary"].as_object().unwrap().len(), 5);
+    // The live-only joint-key check ran and passed.
+    assert!(
+        verdict["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c["check"] == "live.joint_key_nonidentity" && c["status"] == "pass"),
+        "{verdict:#}"
+    );
     assert_eq!(verdict["ballots"], json!(6));
     assert_eq!(
         verdict["ballots_verified"],

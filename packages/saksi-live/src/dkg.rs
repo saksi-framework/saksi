@@ -172,9 +172,10 @@ impl Roster {
         hex::encode(self.digest)
     }
 
-    /// The digest's short form for trustee pages, `XXXX-XXXX-XXXX-XXXX`.
+    /// The digest's short form for trustee pages: its first 16 bytes (128
+    /// bits) as eight groups of four upper-case hex digits.
     pub fn fingerprint(&self) -> String {
-        short(&self.digest)
+        crate::election::short_fingerprint(&self.digest)
     }
 
     /// Refuses unless `secret` is the key at `id`.
@@ -278,21 +279,16 @@ pub fn receive_keygen(rng: &mut (impl RngCore + CryptoRng)) -> (Scalar, Ristrett
     (x, x * basepoint())
 }
 
-fn short(bytes: &[u8]) -> String {
-    let d = hex::encode_upper(&bytes[..8]);
-    format!("{}-{}-{}-{}", &d[0..4], &d[4..8], &d[8..12], &d[12..16])
-}
-
 fn fingerprint_with(domain: &[u8], point: &RistrettoPoint) -> String {
     let mut h = Sha256::new();
     h.update(domain);
     h.update(compress_point(point));
-    short(&h.finalize())
+    crate::election::short_fingerprint(&h.finalize())
 }
 
 /// The short fingerprint of a verification key that trustee pages show:
-/// `SHA-256(FINGERPRINT_DOMAIN || compress(vk))[0..8]`, upper-case hex in four
-/// groups, e.g. `1A2B-3C4D-5E6F-7081`.
+/// `SHA-256(FINGERPRINT_DOMAIN || compress(vk))[0..16]`, upper-case hex in
+/// eight groups of four, e.g. `1A2B-3C4D-5E6F-7081-90A1-B2C3-D4E5-F607`.
 pub fn fingerprint(vk: &RistrettoPoint) -> String {
     fingerprint_with(FINGERPRINT_DOMAIN, vk)
 }

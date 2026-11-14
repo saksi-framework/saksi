@@ -261,15 +261,43 @@ pub fn ballot_set_digest(election_id: &str, ballots: &[Vec<u8>]) -> [u8; 32] {
     h.finalize().into()
 }
 
-/// A digest's short form, `XXXX-XXXX-XXXX-XXXX` (first 8 bytes, upper hex).
-pub fn short_fingerprint(digest: &[u8; 32]) -> String {
-    let d = hex::encode_upper(&digest[..8]);
-    format!("{}-{}-{}-{}", &d[0..4], &d[4..8], &d[8..12], &d[12..16])
+/// Bytes of a digest a fingerprint shows: 16 (128 bits), so that forging a
+/// roster, share or ballot set that shows the same fingerprint as the genuine
+/// one (or several that show one fingerprint) stays out of reach even with
+/// precomputation.
+pub const FINGERPRINT_BYTES: usize = 16;
+
+/// A digest's short form for people to read aloud and compare: its first
+/// [`FINGERPRINT_BYTES`] bytes as upper-case hex in groups of four,
+/// `XXXX-XXXX-XXXX-XXXX-XXXX-XXXX-XXXX-XXXX`. Panics on fewer than 16 bytes
+/// (every caller passes a 32-byte SHA-256 output).
+pub fn short_fingerprint(digest: &[u8]) -> String {
+    let d = hex::encode_upper(&digest[..FINGERPRINT_BYTES]);
+    d.as_bytes()
+        .chunks(4)
+        .map(|c| std::str::from_utf8(c).expect("hex is ASCII"))
+        .collect::<Vec<_>>()
+        .join("-")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_fingerprint_shows_128_bits_in_eight_groups() {
+        let digest: [u8; 32] = core::array::from_fn(|i| (i as u8).wrapping_mul(17));
+        let f = short_fingerprint(&digest);
+        assert_eq!(f, "0011-2233-4455-6677-8899-AABB-CCDD-EEFF");
+        // Only the first 16 bytes show: a change after them is invisible, a
+        // change in byte 15 is not.
+        let mut later = digest;
+        later[16] ^= 1;
+        assert_eq!(short_fingerprint(&later), f);
+        let mut last_shown = digest;
+        last_shown[15] ^= 1;
+        assert_ne!(short_fingerprint(&last_shown), f);
+    }
 
     fn request() -> ParamsRequest {
         let pk = saksi_crypto::group::basepoint() * curve25519_dalek::scalar::Scalar::from(5u64);
