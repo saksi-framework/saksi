@@ -48,6 +48,9 @@ type fakeOps struct {
 	signed      []string      // the nonce each issue-sign consumed
 	nonce       int
 	verify      string // verify-live overall; "" = pass
+	// roster makes dkg-roster fail: "fail" is an op error, "no-digest" an
+	// answer without a roster digest; "" = a normal roster.
+	roster string
 }
 
 func newFakeOps() *fakeOps { return &fakeOps{maxInFlight: map[string]int{}} }
@@ -100,6 +103,16 @@ func (f *fakeOps) run(_ context.Context, op string, input []byte) ([]byte, error
 		out = map[string]any{"params": hex.EncodeToString(raw), "election_id": in["election_id"], "contest_ids": contests,
 			"trustee_ids": ids, "threshold": in["threshold"]}
 	case "dkg-roster":
+		f.mu.Lock()
+		mode := f.roster
+		f.mu.Unlock()
+		switch mode {
+		case "fail":
+			return nil, &liveOpError{op, "fake dkg-roster failure"}
+		case "no-digest":
+			data, _ := json.Marshal(map[string]any{"peers": in["peers"]})
+			return data, nil
+		}
 		seen := map[string]bool{}
 		for _, p := range in["peers"].([]any) {
 			k := p.(map[string]any)["receive_public_key"].(string)
@@ -645,10 +658,12 @@ func TestLiveHappyPathAndWrongStates(t *testing.T) {
 	if out["published"] != true || c.state() != LiveTallied {
 		t.Fatalf("at threshold: %v (%s)", out, c.state())
 	}
+	c.wantJoined(runID, 3)
 	ver := c.ok(http.MethodPost, "/api/live/verify", "admin", nil)
 	if ver["overall"] != "pass" || c.state() != LiveVerified {
 		t.Fatalf("verify: %v", ver)
 	}
+	c.wantJoined(runID, 3)
 	// The verifier was given the chain's nullifier count.
 	board := c.ok(http.MethodGet, "/api/board/"+runID, "", nil)
 	lb := board["live"].(map[string]any)
@@ -1230,5 +1245,44 @@ func TestLiveTrusteesJoinedStartsAtZeroAfterAbandon(t *testing.T) {
 	board := c.ok(http.MethodGet, "/api/board/"+first, "", nil)
 	if n := board["live"].(map[string]any)["counts"].(map[string]any)["trustees_joined"]; n != 2.0 {
 		t.Fatalf("abandoned run's board: trustees_joined %v", n)
+	}
+}
+
+// A dkg-roster that fails, or answers with no digest, on the last receive key
+// rolls the key back: the public count stays one short of the trustees and
+// the roster is not frozen, until a later post of that key succeeds.
+func TestLiveTrusteesJoinedRollsBackOnAFailedRoster(t *testing.T) {
+	for _, mode := range []string{"fail", "no-digest"} {
+		t.Run(mode, func(t *testing.T) {
+			fx := newLiveFixture(t)
+			c := fx.console()
+			runID := c.setup()
+			for id := 1; id <= 2; id++ {
+				c.ok(http.MethodPost, "/api/live/dkg/receive-key", c.tok(id), map[string]any{"trustee_id": id, "receive_public_key": pt(0x70 + id)})
+			}
+			fx.ops.mu.Lock()
+			fx.ops.roster = mode
+			fx.ops.mu.Unlock()
+			last := map[string]any{"trustee_id": 3, "receive_public_key": pt(0x73)}
+			if code, out := c.do(http.MethodPost, "/api/live/dkg/receive-key", c.tok(3), last); code/100 == 2 {
+				t.Fatalf("receive-key with a %s roster: %d %v", mode, code, out)
+			}
+			if c.s.live.st.Roster != nil {
+				t.Fatal("the roster froze after a failed dkg-roster")
+			}
+			c.wantJoined(runID, 2)
+			// A restart reads the same count: the rolled-back key was not saved.
+			c = fx.console()
+			c.wantJoined(runID, 2)
+
+			fx.ops.mu.Lock()
+			fx.ops.roster = ""
+			fx.ops.mu.Unlock()
+			c.ok(http.MethodPost, "/api/live/dkg/receive-key", c.tok(3), last)
+			if c.s.live.st.Roster == nil {
+				t.Fatal("the roster is not frozen after the retried last key")
+			}
+			c.wantJoined(runID, 3)
+		})
 	}
 }
