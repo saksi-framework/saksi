@@ -458,7 +458,7 @@ var wantTotals = []float64{2, 1, 0, 0, 1, 2}
 // --- tests -----------------------------------------------------------------------
 
 // The whole election through five trustee processes, with a kill and restart
-// of trustee 2 at every crash point inside a step and of every trustee
+// of trustee 2 at every crash point inside a step (before and after each post) and of every trustee
 // between steps; no trustee secret in any response, log line or loose file.
 func TestTrusteeProcessesKillAndRestart(t *testing.T) {
 	logs := captureLog(t)
@@ -482,7 +482,7 @@ func TestTrusteeProcessesKillAndRestart(t *testing.T) {
 		f.press(id, "join", nil)
 	}
 	// Trustee 2 stops at each crash point of the ceremony; restart it each time.
-	for _, point := range []string{"keygen-saved", "deal-saved", "ack-saved"} {
+	for _, point := range []string{"keygen-saved", "deal-saved", "ack-saved", "ack-posted"} {
 		f.waitFor(2, "the kill at "+point, func(TrusteeStatus) bool {
 			crashMu.Lock()
 			defer crashMu.Unlock()
@@ -508,6 +508,13 @@ func TestTrusteeProcessesKillAndRestart(t *testing.T) {
 		crashMu.Lock()
 		defer crashMu.Unlock()
 		return crashed["partial-saved"]
+	})
+	time.Sleep(50 * time.Millisecond)
+	f.restart(2)
+	f.waitFor(2, "the kill at partial-posted", func(TrusteeStatus) bool {
+		crashMu.Lock()
+		defer crashMu.Unlock()
+		return crashed["partial-posted"]
 	})
 	time.Sleep(50 * time.Millisecond)
 	f.restart(2)
@@ -1203,4 +1210,181 @@ func TestTrusteeIdentityFromTheConsole(t *testing.T) {
 	if err := T.CheckIdentity(context.Background()); err == nil || !strings.Contains(err.Error(), "401") {
 		t.Fatalf("an unknown token: %v", err)
 	}
+}
+
+// I1: the answer to a post is lost after the console recorded it (the process
+// is killed between the 200 and saving the flag), and the restart comes only
+// after the console has moved on, so the re-post is refused. Trustee 2's ack
+// is re-posted after the election opened: the chain's transcript decides, and
+// it goes on to decrypt and sign. Trustee 4's partial is re-posted after the
+// tally was published: the byte-equal partial on the chain counts as posted.
+// Trustee 5 is in the same spot as trustee 2 but the chain shows it a
+// transcript without its keys: that still ends in the alarm.
+func TestTrusteeLostAnswersAfterPosting(t *testing.T) {
+	var bed atomic.Pointer[trusteeTestBed]
+	var crashMu sync.Mutex
+	crashed := map[string]bool{}
+	hit := func(id int, point string) bool {
+		crashMu.Lock()
+		defer crashMu.Unlock()
+		return crashed[fmt.Sprint(id, point)]
+	}
+	b := newTrusteeTestBed(t, fleetOptions{
+		crash: func(id int, point string) bool {
+			want := (id == 2 || id == 5) && point == "ack-posted" || id == 4 && point == "partial-posted"
+			crashMu.Lock()
+			defer crashMu.Unlock()
+			k := fmt.Sprint(id, point)
+			if !want || crashed[k] {
+				return false
+			}
+			crashed[k] = true
+			return true
+		},
+		chainFor: func(id int, c trusteeChain) trusteeChain {
+			if id != 5 {
+				return c
+			}
+			return lyingChain{trusteeChain: c, dkg: func(eid string) (string, error) {
+				h, err := c.GetDKGTranscript(eid)
+				if err != nil {
+					return h, err
+				}
+				raw, _ := hex.DecodeString(h)
+				var tr pb.DKGTranscript
+				_ = proto.Unmarshal(raw, &tr)
+				b := bed.Load()
+				k := b.h.cliOp("trustee-keygen", map[string]any{"trustee_id": 1, "key_file": filepath.Join(b.h.work, fmt.Sprintf("y-%d.key", time.Now().UnixNano()))})
+				pt, _ := hex.DecodeString(k["receive_public_key"].(string))
+				tr.TrusteeCommitments[0].CoefficientCommitments[0] = pt
+				out, _ := proto.Marshal(&tr)
+				return hex.EncodeToString(out), nil
+			}}
+		},
+	})
+	bed.Store(b)
+	f := b.f
+	b.setup()
+	for id := 1; id <= 5; id++ {
+		f.press(id, "join", nil)
+	}
+	for _, id := range []int{2, 5} {
+		f.waitFor(id, "the kill after the ack", func(TrusteeStatus) bool { return hit(id, "ack-posted") })
+	}
+	// Both acks reached the console, so the others finish and it opens.
+	for _, id := range []int{1, 3, 4} {
+		f.waitStep(id, "join", stepDone)
+	}
+	if el := b.h.must(nil, http.MethodGet, "/api/live/election", "", nil); el["state"] != LiveOpen {
+		t.Fatalf("console state %v", el["state"])
+	}
+	f.restart(2)
+	f.restart(5)
+	st := f.waitStep(2, "join", stepDone)
+	if st.Ceremony.TranscriptCheck != "ok" || !st.Ceremony.Acknowledged {
+		t.Fatalf("trustee 2 after the lost ack answer: %+v", st.Ceremony)
+	}
+	st = f.waitFor(5, "the transcript alarm", func(st TrusteeStatus) bool { return st.Steps["join"].State == stepBlocked })
+	if st.Ceremony.TranscriptCheck != "mismatch" || st.Alarms[0].Code != "transcript" {
+		t.Fatalf("trustee 5: %+v %+v", st.Ceremony, st.Alarms)
+	}
+
+	b.vote()
+	b.close()
+	f.decrypt(2) // the trustee whose ack answer was lost decrypts...
+	f.press(4, "decrypt", nil)
+	f.waitFor(4, "the kill after the partial", func(TrusteeStatus) bool { return hit(4, "partial-posted") })
+	f.decrypt(1)
+	f.sign(1, wantTotals)
+	f.sign(2, wantTotals) // ...and signs
+	if res := f.sign(3, wantTotals); res["published"] != true {
+		t.Fatal("not published after 3 signatures")
+	}
+	// Trustee 4 comes back after publication: the console refuses the re-post
+	// (not closed), and the chain holds its exact partial.
+	f.restart(4)
+	st = f.waitStep(4, "decrypt", stepDone)
+	if !st.Decryption.PartialRecorded || st.Decryption.PartialReadBack != "ok" {
+		t.Fatalf("trustee 4 after the lost partial answer: %+v", st.Decryption)
+	}
+	for _, id := range []int{1, 2, 3, 4} {
+		st := f.waitFor(id, "the published tally", func(st TrusteeStatus) bool { return st.Tally.Published && st.Tally.Matches != nil })
+		if !*st.Tally.Matches {
+			t.Fatalf("trustee %d: published %v, own %v", id, st.Tally.PublishedTotals, st.Tally.Totals)
+		}
+	}
+}
+
+// M1: a peer that read another ballot set: decryption is blocked before any
+// partial is computed.
+func TestTrusteeRefusesAPeerWithAnotherBallotSet(t *testing.T) {
+	var bed atomic.Pointer[trusteeTestBed]
+	fake := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b := bed.Load()
+		if b == nil {
+			http.Error(w, "starting", http.StatusServiceUnavailable)
+			return
+		}
+		v := b.f.procs[0].T.PeerView() // trustee 1's own statement, with another ballot set
+		if v.BallotsDigest != "" {
+			v.BallotsDigest = strings.Repeat("cd", 32)
+		}
+		writeJSONResp(w, 200, v)
+	}))
+	t.Cleanup(fake.Close)
+	b := newTrusteeTestBed(t, fleetOptions{peerFor: func(id, peer int) string {
+		if id == 2 && peer == 1 {
+			return fake.URL
+		}
+		return ""
+	}})
+	bed.Store(b)
+	f := b.f
+	b.setup()
+	f.ceremony()
+	b.vote()
+	b.close()
+	f.decrypt(1)
+	f.press(2, "decrypt", nil)
+	st := f.waitFor(2, "the ballot-set alarm", func(st TrusteeStatus) bool { return st.Steps["decrypt"].State == stepBlocked })
+	if len(st.Alarms) == 0 || st.Alarms[0].Code != "ballots-peer-1" || st.Decryption.PartialComputed {
+		t.Fatalf("status: %+v %+v", st.Alarms, st.Decryption)
+	}
+	el := b.h.must(nil, http.MethodGet, "/api/live/election", "", nil)
+	if el["counts"].(map[string]any)["trustees_decrypted"] != 1.0 {
+		t.Fatalf("trustees decrypted: %v", el["counts"])
+	}
+}
+
+// M2: a --peers URL that answers as another trustee is a visible wait, not an
+// alarm that ends the election, and the start-up check names it.
+func TestTrusteeWrongPeerURLWaits(t *testing.T) {
+	b := newTrusteeTestBed(t, fleetOptions{})
+	f := b.f
+	// Trustee 4's --peers sends peer 2 to trustee 3's host.
+	f.procs[3].opts.Peers[2] = f.procs[2].srv.URL
+	f.restart(4)
+	warn := f.procs[3].T.PeerWarnings(context.Background())
+	if len(warn) != 1 || !strings.Contains(warn[0], "--peers 2="+f.procs[2].srv.URL+" answers as trustee 3") {
+		t.Fatalf("start-up warnings: %v", warn)
+	}
+	b.setup()
+	for id := 1; id <= 5; id++ {
+		f.press(id, "join", nil)
+	}
+	st := f.waitFor(4, "the wait on peer 2", func(st TrusteeStatus) bool {
+		return st.Steps["join"].State == stepWaiting && strings.Contains(st.Steps["join"].Detail, "trustee(s) 2")
+	})
+	for _, e := range st.Ceremony.Roster {
+		if e.TrusteeID == 2 && !strings.Contains(e.Detail, "answers as trustee 3") {
+			t.Fatalf("peer 2 detail: %q", e.Detail)
+		}
+	}
+	if len(st.Alarms) != 0 {
+		t.Fatalf("alarms: %+v", st.Alarms)
+	}
+	// Fixed and restarted, it goes through.
+	f.procs[3].opts.Peers[2] = f.procs[1].srv.URL
+	f.restart(4)
+	f.waitStep(4, "join", stepDone)
 }

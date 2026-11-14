@@ -232,7 +232,7 @@ func (T *TrusteeService) request(step string, check func(p *trusteeProgress) err
 		v, err := T.console.election(ctx)
 		cancel()
 		if err == nil && v != nil {
-			if err := T.adopt(v); err != nil {
+			if err := T.adoptFrom(v, true); err != nil {
 				return err
 			}
 			T.mu.Lock()

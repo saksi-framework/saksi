@@ -365,6 +365,11 @@ func trustee(args []string) {
 		fatal("trustee %d: %v", *id, err)
 	}
 	cancel()
+	pctx, pcancel := context.WithTimeout(context.Background(), 20*time.Second)
+	for _, w := range T.PeerWarnings(pctx) {
+		fmt.Fprintln(os.Stderr, w)
+	}
+	pcancel()
 	scheme := "http"
 	if opts.TLS() {
 		scheme = "https"
@@ -380,11 +385,12 @@ func trustee(args []string) {
 	if warning != "" {
 		fmt.Fprintln(os.Stderr, warning)
 	}
-	T.Start()
+	// Bind first: a failed bind exits before the driver writes any state.
 	ln, err := net.Listen("tcp", *addr)
 	if err != nil {
 		fatal("listen %s: %v", *addr, err)
 	}
+	T.Start()
 	if err := campaign.Serve(ln, opts, handler); err != nil {
 		fmt.Fprintf(os.Stderr, "server error: %v\n", err)
 		os.Exit(1)

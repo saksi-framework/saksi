@@ -779,10 +779,15 @@ func (T *TrusteeService) runStep(ctx context.Context, name string, f func() erro
 
 // adopt follows the console's current election: a new id gets its own folder
 // and a fresh receive key; the old folder is left as it is.
-func (T *TrusteeService) adopt(v *LiveElectionView) error {
+func (T *TrusteeService) adopt(v *LiveElectionView) error { return T.adoptFrom(v, false) }
+
+// adoptFrom is adopt; fromRequest (an action pressed before the driver's
+// first poll) only fills an empty slot, so it never swaps the record the
+// driver may be working on.
+func (T *TrusteeService) adoptFrom(v *LiveElectionView, fromRequest bool) error {
 	T.mu.Lock()
 	defer T.mu.Unlock()
-	if T.p != nil && T.p.ElectionID == v.ElectionID {
+	if T.p != nil && (T.p.ElectionID == v.ElectionID || fromRequest) {
 		return nil
 	}
 	if !electionDirName.MatchString(v.ElectionID) || v.ElectionID == "." || v.ElectionID == ".." {
@@ -1036,7 +1041,17 @@ func (T *TrusteeService) advanceJoin(ctx context.Context, v *LiveElectionView) e
 			return err
 		}
 		if code != 200 {
-			return fmt.Errorf("the console refused this trustee's acknowledgement: %d %s", code, errorText(body))
+			// The console is past the ceremony: an earlier post of this ack
+			// went through but its answer was lost (or the process was killed
+			// before saving it). The chain's transcript decides: it carries
+			// this trustee's commitments, joint key and verification key, or
+			// checkTranscript raises the alarm.
+			if liveStateIndex(v.State) < liveStateIndex(LiveOpen) {
+				return fmt.Errorf("the console refused this trustee's acknowledgement: %d %s", code, errorText(body))
+			}
+			log.Printf("trustee %d: the console answered %d to the acknowledgement after the ceremony; checking the chain's transcript", T.id, code)
+		} else if T.crashed("ack-posted") {
+			return errTrusteeKilled
 		}
 		if err := T.update(func(p *trusteeProgress) { p.AckPosted = true }); err != nil {
 			return err
@@ -1220,6 +1235,45 @@ func (T *TrusteeService) fetchPeer(ctx context.Context, id int) (*TrusteePeerVie
 	return &v, nil
 }
 
+// fetchPeers reads several peers' pages at once, each with its own timeout,
+// so an unreachable peer does not hold up the others.
+func (T *TrusteeService) fetchPeers(ctx context.Context, peers []livePeer) ([]*TrusteePeerView, []error) {
+	views := make([]*TrusteePeerView, len(peers))
+	errs := make([]error, len(peers))
+	var wg sync.WaitGroup
+	for i, peer := range peers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			c, cancel := context.WithTimeout(ctx, trusteePeerTimeout)
+			defer cancel()
+			views[i], errs[i] = T.fetchPeer(c, peer.TrusteeID)
+		}()
+	}
+	wg.Wait()
+	return views, errs
+}
+
+// PeerWarnings checks every --peers URL once (at start-up): one that answers
+// as another trustee is named. An unreachable peer is not a warning; it may
+// start later.
+func (T *TrusteeService) PeerWarnings(ctx context.Context) []string {
+	var peers []livePeer
+	for id := range T.peers {
+		peers = append(peers, livePeer{TrusteeID: id})
+	}
+	sort.Slice(peers, func(i, j int) bool { return peers[i].TrusteeID < peers[j].TrusteeID })
+	views, errs := T.fetchPeers(ctx, peers)
+	var out []string
+	for i, peer := range peers {
+		if errs[i] == nil && views[i].TrusteeID != peer.TrusteeID {
+			out = append(out, fmt.Sprintf("WARNING: --peers %d=%s answers as trustee %d; the ceremony will wait on trustee %d until --peers is fixed",
+				peer.TrusteeID, T.peers[peer.TrusteeID], views[i].TrusteeID, peer.TrusteeID))
+		}
+	}
+	return out
+}
+
 // checkPeersRoster compares the roster with every other trustee's own host:
 // the receive key each states for itself must be the roster's, and each
 // one's roster digest must equal this trustee's. An unreachable peer is
@@ -1231,18 +1285,24 @@ func (T *TrusteeService) checkPeersRoster(ctx context.Context) error {
 	// A peer stating another receive key names the swapped entry, so it is
 	// the alarm shown before any digest difference.
 	var alarm, keyAlarm error
+	var others []livePeer
 	for _, peer := range p.RosterPeers {
-		if peer.TrusteeID == T.id {
-			continue
+		if peer.TrusteeID != T.id {
+			others = append(others, peer)
 		}
+	}
+	views, errs := T.fetchPeers(ctx, others)
+	for i, peer := range others {
 		key := strconv.Itoa(peer.TrusteeID)
-		v, err := T.fetchPeer(ctx, peer.TrusteeID)
+		v, err := views[i], errs[i]
 		var c peerCheck
 		switch {
 		case err != nil:
 			c = peerCheck{State: "waiting", Detail: "not reachable: " + err.Error()}
 		case v.TrusteeID != peer.TrusteeID:
-			c = peerCheck{State: "mismatch", Detail: fmt.Sprintf("the host given for trustee %d says it is trustee %d", peer.TrusteeID, v.TrusteeID)}
+			// Most likely a mistake in --peers, so it is waited on (with the
+			// reason shown) rather than ending the election.
+			c = peerCheck{State: "waiting", Detail: fmt.Sprintf("the --peers URL for trustee %d (%s) answers as trustee %d: fix --peers and restart this process", peer.TrusteeID, T.peers[peer.TrusteeID], v.TrusteeID)}
 		case v.ElectionID != p.ElectionID:
 			c = peerCheck{State: "waiting", Detail: fmt.Sprintf("it is on election %q", v.ElectionID)}
 		case v.ReceivePublicKey == "":
@@ -1646,6 +1706,20 @@ func (T *TrusteeService) advanceDecrypt(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
+		if code != 200 {
+			// An earlier post may have gone through with its answer lost: a
+			// byte-equal partial on the chain under this trustee's id counts
+			// as posted.
+			switch err := T.readBackPartial(); {
+			case err == nil:
+				log.Printf("trustee %d: the console answered %d to the partial; the chain holds this exact partial", T.id, code)
+				code = 200
+			case errors.As(err, new(tAlarm)), errors.As(err, new(tChainErr)):
+				return err
+			}
+		} else if T.crashed("partial-posted") {
+			return errTrusteeKilled
+		}
 		switch {
 		case code == 200:
 		case code == 409 && strings.Contains(errorText(body), "different partial"):
@@ -1709,15 +1783,22 @@ func (T *TrusteeService) checkPeersBallots(ctx context.Context) error {
 	p := T.p
 	checks := map[string]peerCheck{}
 	var alarm error
+	var others []livePeer
 	for id := 1; id <= p.Trustees; id++ {
-		if id == T.id {
-			continue
+		if id != T.id {
+			others = append(others, livePeer{TrusteeID: id})
 		}
+	}
+	views, errs := T.fetchPeers(ctx, others)
+	for i, peer := range others {
+		id := peer.TrusteeID
 		key := strconv.Itoa(id)
-		v, err := T.fetchPeer(ctx, id)
+		v, err := views[i], errs[i]
 		switch {
 		case err != nil:
 			checks[key] = peerCheck{State: "waiting", Detail: "not reachable: " + err.Error()}
+		case v.TrusteeID != id:
+			checks[key] = peerCheck{State: "waiting", Detail: fmt.Sprintf("the --peers URL for trustee %d answers as trustee %d", id, v.TrusteeID)}
 		case v.ElectionID != p.ElectionID || v.BallotsDigest == "":
 			checks[key] = peerCheck{State: "waiting", Detail: "it has no ballot set for this election yet"}
 		case !strings.EqualFold(v.BallotsDigest, p.BallotsDigest):

@@ -1,10 +1,12 @@
 # Live election trustee process (`saksi-campaign trustee`)
 
-One process per trustee. Each holds that trustee's secrets (its receive key and
-its key share) in its own private folder, runs that trustee's
-`saksi-demo live` ops (`wire-format.md`, section **Trustee**), reads the ledger
-itself through its own Fabric gateway connection, and talks to the console
-(`http-api.md`) only to post what the trustee produced. The trustee app
+One process per trustee. Each keeps that trustee's secrets (its receive key and
+its key share) in its own state folder, runs that trustee's
+`saksi-demo live` ops (`wire-format.md`, section **Trustee**), opens its own
+Fabric gateway connection to read the ledger instead of asking the console, and
+talks to the console (`http-api.md`) only to post what the trustee produced.
+In this demo the five processes run on one Mac as one user and read through the
+same peer with the same identity: see **Limits of this demo**. The trustee app
 (`apps/trustee`, task 6) is built from this file: it is served by the process
 at `/trustee/` and calls the routes below on the same origin.
 
@@ -14,7 +16,10 @@ This is a later build, not the study build. The study's routes are unchanged.
 
 Nothing it acts on. The console relays the trustees' partial decryptions, so a
 console that showed a trustee a one-ballot view of the election could open
-that one vote. So:
+that one vote. So the process takes what it acts on from the chain, through its
+own gateway connection; it then trusts the Fabric peer it reads from and the
+identity it reads with, which in this demo are the same for all five (**Limits
+of this demo**):
 
 - **Read from the chain, never from the console:** the election as created
   (`GetElection`), its status (`GetElectionStatus`), the DKG transcript
@@ -32,6 +37,36 @@ that one vote. So:
 - **Only writes go through the console:** the receive key, the deal, the
   acknowledgement, the partial decryption and the tally signature, each posted
   exactly as the CLI printed it.
+
+## Limits of this demo
+
+The demo shows five separate trustee processes, each with its own secrets,
+state, sessions and checks. It does not show five independent trustees. Three
+things are shared:
+
+1. **One peer and one identity.** All five read `peer0.org1.example.com`
+   (`localhost:7051`) with the org1 `User1` identity, as the console does.
+   The console cannot change what a trustee reads, but that peer can: a
+   dishonest `peer0.org1` could give all five the same subset of the ballots,
+   and the peer ballot-digest check would not notice, because all five would
+   read the same subset.
+2. **One OS user.** All six processes (the console and five trustees) run as the
+   same user on one Mac. Modes `0700` and `0600` keep out other users, not the
+   other trustees or the console: any process running as that user can read
+   all five key shares.
+3. **One certificate key.** One `*.vancornelio.dev` wildcard certificate and
+   key serve the console and every trustee host. Whoever holds that key and can
+   steer name resolution on the Mac can serve a false `/api/trustee/peer` page
+   for any trustee. The roster check with the peers shows how the check works;
+   in this setup it does not separate trust between the hosts.
+
+**An option that is not set up:** point some trustees (for example two) at
+`peer0.org2.example.com` (`localhost:9051`) with an org2 identity
+(`--fabric-peer localhost:9051 --fabric-gateway-peer peer0.org2.example.com
+--fabric-msp-id Org2MSP` and org2's TLS CA, certificate and key). Their reads
+would then not depend on `peer0.org1`. This has not been run or tested. Real
+custody would also need each trustee on its own machine and account, with its
+own certificate.
 
 ## Starting it
 
@@ -114,7 +149,9 @@ At start the process:
   the steps' states and the alarms. No secret.
 - **Nothing secret leaves the process:** no share, receive key, token or
   Fabric key is in any response, log line, error string or status. Only
-  fingerprints and public keys.
+  fingerprints and public keys. The folder modes keep out other OS users; they
+  do not keep out another process running as the same user (**Limits of this
+  demo**).
 
 ## The three buttons
 
@@ -146,7 +183,11 @@ stand.
    alarm `roster-peer-<id>`, naming the peer and what differed; a peer stating
    another key is shown before a digest difference. **A peer that is not
    reachable, is on another election, or has no digest yet is waited for, not
-   skipped.**
+   skipped.** A `--peers` URL that answers as another trustee is also waited
+   on, with the reason in the roster entry's `detail` (fix `--peers` and
+   restart); at start-up the process prints a warning naming that
+   `--peers` value. Peers are fetched in parallel, each with a 15-second
+   timeout.
 6. **Deals** (`dkg-deal` over the chain's parameters and the checked roster;
    its digest must be the checked one) and posts the output exactly as printed
    (`POST /api/live/dkg/deal`). The output is saved before it is posted, so a
@@ -158,6 +199,12 @@ stand.
    against its dealer's commitments and the roster (a failure is alarm
    `receive`, naming the dealer), and posts the output exactly as printed
    (`POST /api/live/dkg/ack`).
+   An acknowledgement whose answer was lost (the console recorded it, then the
+   process was killed or the connection dropped) is posted again after a
+   restart. If the console has meanwhile opened the election, it refuses the
+   repeat; the process then lets the transcript on the chain decide (step 8):
+   a transcript with this trustee's keys passes, one without them is alarm
+   `transcript`.
 8. **Transcript.** When the console reports the election open, reads the
    transcript **from the chain** and checks: this trustee's own commitments
    are under its id; the transcript is exactly `dkg-transcript` of the
@@ -199,6 +246,9 @@ The join step is `done` once the transcript on the chain is checked.
    under this trustee's id is alarm `partial-conflict`.
 8. **Reads its partial back from the chain**, contest by contest, and compares
    bytes. A difference is alarm `partial-readback`.
+   If the console refuses a repeated post (its answer to the first was lost and
+   the tally has since been published), the process reads the chain first: a
+   byte-equal partial under this trustee's id counts as posted.
 
 ### Combine (automatic) and Sign tally
 
@@ -241,7 +291,13 @@ The join step is `done` once the transcript on the chain is checked.
 ## Local HTTP API
 
 Same origin as the app (`/trustee/`). JSON in, JSON out; errors are
-`{"error": "<plain reason>"}`. Every route passes the Host allowlist and the
+`{"error": "<plain reason>"}`. A route called with the wrong method answers
+**405**: `{"error": "GET required"}` or `{"error": "POST required"}` on the
+`/api/trustee/` routes, plain text `POST required` on `/api/login` and
+`/api/logout` (`/api/me` answers any method). On `join`, `decrypt` and `sign`
+a body that is not JSON, has an unknown field, or is over 16 KiB answers
+**400** `{"error": "invalid JSON body"}`; on `/api/login` a body that is not
+JSON answers 400 `invalid JSON body` in plain text. Every route passes the Host allowlist and the
 same-origin POST check (`guard`), which answer **plain text**
 `403 forbidden host` and `403 cross-origin request rejected`. Every route is in
 the process's access table; an unknown path is 404.
@@ -257,6 +313,8 @@ the process's access table; an unknown path is 404.
 | `/api/trustee/sign` | POST | this trustee's session |
 | `/api/trustee/peer` | GET | public (the other trustees) |
 | `/trustee/` | GET | public (the app's static files, with `--web-dir`) |
+| `/trustee` | GET | public: **301** to `/trustee/`, keeping the query (with `--web-dir`) |
+| `/favicon.ico` | GET | public: **204**, no body |
 
 "This trustee's session" is a session of an account in `--auth-file`, all of
 which are trustee accounts with this `--id`. A session of the console, or of
@@ -403,7 +461,7 @@ investigating.
 |---|---|---|
 | `params` | The console's parameters differ from the chain's, or the chain's are unusable for this trustee | join, decrypt, sign |
 | `roster-params`, `roster`, `roster-own-key`, `roster-digest` | The roster names other parameters, has the wrong size, holds another key for this trustee, or its digest differs from the one this trustee computes | join, decrypt, sign |
-| `roster-peer-<id>` | Peer `<id>`'s own host states another receive key than the roster, says it is another trustee, or computed another roster digest | join, decrypt, sign |
+| `roster-peer-<id>` | Peer `<id>`'s own host states another receive key than the roster, or computed another roster digest | join, decrypt, sign |
 | `deal-roster` | `dkg-deal` computed another digest than the checked one | join, decrypt, sign |
 | `inbox`, `inbox-own-deal` | The inbox is for another trustee, parameters or roster, or carries other commitments for this trustee's deal | join, decrypt, sign |
 | `receive` | `dkg-receive` refused a share (it names the dealer) | join, decrypt, sign |
