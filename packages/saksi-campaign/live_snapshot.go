@@ -39,6 +39,10 @@ type liveSnapshot struct {
 	RosterFingerprint   string
 	CeremonyError       string
 
+	// TrusteesJoined is how many trustees' receive keys are in the roster:
+	// a count only, never which trustees or their keys.
+	TrusteesJoined int
+
 	Lifecycle map[string]LiveTx
 
 	Ballots int
@@ -72,9 +76,10 @@ func snapshotOf(st *liveState, dir string) *liveSnapshot {
 		Positions: positions, Trustees: st.Trustees, Threshold: st.Threshold,
 		Params: st.Params, ContestIDs: slices.Clone(st.ContestIDs), IssuerPublicKey: st.IssuerPublicKey,
 		DKG: st.DKG, JointPublicKey: st.JointPublicKey, JointKeyFingerprint: st.JointKeyFingerprint,
-		CeremonyError: st.CeremonyError,
-		Lifecycle:     maps.Clone(st.Lifecycle),
-		Ballots:       st.Ballots, Issued: st.Issued,
+		CeremonyError:  st.CeremonyError,
+		TrusteesJoined: len(st.ReceiveKeys),
+		Lifecycle:      maps.Clone(st.Lifecycle),
+		Ballots:        st.Ballots, Issued: st.Issued,
 		Decrypted:       []int{},
 		TallySignatures: sortedIDs(st.Signatures),
 		Tallied:         st.Tally != "",

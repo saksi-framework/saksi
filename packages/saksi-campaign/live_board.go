@@ -117,6 +117,7 @@ func (s *Server) buildLiveBoard(rec RunRecord, dir string) BoardResponse {
 			VotersOnRoll: rec.Config.Voters, CredentialsIssued: st.Issued,
 			BallotRecords: st.Ballots, BallotRecordsSource: "console",
 			TrusteesDecrypted: k, TallySignatures: len(st.TallySignatures),
+			TrusteesJoined: st.TrusteesJoined,
 		},
 		Decryption: LiveBoardDecryption{
 			TrusteesDecrypted: k, Threshold: st.Threshold, Trustees: st.Trustees,

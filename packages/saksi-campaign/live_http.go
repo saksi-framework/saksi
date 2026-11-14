@@ -455,6 +455,10 @@ type LiveCounts struct {
 	BallotRecordsSource string `json:"ballot_records_source"`
 	TrusteesDecrypted   int    `json:"trustees_decrypted"`
 	TallySignatures     int    `json:"tally_signatures"`
+	// TrusteesJoined is the number of trustees whose receive key is in the
+	// election's roster: 0 after setup, the trustee count once the roster is
+	// complete, and unchanged after that.
+	TrusteesJoined int `json:"trustees_joined"`
 }
 
 // LiveElectionView is GET /api/live/election.
@@ -504,6 +508,7 @@ func (L *liveService) electionViewOf(sn *liveSnapshot) LiveElectionView {
 			VotersOnRoll: len(L.voterRoll()), CredentialsIssued: sn.Issued,
 			BallotRecords: sn.Ballots, BallotRecordsSource: "console",
 			TrusteesDecrypted: len(sn.Decrypted), TallySignatures: len(sn.TallySignatures),
+			TrusteesJoined: sn.TrusteesJoined,
 		},
 	}
 	if sn.stateIndex() >= liveStateIndex(LiveCeremony) {

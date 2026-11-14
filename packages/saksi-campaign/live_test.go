@@ -1139,3 +1139,96 @@ func TestTLSServesHTTPSWithASecureCookie(t *testing.T) {
 		t.Fatal("a TLS 1.1 client was served")
 	}
 }
+
+// wantJoined reads counts.trustees_joined from GET /api/live/election and
+// from the board's live.counts, and fails unless both say want. It also
+// checks neither answer carries a receive key or the per-trustee roster.
+func (c *liveConsole) wantJoined(runID string, want int, keys ...string) {
+	c.t.Helper()
+	view := c.ok(http.MethodGet, "/api/live/election", "", nil)
+	board := c.ok(http.MethodGet, "/api/board/"+runID, "", nil)
+	vc := view["counts"].(map[string]any)
+	bc := board["live"].(map[string]any)["counts"].(map[string]any)
+	if vc["trustees_joined"] != float64(want) || bc["trustees_joined"] != float64(want) {
+		c.t.Fatalf("trustees_joined: election %v, board %v, want %d", vc["trustees_joined"], bc["trustees_joined"], want)
+	}
+	for _, body := range c.bodies[len(c.bodies)-2:] {
+		for _, k := range keys {
+			if strings.Contains(body, k) {
+				c.t.Fatalf("a public answer carries receive key %s", k)
+			}
+		}
+		for _, f := range []string{"receive_keys", "receive_public_key", `"received"`, `"peers"`} {
+			if strings.Contains(body, f) {
+				c.t.Fatalf("a public answer carries %s: %s", f, body)
+			}
+		}
+	}
+}
+
+func TestLiveTrusteesJoinedCount(t *testing.T) {
+	fx := newLiveFixture(t)
+	c := fx.console()
+	runID := c.setup()
+	if c.state() != LiveCeremony {
+		t.Fatalf("after setup: %s", c.state())
+	}
+	key := func(id int) string { return pt(0x70 + id) }
+	all := []string{key(1), key(2), key(3)}
+	c.wantJoined(runID, 0, all...)
+
+	c.ok(http.MethodPost, "/api/live/dkg/receive-key", c.tok(1), map[string]any{"trustee_id": 1, "receive_public_key": key(1)})
+	c.wantJoined(runID, 1, all...)
+	// The same key again is a no-op for the count.
+	c.ok(http.MethodPost, "/api/live/dkg/receive-key", c.tok(1), map[string]any{"trustee_id": 1, "receive_public_key": key(1)})
+	c.wantJoined(runID, 1, all...)
+	c.ok(http.MethodPost, "/api/live/dkg/receive-key", c.tok(2), map[string]any{"trustee_id": 2, "receive_public_key": key(2)})
+	c.wantJoined(runID, 2, all...)
+
+	// A restart mid-ceremony reads the count back from live.json.
+	c = fx.console()
+	c.wantJoined(runID, 2, all...)
+
+	c.ok(http.MethodPost, "/api/live/dkg/receive-key", c.tok(3), map[string]any{"trustee_id": 3, "receive_public_key": key(3)})
+	if c.s.live.st.Roster == nil {
+		t.Fatal("the roster is not frozen after every key")
+	}
+	c.wantJoined(runID, 3, all...)
+	c = fx.console()
+	c.wantJoined(runID, 3, all...)
+
+	// The rest of the election keeps the full count.
+	for id := 1; id <= 3; id++ {
+		c.ok(http.MethodPost, "/api/live/dkg/deal", c.tok(id), fakeDeal(runID, id, 3))
+	}
+	for id := 1; id <= 3; id++ {
+		c.ok(http.MethodPost, "/api/live/dkg/ack", c.tok(id), fakeAck(runID, id))
+	}
+	if c.state() != LiveOpen {
+		t.Fatalf("after the ceremony: %s", c.state())
+	}
+	c.wantJoined(runID, 3, all...)
+	c.ok(http.MethodPost, "/api/live/close", "admin", nil)
+	c.wantJoined(runID, 3, all...)
+}
+
+func TestLiveTrusteesJoinedStartsAtZeroAfterAbandon(t *testing.T) {
+	fx := newLiveFixture(t)
+	c := fx.console()
+	first := c.setup()
+	c.ok(http.MethodPost, "/api/live/dkg/receive-key", c.tok(1), map[string]any{"trustee_id": 1, "receive_public_key": pt(0x71)})
+	c.ok(http.MethodPost, "/api/live/dkg/receive-key", c.tok(2), map[string]any{"trustee_id": 2, "receive_public_key": pt(0x72)})
+	c.ok(http.MethodPost, "/api/live/abandon", "admin", nil)
+	c.wantJoined(first, 2, pt(0x71), pt(0x72))
+
+	second := c.setup()
+	if second == first {
+		t.Fatal("the second election reused the first run id")
+	}
+	c.wantJoined(second, 0)
+	// The abandoned run's board still reads its own count from its folder.
+	board := c.ok(http.MethodGet, "/api/board/"+first, "", nil)
+	if n := board["live"].(map[string]any)["counts"].(map[string]any)["trustees_joined"]; n != 2.0 {
+		t.Fatalf("abandoned run's board: trustees_joined %v", n)
+	}
+}
