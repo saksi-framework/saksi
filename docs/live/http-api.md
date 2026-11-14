@@ -275,7 +275,7 @@ Everything the phone's wasm needs, and the counts:
  "ceremony_error": "...",                      "(only if the transcript was refused)"
  "counts": {"voters_on_roll": 3, "credentials_issued": 3,
             "ballot_records": 6, "ballot_records_source": "chain",
-            "trustees_decrypted": 3, "tally_signatures": 3},
+            "trustees_decrypted": 3, "tally_signatures": 3, "trustees_joined": 5},
  "lifecycle": {"CreateElection": {"tx_id": "...", "block_number": 390}, "...": {}},
  "totals": [2,1,0,0,1,2],                     "(once tallied)"
  "verify_overall": "pass",
@@ -285,7 +285,10 @@ Everything the phone's wasm needs, and the counts:
 `ballot_records` is the chain's committed nullifier count
 (`ballot_records_source: "chain"`), or the console's own count with
 `"console"` when the chain did not answer. `trustees_decrypted` counts
-trustees with a partial recorded for every contest. 404 before any setup.
+trustees with a partial recorded for every contest. `trustees_joined` counts
+trustees whose receive key is in the key ceremony's roster: 0 after setup, the
+trustee count once the roster is complete, and unchanged for the rest of the
+election (it names no trustee). 404 before any setup.
 
 This view, the board, the ledger read, the issuance gate and the ballot
 route's state check read a snapshot of the public state that the console
@@ -428,7 +431,9 @@ Rules (each tested):
   are open at once (429). `sign` without an open session is 409.
 - One `issue-presign` or `issue-sign` runs at a time across all accounts.
 - Issuance is open only in state `open` (it ends with `close`).
-- 403 for an account that is not a voter.
+- 401 without a session (`login required`, from the console's route guard,
+  before the handler runs); 403 for a signed-in account that is not a voter
+  (`only a voter account may obtain a credential`).
 
 ## Trustee (bearer token)
 
@@ -595,7 +600,8 @@ Added for live runs only, under `live`:
 ```json
 {"live": {"state": "verified", "title": "...",
           "counts": {"voters_on_roll": 3, "credentials_issued": 3, "ballot_records": 6,
-                     "ballot_records_source": "chain", "trustees_decrypted": 3, "tally_signatures": 3},
+                     "ballot_records_source": "chain", "trustees_decrypted": 3, "tally_signatures": 3,
+                     "trustees_joined": 5},
           "decryption": {"trustees_decrypted": 3, "threshold": 3, "trustees": 5,
                          "decrypted": [1,2,3], "tally_signatures": [1,2,3]},
           "joint_key_fingerprint": "...", "roster_fingerprint": "...",
