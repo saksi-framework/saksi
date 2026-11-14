@@ -683,6 +683,7 @@ func (L *liveService) finishSetupLocked() error {
 	}
 	if rc.TxID != "" {
 		L.st.Lifecycle["CreateElection"] = txOf(rc)
+		L.appendLifecycleLocked("CreateElection", "", rc)
 	}
 	L.st.State = LiveCeremony
 	log.Printf("live: %s ceremony", L.st.RunID)
