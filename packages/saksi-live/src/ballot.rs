@@ -7,7 +7,7 @@
 use curve25519_dalek::scalar::Scalar;
 use rand_core::{CryptoRng, RngCore};
 use serde::{Deserialize, Serialize};
-use zeroize::Zeroize;
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
 use saksi_crypto::{
     elgamal::{encrypt, Plaintext},
@@ -59,12 +59,84 @@ pub struct BallotResponse {
     pub tracking_code: String,
 }
 
+/// `kind` of a [`BallotOpening`].
+pub const OPENING_KIND: &str = "saksi-live-ballot-opening-v1";
+
+/// What a Benaloh challenge needs to open a ballot built by
+/// [`build_ballot_with_opening`]: the per-slot ElGamal randomness and the
+/// choice. **Secret**: with it anyone can read the ballot's vote. The phone
+/// keeps it in memory only, for the cast-or-challenge decision, and drops it
+/// when the ballot is cast. Its strings are wiped when it is dropped.
+#[derive(Clone, Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
+#[serde(deny_unknown_fields)]
+pub struct BallotOpening {
+    /// [`OPENING_KIND`].
+    pub kind: String,
+    /// SHA-256 of the ballot's protobuf bytes (hex), so an opening is only
+    /// ever applied to the ballot it was made with.
+    pub ballot_digest: String,
+    /// The contest ids of the ballot's slots, in order.
+    pub contest_ids: Vec<String>,
+    /// 0-based index of the chosen candidate within the position.
+    pub choice: usize,
+    /// The ElGamal randomness `r_k` of slot `k` (scalar hex).
+    pub randomness: Vec<String>,
+}
+
+/// SHA-256 of a ballot's protobuf bytes, hex.
+pub fn ballot_digest(ballot_bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    hex::encode(Sha256::digest(ballot_bytes))
+}
+
 /// Builds one ballot record. Refuses a credential the election's issuer did
 /// not sign, a transcript that is not the election's, an unknown position and
 /// a choice outside the position's candidates.
 pub fn build_ballot(
     req: &BallotRequest,
     rng: &mut (impl RngCore + CryptoRng),
+) -> LiveResult<BallotResponse> {
+    build(req, rng, None)
+}
+
+/// [`build_ballot`], also returning the ballot's [`BallotOpening`] for a
+/// Benaloh challenge. For the same random stream the ballot bytes are exactly
+/// [`build_ballot`]'s: the randomness is copied out, not drawn differently.
+///
+/// A ballot that is challenged (opened) must never be submitted: the caller
+/// discards it and builds a fresh one, with fresh randomness.
+pub fn build_ballot_with_opening(
+    req: &BallotRequest,
+    rng: &mut (impl RngCore + CryptoRng),
+) -> LiveResult<(BallotResponse, BallotOpening)> {
+    let mut randomness = Vec::new();
+    let built = build(req, rng, Some(&mut randomness));
+    let response = match built {
+        Ok(r) => r,
+        Err(e) => {
+            randomness.zeroize();
+            return Err(e);
+        }
+    };
+    let bytes = codec::bytes(&response.ballot, "ballot")?;
+    let opening = BallotOpening {
+        kind: OPENING_KIND.into(),
+        ballot_digest: ballot_digest(&bytes),
+        contest_ids: response.contest_ids.clone(),
+        choice: req.choice,
+        randomness: randomness.iter().map(codec::scalar_hex).collect(),
+    };
+    randomness.zeroize();
+    Ok((response, opening))
+}
+
+/// The builder. When `keep` is given, each slot's randomness is copied into
+/// it before it is wiped; nothing else differs, so the random stream and the
+/// ballot bytes are the same either way.
+fn build(
+    req: &BallotRequest,
+    rng: &mut (impl RngCore + CryptoRng),
+    mut keep: Option<&mut Vec<Scalar>>,
 ) -> LiveResult<BallotResponse> {
     let params: ElectionParameters = codec::message(&req.params, "params")?;
     let transcript: DKGTranscript = codec::message(&req.dkg, "dkg")?;
@@ -109,6 +181,9 @@ pub fn build_ballot(
         let mut r = Scalar::random(&mut *rng);
         let ct = encrypt(&public_key, Plaintext::from_small_integer(bit as u64), r);
         r_sum += r;
+        if let Some(keep) = keep.as_deref_mut() {
+            keep.push(r);
+        }
         let context = binding_context(election_id, contest_id.as_bytes(), &nullifier);
         let proof = CDSProof::prove(&public_key, &ct, &choice_set, bit, &r, &context, rng);
         r.zeroize();
@@ -155,4 +230,50 @@ pub fn build_ballot(
         tracking_code: tracking_code(&nullifier),
         nullifier: hex::encode(&nullifier),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::{election, StreamRng};
+
+    #[test]
+    fn the_opening_variant_builds_the_same_bytes_for_the_same_stream() {
+        let e = election("live-open");
+        for (position, choice) in [("president", 0), ("president", 2), ("secretary", 1)] {
+            let req = e.request(position, choice);
+            let plain = build_ballot(&req, &mut StreamRng::new(7)).unwrap();
+            let (with, opening) = build_ballot_with_opening(&req, &mut StreamRng::new(7)).unwrap();
+            assert_eq!(plain.ballot, with.ballot, "{position}/{choice}");
+            assert_eq!(plain.nullifier, with.nullifier);
+            assert_eq!(plain.tracking_code, with.tracking_code);
+            assert_eq!(opening.kind, OPENING_KIND);
+            assert_eq!(opening.choice, choice);
+            assert_eq!(opening.randomness.len(), 3);
+            assert_eq!(opening.contest_ids, plain.contest_ids);
+            assert_eq!(
+                opening.ballot_digest,
+                ballot_digest(&hex::decode(&plain.ballot).unwrap())
+            );
+            // The same stream twice gives the same ballot; another stream
+            // does not.
+            let other = build_ballot(&req, &mut StreamRng::new(8)).unwrap();
+            assert_ne!(other.ballot, plain.ballot);
+            // The nullifier is per voter per position, not per ballot.
+            assert_eq!(other.nullifier, plain.nullifier);
+        }
+    }
+
+    #[test]
+    fn the_opening_variant_refuses_what_the_builder_refuses() {
+        let e = election("live-open-bad");
+        let mut req = e.request("president", 3);
+        assert!(build_ballot_with_opening(&req, &mut StreamRng::new(1))
+            .err()
+            .unwrap()
+            .contains("outside"));
+        req.choice = 0;
+        req.position_id = "treasurer".into();
+        assert!(build_ballot_with_opening(&req, &mut StreamRng::new(1)).is_err());
+    }
 }

@@ -32,7 +32,7 @@ use saksi_crypto::{
     group::basepoint,
     nizk::{chaum_pedersen::ChaumPedersenProof, schnorr::SchnorrProof},
 };
-use saksi_live::{ballot, codec, dkg, election, issuance};
+use saksi_live::{ballot, benaloh, codec, dkg, election, issuance};
 use saksi_protocol::{PartialDecryption, TallyResult, TrusteeSignature, WIRE_VERSION};
 
 type R<T> = Result<T, String>;
@@ -56,6 +56,7 @@ pub const OPS: &[&str] = &[
     "voter-blind",
     "voter-finalize",
     "ballot",
+    "benaloh-check",
     "verify-live",
 ];
 
@@ -114,6 +115,7 @@ fn dispatch(op: &str, input: &str) -> R<Value> {
         "voter-blind" => to_value(issuance::voter_blind(&parse(input)?, &mut OsRng)?),
         "voter-finalize" => to_value(issuance::voter_finalize(&parse(input)?)?),
         "ballot" => to_value(ballot::build_ballot(&parse(input)?, &mut OsRng)?),
+        "benaloh-check" => to_value(benaloh::check(&parse(input)?)?),
         "verify-live" => verify(parse(input)?),
         other => Err(format!(
             "unknown live op {other:?}; ops: {}",
@@ -525,6 +527,7 @@ fn dkg_receive(i: ReceiveIn) -> R<Value> {
         "verification_key": vk,
         "fingerprint": fingerprint,
         "joint_public_key": joint,
+        "joint_key_fingerprint": election::joint_key_fingerprint(&received.joint_public_key),
         "roster_digest": roster_digest,
         "roster_fingerprint": roster_fingerprint,
     }))
@@ -603,6 +606,7 @@ fn dkg_transcript(i: TranscriptIn) -> R<Value> {
         "dkg": codec::message_hex(&transcript),
         "election_id": e.parameters.election_id,
         "joint_public_key": codec::point_hex(&e.joint_public_key),
+        "joint_key_fingerprint": election::joint_key_fingerprint(&e.joint_public_key),
         "verification_keys": verification_keys(&e),
     }))
 }

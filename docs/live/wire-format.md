@@ -240,6 +240,7 @@ the `dkg-deal` output of that dealer. Output:
 {"dkg": "<hex DKGTranscript: the PublishDKGTranscript argument>",
  "election_id": "live-2026",
  "joint_public_key": "<point>",
+ "joint_key_fingerprint": "7A1B-2C3D-4E5F-6071-8293-A4B5-C6D7-E8F9",
  "verification_keys": [
    {"trustee_id": "1", "verification_key": "<point>", "fingerprint": "1A2B-3C4D-5E6F-7081-90A1-B2C3-D4E5-F607"},
    "..."]}
@@ -366,6 +367,43 @@ and a choice outside its candidates. Output:
 case, split 4-4: the board's `formatTrackingCode` (both give the empty string
 for a nullifier shorter than 4 bytes). The nullifier is per voter per
 position, so a voter gets one code per position.
+
+### `benaloh-check`
+
+The Benaloh challenge's check, the same function as the phone's
+`benaloh_check` (`saksi_live::benaloh::check`), as a native process so a
+challenged ballot can be checked by code other than the phone's. Input:
+
+```json
+{"params": "<hex ElectionParameters>",
+ "dkg": "<hex DKGTranscript>",
+ "ballot": "<hex Ballot: the challenged one>",
+ "opened": {"election_id": "live-2026", "position_id": "president",
+            "nullifier": "<32-byte hex>", "tracking_code": "BC-7F3A-92C1",
+            "slots": [{"contest_id": "president/alice", "plaintext": 0, "randomness": "<scalar>"},
+                      {"contest_id": "president/bob",   "plaintext": 1, "randomness": "<scalar>"},
+                      {"contest_id": "president/carol", "plaintext": 0, "randomness": "<scalar>"}]}}
+```
+
+`opened` is the phone's `benaloh_open` output (see **WebAssembly (phone)**).
+Re-encrypts each slot under the transcript's joint key with the revealed
+randomness and compares it with the ballot's ciphertext. Output:
+
+```json
+{"valid": true,
+ "position_id": "president",
+ "tracking_code": "BC-7F3A-92C1",
+ "slots": [{"contest_id": "president/alice", "plaintext": 0, "reproduces": true}, "..."],
+ "encoded_choice": 1,
+ "encoded_candidate": "bob"}
+```
+
+`valid` is true iff every slot reproduces and exactly one slot holds 1 (the
+rest 0); `encoded_choice` and `encoded_candidate` are then the candidate the
+ballot encodes, else `null`. A randomness that is not a canonical scalar is a
+slot that does not reproduce. Refused with an error (not a verdict): a ballot
+or opening for another election, position or nullifier, a slot count that is
+not the position's, or a slot whose contest id is not the election's.
 
 ## Trustee
 
@@ -501,12 +539,16 @@ file, and outputs:
  "verification_key": "<point s_2·G>",
  "fingerprint": "1A2B-3C4D-5E6F-7081-90A1-B2C3-D4E5-F607",
  "joint_public_key": "<point>",
+ "joint_key_fingerprint": "7A1B-2C3D-4E5F-6071-8293-A4B5-C6D7-E8F9",
  "roster_digest": "<32-byte hex>",
  "roster_fingerprint": "3C4D-5E6F-7081-1A2B-8E9F-A0B1-C2D3-E4F5"}
 ```
 
 `fingerprint` is `SHA-256("saksi.live.share-fingerprint.v1" || compress(vk))`
-shown as a fingerprint (see **Fingerprints**).
+shown as a fingerprint (see **Fingerprints**). `joint_key_fingerprint` is
+`SHA-256("saksi.live.joint-key-fingerprint.v1" || compress(Y))` shown the same
+way; `dkg-transcript` and the phone (`election_info`) show the same value, so
+people can confirm the phone encrypts under the key the trustees made.
 
 **The trustee process must compare**:
 - `roster_fingerprint` with every other trustee's (see **What the mask protects, and on what condition**);

@@ -18,6 +18,7 @@
 use curve25519_dalek::scalar::Scalar;
 use rand_core::{CryptoRng, RngCore};
 use serde::{Deserialize, Serialize};
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
 use saksi_credentials::{
     issuer_pre_sign, issuer_sign as lib_issuer_sign, voter_begin_issuance, voter_blind_challenge,
@@ -29,7 +30,8 @@ use saksi_credentials::{
 use crate::codec::{self, LiveResult};
 
 /// The voter's secret state between `voter-begin` and `voter-blind`.
-#[derive(Clone, Serialize, Deserialize)]
+/// Its strings are wiped when it is dropped.
+#[derive(Clone, Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
 #[serde(deny_unknown_fields)]
 pub struct BlindState {
     /// Credential secret `s_cred` (scalar hex). Secret.
@@ -39,7 +41,8 @@ pub struct BlindState {
 }
 
 /// The voter's secret state between `voter-blind` and `voter-finalize`.
-#[derive(Clone, Serialize, Deserialize)]
+/// Its strings are wiped when it is dropped.
+#[derive(Clone, Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
 #[serde(deny_unknown_fields)]
 pub struct FinalizeState {
     /// Credential secret `s_cred` (scalar hex). Secret.
@@ -53,7 +56,8 @@ pub struct FinalizeState {
 }
 
 /// A finished credential, as the phone stores it.
-#[derive(Clone, Serialize, Deserialize)]
+/// Its strings are wiped when it is dropped.
+#[derive(Clone, Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
 #[serde(deny_unknown_fields)]
 pub struct CredentialParts {
     /// Credential secret `s_cred` (scalar hex). Secret: it votes.

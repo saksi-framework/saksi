@@ -286,6 +286,15 @@ fn dkg_as_five_processes() {
     for r in &received {
         assert_eq!(r["fingerprint"].as_str().unwrap().len(), 39);
     }
+    // Every trustee and the transcript show one joint-key fingerprint, the
+    // one the phone shows.
+    let joint_fp = saksi_live::election::joint_key_fingerprint(&point(
+        transcript["joint_public_key"].as_str().unwrap(),
+    ));
+    assert_eq!(transcript["joint_key_fingerprint"], json!(joint_fp));
+    for r in &received {
+        assert_eq!(r["joint_key_fingerprint"], json!(joint_fp));
+    }
     // Each trustee's verification key is the one the transcript derives.
     for (k, r) in received.iter().enumerate() {
         assert_eq!(
@@ -493,6 +502,44 @@ fn an_identity_joint_key_is_refused_by_transcript_and_ballot() {
         check["detail"].as_str().unwrap().contains("identity"),
         "{check}"
     );
+    let _ = std::fs::remove_dir_all(&c.dir);
+}
+
+#[test]
+fn benaloh_check_through_the_cli() {
+    let c = Ceremony::new("live-benaloh");
+    let dkg = c.transcript()["dkg"].as_str().unwrap().to_string();
+    let credential = issue(&c.dir, 0, &c.issuer_key, &c.issuer_pk)["credential"].clone();
+    let req = saksi_live::ballot::BallotRequest {
+        params: c.params.clone(),
+        dkg: dkg.clone(),
+        credential: serde_json::from_value(credential).unwrap(),
+        position_id: "secretary".into(),
+        choice: 2,
+    };
+    let (built, opening) =
+        saksi_live::ballot::build_ballot_with_opening(&req, &mut rand_core::OsRng).unwrap();
+    let opened = serde_json::to_value(
+        saksi_live::benaloh::open(&saksi_live::benaloh::OpenRequest {
+            ballot: built.ballot.clone(),
+            opening,
+        })
+        .unwrap(),
+    )
+    .unwrap();
+    let input = |opened: &Value| json!({ "params": c.params, "dkg": dkg, "ballot": built.ballot, "opened": opened });
+    let v = ok("benaloh-check", input(&opened));
+    assert_eq!(v["valid"], json!(true), "{v:#}");
+    assert_eq!(v["encoded_candidate"], json!("fay"));
+    assert_eq!(v["encoded_choice"], json!(2));
+    assert_eq!(v["tracking_code"], json!(built.tracking_code));
+
+    let mut moved = opened.clone();
+    moved["slots"][2]["plaintext"] = json!(0);
+    moved["slots"][0]["plaintext"] = json!(1);
+    let v = ok("benaloh-check", input(&moved));
+    assert_eq!(v["valid"], json!(false));
+    assert_eq!(v["encoded_candidate"], Value::Null);
     let _ = std::fs::remove_dir_all(&c.dir);
 }
 

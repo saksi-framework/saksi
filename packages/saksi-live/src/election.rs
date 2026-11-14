@@ -238,6 +238,21 @@ pub fn tracking_code(nullifier: &[u8]) -> String {
     format!("BC-{}-{}", &h[..4], &h[4..8])
 }
 
+/// Domain of [`joint_key_fingerprint`].
+pub const JOINT_KEY_FINGERPRINT_DOMAIN: &[u8] = b"saksi.live.joint-key-fingerprint.v1";
+
+/// The fingerprint of an election's joint ElGamal key that the phone and every
+/// trustee page show, so people can confirm the phone encrypts under the key
+/// the trustees made: `SHA-256(JOINT_KEY_FINGERPRINT_DOMAIN || compress(Y))`,
+/// shown as [`short_fingerprint`].
+pub fn joint_key_fingerprint(joint: &RistrettoPoint) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(JOINT_KEY_FINGERPRINT_DOMAIN);
+    h.update(joint.compress().as_bytes());
+    short_fingerprint(&h.finalize())
+}
+
 /// Domain of [`ballot_set_digest`].
 pub const BALLOT_SET_DOMAIN: &[u8] = b"saksi.live.ballot-set.v1";
 

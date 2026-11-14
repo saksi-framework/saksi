@@ -18,7 +18,7 @@ saksi-credentials = { path = "../saksi-credentials", features = ["export"] }
 saksi-protocol = { path = "../saksi-protocol/rust" }
 curve25519-dalek.workspace = true
 rand_core.workspace = true
-zeroize.workspace = true
+zeroize = { workspace = true, features = ["alloc"] }
 subtle.workspace = true
 sha2 = { version = "0.10", default-features = false }
 hex = "0.4"
