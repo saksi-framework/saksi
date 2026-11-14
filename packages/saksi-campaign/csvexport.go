@@ -60,12 +60,7 @@ func writeBallotsCSV(dir string) error {
 	}
 	defer f.Close()
 	w := csv.NewWriter(f)
-	if err := w.Write([]string{
-		"index", "election_id", "position_id",
-		"voter_credential_commitment", "nullifier",
-		"num_ciphertexts", "num_wellformedness_proofs",
-		"ballot_sha256", "ballot_json",
-	}); err != nil {
+	if err := w.Write(ballotsCSVHeader); err != nil {
 		return err
 	}
 	// One ballot in memory at a time: decoded, written, discarded. The whole
@@ -76,38 +71,55 @@ func writeBallotsCSV(dir string) error {
 		if err != nil {
 			return fmt.Errorf("ballot %d not hex: %w", i, err)
 		}
-		var b pb.Ballot
-		if err := proto.Unmarshal(raw, &b); err != nil {
-			return fmt.Errorf("decode ballot %d: %w", i, err)
-		}
-		nullifier := ""
-		if b.CredentialPresentation != nil && b.CredentialPresentation.Nullifier != nil {
-			nullifier = hex.EncodeToString(b.CredentialPresentation.Nullifier.Value)
-		}
-		// ballot_json carries the ACTUAL encrypted values (ciphertext pad/data,
-		// CDS proof branches, nullifier, commitment) so the row is self-verifying
-		// evidence, not a summary. ballot_sha256 is the wire-byte fingerprint.
-		bjson, err := jsonMarshal.Marshal(&b)
+		row, err := ballotsCSVRow(i, raw)
 		if err != nil {
-			return fmt.Errorf("json ballot %d: %w", i, err)
+			return err
 		}
-		return w.Write([]string{
-			strconv.Itoa(i),
-			b.ElectionId,
-			b.PositionId,
-			hex.EncodeToString(b.VoterCredentialCommitment),
-			nullifier,
-			strconv.Itoa(len(b.Ciphertexts)),
-			strconv.Itoa(len(b.WellFormednessProofs)),
-			sha256Hex(raw),
-			string(bjson),
-		})
+		return w.Write(row)
 	})
 	if err != nil {
 		return fmt.Errorf("read ballots: %w", err)
 	}
 	w.Flush()
 	return w.Error()
+}
+
+// ballotsCSVHeader is ballots.csv's header row.
+var ballotsCSVHeader = []string{
+	"index", "election_id", "position_id",
+	"voter_credential_commitment", "nullifier",
+	"num_ciphertexts", "num_wellformedness_proofs",
+	"ballot_sha256", "ballot_json",
+}
+
+// ballotsCSVRow is ballot i's ballots.csv row, from its wire bytes raw.
+func ballotsCSVRow(i int, raw []byte) ([]string, error) {
+	var b pb.Ballot
+	if err := proto.Unmarshal(raw, &b); err != nil {
+		return nil, fmt.Errorf("decode ballot %d: %w", i, err)
+	}
+	nullifier := ""
+	if b.CredentialPresentation != nil && b.CredentialPresentation.Nullifier != nil {
+		nullifier = hex.EncodeToString(b.CredentialPresentation.Nullifier.Value)
+	}
+	// ballot_json carries the ACTUAL encrypted values (ciphertext pad/data,
+	// CDS proof branches, nullifier, commitment) so the row is self-verifying
+	// evidence, not a summary. ballot_sha256 is the wire-byte fingerprint.
+	bjson, err := jsonMarshal.Marshal(&b)
+	if err != nil {
+		return nil, fmt.Errorf("json ballot %d: %w", i, err)
+	}
+	return []string{
+		strconv.Itoa(i),
+		b.ElectionId,
+		b.PositionId,
+		hex.EncodeToString(b.VoterCredentialCommitment),
+		nullifier,
+		strconv.Itoa(len(b.Ciphertexts)),
+		strconv.Itoa(len(b.WellFormednessProofs)),
+		sha256Hex(raw),
+		string(bjson),
+	}, nil
 }
 
 // ballotsDigest returns a single SHA-256 over every ballot's wire bytes in

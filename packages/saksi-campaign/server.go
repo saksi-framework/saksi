@@ -102,6 +102,9 @@ type Server struct {
 
 	// auth is nil unless EnableAuth was called; nil means every route is open.
 	auth *authState
+	// live is nil unless EnableLive was called; nil means every /api/live/
+	// route answers 404 (live.go).
+	live *liveService
 	// routes is every pattern registered on the mux, for the role-table test.
 	routes []string
 
@@ -177,6 +180,7 @@ func NewServer(store *RunStore, exec *Executor, hub *Hub, fabric FabricConfig, a
 	mux.HandleFunc("/api/campaigns", s.handleCampaigns)
 	mux.HandleFunc("/api/campaigns/", s.handleCampaign)
 	mux.HandleFunc("/api/network/reset", s.handleNetworkReset)
+	registerLiveRoutes(mux, s)
 	// Browsers ask for a favicon on every page; without this route the request
 	// falls through to "/" and, with auth on, logs a 401 on the public board.
 	mux.HandleFunc("/favicon.ico", func(w http.ResponseWriter, r *http.Request) {
