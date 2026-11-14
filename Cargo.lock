@@ -725,6 +725,7 @@ dependencies = [
  "rayon",
  "saksi-credentials",
  "saksi-crypto",
+ "saksi-live",
  "saksi-protocol",
  "serde",
  "serde_json",
@@ -770,10 +771,19 @@ dependencies = [
 name = "saksi-demo"
 version = "0.0.0"
 dependencies = [
+ "curve25519-dalek",
  "hex",
+ "prost",
  "rand_core 0.6.4",
  "saksi-auditor",
+ "saksi-credentials",
+ "saksi-crypto",
+ "saksi-ffi-tauri",
+ "saksi-live",
+ "saksi-protocol",
+ "serde",
  "serde_json",
+ "zeroize",
 ]
 
 [[package]]
@@ -804,6 +814,24 @@ dependencies = [
  "saksi-protocol",
  "serde",
  "sha2",
+]
+
+[[package]]
+name = "saksi-live"
+version = "0.0.0"
+dependencies = [
+ "curve25519-dalek",
+ "hex",
+ "prost",
+ "rand_core 0.6.4",
+ "saksi-credentials",
+ "saksi-crypto",
+ "saksi-protocol",
+ "serde",
+ "serde_json",
+ "sha2",
+ "subtle",
+ "zeroize",
 ]
 
 [[package]]

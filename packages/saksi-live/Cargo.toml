@@ -1,0 +1,29 @@
+[package]
+name = "saksi-live"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Saksi: the live election's party-side steps (voter issuance and ballot, trustee DKG share masking) as I/O-free functions with a hex/JSON wire format. Compiles for wasm32-unknown-unknown."
+
+[lib]
+name = "saksi_live"
+path = "src/lib.rs"
+
+[dependencies]
+saksi-crypto = { path = "../saksi-crypto" }
+saksi-credentials = { path = "../saksi-credentials", features = ["export"] }
+saksi-protocol = { path = "../saksi-protocol/rust" }
+curve25519-dalek.workspace = true
+rand_core.workspace = true
+zeroize.workspace = true
+subtle.workspace = true
+sha2 = { version = "0.10", default-features = false }
+hex = "0.4"
+serde = { version = "1", features = ["derive", "std"] }
+prost = "0.13"
+
+[dev-dependencies]
+serde_json = "1"
