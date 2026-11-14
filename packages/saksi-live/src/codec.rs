@@ -26,7 +26,9 @@ pub fn scalar_hex(scalar: &Scalar) -> String {
 
 /// Decodes `value` as hex bytes. `what` names the field in the error.
 pub fn bytes(value: &str, what: &str) -> LiveResult<Vec<u8>> {
-    hex::decode(value.trim()).map_err(|e| format!("{what} is not valid hex: {e}"))
+    // The decoder's own error names the offending character; in a secret
+    // field that would be one character of the secret, so it is not quoted.
+    hex::decode(value.trim()).map_err(|_| format!("{what} is not valid hex"))
 }
 
 /// Decodes exactly 32 hex bytes.

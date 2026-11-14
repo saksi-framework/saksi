@@ -19,7 +19,7 @@
 //!
 //! Nothing here changes any existing check or its output.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
 
 use curve25519_dalek::{ristretto::RistrettoPoint, traits::Identity};
@@ -93,6 +93,22 @@ impl LiveElection {
         let dkg = crate::dkg::verify_dkg_transcript(&parameters, &transcript, &mut builder);
         failures(builder)?;
         let dkg = dkg.ok_or("DKG transcript does not verify")?;
+        if dkg.joint_public_key == RistrettoPoint::identity() {
+            return Err(
+                "the DKG transcript's joint public key is the identity: every vote would be in the clear"
+                    .into(),
+            );
+        }
+        if let Some(k) = dkg
+            .trustee_share_publics
+            .iter()
+            .position(|vk| *vk == RistrettoPoint::identity())
+        {
+            return Err(format!(
+                "trustee {}'s verification key is the identity",
+                parameters.trustee_ids[k]
+            ));
+        }
         if parameters.issuer_public_key.is_empty() {
             return Err("election parameters bind no issuer key".into());
         }
@@ -119,16 +135,20 @@ impl LiveElection {
     }
 
     /// Runs the audit's per-ballot checks over `ballots` (hex `Ballot`s) and
-    /// nullifier uniqueness, and returns the per-contest aggregate. Refuses
-    /// the whole set on the first ballot that fails any check, on a ballot of
-    /// another election, and on a repeated nullifier: a trustee never
-    /// decrypts an aggregate it could not account for.
-    pub fn verify_and_aggregate(&self, ballots: &[String]) -> Result<Vec<Ciphertext>, String> {
+    /// nullifier uniqueness, and returns the per-contest aggregate with the
+    /// set's count and digest. Refuses the whole set on the first ballot that
+    /// fails any check, on a ballot of another election, and on a repeated
+    /// nullifier: a trustee never decrypts an aggregate it could not account
+    /// for.
+    pub fn verify_ballot_set(&self, ballots: &[String]) -> Result<BallotSet, String> {
         let pk = PublicKey::from_point(self.joint_public_key);
         let zero = Ciphertext::new(RistrettoPoint::identity(), RistrettoPoint::identity());
         let mut aggregate = vec![zero; self.parameters.contest_ids.len()];
         let mut nullifiers = HashSet::new();
+        let mut raw = Vec::with_capacity(ballots.len());
+        let mut by_position = BTreeMap::new();
         for (idx, hex_ballot) in ballots.iter().enumerate() {
+            let bytes = codec::bytes(hex_ballot, &format!("ballots[{idx}]"))?;
             let ballot: Ballot = codec::message(hex_ballot, &format!("ballots[{idx}]"))?;
             if ballot.election_id != self.parameters.election_id {
                 return Err(format!(
@@ -159,8 +179,15 @@ impl LiveElection {
             for ct in decoded {
                 aggregate[ct.contest] += Ciphertext::new(ct.pad, ct.data);
             }
+            *by_position.entry(ballot.position_id.clone()).or_insert(0) += 1;
+            raw.push(bytes);
         }
-        Ok(aggregate)
+        Ok(BallotSet {
+            aggregate,
+            count: ballots.len(),
+            digest: saksi_live::election::ballot_set_digest(&self.parameters.election_id, &raw),
+            by_position,
+        })
     }
 
     /// Recovers every contest's total from `partials` over `aggregate`, the
@@ -193,6 +220,18 @@ impl LiveElection {
     }
 }
 
+/// A checked set of ballot records and what was computed from it.
+pub struct BallotSet {
+    /// Per-contest homomorphic sum, in `contest_ids` order.
+    pub aggregate: Vec<Ciphertext>,
+    /// Ballot records in the set.
+    pub count: usize,
+    /// [`saksi_live::election::ballot_set_digest`] of the set.
+    pub digest: [u8; 32],
+    /// Records per position id.
+    pub by_position: BTreeMap<String, usize>,
+}
+
 /// The Chaum-Pedersen context of a partial decryption by `trustee_id` for
 /// `contest_id`, under [`BINDING_CONTEXT`].
 pub fn cp_context(trustee_id: &str, contest_id: &str) -> Vec<u8> {
@@ -215,6 +254,20 @@ pub struct LiveRecord {
     pub partial_decryptions: Vec<String>,
     /// The published `TallyResult`.
     pub tally: String,
+    /// How many ballots the chain holds, when the caller knows (its committed
+    /// nullifier count). A record with fewer or more ballots then fails
+    /// `stream.completeness`, so an omitted ballot cannot pass unseen.
+    #[serde(default)]
+    pub expected_ballots: Option<usize>,
+}
+
+/// Ballots that passed every per-ballot check and were counted.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct BallotsVerified {
+    /// Eligible ballot records.
+    pub total: usize,
+    /// Eligible records per position id.
+    pub by_position: BTreeMap<String, usize>,
 }
 
 /// One audit check, summarised over all its findings.
@@ -261,6 +314,8 @@ pub struct LiveVerdict {
     pub contests: Vec<LiveContest>,
     /// Ballot records audited.
     pub ballots: usize,
+    /// Ballot records that verified, in total and per position.
+    pub ballots_verified: BallotsVerified,
     /// The `ledger.order` verdict when a run folder held a ledger dump.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ledger_order: Option<String>,
@@ -303,6 +358,7 @@ fn verdict(
     parameters: &ElectionParameters,
     tally: &TallyResult,
     ballots: usize,
+    ballots_verified: BallotsVerified,
     ledger_order: Option<String>,
 ) -> LiveVerdict {
     let mut checks: Vec<CheckSummary> = Vec::new();
@@ -386,6 +442,7 @@ fn verdict(
         failed_checks,
         contests,
         ballots,
+        ballots_verified,
         ledger_order,
     }
 }
@@ -422,10 +479,24 @@ fn run(
     d: &Decoded,
     ballots: impl Iterator<Item = Result<Ballot, String>>,
     expected: Option<usize>,
-) -> (AuditReport, Vec<crate::tally::ContestEvidence>, usize) {
-    let mut count = 0usize;
-    let counted = ballots.inspect(|_| count += 1);
-    let (report, evidence, _) = crate::audit_streaming(
+) -> (
+    AuditReport,
+    Vec<crate::tally::ContestEvidence>,
+    usize,
+    BallotsVerified,
+) {
+    // Position of every streamed ballot (empty for one that did not decode),
+    // and the stream index of every ballot the audit found eligible.
+    let mut positions: Vec<String> = Vec::new();
+    let mut eligible: Vec<usize> = Vec::new();
+    let counted = ballots.inspect(|b| {
+        positions.push(
+            b.as_ref()
+                .map(|b| b.position_id.clone())
+                .unwrap_or_default(),
+        )
+    });
+    let (report, evidence, _) = crate::audit_streaming_observed(
         crate::AuditInputs {
             parameters: &d.parameters,
             dkg_transcript: &d.dkg_transcript,
@@ -440,8 +511,17 @@ fn run(
         },
         counted,
         None,
+        &mut |idx, _| eligible.push(idx),
     );
-    (report, evidence, count)
+    let mut by_position = BTreeMap::new();
+    for idx in &eligible {
+        *by_position.entry(positions[*idx].clone()).or_insert(0) += 1;
+    }
+    let verified = BallotsVerified {
+        total: eligible.len(),
+        by_position,
+    };
+    (report, evidence, positions.len(), verified)
 }
 
 /// Audits a live election's public record held in memory.
@@ -458,13 +538,14 @@ pub fn verify_live(record: &LiveRecord) -> Result<LiveVerdict, String> {
         .iter()
         .enumerate()
         .map(|(i, b)| codec::message::<Ballot>(b, &format!("ballots[{i}]")));
-    let (report, evidence, n) = run(&d, ballots, None);
+    let (report, evidence, n, verified) = run(&d, ballots, record.expected_ballots);
     Ok(verdict(
         &report,
         &evidence,
         &d.parameters,
         &d.tally,
         n,
+        verified,
         None,
     ))
 }
@@ -486,7 +567,7 @@ pub fn verify_live_dir(dir: &Path) -> Result<LiveVerdict, String> {
         return Err("header binding_context is not the live binding context".into());
     }
     let ballots = crate::stream::BallotLines::open(dir)?;
-    let (mut report, evidence, n) = run(&d, ballots, Some(header.n));
+    let (mut report, evidence, n, verified) = run(&d, ballots, Some(header.n));
     let ledger_dir = dir.join(crate::demo::LEDGER_DIR);
     let mut ledger_order = None;
     if ledger_dir.join(crate::stream::BALLOTS_FILE).exists() {
@@ -508,6 +589,7 @@ pub fn verify_live_dir(dir: &Path) -> Result<LiveVerdict, String> {
         &d.parameters,
         &d.tally,
         n,
+        verified,
         ledger_order,
     ))
 }

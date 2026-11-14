@@ -110,9 +110,15 @@ pub fn build_ballot(
         let ct = encrypt(&public_key, Plaintext::from_small_integer(bit as u64), r);
         r_sum += r;
         let context = binding_context(election_id, contest_id.as_bytes(), &nullifier);
-        let proof = CDSProof::prove(&public_key, &ct, &choice_set, bit, &r, &context, rng)
-            .map_err(|e| format!("CDS prove for {contest_id}: {e}"))?;
+        let proof = CDSProof::prove(&public_key, &ct, &choice_set, bit, &r, &context, rng);
         r.zeroize();
+        let proof = match proof {
+            Ok(p) => p,
+            Err(e) => {
+                r_sum.zeroize();
+                return Err(format!("CDS prove for {contest_id}: {e}"));
+            }
+        };
         let (pad, data) = ct.to_compressed_bytes();
         ciphertexts.push(WireCiphertext {
             version: WIRE_VERSION,

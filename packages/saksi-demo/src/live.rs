@@ -23,10 +23,12 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::{json, Value};
 use zeroize::Zeroize;
 
-use saksi_auditor::live::{cp_context, verify_live, verify_live_dir, LiveElection, LiveRecord};
+use saksi_auditor::live::{
+    cp_context, verify_live, verify_live_dir, BallotSet, LiveElection, LiveRecord,
+};
 use saksi_crypto::{
     dkg::{DealerCommitments, DkgOutput},
-    elgamal::{Ciphertext, PublicKey},
+    elgamal::PublicKey,
     group::basepoint,
     nizk::{chaum_pedersen::ChaumPedersenProof, schnorr::SchnorrProof},
 };
@@ -239,6 +241,13 @@ struct ShareFile {
     verification_key: String,
     joint_public_key: String,
     fingerprint: String,
+    roster_digest: String,
+}
+
+impl Drop for ShareFile {
+    fn drop(&mut self) {
+        self.share.as_mut_str().zeroize();
+    }
 }
 
 /// A secret scalar that matches its recorded public point.
@@ -279,7 +288,7 @@ impl Drop for Share {
 fn read_share(path: &str) -> R<Share> {
     let f: ShareFile = read_secret(path, SHARE)?;
     Ok(Share {
-        election_id: f.election_id,
+        election_id: f.election_id.clone(),
         trustee_id: f.trustee_id,
         value: keypair(&f.share, &f.verification_key, path)?,
     })
@@ -339,15 +348,36 @@ struct SignIn {
 
 fn issue_sign(i: SignIn) -> R<Value> {
     let mut sk = issuer_secret(&i.issuer_key_file)?;
-    let session: SessionFile = read_secret(&i.session_file, SESSION)?;
-    // Destroy the session before using it: a nonce signs one challenge only.
-    // Two responses under one nonce would reveal the issuer key.
-    fs::remove_file(&i.session_file).map_err(|e| {
-        format!(
-            "cannot consume session {}: {e}; not signing",
+    // Claim the session atomically before reading it: of two concurrent
+    // calls only one rename can succeed, and a session file recreated later
+    // under the same name is a different file. The claimed file is deleted
+    // before signing, so a nonce signs one challenge only. Two responses
+    // under one nonce would reveal the issuer key.
+    let mut tag = [0u8; 16];
+    rand_core::RngCore::fill_bytes(&mut OsRng, &mut tag);
+    let claimed = format!("{}.claimed.{}", i.session_file, hex::encode(tag));
+    if let Err(e) = fs::rename(&i.session_file, &claimed) {
+        sk.zeroize();
+        return Err(format!(
+            "session {} is already used or missing ({e}); not signing",
             i.session_file
-        )
-    })?;
+        ));
+    }
+    let session: R<SessionFile> = read_secret(&claimed, SESSION);
+    let removed = fs::remove_file(&claimed);
+    let session = match (session, removed) {
+        (Ok(s), Ok(())) => s,
+        (Err(e), _) => {
+            sk.zeroize();
+            return Err(e);
+        }
+        (_, Err(e)) => {
+            sk.zeroize();
+            return Err(format!(
+                "cannot delete claimed session {claimed}: {e}; not signing"
+            ));
+        }
+    };
     let k = codec::scalar(&session.k, "session")?;
     let result = issuance::issuer_sign(&sk, k, &i.e_prime);
     sk.zeroize();
@@ -378,7 +408,11 @@ fn trustee_keygen(i: TrusteeKeygenIn) -> R<Value> {
     );
     secret.zeroize();
     written?;
-    Ok(json!({ "trustee_id": i.trustee_id, "receive_public_key": public_key }))
+    Ok(json!({
+        "trustee_id": i.trustee_id,
+        "receive_public_key": public_key,
+        "fingerprint": dkg::receive_key_fingerprint(&public),
+    }))
 }
 
 fn receive_secret(path: &str, trustee_id: usize) -> R<Scalar> {
@@ -392,25 +426,41 @@ fn receive_secret(path: &str, trustee_id: usize) -> R<Scalar> {
     keypair(&f.secret, &f.public_key, path)
 }
 
+/// `(election_id, threshold, trustees)` of the election, read from its
+/// parameters rather than from loose caller fields, with the live trustee-id
+/// convention `"1".."n"` checked.
+fn dkg_config(params: &str) -> R<(String, usize, usize)> {
+    let p: saksi_protocol::ElectionParameters = codec::message(params, "params")?;
+    let n = p.trustee_ids.len();
+    if p.trustee_ids.iter().map(String::as_str).ne((1..=n)
+        .map(|i| i.to_string())
+        .collect::<Vec<_>>()
+        .iter()
+        .map(String::as_str))
+    {
+        return Err("params.trustee_ids are not \"1\"..\"n\" in order".into());
+    }
+    Ok((p.election_id, p.threshold as usize, n))
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct DealIn {
     receive_key_file: String,
-    election_id: String,
+    params: String,
     dealer_id: usize,
-    threshold: usize,
-    trustees: usize,
     peers: Vec<dkg::Peer>,
 }
 
 fn dkg_deal(i: DealIn) -> R<Value> {
+    let (election_id, threshold, trustees) = dkg_config(&i.params)?;
     let mut secret = receive_secret(&i.receive_key_file, i.dealer_id)?;
     let out = dkg::deal(
         &dkg::DealRequest {
-            election_id: i.election_id,
+            election_id,
             dealer_id: i.dealer_id,
-            threshold: i.threshold,
-            trustees: i.trustees,
+            threshold,
+            trustees,
             peers: i.peers,
         },
         &secret,
@@ -425,21 +475,22 @@ fn dkg_deal(i: DealIn) -> R<Value> {
 struct ReceiveIn {
     receive_key_file: String,
     share_file: String,
-    election_id: String,
+    params: String,
     trustee_id: usize,
-    threshold: usize,
-    trustees: usize,
+    peers: Vec<dkg::Peer>,
     dealers: Vec<dkg::DealerInput>,
 }
 
 fn dkg_receive(i: ReceiveIn) -> R<Value> {
+    let (election_id, threshold, trustees) = dkg_config(&i.params)?;
     let mut secret = receive_secret(&i.receive_key_file, i.trustee_id)?;
     let received = dkg::receive(
         &dkg::ReceiveRequest {
-            election_id: i.election_id.clone(),
+            election_id: election_id.clone(),
             trustee_id: i.trustee_id,
-            threshold: i.threshold,
-            trustees: i.trustees,
+            threshold,
+            trustees,
+            peers: i.peers,
             dealers: i.dealers,
         },
         &secret,
@@ -449,30 +500,33 @@ fn dkg_receive(i: ReceiveIn) -> R<Value> {
     let vk = codec::point_hex(&received.verification_key);
     let joint = codec::point_hex(&received.joint_public_key);
     let fingerprint = dkg::fingerprint(&received.verification_key);
-    let mut share_hex = codec::scalar_hex(&received.share);
-    let written = write_secret(
-        &i.share_file,
-        &serde_json::to_value(ShareFile {
-            kind: SHARE.into(),
-            election_id: i.election_id.clone(),
-            trustee_id: i.trustee_id,
-            threshold: i.threshold,
-            trustees: i.trustees,
-            share: share_hex.clone(),
-            verification_key: vk.clone(),
-            joint_public_key: joint.clone(),
-            fingerprint: fingerprint.clone(),
-        })
-        .map_err(|e| e.to_string())?,
-    );
-    share_hex.zeroize();
-    written?;
+    let roster_digest = received.roster.digest_hex();
+    let roster_fingerprint = received.roster.fingerprint();
+    let share_hex = Wiped(codec::scalar_hex(&received.share));
+    let file = ShareFile {
+        kind: SHARE.into(),
+        election_id: election_id.clone(),
+        trustee_id: i.trustee_id,
+        threshold,
+        trustees,
+        share: share_hex.0.clone(),
+        verification_key: vk.clone(),
+        joint_public_key: joint.clone(),
+        fingerprint: fingerprint.clone(),
+        roster_digest: roster_digest.clone(),
+    };
+    let value = serde_json::to_value(&file).map_err(|e| e.to_string());
+    drop(file);
+    drop(share_hex);
+    write_secret(&i.share_file, &value?)?;
     Ok(json!({
-        "election_id": i.election_id,
+        "election_id": election_id,
         "trustee_id": i.trustee_id,
         "verification_key": vk,
         "fingerprint": fingerprint,
         "joint_public_key": joint,
+        "roster_digest": roster_digest,
+        "roster_fingerprint": roster_fingerprint,
     }))
 }
 
@@ -542,7 +596,8 @@ fn dkg_transcript(i: TranscriptIn) -> R<Value> {
         threshold: params.threshold as usize,
     }
     .to_protocol_transcript(params.election_id.clone());
-    // Then the auditor's own transcript checks over the result.
+    // Then the auditor's own transcript checks over the result, which also
+    // refuse an identity joint key or verification key.
     let e = LiveElection::from_messages(params, transcript.clone())?;
     Ok(json!({
         "dkg": codec::message_hex(&transcript),
@@ -556,47 +611,48 @@ fn dkg_transcript(i: TranscriptIn) -> R<Value> {
 // Tally
 // ---------------------------------------------------------------------------
 
-#[derive(Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-struct AggregateContest {
-    contest_id: String,
-    pad: String,
-    data: String,
+/// The election and the checked ballot set every tally op works from. The
+/// aggregate is always computed here from the ballot records, never taken
+/// from the caller.
+struct Counted {
+    e: LiveElection,
+    set: BallotSet,
 }
 
-#[derive(Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-struct Aggregate {
-    election_id: String,
-    ballot_count: u64,
-    contests: Vec<AggregateContest>,
-}
-
-impl Aggregate {
-    /// The aggregate as ciphertexts, checked against the election's contests.
-    fn ciphertexts(&self, e: &LiveElection) -> R<Vec<Ciphertext>> {
-        if self.election_id != e.parameters.election_id {
-            return Err(format!("aggregate is for election {:?}", self.election_id));
+impl Counted {
+    fn new(params: &str, dkg: &str, ballots: &[String], allow_empty: bool) -> R<Self> {
+        let e = LiveElection::load(params, dkg)?;
+        if ballots.is_empty() && !allow_empty {
+            return Err(
+                "the ballot list is empty; refusing to decrypt or sign an empty aggregate".into(),
+            );
         }
-        if self.contests.len() != e.parameters.contest_ids.len()
-            || self
-                .contests
-                .iter()
-                .zip(&e.parameters.contest_ids)
-                .any(|(c, id)| &c.contest_id != id)
-        {
-            return Err("aggregate contests are not the election's, in order".into());
-        }
-        self.contests
-            .iter()
-            .map(|c| {
-                Ok(Ciphertext::new(
-                    codec::point(&c.pad, &format!("aggregate {} pad", c.contest_id))?,
-                    codec::point(&c.data, &format!("aggregate {} data", c.contest_id))?,
-                ))
-            })
-            .collect()
+        let set = e.verify_ballot_set(ballots)?;
+        Ok(Self { e, set })
     }
+
+    /// `ballot_count`, `ballots_digest`, `ballots_fingerprint`, `ballots_by_position`.
+    fn summary(&self) -> Value {
+        json!({
+            "ballot_count": self.set.count,
+            "ballots_digest": hex::encode(self.set.digest),
+            "ballots_fingerprint": election::short_fingerprint(&self.set.digest),
+            "ballots_by_position": self.set.by_position,
+        })
+    }
+
+    fn totals(&self, partials: &[PartialDecryption]) -> R<Vec<u64>> {
+        self.e
+            .decrypt_totals(&self.set.aggregate, partials, self.set.count as u64)
+    }
+}
+
+/// `base` with `summary`'s fields merged in.
+fn with_summary(mut base: Value, c: &Counted) -> Value {
+    if let (Some(b), Value::Object(s)) = (base.as_object_mut(), c.summary()) {
+        b.extend(s);
+    }
+    base
 }
 
 #[derive(Deserialize)]
@@ -608,23 +664,21 @@ struct AggregateIn {
 }
 
 fn aggregate(i: AggregateIn) -> R<Value> {
-    let e = LiveElection::load(&i.params, &i.dkg)?;
-    let cts = e.verify_and_aggregate(&i.ballots)?;
-    to_value(Aggregate {
-        election_id: e.parameters.election_id.clone(),
-        ballot_count: i.ballots.len() as u64,
-        contests: e
-            .parameters
+    let c = Counted::new(&i.params, &i.dkg, &i.ballots, true)?;
+    let contests: Vec<Value> =
+        c.e.parameters
             .contest_ids
             .iter()
-            .zip(&cts)
-            .map(|(id, ct)| AggregateContest {
-                contest_id: id.clone(),
-                pad: codec::point_hex(&ct.pad),
-                data: codec::point_hex(&ct.data),
+            .zip(&c.set.aggregate)
+            .map(|(id, ct)| {
+                json!({ "contest_id": id, "pad": codec::point_hex(&ct.pad),
+                    "data": codec::point_hex(&ct.data) })
             })
-            .collect(),
-    })
+            .collect();
+    Ok(with_summary(
+        json!({ "election_id": c.e.parameters.election_id, "contests": contests }),
+        &c,
+    ))
 }
 
 /// The share file's trustee, checked against the election and its transcript.
@@ -652,22 +706,24 @@ struct PartialIn {
     share_file: String,
     params: String,
     dkg: String,
-    aggregate: Aggregate,
+    ballots: Vec<String>,
 }
 
 fn partial(i: PartialIn) -> R<Value> {
-    let e = LiveElection::load(&i.params, &i.dkg)?;
-    let cts = i.aggregate.ciphertexts(&e)?;
+    let c = Counted::new(&i.params, &i.dkg, &i.ballots, false)?;
+    let e = &c.e;
+    let cts = &c.set.aggregate;
     let share = read_share(&i.share_file)?;
-    let (trustee_id, vk) = trustee_of(&e, &share)?;
+    let (trustee_id, vk) = trustee_of(e, &share)?;
     // Wiped on every return path, including the early ones.
     let secret_hex = Wiped(codec::scalar_hex(&share.value));
     let mut partials = Vec::with_capacity(cts.len());
     let mut produced = Vec::with_capacity(cts.len());
-    for (contest_id, ct) in e.parameters.contest_ids.iter().zip(&cts) {
+    for (contest_id, ct) in e.parameters.contest_ids.iter().zip(cts) {
         // The auditor's context bytes; `partial_decrypt_v2` takes them as a
-        // string. Ids are ASCII and at most 64 bytes, so every length prefix
-        // is one ASCII byte and the conversion is lossless.
+        // string. `election-params` caps contest ids at 127 bytes and trustee
+        // ids are short, so every length prefix is ASCII and the conversion
+        // is lossless.
         let context = String::from_utf8(cp_context(&trustee_id, contest_id))
             .map_err(|_| format!("contest {contest_id}: context is not UTF-8"))?;
         let dto = saksi_ffi_tauri::commands::partial_decrypt_v2(
@@ -699,7 +755,7 @@ fn partial(i: PartialIn) -> R<Value> {
     }
     drop(secret_hex);
     // Self-check: every proof verifies exactly as the auditor will check it.
-    for (pd, ct) in produced.iter().zip(&cts) {
+    for (pd, ct) in produced.iter().zip(cts) {
         let proof = ChaumPedersenProof::from_wire(pd.proof.as_ref().expect("set above"))
             .map_err(|e| e.to_string())?;
         let point = codec::point(&hex::encode(&pd.share), "share")?;
@@ -713,9 +769,10 @@ fn partial(i: PartialIn) -> R<Value> {
             )
             .map_err(|_| format!("contest {}: own partial does not verify", pd.contest_id))?;
     }
-    Ok(
+    Ok(with_summary(
         json!({ "election_id": e.parameters.election_id, "trustee_id": trustee_id, "partials": partials }),
-    )
+        &c,
+    ))
 }
 
 fn decode_partials(partials: &[String]) -> R<Vec<PartialDecryption>> {
@@ -731,30 +788,24 @@ fn decode_partials(partials: &[String]) -> R<Vec<PartialDecryption>> {
 struct CombineIn {
     params: String,
     dkg: String,
-    aggregate: Aggregate,
+    ballots: Vec<String>,
     partials: Vec<String>,
 }
 
-fn totals_of(
-    e: &LiveElection,
-    aggregate: &Aggregate,
-    partials: &[PartialDecryption],
-) -> R<Vec<u64>> {
-    let cts = aggregate.ciphertexts(e)?;
-    e.decrypt_totals(&cts, partials, aggregate.ballot_count)
-}
-
 fn combine(i: CombineIn) -> R<Value> {
-    let e = LiveElection::load(&i.params, &i.dkg)?;
-    let totals = totals_of(&e, &i.aggregate, &decode_partials(&i.partials)?)?;
-    let contests: Vec<Value> = e
-        .parameters
-        .contest_ids
-        .iter()
-        .zip(&totals)
-        .map(|(id, t)| json!({ "contest_id": id, "total": t }))
-        .collect();
-    Ok(json!({ "election_id": e.parameters.election_id, "totals": totals, "contests": contests }))
+    let c = Counted::new(&i.params, &i.dkg, &i.ballots, false)?;
+    let totals = c.totals(&decode_partials(&i.partials)?)?;
+    let contests: Vec<Value> =
+        c.e.parameters
+            .contest_ids
+            .iter()
+            .zip(&totals)
+            .map(|(id, t)| json!({ "contest_id": id, "total": t }))
+            .collect();
+    Ok(with_summary(
+        json!({ "election_id": c.e.parameters.election_id, "totals": totals, "contests": contests }),
+        &c,
+    ))
 }
 
 #[derive(Deserialize)]
@@ -763,15 +814,16 @@ struct SignIn2 {
     share_file: String,
     params: String,
     dkg: String,
-    aggregate: Aggregate,
+    ballots: Vec<String>,
     partials: Vec<String>,
     totals: Vec<u64>,
 }
 
 fn sign_tally(i: SignIn2) -> R<Value> {
-    let e = LiveElection::load(&i.params, &i.dkg)?;
-    // A trustee signs only totals it recomputed itself from the partials.
-    let totals = totals_of(&e, &i.aggregate, &decode_partials(&i.partials)?)?;
+    let c = Counted::new(&i.params, &i.dkg, &i.ballots, false)?;
+    // A trustee signs only totals it recomputed itself, from its own
+    // aggregate of the ballot records and the partials.
+    let totals = c.totals(&decode_partials(&i.partials)?)?;
     if totals != i.totals {
         return Err(format!(
             "the totals to sign {:?} differ from the totals the partials decrypt to {totals:?}",
@@ -779,15 +831,18 @@ fn sign_tally(i: SignIn2) -> R<Value> {
         ));
     }
     let share = read_share(&i.share_file)?;
-    let (trustee_id, vk) = trustee_of(&e, &share)?;
-    let context = e.tally_sig_context(&totals);
+    let (trustee_id, vk) = trustee_of(&c.e, &share)?;
+    let context = c.e.tally_sig_context(&totals);
     let proof = SchnorrProof::prove(&basepoint(), &vk, &share.value, &context, &mut OsRng);
-    Ok(json!({
-        "election_id": e.parameters.election_id,
-        "trustee_id": trustee_id,
-        "totals": totals,
-        "signature": hex::encode(proof.to_bytes()),
-    }))
+    Ok(with_summary(
+        json!({
+            "election_id": c.e.parameters.election_id,
+            "trustee_id": trustee_id,
+            "totals": totals,
+            "signature": hex::encode(proof.to_bytes()),
+        }),
+        &c,
+    ))
 }
 
 #[derive(Deserialize)]
@@ -802,16 +857,17 @@ struct SignatureIn {
 struct AssembleIn {
     params: String,
     dkg: String,
-    aggregate: Aggregate,
+    ballots: Vec<String>,
     partials: Vec<String>,
     totals: Vec<u64>,
     signatures: Vec<SignatureIn>,
 }
 
 fn tally_assemble(i: AssembleIn) -> R<Value> {
-    let e = LiveElection::load(&i.params, &i.dkg)?;
+    let c = Counted::new(&i.params, &i.dkg, &i.ballots, false)?;
+    let e = &c.e;
     let partials = decode_partials(&i.partials)?;
-    let totals = totals_of(&e, &i.aggregate, &partials)?;
+    let totals = c.totals(&partials)?;
     if totals != i.totals {
         return Err(format!(
             "totals {:?} differ from the decrypted {totals:?}",
@@ -852,16 +908,19 @@ fn tally_assemble(i: AssembleIn) -> R<Value> {
         partial_decryptions: partials,
         signatures,
     };
-    Ok(json!({
-        "tally": codec::message_hex(&tally),
-        "election_id": e.parameters.election_id,
-        "totals": totals,
-        "signatures": i.signatures.len(),
-        "threshold": threshold,
-        // Deliberately not enforced here: the console may assemble a tally
-        // below threshold to show the chaincode refusing it.
-        "meets_threshold": i.signatures.len() >= threshold,
-    }))
+    Ok(with_summary(
+        json!({
+            "tally": codec::message_hex(&tally),
+            "election_id": e.parameters.election_id,
+            "totals": totals,
+            "signatures": i.signatures.len(),
+            "threshold": threshold,
+            // Deliberately not enforced here: the console may assemble a tally
+            // below threshold to show the chaincode refusing it.
+            "meets_threshold": i.signatures.len() >= threshold,
+        }),
+        &c,
+    ))
 }
 
 // ---------------------------------------------------------------------------
