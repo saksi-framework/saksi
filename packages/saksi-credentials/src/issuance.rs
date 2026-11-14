@@ -439,6 +439,85 @@ pub fn voter_finalize_issuance(
 }
 
 // ---------------------------------------------------------------------------
+// Export of secret parts (feature `export`)
+// ---------------------------------------------------------------------------
+//
+// The issuance protocol runs across separate processes in the live demo: the
+// voter's steps run in the phone's WebAssembly between HTTP round trips, and
+// the issuer's two steps run as two `saksi-demo live` invocations. Each side
+// therefore has to persist its in-between state. These accessors hand out the
+// raw scalars for that and nothing else; the protocol functions above stay the
+// only way to compute a step. Without the feature none of this is compiled and
+// no secret scalar leaves the crate.
+
+#[cfg(feature = "export")]
+impl Credential {
+    /// The credential's parts `(s_cred, R', s_sig)`, the inverse of
+    /// [`Credential::from_parts`]. `s_cred` is the voter's secret: whoever
+    /// holds it can vote with this credential.
+    pub fn to_parts(&self) -> (Scalar, RistrettoPoint, Scalar) {
+        (self.s_cred, self.signature_r, self.signature_s)
+    }
+}
+
+#[cfg(feature = "export")]
+impl VoterBlindState {
+    /// The voter's state after step 1: `(s_cred, b)`. The commitment is
+    /// `s_cred · G` and is recomputed by [`VoterBlindState::from_parts`].
+    pub fn to_parts(&self) -> (Scalar, Scalar) {
+        (self.s_cred, self.b)
+    }
+
+    /// Rebuilds the state [`voter_begin_issuance`] returned from its parts.
+    pub fn from_parts(s_cred: Scalar, b: Scalar) -> Self {
+        Self {
+            s_cred,
+            commitment: s_cred * basepoint(),
+            b,
+        }
+    }
+}
+
+#[cfg(feature = "export")]
+impl VoterFinalizeState {
+    /// The voter's state after step 2: `(s_cred, R', α, β)`.
+    pub fn to_parts(&self) -> (Scalar, RistrettoPoint, Scalar, Scalar) {
+        (self.s_cred, self.r_prime, self.alpha, self.beta)
+    }
+
+    /// Rebuilds the state [`voter_blind_challenge`] returned from its parts.
+    pub fn from_parts(
+        s_cred: Scalar,
+        r_prime: RistrettoPoint,
+        alpha: Scalar,
+        beta: Scalar,
+    ) -> Self {
+        Self {
+            s_cred,
+            commitment: s_cred * basepoint(),
+            r_prime,
+            alpha,
+            beta,
+        }
+    }
+}
+
+#[cfg(feature = "export")]
+impl IssuerSession {
+    /// The session nonce `k`. **Use a session at most once:** two
+    /// [`issuer_sign`] calls on the same `k` with different challenges reveal
+    /// the issuer's secret key.
+    pub fn to_scalar(&self) -> Scalar {
+        self.k
+    }
+
+    /// Rebuilds the session [`issuer_pre_sign`] returned from its nonce.
+    pub fn from_scalar(k: Scalar) -> Self {
+        Self { k }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
 
