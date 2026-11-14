@@ -81,9 +81,19 @@ func (L *liveService) relayBallot(ballotHex string) (*LiveBallotReceipt, error) 
 		return nil, badRequestf("ballot is not valid hex")
 	}
 
-	// The exact string the phone sent goes to the chain. It is decoded only to
-	// read the nullifier for the read-back; a record that does not decode is
-	// still relayed, and the chaincode's decode gate answers it.
+	// A copy is decoded to check that the record is for this election: the
+	// chaincode files a ballot under the election named inside it, so without
+	// this check the console would relay anonymous ballots into any open
+	// election on the channel and file them in this run. A record that does
+	// not decode is still relayed, and the chaincode's decode gate answers it.
+	var pre pb.Ballot
+	if proto.Unmarshal(raw, &pre) == nil && pre.ElectionId != electionID {
+		return nil, errBadRequest{code: "wrong-election",
+			msg: fmt.Sprintf("the ballot is for election %q, not the live election %q; it was not relayed", pre.ElectionId, electionID)}
+	}
+
+	// The exact string the phone sent goes to the chain, never a re-encoding.
+	// The copy is used only to read the nullifier for the read-back.
 	rc, err := L.chainSubmit("SubmitBallot", ballotHex)
 	if err != nil {
 		return nil, err

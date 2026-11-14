@@ -1,6 +1,7 @@
 package campaign
 
 import (
+	"bytes"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -244,5 +245,43 @@ func TestLiveTallyAlreadyOnTheChain(t *testing.T) {
 	code, res := d.do(http.MethodPost, "/api/live/tally/publish", "admin", nil)
 	if code != http.StatusConflict || !strings.Contains(res["error"].(string), "different tally") || d.state() != LiveClosed {
 		t.Fatalf("other totals on the chain: %d %v, state %s", code, res, d.state())
+	}
+}
+
+// S4: a ballot naming another election is refused with a stable code before
+// it reaches the chain, and nothing is filed. A record that does not decode
+// is still relayed unchanged, so the chain's own gate answers it.
+func TestLiveBallotForAnotherElectionIsNotRelayed(t *testing.T) {
+	fx := newLiveFixture(t)
+	c := fx.console()
+	runID := c.toState(LiveOpen)
+	// Another open election on the same channel.
+	other, _ := proto.Marshal(&pb.ElectionParameters{Version: 1, ElectionId: "study-other"})
+	if _, err := fx.chain.oracleChain.Submit("CreateElection", hex.EncodeToString(other)); err != nil {
+		t.Fatal(err)
+	}
+	submits := len(fx.chain.oracleChain.submits)
+	csvBefore, _ := os.ReadFile(filepath.Join(fx.runs, runID, BallotsCSV))
+	code, out := c.do(http.MethodPost, "/api/live/ballot", "", map[string]string{"ballot": fakeBallot("study-other", "president", 7, nil)})
+	if code != http.StatusBadRequest || out["code"] != "wrong-election" {
+		t.Fatalf("a ballot for another election: %d %v", code, out)
+	}
+	if len(fx.chain.oracleChain.submits) != submits {
+		t.Fatal("a ballot for another election was submitted")
+	}
+	csvAfter, _ := os.ReadFile(filepath.Join(fx.runs, runID, BallotsCSV))
+	if !bytes.Equal(csvBefore, csvAfter) || c.s.live.snapshot().Ballots != 1 {
+		t.Fatal("a ballot for another election was filed in this run")
+	}
+
+	// Bytes that are not a Ballot go to the chain exactly as posted.
+	junk := "ffff"
+	code, out = c.do(http.MethodPost, "/api/live/ballot", "", map[string]string{"ballot": junk})
+	if code != http.StatusUnprocessableEntity || out["gate"] != "decode" {
+		t.Fatalf("an undecodable record: %d %v", code, out)
+	}
+	last := fx.chain.oracleChain.bytesIn[len(fx.chain.oracleChain.bytesIn)-1]
+	if hex.EncodeToString(last) != junk {
+		t.Fatalf("the chain got %x, not the posted bytes", last)
 	}
 }

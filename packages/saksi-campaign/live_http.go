@@ -54,7 +54,11 @@ func liveFail(w http.ResponseWriter, err error) {
 	case errors.As(err, &conflict):
 		writeJSONResp(w, http.StatusConflict, map[string]string{"error": conflict.msg})
 	case errors.As(err, &bad):
-		writeJSONResp(w, http.StatusBadRequest, map[string]string{"error": bad.msg})
+		body := map[string]string{"error": bad.msg}
+		if bad.code != "" {
+			body["code"] = bad.code
+		}
+		writeJSONResp(w, http.StatusBadRequest, body)
 	case errors.As(err, &forbidden):
 		writeJSONResp(w, http.StatusForbidden, map[string]string{"error": forbidden.msg})
 	case errors.As(err, &notFound):

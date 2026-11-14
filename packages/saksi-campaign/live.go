@@ -501,13 +501,17 @@ func (e errConflict) Error() string { return e.msg }
 
 func conflictf(format string, args ...any) error { return errConflict{fmt.Sprintf(format, args...)} }
 
-// errBadRequest is a malformed request: 400 with this reason.
-type errBadRequest struct{ msg string }
+// errBadRequest is a malformed request: 400 with this reason, and a stable
+// short code when one is set.
+type errBadRequest struct {
+	msg  string
+	code string
+}
 
 func (e errBadRequest) Error() string { return e.msg }
 
 func badRequestf(format string, args ...any) error {
-	return errBadRequest{fmt.Sprintf(format, args...)}
+	return errBadRequest{msg: fmt.Sprintf(format, args...)}
 }
 
 // errRefused is the chaincode refusing a transaction: 422 with its own words.
