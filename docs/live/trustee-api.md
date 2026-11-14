@@ -410,7 +410,7 @@ Fields:
 | `fingerprints` | 128-bit fingerprints of this trustee's receive key, the roster digest, its key share, the joint key and the ballot set. Compare them aloud with the other trustee pages, the board and the phones. |
 | `ceremony.roster[].peer_check` | `self`; `pending` (not checked yet); `ok`; `waiting` (with `detail`); `mismatch` (with `detail`, and an alarm). |
 | `ceremony.transcript_check` | `""` (not yet), `ok`, `mismatch`. |
-| `decryption.peer_checks[].state` | `ok`, `waiting` (the peer has no set yet, or is unreachable; not waited for), `mismatch`. |
+| `decryption.peer_checks[].state` | `ok` (same set); `waiting` (the peer has no set for this election yet, or its `--peers` URL answers as another trustee; not waited for); `reported` (the peer states a set and this trustee has none of its own to compare; `detail` names the peer's set); `unreachable` (the peer did not answer; `detail` says how); `mismatch` (with an alarm). Read again from every peer on each poll from the close on (one `GET /api/trustee/peer` per other trustee per poll, 3 s timeout), and at this trustee's own decrypt. |
 | `decryption.partial_read_back` | `""`, `ok`, `mismatch`. |
 | `tally.totals` | This trustee's own combine, in `contest_ids` order; `[]` until it ran. |
 | `tally.ready_to_sign` | Totals are shown, Sign was not pressed, nothing blocks it. |

@@ -1389,3 +1389,65 @@ func TestTrusteeWrongPeerURLWaits(t *testing.T) {
 	f.restart(4)
 	f.waitStep(4, "join", stepDone)
 }
+
+// I1 (rehearsal 1): a trustee's view of its peers' ballot sets is read again
+// on every poll from the close on, not only at its own decrypt. A peer that
+// decrypts later shows as the same ballots; a trustee that never decrypts
+// still reports what each peer states; a peer that does not answer says so.
+func TestTrusteePeerBallotChecksFollowLaterDecrypts(t *testing.T) {
+	b := newTrusteeTestBed(t, fleetOptions{})
+	f := b.f
+	b.setup()
+	f.ceremony()
+	b.vote()
+	b.close()
+	peer := func(st TrusteeStatus, id int) TrusteePeerBallotCheck {
+		for _, c := range st.Decryption.PeerChecks {
+			if c.TrusteeID == id {
+				return c
+			}
+		}
+		return TrusteePeerBallotCheck{TrusteeID: id}
+	}
+	// Before anyone decrypts, a closed election already shows each peer's
+	// statement: none has a ballot set yet.
+	f.waitFor(4, "peers read after the close", func(st TrusteeStatus) bool {
+		return peer(st, 1).State == "waiting" && peer(st, 5).State == "waiting"
+	})
+	// Trustee 1 decrypts first. Trustee 4, with no set of its own yet (its
+	// combine waits for the threshold), reports trustee 1's set as stated.
+	one := f.decrypt(1)
+	st := f.waitFor(4, "peer 1 reported", func(st TrusteeStatus) bool { return peer(st, 1).State == "reported" })
+	if c := peer(st, 1); !strings.Contains(c.Detail, one.Fingerprints.Ballots) {
+		t.Fatalf("trustee 4 on peer 1: %+v, want ballot set %s named", c, one.Fingerprints.Ballots)
+	}
+	if c := peer(st, 2); c.State != "waiting" || !strings.Contains(c.Detail, "no ballot set") {
+		t.Fatalf("trustee 4 on peer 2: %+v", c)
+	}
+	// Trustees 2 and 3 decrypt after trustee 1: trustee 1 sees them.
+	f.decrypt(2)
+	f.decrypt(3)
+	f.waitFor(1, "peers 2 and 3 with the same ballots", func(st TrusteeStatus) bool {
+		return peer(st, 2).State == "ok" && peer(st, 3).State == "ok"
+	})
+	// After the threshold every trustee combines over the chain's set, so
+	// trustee 4, which never decrypted, ends with the same set as every peer.
+	st = f.waitFor(4, "every peer with the same ballots", func(st TrusteeStatus) bool {
+		for _, id := range []int{1, 2, 3, 5} {
+			if peer(st, id).State != "ok" {
+				return false
+			}
+		}
+		return true
+	})
+	if len(st.Alarms) != 0 {
+		t.Fatalf("trustee 4 alarms: %+v", st.Alarms)
+	}
+	// Trustee 5's process stops answering: the others say it cannot be reached.
+	f.procs[4].T.Close()
+	f.procs[4].handler.Store(nil)
+	st = f.waitFor(1, "peer 5 unreachable", func(st TrusteeStatus) bool { return peer(st, 5).State == "unreachable" })
+	if c := peer(st, 5); !strings.Contains(c.Detail, "not reachable") {
+		t.Fatalf("trustee 1 on peer 5: %+v", c)
+	}
+}

@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"maps"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -142,7 +143,7 @@ type stepStatus struct {
 
 // peerCheck is one peer's comparison result.
 type peerCheck struct {
-	State  string `json:"state"` // ok, waiting, mismatch
+	State  string `json:"state"` // ok, waiting, mismatch; ballot checks also reported, unreachable
 	Detail string `json:"detail,omitempty"`
 }
 
@@ -714,6 +715,9 @@ func (T *TrusteeService) tick(ctx context.Context) error {
 		if err := T.runStep(ctx, "join", func() error { return T.advanceJoin(ctx, v) }); err != nil {
 			return err
 		}
+	}
+	if liveStateIndex(v.State) >= liveStateIndex(LiveClosed) {
+		T.refreshPeersBallots(ctx)
 	}
 	if decrypt {
 		if err := T.runStep(ctx, "decrypt", func() error { return T.advanceDecrypt(ctx) }); err != nil {
@@ -1778,13 +1782,27 @@ func (T *TrusteeService) readBackPartial() error {
 // checkPeersBallots compares this trustee's ballot-set digest with every
 // other trustee that has one for this election. A difference refuses the
 // decryption; a peer that has none yet is not waited for, because every
-// trustee reads the set from the chain itself.
+// trustee reads the set from the chain itself. Before this trustee has a set
+// of its own, a peer's set is reported, not compared.
 func (T *TrusteeService) checkPeersBallots(ctx context.Context) error {
-	p := T.p
+	checks, alarm := T.readPeersBallots(ctx)
+	if err := T.update(func(p *trusteeProgress) { p.PeerBallotChecks = checks }); err != nil {
+		return err
+	}
+	return alarm
+}
+
+// readPeersBallots reads every other trustee's own statement of its ballot
+// set and compares it with this trustee's.
+func (T *TrusteeService) readPeersBallots(ctx context.Context) (map[string]peerCheck, error) {
+	T.mu.Lock()
+	n, eid := T.p.Trustees, T.p.ElectionID
+	digest, fp := T.p.BallotsDigest, T.p.BallotsFingerprint
+	T.mu.Unlock()
 	checks := map[string]peerCheck{}
 	var alarm error
 	var others []livePeer
-	for id := 1; id <= p.Trustees; id++ {
+	for id := 1; id <= n; id++ {
 		if id != T.id {
 			others = append(others, livePeer{TrusteeID: id})
 		}
@@ -1796,13 +1814,15 @@ func (T *TrusteeService) checkPeersBallots(ctx context.Context) error {
 		v, err := views[i], errs[i]
 		switch {
 		case err != nil:
-			checks[key] = peerCheck{State: "waiting", Detail: "not reachable: " + err.Error()}
+			checks[key] = peerCheck{State: "unreachable", Detail: "not reachable: " + err.Error()}
 		case v.TrusteeID != id:
 			checks[key] = peerCheck{State: "waiting", Detail: fmt.Sprintf("the --peers URL for trustee %d answers as trustee %d", id, v.TrusteeID)}
-		case v.ElectionID != p.ElectionID || v.BallotsDigest == "":
+		case v.ElectionID != eid || v.BallotsDigest == "":
 			checks[key] = peerCheck{State: "waiting", Detail: "it has no ballot set for this election yet"}
-		case !strings.EqualFold(v.BallotsDigest, p.BallotsDigest):
-			checks[key] = peerCheck{State: "mismatch", Detail: fmt.Sprintf("trustee %d read ballot set %s, this trustee %s", id, v.BallotsFingerprint, p.BallotsFingerprint)}
+		case digest == "":
+			checks[key] = peerCheck{State: "reported", Detail: fmt.Sprintf("trustee %d read ballot set %s; this trustee has not read one to compare", id, v.BallotsFingerprint)}
+		case !strings.EqualFold(v.BallotsDigest, digest):
+			checks[key] = peerCheck{State: "mismatch", Detail: fmt.Sprintf("trustee %d read ballot set %s, this trustee %s", id, v.BallotsFingerprint, fp)}
 			if alarm == nil {
 				alarm = tAlarm{"ballots-peer-" + key, checks[key].Detail, []string{"decrypt", "sign"}}
 			}
@@ -1810,10 +1830,40 @@ func (T *TrusteeService) checkPeersBallots(ctx context.Context) error {
 			checks[key] = peerCheck{State: "ok"}
 		}
 	}
-	if err := T.update(func(p *trusteeProgress) { p.PeerBallotChecks = checks }); err != nil {
-		return err
+	return checks, alarm
+}
+
+// trusteePeerRefreshTimeout bounds the poll's peer reads, so a peer that
+// hangs delays this trustee's own steps by at most this much per poll.
+const trusteePeerRefreshTimeout = 3 * time.Second
+
+// refreshPeersBallots reads the peers' ballot sets again on every poll from
+// the close on, so the roster follows peers that decrypt after this trustee
+// (or while it never does). It costs one GET /api/trustee/peer per other
+// trustee per poll, to the trustee processes only; the progress file is
+// written only when a check changed.
+func (T *TrusteeService) refreshPeersBallots(ctx context.Context) {
+	c, cancel := context.WithTimeout(ctx, trusteePeerRefreshTimeout)
+	defer cancel()
+	checks, alarm := T.readPeersBallots(c)
+	if ctx.Err() != nil {
+		return
 	}
-	return alarm
+	T.mu.Lock()
+	same := maps.Equal(T.p.PeerBallotChecks, checks)
+	T.mu.Unlock()
+	if !same {
+		_ = T.update(func(p *trusteeProgress) { p.PeerBallotChecks = checks })
+	}
+	var a tAlarm
+	if errors.As(alarm, &a) {
+		T.mu.Lock()
+		known := slices.ContainsFunc(T.p.Alarms, func(x trusteeAlarm) bool { return x.Code == a.code })
+		T.mu.Unlock()
+		if !known {
+			T.raise(a.code, a.msg, a.blocks...)
+		}
+	}
 }
 
 // --- step 3: combine (automatic) and sign (on the trustee's press) -----------
