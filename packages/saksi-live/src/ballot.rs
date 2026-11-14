@@ -55,8 +55,13 @@ pub struct BallotResponse {
     pub contest_ids: Vec<String>,
     /// Hex nullifier (32 bytes) of this record.
     pub nullifier: String,
-    /// `BC-XXXX-XXXX`, the first 8 hex digits of the nullifier.
+    /// `BC-XXXX-XXXX`, the first 8 hex digits of the nullifier. It names the
+    /// voter's slot for this position (every ballot this voter builds for
+    /// the position has it), not this particular ballot.
     pub tracking_code: String,
+    /// [`ballot_fingerprint`] of this record: names this particular ballot.
+    /// The phone shows it before the voter chooses cast or challenge.
+    pub ballot_fingerprint: String,
 }
 
 /// `kind` of a [`BallotOpening`].
@@ -83,10 +88,26 @@ pub struct BallotOpening {
     pub randomness: Vec<String>,
 }
 
+fn digest_bytes(ballot_bytes: &[u8]) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(ballot_bytes).into()
+}
+
 /// SHA-256 of a ballot's protobuf bytes, hex.
 pub fn ballot_digest(ballot_bytes: &[u8]) -> String {
-    use sha2::{Digest, Sha256};
-    hex::encode(Sha256::digest(ballot_bytes))
+    hex::encode(digest_bytes(ballot_bytes))
+}
+
+/// The per-ballot fingerprint people compare: `SHA-256(ballot bytes)`, the
+/// same digest as [`ballot_digest`], shown as
+/// [`crate::election::short_fingerprint`] (first 16 bytes, eight groups of
+/// four upper-case hex digits). `ballot bytes` are the record's protobuf
+/// encoding exactly as submitted, which is what the chaincode stores and
+/// `GetBallot` returns (hex), so anyone holding the record can recompute it.
+/// Two ballots for the same voter and position share a tracking code but,
+/// with fresh randomness, never a fingerprint.
+pub fn ballot_fingerprint(ballot_bytes: &[u8]) -> String {
+    crate::election::short_fingerprint(&digest_bytes(ballot_bytes))
 }
 
 /// Builds one ballot record. Refuses a credential the election's issuer did
@@ -222,8 +243,10 @@ fn build(
         position_id: req.position_id.clone(),
         selection_proof: Some(selection.to_wire()),
     };
+    let bytes = prost::Message::encode_to_vec(&ballot);
     Ok(BallotResponse {
-        ballot: codec::message_hex(&ballot),
+        ballot: hex::encode(&bytes),
+        ballot_fingerprint: ballot_fingerprint(&bytes),
         election_id: params.election_id,
         position_id: req.position_id.clone(),
         contest_ids: contests,
@@ -247,6 +270,7 @@ mod tests {
             assert_eq!(plain.ballot, with.ballot, "{position}/{choice}");
             assert_eq!(plain.nullifier, with.nullifier);
             assert_eq!(plain.tracking_code, with.tracking_code);
+            assert_eq!(plain.ballot_fingerprint, with.ballot_fingerprint);
             assert_eq!(opening.kind, OPENING_KIND);
             assert_eq!(opening.choice, choice);
             assert_eq!(opening.randomness.len(), 3);
@@ -259,8 +283,19 @@ mod tests {
             // does not.
             let other = build_ballot(&req, &mut StreamRng::new(8)).unwrap();
             assert_ne!(other.ballot, plain.ballot);
-            // The nullifier is per voter per position, not per ballot.
+            // The nullifier, and so the tracking code, is per voter per
+            // position; the ballot fingerprint is per ballot.
             assert_eq!(other.nullifier, plain.nullifier);
+            assert_eq!(other.tracking_code, plain.tracking_code);
+            assert_ne!(other.ballot_fingerprint, plain.ballot_fingerprint);
+            // Anyone can recompute it from the record bytes alone.
+            let bytes = hex::decode(&plain.ballot).unwrap();
+            assert_eq!(plain.ballot_fingerprint, ballot_fingerprint(&bytes));
+            assert_eq!(plain.ballot_fingerprint.len(), 39);
+            assert_eq!(
+                plain.ballot_fingerprint.replace('-', ""),
+                opening.ballot_digest[..32].to_uppercase()
+            );
         }
     }
 

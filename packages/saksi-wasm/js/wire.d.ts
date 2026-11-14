@@ -128,7 +128,10 @@ export interface BuildBallotOutput {
   position_id: string;
   contest_ids: string[];
   nullifier: Hex;
+  /** The voter's slot for this position: the same for every ballot this voter builds for it. */
   tracking_code: string;
+  /** Names this particular ballot. Show it before the voter chooses cast or challenge. */
+  ballot_fingerprint: string;
   opening: BallotOpening;
 }
 
@@ -167,8 +170,11 @@ export interface SlotCheck {
 
 export interface BenalohCheckOutput {
   valid: boolean;
+  /** Compare with the position the voter was voting in. */
   position_id: string;
   tracking_code: string;
+  /** The fingerprint of the ballot actually checked: compare with the one shown before the challenge. */
+  ballot_fingerprint: string;
   slots: SlotCheck[];
   encoded_choice: number | null;
   encoded_candidate: string | null;

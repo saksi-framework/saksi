@@ -41,7 +41,11 @@ if ! grep -q "wasm-bindgen = \"=$WASM_BINDGEN_VERSION\"" "$crate/Cargo.toml"; th
 fi
 
 git_rev="$(git -C "$repo" rev-parse --short HEAD 2>/dev/null || echo unknown)"
-if [ -n "$(git -C "$repo" status --porcelain -- packages 2>/dev/null)" ]; then
+# Dirty if anything git tracks or could track changed (sources, Cargo.toml,
+# Cargo.lock, these scripts, the proto files). Ignored build output (target/,
+# pkg/, tools/live/.tools) does not count. This over-reports rather than ever
+# calling a modified build clean.
+if [ -n "$(git -C "$repo" status --porcelain 2>/dev/null)" ]; then
   git_rev="$git_rev-dirty"
 fi
 

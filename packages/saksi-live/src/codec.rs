@@ -9,6 +9,7 @@
 use curve25519_dalek::{ristretto::RistrettoPoint, scalar::Scalar};
 use prost::Message;
 use saksi_crypto::group::{compress_point, point_from_compressed, scalar_from_canonical_bytes};
+use zeroize::Zeroize;
 
 /// Errors from this crate are plain strings: they cross a process or a
 /// WebAssembly boundary as `{"error": "..."}` and never carry secret material.
@@ -19,9 +20,13 @@ pub fn point_hex(point: &RistrettoPoint) -> String {
     hex::encode(compress_point(point))
 }
 
-/// Lowercase hex of a canonical scalar.
+/// Lowercase hex of a canonical scalar. The byte copy is wiped, since the
+/// scalar may be a secret.
 pub fn scalar_hex(scalar: &Scalar) -> String {
-    hex::encode(scalar.to_bytes())
+    let mut b = scalar.to_bytes();
+    let h = hex::encode(b);
+    b.zeroize();
+    h
 }
 
 /// Decodes `value` as hex bytes. `what` names the field in the error.
@@ -31,11 +36,14 @@ pub fn bytes(value: &str, what: &str) -> LiveResult<Vec<u8>> {
     hex::decode(value.trim()).map_err(|_| format!("{what} is not valid hex"))
 }
 
-/// Decodes exactly 32 hex bytes.
+/// Decodes exactly 32 hex bytes. The intermediate buffer is wiped, since the
+/// value may be a secret scalar.
 pub fn bytes32(value: &str, what: &str) -> LiveResult<[u8; 32]> {
-    let raw = bytes(value, what)?;
-    <[u8; 32]>::try_from(raw.as_slice())
-        .map_err(|_| format!("{what} is {} bytes, want 32", raw.len()))
+    let mut raw = bytes(value, what)?;
+    let out = <[u8; 32]>::try_from(raw.as_slice())
+        .map_err(|_| format!("{what} is {} bytes, want 32", raw.len()));
+    raw.zeroize();
+    out
 }
 
 /// Decodes a compressed ristretto255 point.
@@ -57,8 +65,11 @@ pub fn nonzero_point(value: &str, what: &str) -> LiveResult<RistrettoPoint> {
 
 /// Decodes a canonical scalar.
 pub fn scalar(value: &str, what: &str) -> LiveResult<Scalar> {
-    scalar_from_canonical_bytes(bytes32(value, what)?)
-        .map_err(|_| format!("{what} is not a canonical scalar"))
+    let mut raw = bytes32(value, what)?;
+    let s =
+        scalar_from_canonical_bytes(raw).map_err(|_| format!("{what} is not a canonical scalar"));
+    raw.zeroize();
+    s
 }
 
 /// Lowercase hex of a protobuf message's canonical encoding.

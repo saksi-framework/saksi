@@ -18,6 +18,7 @@ import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { createHash } from "node:crypto";
 import { createRequire } from "node:module";
 import { pathToFileURL } from "node:url";
 import { performance } from "node:perf_hooks";
@@ -63,6 +64,9 @@ function cli(op, input) {
 }
 
 const dir = fs.mkdtempSync(path.join(os.tmpdir(), "saksi-wasm-flow-"));
+// The folder holds test issuer and trustee keys: remove it however the run
+// ends (a failed assertion exits through here too).
+process.on("exit", () => fs.rmSync(dir, { recursive: true, force: true }));
 const file = (name) => path.join(dir, name);
 
 // ---------------------------------------------------------------------------
@@ -310,7 +314,30 @@ check("build_ballot in wasm: the CLI ballot output plus an opening", () => {
   }
 });
 
+// The ballot fingerprint, as the board or the console would compute it from
+// the chain record: SHA-256 of the record bytes, first 16 bytes, upper hex in
+// groups of four.
+const fingerprintOf = (ballotHex) =>
+  createHash("sha256")
+    .update(Buffer.from(ballotHex, "hex"))
+    .digest("hex")
+    .slice(0, 32)
+    .toUpperCase()
+    .match(/.{4}/g)
+    .join("-");
+
+check("ballot_fingerprint names the ballot; the tracking code names the voter's slot", () => {
+  const again = saksi.build_ballot({ params, dkg, credential, position_id: "president", choice: 1 });
+  assert.equal(again.tracking_code, wasmBallots[0].tracking_code);
+  assert.equal(again.nullifier, wasmBallots[0].nullifier);
+  assert.notEqual(again.ballot_fingerprint, wasmBallots[0].ballot_fingerprint);
+  for (const b of [...wasmBallots, again]) {
+    assert.equal(b.ballot_fingerprint, fingerprintOf(b.ballot));
+  }
+});
+
 const cliBallots = [];
+// (Each CLI ballot's fingerprint is checked against the record bytes below.)
 for (const tag of ["b", "c"]) {
   const cred = cliIssue(tag);
   POSITIONS.forEach((p, k) =>
@@ -320,6 +347,9 @@ for (const tag of ["b", "c"]) {
   );
 }
 const ballots = [...wasmBallots.map((b) => b.ballot), ...cliBallots.map((b) => b.ballot)];
+check("the CLI ballot op reports the same fingerprint rule", () => {
+  for (const b of cliBallots) assert.equal(b.ballot_fingerprint, fingerprintOf(b.ballot));
+});
 
 // More ballots, for the timings only (one position, three candidates).
 for (let i = 0; i < 9; i++) {
@@ -353,6 +383,10 @@ check("benaloh_open + benaloh_check pass for an honest ballot and name the candi
   assert.equal(v.encoded_candidate, "alice");
   assert.ok(v.slots.every((s) => s.reproduces));
   // The native CLI, independent of the phone's code, agrees.
+  // It reports the fingerprint of the ballot it checked: the one shown before
+  // the challenge, and the CLI computes the same from the same record.
+  assert.equal(v.ballot_fingerprint, challenged.ballot_fingerprint);
+  assert.equal(v.position_id, "president");
   assert.deepEqual(cli("benaloh-check", { params, dkg, ballot: challenged.ballot, opened }), v);
 });
 
@@ -548,5 +582,4 @@ if (process.env.SAKSI_WASM_TIMINGS) {
   fs.writeFileSync(process.env.SAKSI_WASM_TIMINGS, JSON.stringify(summary, null, 2) + "\n");
 }
 
-fs.rmSync(dir, { recursive: true, force: true });
 console.log(`\n${passed} checks passed; fixture written to ${FIXTURE}`);

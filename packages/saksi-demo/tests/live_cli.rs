@@ -67,7 +67,28 @@ fn live(op: &str, input: &Value) -> Result<Value, String> {
 }
 
 fn ok(op: &str, input: Value) -> Value {
-    live(op, &input).unwrap_or_else(|e| panic!("{op} failed: {e}"))
+    let out = live(op, &input).unwrap_or_else(|e| panic!("{op} failed: {e}"));
+    if op == "verify-live" {
+        assert_honest_summary(&out);
+    }
+    out
+}
+
+/// A verdict whose `overall` is `fail` has at least one failing summary
+/// group, so a page that shows only the summary cannot show all-pass. Held
+/// for every `verify-live` these tests run.
+fn assert_honest_summary(verdict: &Value) {
+    let summary = verdict["summary"].as_object().unwrap();
+    assert_eq!(summary.len(), 7, "{summary:?}");
+    for group in ["election_keys", "other_checks"] {
+        assert!(summary.contains_key(group), "{summary:?}");
+    }
+    if verdict["overall"] == "fail" {
+        assert!(
+            summary.values().any(|v| v == "fail"),
+            "overall fail but every summary group passes: {verdict:#}"
+        );
+    }
 }
 
 fn tempdir() -> PathBuf {
@@ -505,6 +526,54 @@ fn an_identity_joint_key_is_refused_by_transcript_and_ballot() {
         check["detail"].as_str().unwrap().contains("identity"),
         "{check}"
     );
+    assert_eq!(verdict["summary"]["election_keys"], "fail");
+
+    // An identity verification key with a non-identity joint key: trustee 1's
+    // VK is sum_i sum_k A_{i,k} (x = 1), so shifting dealer 5's A_{5,1} by it
+    // makes VK_1 the identity and leaves Y = sum_i A_{i,0} alone.
+    let mut vk_forged: saksi_protocol::DKGTranscript = prost::Message::decode(
+        hex::decode(c.transcript()["dkg"].as_str().unwrap())
+            .unwrap()
+            .as_slice(),
+    )
+    .unwrap();
+    let vk1 = vk_forged
+        .trustee_commitments
+        .iter()
+        .flat_map(|d| d.coefficient_commitments.iter())
+        .fold(
+            curve25519_dalek::ristretto::RistrettoPoint::default(),
+            |acc, a| acc + point(&hex::encode(a)),
+        );
+    let a51 = point(&hex::encode(
+        &vk_forged.trustee_commitments[4].coefficient_commitments[1],
+    ));
+    vk_forged.trustee_commitments[4].coefficient_commitments[1] =
+        (a51 - vk1).compress().to_bytes().to_vec();
+    let verdict = ok(
+        "verify-live",
+        json!({ "record": {
+            "params": c.params, "dkg": hex::encode(prost::Message::encode_to_vec(&vk_forged)),
+            "issuer_public_key": c.issuer_pk, "ballots": [], "partial_decryptions": [],
+            "tally": hex::encode(prost::Message::encode_to_vec(&tally)),
+        }}),
+    );
+    assert_eq!(verdict["overall"], "fail");
+    let check = verdict["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["check"] == "live.joint_key_nonidentity")
+        .unwrap_or_else(|| panic!("no joint-key check: {verdict:#}"));
+    assert_eq!(check["status"], "fail", "{check}");
+    assert!(
+        check["detail"]
+            .as_str()
+            .unwrap()
+            .contains("trustee 1's published verification key is the identity"),
+        "{check}"
+    );
+    assert_eq!(verdict["summary"]["election_keys"], "fail");
     let _ = std::fs::remove_dir_all(&c.dir);
 }
 
@@ -536,6 +605,30 @@ fn benaloh_check_through_the_cli() {
     assert_eq!(v["encoded_candidate"], json!("fay"));
     assert_eq!(v["encoded_choice"], json!(2));
     assert_eq!(v["tracking_code"], json!(built.tracking_code));
+    assert_eq!(v["ballot_fingerprint"], json!(built.ballot_fingerprint));
+
+    // Two CLI ballots for the same voter and position: one tracking code (the
+    // voter's slot), two ballot fingerprints, each recomputable from the
+    // record bytes alone.
+    let cred = serde_json::to_value(&req.credential).unwrap();
+    let cast = |choice: usize| {
+        ok(
+            "ballot",
+            json!({ "params": c.params, "dkg": dkg, "credential": cred,
+                    "position_id": "secretary", "choice": choice }),
+        )
+    };
+    let (b1, b2) = (cast(2), cast(2));
+    assert_eq!(b1["tracking_code"], b2["tracking_code"]);
+    assert_eq!(b1["tracking_code"], json!(built.tracking_code));
+    assert_ne!(b1["ballot_fingerprint"], b2["ballot_fingerprint"]);
+    for b in [&b1, &b2] {
+        let bytes = hex::decode(b["ballot"].as_str().unwrap()).unwrap();
+        assert_eq!(
+            b["ballot_fingerprint"],
+            json!(saksi_live::ballot::ballot_fingerprint(&bytes))
+        );
+    }
 
     let mut moved = opened.clone();
     moved["slots"][2]["plaintext"] = json!(0);
@@ -794,7 +887,7 @@ fn full_pipeline_through_the_cli() {
     for (k, v) in verdict["summary"].as_object().unwrap() {
         assert_eq!(v, "pass", "{k}");
     }
-    assert_eq!(verdict["summary"].as_object().unwrap().len(), 5);
+    assert_eq!(verdict["summary"].as_object().unwrap().len(), 7);
     // The live-only joint-key check ran and passed.
     assert!(
         verdict["checks"]
@@ -818,6 +911,24 @@ fn full_pipeline_through_the_cli() {
         assert_eq!(row["decoded"], json!(t));
         assert_eq!(row["published_tally"], json!(t));
     }
+
+    // A record whose only fault is outside the five ballot and tally
+    // questions (the chain says 7 ballots, the record holds 6): those five
+    // groups all pass, so `other_checks` must carry the failure.
+    let verdict = ok("verify-live", record(&e, e.ballot_hexes(), Some(7)));
+    assert_eq!(verdict["overall"], "fail");
+    assert_eq!(failed(&verdict), vec!["stream.completeness".to_string()]);
+    for group in [
+        "ballot_proofs",
+        "nullifiers_unique",
+        "partial_decryption_proofs",
+        "totals_match_tally",
+        "tally_signatures",
+        "election_keys",
+    ] {
+        assert_eq!(verdict["summary"][group], "pass", "{group}");
+    }
+    assert_eq!(verdict["summary"]["other_checks"], "fail");
 
     // The same record as a run folder (header.json + ballots.ndjson).
     let run = c.dir.join("run");

@@ -367,19 +367,45 @@ and a choice outside its candidates. Output:
  "position_id": "president",
  "contest_ids": ["president/alice", "president/bob", "president/carol"],
  "nullifier": "<32-byte hex>",
- "tracking_code": "BC-7F3A-92C1"}
+ "tracking_code": "BC-7F3A-92C1",
+ "ballot_fingerprint": "4F2A-91C3-07B8-D6E5-1A2B-3C4D-5E6F-7081"}
 ```
 
 `tracking_code` is `BC-` and the first 8 hex digits of the nullifier in upper
 case, split 4-4: the board's `formatTrackingCode` (both give the empty string
-for a nullifier shorter than 4 bytes). The nullifier is per voter per
-position, so a voter gets one code per position.
+for a nullifier shorter than 4 bytes). **The tracking code identifies the
+voter's slot for a position, not a particular ballot:** the nullifier is per
+voter per position, so every ballot a voter builds for a position, including
+one discarded after a Benaloh challenge, has the same code.
+
+`ballot_fingerprint` identifies the particular ballot. It is
+
+```
+ballot_fingerprint = upper_hex( SHA-256(ballot_bytes)[0..16] ) in eight groups of four
+```
+
+where `ballot_bytes` are the record's protobuf bytes exactly as submitted: the
+`ballot` hex decoded. The chaincode stores those bytes unchanged and
+`GetBallot` / `GetBallots` return them as hex, so the board and the console
+compute the same fingerprint from the chain record alone, with no key and no
+other input. It is the first half of the same SHA-256 as the opening's
+`ballot_digest`. Two ballots for the same voter and position share the
+tracking code but, built with fresh randomness, never the fingerprint. The
+board should show it next to the tracking code, so a voter can see that the
+recorded ballot is the one the phone showed.
 
 ### `benaloh-check`
 
 The Benaloh challenge's check, the same function as the phone's
 `benaloh_check` (`saksi_live::benaloh::check`), as a native process so a
-challenged ballot can be checked by code other than the phone's. Input:
+challenged ballot can be checked by code other than the phone's.
+
+**What it is for:** tests, and checking offline a challenged ballot that is
+already superseded on the chain (the voter's fresh ballot with the same
+nullifier is recorded). A challenged ballot is a valid, submittable ballot
+until then (see **The Benaloh challenge**), so this op must never be wired to
+a server route, and no server component (the console included) may accept,
+hold or check a challenged ballot. Input:
 
 ```json
 {"params": "<hex ElectionParameters>",
@@ -400,6 +426,7 @@ randomness and compares it with the ballot's ciphertext. Output:
 {"valid": true,
  "position_id": "president",
  "tracking_code": "BC-7F3A-92C1",
+ "ballot_fingerprint": "4F2A-91C3-07B8-D6E5-1A2B-3C4D-5E6F-7081",
  "slots": [{"contest_id": "president/alice", "plaintext": 0, "reproduces": true}, "..."],
  "encoded_choice": 1,
  "encoded_candidate": "bob"}
@@ -407,7 +434,10 @@ randomness and compares it with the ballot's ciphertext. Output:
 
 `valid` is true iff every slot reproduces and exactly one slot holds 1 (the
 rest 0); `encoded_choice` and `encoded_candidate` are then the candidate the
-ballot encodes, else `null`. A randomness that is not a canonical scalar is a
+ballot encodes, else `null`. `position_id` is the position of the ballot it
+checked and `ballot_fingerprint` that ballot's fingerprint (see `ballot`): the
+caller compares both, and the candidate, with what the voter chose and was
+shown. A randomness that is not a canonical scalar is a
 slot that does not reproduce. Refused with an error (not a verdict): a ballot
 or opening for another election, position or nullifier, a slot count that is
 not the position's, or a slot whose contest id is not the election's.
@@ -736,7 +766,8 @@ Output:
 {"overall": "pass",
  "summary": {"ballot_proofs": "pass", "nullifiers_unique": "pass",
              "partial_decryption_proofs": "pass", "totals_match_tally": "pass",
-             "tally_signatures": "pass"},
+             "tally_signatures": "pass", "election_keys": "pass",
+             "other_checks": "pass"},
  "checks": [{"check": "parameters.shape", "status": "pass", "passed": 1, "failed": 0,
              "detail": "election parameters shape is consistent"}, "..."],
  "failed_checks": [],
@@ -755,8 +786,13 @@ Output:
   `decryption.duplicate`, `decryption.share_decode`, `decryption.cp_decode`,
   `decryption.cp_proof`, `decryption.threshold`; `totals_match_tally` =
   `tally.shape`, `tally.homomorphic_sum`, `tally.range`; `tally_signatures` =
-  `tally.signatures`. A group is `pass` only if at least one of its checks ran
-  and none failed.
+  `tally.signatures`; `election_keys` = every `parameters.*`, `dkg.*` and
+  `live.*` check. A group is `pass` only if at least one of its checks ran and
+  none failed. `other_checks` covers everything else (`stream.completeness`,
+  `ledger.order`, ...): it is `fail` iff a fatal check outside the other
+  groups failed. So whenever `overall` is `fail`, at least one group is
+  `fail`; a page that shows only the summary still cannot show all-pass for a
+  failed audit. Read `overall` and `failed_checks` for the verdict.
 - `contests[].decoded` is what threshold decryption of the recorded partials
   recovered (`null` if the combine could not run); `published_tally` is the
   tally's claim.
@@ -828,7 +864,8 @@ Output `{"name": "saksi-wasm", "version": "0.1.0", "wire_format":
 "saksi-live-wire-v1", "protocol_wire_version": 1, "git_rev": "11c51c5"}`.
 `wire_format` is `saksi_live::WIRE_FORMAT`, the version of this document's
 format; `git_rev` is the saksi commit the build script built from (with
-`-dirty` when `packages/` had uncommitted changes), `null` when built without
+`-dirty` when the checkout had any uncommitted change outside ignored build
+output), `null` when built without
 the script. The app shows it and logs it.
 
 #### `begin_issuance()`
@@ -895,6 +932,7 @@ Input: the CLI `ballot` input. Output: the CLI `ballot` output, plus
  "election_id": "live-2026", "position_id": "president",
  "contest_ids": ["president/alice", "president/bob", "president/carol"],
  "nullifier": "<32-byte hex>", "tracking_code": "BC-7F3A-92C1",
+ "ballot_fingerprint": "4F2A-91C3-07B8-D6E5-1A2B-3C4D-5E6F-7081",
  "opening": {"kind": "saksi-live-ballot-opening-v1",
              "ballot_digest": "<SHA-256 of the ballot bytes, hex>",
              "contest_ids": ["president/alice", "president/bob", "president/carol"],
@@ -906,8 +944,19 @@ It is `saksi_live::ballot::build_ballot_with_opening`: the same builder as the
 CLI's `ballot`, which only copies each slot's ElGamal randomness out before
 wiping it, so for the same random stream the ballot bytes are identical.
 `opening` is opaque to the app: it hands it back to `benaloh_open` unchanged.
+`ballot_fingerprint` (see the CLI `ballot`) names this ballot; the phone shows
+it **before** the voter chooses cast or challenge, because that is what
+commits the phone to this ballot. The tracking code does not: it is the same
+for every ballot the voter builds for the position.
 
 #### `benaloh_open(input)`
+
+**A challenged ballot is a valid, submittable ballot** until a different
+ballot with the same nullifier is recorded on the chain: whoever holds it can
+submit it in the voter's place, and the opening tells them its vote. So the
+challenged ballot and its opening (and these opened values) **never leave the
+phone before the fresh ballot is on the chain**, and no server component, the
+console above all, may accept or hold a challenged ballot.
 
 Input `{"ballot": "<hex Ballot>", "opening": {...}}`. Refuses an opening made
 for another ballot (`this opening is not for this ballot`, by
@@ -925,13 +974,16 @@ for another ballot (`this opening is not for this ballot`, by
 
 Input `{"params", "dkg", "ballot", "opened"}` with `opened` as above. Output
 exactly as the CLI's `benaloh-check` (same function): `{"valid", "position_id",
-"tracking_code", "slots": [{"contest_id", "plaintext", "reproduces"}],
-"encoded_choice", "encoded_candidate"}`. Each slot is re-encrypted under the
+"tracking_code", "ballot_fingerprint", "slots": [{"contest_id", "plaintext",
+"reproduces"}], "encoded_choice", "encoded_candidate"}`. Each slot is re-encrypted under the
 transcript's joint key with the revealed randomness,
 `(r·G, m·G + r·Y)`, and compared with the ballot's `(pad, data)`. `valid` is
 true iff every slot reproduces and exactly one slot holds 1; then
 `encoded_candidate` is the candidate id the ballot encodes. **The app
-compares `encoded_candidate` with the voter's choice** and shows both.
+compares `position_id` and `encoded_candidate` with the position and the
+candidate the voter chose**, and `ballot_fingerprint` (the fingerprint of the
+ballot actually checked) with the one it showed before the challenge, and
+shows all three side by side.
 
 #### `tracking_code(input)`
 
@@ -941,20 +993,30 @@ Input `{"nullifier": "<hex>"}`, output `{"tracking_code": "BC-XXXX-XXXX"}`
 ### The Benaloh challenge
 
 1. The phone builds the ballot (`build_ballot`) and shows the voter its
-   tracking code.
+   **`ballot_fingerprint`**, before asking cast or challenge. That commits the
+   phone to this ballot; the tracking code, shared by every ballot the voter
+   builds for the position, would not.
 2. The voter chooses **cast** or **challenge**.
-   - **Cast:** the app submits `ballot` and drops `opening`.
+   - **Cast:** the app submits `ballot` and drops `opening`. The board shows
+     the recorded ballot's fingerprint next to its tracking code; the voter
+     can see it is the one the phone showed.
    - **Challenge:** the app calls `benaloh_open`, then `benaloh_check`, and
-     shows the slots, `valid` and `encoded_candidate` next to the voter's
-     choice. The opened values are plain JSON, so any other implementation
-     can check them too (`saksi-demo live benaloh-check` is one).
-3. **A challenged ballot is never submitted.** Its vote is now readable by
-   whoever sees the opening. The app discards the ballot, the opening and the
-   opened values, and builds a fresh ballot (`build_ballot` again), which
-   draws fresh randomness. The voter may challenge again or cast.
+     shows the slots, `valid`, `position_id`, `encoded_candidate` and the
+     checked `ballot_fingerprint` next to the voter's position, choice and the
+     fingerprint shown in step 1.
+3. **A challenged ballot is never submitted, and never leaves the phone**
+   until the fresh ballot is recorded. Until then it is a valid ballot
+   carrying the voter's nullifier: anyone holding it could submit it in place
+   of the voter's real ballot, and the chain would take it (first use of the
+   nullifier) and refuse the real one. No server component may accept or hold
+   one. The app discards the ballot, the opening and the opened values, and
+   builds a fresh ballot (`build_ballot` again), which draws fresh randomness
+   and so has a new fingerprint. The voter may challenge again or cast.
+   Checking the opened values elsewhere (`saksi-demo live benaloh-check`, or a
+   second device) is for after the fresh ballot is on the chain, offline.
 
 The fresh ballot has **the same nullifier**, and so the same tracking code,
-as the challenged one. The nullifier is a function of the credential, the
+as the challenged one, but a different ballot fingerprint. The nullifier is a function of the credential, the
 election and the position: one per voter per position, so a voter cannot
 cast twice in a position. That is fine for the challenge because the
 challenged ballot never reaches the chain; the chain sees the nullifier once,
@@ -977,7 +1039,8 @@ show the mechanism; the honest version checks the opened values elsewhere.
 | `finalize_issuance().credential` | yes (`s_cred` votes) | **the one value it stores** (IndexedDB); never sent to the console |
 | `build_ballot().opening` | yes (reveals the vote) | memory only; dropped once the ballot is cast or opened |
 | `benaloh_open()` output | reveals the challenged vote | shown, then dropped with the challenged ballot |
-| `blinded_commitment`, `e_prime`, `ballot`, `nullifier`, `tracking_code` | no | sent to the console or shown |
+| `blinded_commitment`, `e_prime`, the cast `ballot`, `nullifier`, `tracking_code`, `ballot_fingerprint` | no | sent to the console or shown |
+| a challenged `ballot` | not secret, but submittable | never leaves the phone before the fresh ballot is recorded; then dropped |
 
 The app must never log the inputs or outputs of these exports. Inside the
 crate, every input string is wiped once parsed, every output is serialised

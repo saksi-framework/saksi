@@ -302,9 +302,12 @@ pub struct LiveContest {
 pub struct LiveVerdict {
     /// `pass` iff every fatal check passed.
     pub overall: String,
-    /// The five questions the live demo asks, each `pass` or `fail`:
+    /// The questions the live demo asks, each `pass` or `fail`:
     /// `ballot_proofs`, `nullifiers_unique`, `partial_decryption_proofs`,
-    /// `totals_match_tally`, `tally_signatures`.
+    /// `totals_match_tally`, `tally_signatures`, `election_keys`
+    /// (`parameters.*`, `dkg.*`, `live.*`), and `other_checks` (fails on any
+    /// fatal failure outside the other groups). Whenever `overall` is `fail`,
+    /// at least one group is `fail`.
     pub summary: std::collections::BTreeMap<String, String>,
     /// Every check id, in first-seen order.
     pub checks: Vec<CheckSummary>,
@@ -351,6 +354,15 @@ const SUMMARY: &[(&str, &[&str])] = &[
     ),
     ("tally_signatures", &["tally.signatures"]),
 ];
+
+/// Prefixes of the check ids the `election_keys` summary group covers: the
+/// parameters, the DKG transcript, and the live-only key checks.
+const ELECTION_KEYS_PREFIXES: &[&str] = &["parameters.", "dkg.", "live."];
+
+fn in_named_group(check: &str) -> bool {
+    SUMMARY.iter().any(|(_, ids)| ids.contains(&check))
+        || ELECTION_KEYS_PREFIXES.iter().any(|p| check.starts_with(p))
+}
 
 fn verdict(
     report: &AuditReport,
@@ -402,7 +414,7 @@ fn verdict(
         })
         .cloned()
         .collect();
-    let summary = SUMMARY
+    let mut summary = SUMMARY
         .iter()
         .map(|(name, ids)| {
             let seen: Vec<&CheckSummary> = checks
@@ -416,7 +428,31 @@ fn verdict(
                 if ok { "pass" } else { "fail" }.to_string(),
             )
         })
+        .collect::<BTreeMap<String, String>>();
+    // The election's keys: a question no finding answered is a fail, as above.
+    let keys: Vec<&CheckSummary> = checks
+        .iter()
+        .filter(|c| {
+            ELECTION_KEYS_PREFIXES
+                .iter()
+                .any(|p| c.check.starts_with(p))
+        })
         .collect();
+    let keys_ok = !keys.is_empty() && keys.iter().all(|c| c.failed == 0);
+    summary.insert(
+        "election_keys".into(),
+        if keys_ok { "pass" } else { "fail" }.into(),
+    );
+    // Every other check (completeness, ledger order, ...): a fatal failure
+    // outside the named groups fails this one, so the summary can never read
+    // all-pass while `overall` is `fail`.
+    let other_fatal = report.findings.iter().any(|f| {
+        f.severity == Severity::Fatal && f.status == AuditStatus::Fail && !in_named_group(f.check)
+    });
+    summary.insert(
+        "other_checks".into(),
+        if other_fatal { "fail" } else { "pass" }.into(),
+    );
     let contests = parameters
         .contest_ids
         .iter()

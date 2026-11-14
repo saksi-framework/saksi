@@ -1,27 +1,36 @@
 //! The voter's Benaloh challenge ("cast or challenge").
 //!
 //! After the phone builds a ballot with
-//! [`crate::ballot::build_ballot_with_opening`], the voter either casts it
-//! (the phone submits it and drops the opening) or challenges it: the phone
-//! [`open`]s it, revealing every slot's ElGamal randomness and plaintext, and
-//! [`check`] re-encrypts each slot under the election's joint key with the
-//! revealed randomness. If every slot reproduces the ballot's ciphertext, the
-//! ballot encodes exactly the plaintexts revealed, so the voter can see that
-//! the phone encrypted the candidate they chose.
+//! [`crate::ballot::build_ballot_with_opening`], it shows the ballot's
+//! fingerprint ([`crate::ballot::ballot_fingerprint`]), which commits it to
+//! this ballot. The voter then either casts it (the phone submits it and
+//! drops the opening) or challenges it: the phone [`open`]s it, revealing
+//! every slot's ElGamal randomness and plaintext, and [`check`] re-encrypts
+//! each slot under the election's joint key with the revealed randomness. If
+//! every slot reproduces the ballot's ciphertext, the ballot encodes exactly
+//! the plaintexts revealed. The check reports the fingerprint of the ballot it
+//! checked, so the voter can see it is the ballot shown before the choice.
 //!
-//! A challenged ballot must never be submitted: its vote is now public to
-//! whoever saw the opening. The caller discards it and builds a fresh ballot
-//! with fresh randomness. The fresh ballot carries the **same nullifier** (the
-//! nullifier is a function of the credential, the election and the position,
-//! one per voter per position), so it gets the same tracking code. That is
-//! fine because the challenged ballot never reaches the chain: the chain sees
-//! the nullifier once, on the ballot that is cast. It does mean an opening
-//! links the challenged choice to the voter's tracking code, which is why the
-//! opened values stay on the phone.
+//! **A challenged ballot is still a valid, submittable ballot** until a
+//! different ballot with the same nullifier is recorded on the chain. Whoever
+//! holds it can submit it in place of the voter's real one, and its vote is
+//! known to whoever saw the opening. So the challenged ballot and its opening
+//! never leave the phone before the fresh ballot is on the chain, and no
+//! server component (the console above all) may accept, hold or check one.
+//! The caller discards it and builds a fresh ballot with fresh randomness.
+//!
+//! The fresh ballot carries the **same nullifier** (a function of the
+//! credential, the election and the position, one per voter per position), so
+//! it gets the same tracking code, but a different ballot fingerprint. That
+//! is fine because the challenged ballot never reaches the chain: the chain
+//! sees the nullifier once, on the ballot that is cast. It does mean an
+//! opening links the challenged choice to the voter's tracking code.
 //!
 //! [`check`] is only as independent as the code that runs it. The opened
-//! values are plain JSON, so any other implementation (the
-//! `saksi-demo live benaloh-check` op, or a second device) can check them too.
+//! values are plain JSON, so other code can check them too: the
+//! `saksi-demo live benaloh-check` op exists for tests and for checking,
+//! offline, a challenged ballot that is already superseded on the chain. It
+//! must never be wired to a server route.
 
 use serde::{Deserialize, Serialize};
 use zeroize::{Zeroize, ZeroizeOnDrop};
@@ -109,8 +118,12 @@ pub struct CheckResponse {
     pub valid: bool,
     /// The ballot's position id.
     pub position_id: String,
-    /// The ballot's tracking code.
+    /// The ballot's tracking code (the voter's slot for the position, shared
+    /// by every ballot the voter builds for it).
     pub tracking_code: String,
+    /// [`crate::ballot::ballot_fingerprint`] of the ballot this check
+    /// actually checked: compare it with the one shown before the challenge.
+    pub ballot_fingerprint: String,
     /// Every slot's verdict, in the ballot's order.
     pub slots: Vec<SlotCheck>,
     /// 0-based index of the candidate the ballot encodes, when `valid`.
@@ -193,7 +206,7 @@ pub fn check(req: &CheckRequest) -> LiveResult<CheckResponse> {
     let params: ElectionParameters = codec::message(&req.params, "params")?;
     let transcript: DKGTranscript = codec::message(&req.dkg, "dkg")?;
     let public_key = joint_public_key(&params, &transcript)?;
-    let (ballot, _) = decode_ballot(&req.ballot)?;
+    let (ballot, bytes) = decode_ballot(&req.ballot)?;
     let o = &req.opened;
     if ballot.election_id != params.election_id || o.election_id != params.election_id {
         return Err("the ballot or the opening is not for this election".into());
@@ -261,6 +274,7 @@ pub fn check(req: &CheckRequest) -> LiveResult<CheckResponse> {
         valid: well_formed,
         position_id: ballot.position_id.clone(),
         tracking_code: tracking_code(&nullifier),
+        ballot_fingerprint: crate::ballot::ballot_fingerprint(&bytes),
         slots,
         encoded_choice,
         encoded_candidate,
@@ -285,6 +299,8 @@ mod tests {
         .unwrap();
         assert_eq!(opened.tracking_code, built.tracking_code);
         assert_eq!(opened.nullifier, built.nullifier);
+        let checked = run(&e, &built.ballot, opened.clone());
+        assert_eq!(checked.ballot_fingerprint, built.ballot_fingerprint);
         (e, built.ballot, opened)
     }
 
