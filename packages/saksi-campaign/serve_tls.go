@@ -79,3 +79,23 @@ func Serve(ln net.Listener, o ServeOptions, h http.Handler) error {
 	}
 	return srv.Serve(ln)
 }
+
+// CheckTrusteeServeOptions is the trustee process's start-up rule, the same
+// as live mode's: TLS flags together, and without TLS only a loopback bind.
+func CheckTrusteeServeOptions(o ServeOptions) (warning string, err error) {
+	if (o.TLSCert == "") != (o.TLSKey == "") {
+		return "", errors.New("--tls-cert and --tls-key go together: give both or neither")
+	}
+	if o.TLS() {
+		return "", nil
+	}
+	host, _, err := net.SplitHostPort(o.Addr)
+	if err != nil {
+		return "", fmt.Errorf("--addr %q: %v", o.Addr, err)
+	}
+	if ip := net.ParseIP(host); host != "localhost" && (ip == nil || !ip.IsLoopback()) {
+		return "", fmt.Errorf("a trustee process without --tls-cert/--tls-key serves its password and session cookie in the clear; it starts only on a loopback --addr (got %q)", o.Addr)
+	}
+	return "WARNING: trustee process without TLS. Its password and session cookie travel in the clear; " +
+		"this is only acceptable because the bind is loopback.", nil
+}

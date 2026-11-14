@@ -249,8 +249,14 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // 127.0.0.1:<port>, so we check Host against an allowlist and require any
 // browser Origin to be same-origin.
 func (s *Server) guard(next http.Handler) http.Handler {
+	return guardHosts(s.allowHosts, next)
+}
+
+// guardHosts is guard over an allowlist; the trustee process (trustee_http.go)
+// uses it too. An empty allowlist accepts any Host.
+func guardHosts(allowHosts map[string]bool, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if len(s.allowHosts) > 0 && !s.allowHosts[r.Host] {
+		if len(allowHosts) > 0 && !allowHosts[r.Host] {
 			http.Error(w, "forbidden host", http.StatusForbidden)
 			return
 		}

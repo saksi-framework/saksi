@@ -832,7 +832,14 @@ func (L *liveService) reconcileBallotsLocked(c liveChain) error {
 	return L.save()
 }
 
-func allNullifiers(c liveChain, electionID string) ([]string, error) {
+// ballotLister is the part of the chain the ballot reads need; the console's
+// liveChain and the trustee's read-only chain both have it.
+type ballotLister interface {
+	ListNullifiers(electionID string, pageSize int, bookmark string) (clientsdk.NullifierPage, error)
+	GetBallots(electionID string, nullifiers []string) ([]string, error)
+}
+
+func allNullifiers(c ballotLister, electionID string) ([]string, error) {
 	var out []string
 	bookmark := ""
 	for {
@@ -848,7 +855,7 @@ func allNullifiers(c liveChain, electionID string) ([]string, error) {
 	}
 }
 
-func getBallots(c liveChain, electionID string, nullifiers []string) ([]string, error) {
+func getBallots(c ballotLister, electionID string, nullifiers []string) ([]string, error) {
 	var out []string
 	for start := 0; start < len(nullifiers); start += clientsdk.BallotBatchSize {
 		end := min(start+clientsdk.BallotBatchSize, len(nullifiers))

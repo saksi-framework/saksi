@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/hex"
 	"encoding/json"
+	"encoding/pem"
 	"fmt"
 	"io"
 	"log"
@@ -238,6 +239,13 @@ type liveE2E struct {
 	runsDir string
 	// phoneSent is every ballot hex a phone (or the test's tamperer) built.
 	phoneSent map[string]bool
+	// caFile is the console's TLS certificate (httptest's), which the trustee
+	// processes trust through --console-ca.
+	caFile string
+	// tr, when set, plays the trustees as five trustee processes driven only
+	// through their own HTTP API (trustee_test.go); nil plays them with the
+	// CLI directly.
+	tr *trusteeFleet
 }
 
 // cliOp runs a CLI op as a trustee or voter would.
@@ -278,7 +286,7 @@ func (h *liveE2E) call(c *http.Client, method, path, bearer string, body any) (i
 		req.Header.Set("Authorization", "Bearer "+bearer)
 	}
 	if c == nil {
-		c = http.DefaultClient
+		c = h.srv.Client()
 	}
 	resp, err := c.Do(req)
 	if err != nil {
@@ -306,7 +314,7 @@ func (h *liveE2E) must(c *http.Client, method, path, bearer string, body any) ma
 func (h *liveE2E) login(user, pw string) *http.Client {
 	h.t.Helper()
 	jar, _ := cookiejar.New(nil)
-	c := &http.Client{Jar: jar}
+	c := &http.Client{Jar: jar, Transport: h.srv.Client().Transport}
 	code, out := h.call(c, http.MethodPost, "/api/login", "", map[string]string{"username": user, "password": pw})
 	if code != http.StatusNoContent {
 		h.t.Fatalf("login %s: %d %v", user, code, out)
@@ -360,8 +368,12 @@ func newLiveE2E(t *testing.T, demo string, dial func() (liveChain, error)) *live
 		t.Fatal(err)
 	}
 	h.s = s
-	h.srv = httptest.NewServer(s)
+	h.srv = httptest.NewTLSServer(s)
 	t.Cleanup(h.srv.Close)
+	h.caFile = filepath.Join(h.work, "console-ca.pem")
+	if err := os.WriteFile(h.caFile, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: h.srv.Certificate().Raw}), 0o644); err != nil {
+		t.Fatal(err)
+	}
 	return h
 }
 
@@ -393,50 +405,10 @@ func runLiveElection(t *testing.T, h *liveE2E) string {
 	step("setup: CreateElection recorded, state ceremony (" + runID + ")")
 
 	// The key ceremony, five trustee processes.
-	for id := 1; id <= 5; id++ {
-		k := h.cliOp("trustee-keygen", map[string]any{"trustee_id": id, "key_file": filepath.Join(h.tdir(id), "receive.key")})
-		h.must(nil, http.MethodPost, "/api/live/dkg/receive-key", h.tokens[id-1], k)
-	}
-	var roster map[string]any
-	deals := map[int]map[string]any{}
-	for id := 1; id <= 5; id++ {
-		roster = h.must(nil, http.MethodGet, "/api/live/dkg/roster", h.tokens[id-1], nil)
-		if roster["complete"] != true {
-			t.Fatalf("roster: %v", roster)
-		}
-		deal := h.cliOp("dkg-deal", map[string]any{
-			"receive_key_file": filepath.Join(h.tdir(id), "receive.key"), "params": roster["params"],
-			"dealer_id": id, "peers": roster["peers"],
-		})
-		if deal["roster_digest"] != roster["roster_digest"] {
-			t.Fatalf("trustee %d: dealer digest %v, console %v", id, deal["roster_digest"], roster["roster_digest"])
-		}
-		deals[id] = deal
-		h.must(nil, http.MethodPost, "/api/live/dkg/deal", h.tokens[id-1], deal)
-	}
-	var lastAck map[string]any
-	for id := 1; id <= 5; id++ {
-		in := h.must(nil, http.MethodGet, "/api/live/dkg/inbox", h.tokens[id-1], nil)
-		// The relay returns each masked share exactly as its dealer posted it.
-		for _, d := range in["dealers"].([]any) {
-			dm := d.(map[string]any)
-			dealer := int(dm["dealer_id"].(float64))
-			want, _ := json.Marshal(deals[dealer]["masked_shares"].([]any)[id-1])
-			got, _ := json.Marshal(dm["masked_share"])
-			if !bytes.Equal(want, got) {
-				t.Fatalf("trustee %d: dealer %d's share was altered in relay", id, dealer)
-			}
-		}
-		rcv := h.cliOp("dkg-receive", map[string]any{
-			"receive_key_file": filepath.Join(h.tdir(id), "receive.key"),
-			"share_file":       filepath.Join(h.tdir(id), "share.json"),
-			"params":           in["params"], "trustee_id": id,
-			"peers": in["peers"], "dealers": in["dealers"],
-		})
-		lastAck = h.must(nil, http.MethodPost, "/api/live/dkg/ack", h.tokens[id-1], rcv)
-	}
-	if lastAck["published"] != true {
-		t.Fatalf("last ack did not publish: %v", lastAck)
+	if h.tr != nil {
+		h.tr.ceremony()
+	} else {
+		cliCeremony(t, h)
 	}
 	el = h.must(nil, http.MethodGet, "/api/live/election", "", nil)
 	if el["state"] != LiveOpen || el["dkg"] == "" {
@@ -520,6 +492,10 @@ func runLiveElection(t *testing.T, h *liveE2E) string {
 		}
 	}
 	for id := 1; id <= 3; id++ {
+		if h.tr != nil {
+			h.tr.decrypt(id)
+			continue
+		}
 		part := h.cliOp("partial", map[string]any{"share_file": filepath.Join(h.tdir(id), "share.json"), "params": led["params"], "dkg": led["dkg"], "ballots": ballots})
 		h.must(nil, http.MethodPost, "/api/live/partial", h.tokens[id-1], part)
 	}
@@ -534,6 +510,9 @@ func runLiveElection(t *testing.T, h *liveE2E) string {
 	step("decrypt: 3 trustees x 6 contests SubmitPartialDecryption recorded")
 
 	sign := func(id int) map[string]any {
+		if h.tr != nil {
+			return h.tr.sign(id, want)
+		}
 		comb := h.cliOp("combine", map[string]any{"params": led["params"], "dkg": led["dkg"], "ballots": ballots, "partials": partials})
 		sig := h.cliOp("sign-tally", map[string]any{"share_file": filepath.Join(h.tdir(id), "share.json"), "params": led["params"], "dkg": led["dkg"], "ballots": ballots, "partials": partials, "totals": comb["totals"]})
 		return h.must(nil, http.MethodPost, "/api/live/tally-sig", h.tokens[id-1], sig)
@@ -579,6 +558,55 @@ func runLiveElection(t *testing.T, h *liveE2E) string {
 	}
 	step("board: verified, 6 ballots with tracking code and fingerprint; tracking-code check confirms on chain")
 	return runID
+}
+
+// cliCeremony plays the five trustees' ceremony with the CLI directly.
+func cliCeremony(t *testing.T, h *liveE2E) {
+	for id := 1; id <= 5; id++ {
+		k := h.cliOp("trustee-keygen", map[string]any{"trustee_id": id, "key_file": filepath.Join(h.tdir(id), "receive.key")})
+		h.must(nil, http.MethodPost, "/api/live/dkg/receive-key", h.tokens[id-1], k)
+	}
+	var roster map[string]any
+	deals := map[int]map[string]any{}
+	for id := 1; id <= 5; id++ {
+		roster = h.must(nil, http.MethodGet, "/api/live/dkg/roster", h.tokens[id-1], nil)
+		if roster["complete"] != true {
+			t.Fatalf("roster: %v", roster)
+		}
+		deal := h.cliOp("dkg-deal", map[string]any{
+			"receive_key_file": filepath.Join(h.tdir(id), "receive.key"), "params": roster["params"],
+			"dealer_id": id, "peers": roster["peers"],
+		})
+		if deal["roster_digest"] != roster["roster_digest"] {
+			t.Fatalf("trustee %d: dealer digest %v, console %v", id, deal["roster_digest"], roster["roster_digest"])
+		}
+		deals[id] = deal
+		h.must(nil, http.MethodPost, "/api/live/dkg/deal", h.tokens[id-1], deal)
+	}
+	var lastAck map[string]any
+	for id := 1; id <= 5; id++ {
+		in := h.must(nil, http.MethodGet, "/api/live/dkg/inbox", h.tokens[id-1], nil)
+		// The relay returns each masked share exactly as its dealer posted it.
+		for _, d := range in["dealers"].([]any) {
+			dm := d.(map[string]any)
+			dealer := int(dm["dealer_id"].(float64))
+			want, _ := json.Marshal(deals[dealer]["masked_shares"].([]any)[id-1])
+			got, _ := json.Marshal(dm["masked_share"])
+			if !bytes.Equal(want, got) {
+				t.Fatalf("trustee %d: dealer %d's share was altered in relay", id, dealer)
+			}
+		}
+		rcv := h.cliOp("dkg-receive", map[string]any{
+			"receive_key_file": filepath.Join(h.tdir(id), "receive.key"),
+			"share_file":       filepath.Join(h.tdir(id), "share.json"),
+			"params":           in["params"], "trustee_id": id,
+			"peers": in["peers"], "dealers": in["dealers"],
+		})
+		lastAck = h.must(nil, http.MethodPost, "/api/live/dkg/ack", h.tokens[id-1], rcv)
+	}
+	if lastAck["published"] != true {
+		t.Fatalf("last ack did not publish: %v", lastAck)
+	}
 }
 
 // tamperCDS changes one byte of the first CDS proof's response.
@@ -678,7 +706,41 @@ func TestLiveElectionEndToEnd(t *testing.T) {
 	t.Logf("functions submitted: %v", chain.submits)
 }
 
-// TestLiveElectionOnFabric is the same flow against a real Fabric network.
+// TestLiveElectionWithTrusteeProcesses is the end-to-end flow with the five
+// trustees as five trustee processes (saksi-campaign trustee), each reading
+// the chain itself and driven only through its own HTTP API.
+func TestLiveElectionWithTrusteeProcesses(t *testing.T) {
+	if os.Getenv("SAKSI_DEMO_BIN") == "" {
+		t.Skip("set SAKSI_DEMO_BIN to the saksi-demo binary to run the live end-to-end test")
+	}
+	demo := findDemo(t)
+	logs := captureLog(t)
+	var chain *oracleChain
+	h := newLiveE2E(t, demo, func() (liveChain, error) { return chain, nil })
+	chain = newOracleChain(t, demo)
+	newTrusteeFleet(t, h, func(int) func() (trusteeChain, error) {
+		return func() (trusteeChain, error) { return chain, nil }
+	}, fleetOptions{})
+	runID := runLiveElection(t, h)
+	checkTrusteesAfterTally(t, h)
+	checkSecretsKept(t, h, runID, logs.String())
+	h.tr.checkSecrets(logs.String())
+}
+
+// checkTrusteesAfterTally: every trustee process read the published tally
+// from the chain and it equals its own combine.
+func checkTrusteesAfterTally(t *testing.T, h *liveE2E) {
+	for id := 1; id <= 5; id++ {
+		st := h.tr.waitFor(id, "the published tally", func(st TrusteeStatus) bool { return st.Tally.Published && st.Tally.Matches != nil })
+		if !*st.Tally.Matches || len(st.Alarms) != 0 {
+			t.Fatalf("trustee %d: published %v, own %v, alarms %v", id, st.Tally.PublishedTotals, st.Tally.Totals, st.Alarms)
+		}
+	}
+	t.Logf("trustees: all 5 read the published tally from the chain; it equals each one's own combine")
+}
+
+// TestLiveElectionOnFabric is the same flow against a real Fabric network,
+// with the trustees as five trustee processes reading the real chain.
 // Gated by SAKSI_LIVE_FABRIC=1, with SAKSI_DEMO_BIN and the connection from
 // SAKSI_FABRIC_TLS_CERT, SAKSI_FABRIC_CERT, SAKSI_FABRIC_KEY and, optionally,
 // SAKSI_FABRIC_PEER (localhost:7051), SAKSI_FABRIC_GATEWAY_PEER
@@ -725,7 +787,12 @@ func TestLiveElectionOnFabric(t *testing.T) {
 	logs := captureLog(t)
 	start := time.Now()
 	h := newLiveE2E(t, findDemo(t), func() (liveChain, error) { return chain, nil })
+	// Five trustee processes, each with its own gateway connection, reading
+	// the real chain.
+	newTrusteeFleet(t, h, func(int) func() (trusteeChain, error) { return TrusteeFabricDial(cfg) }, fleetOptions{})
 	runID := runLiveElection(t, h)
+	checkTrusteesAfterTally(t, h)
+	h.tr.checkSecrets(logs.String())
 
 	// The bytes the chain holds are the bytes the phones sent: ballots.ndjson
 	// holds what GetBallot returned, and each receipt said they matched.

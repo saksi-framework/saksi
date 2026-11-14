@@ -595,6 +595,12 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
+	s.auth.handleLogin(w, r)
+}
+
+// handleLogin is POST /api/login over this account set, shared by the console
+// and the trustee process (trustee_http.go).
+func (a *authState) handleLogin(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		Username string `json:"username"`
 		Password string `json:"password"`
@@ -603,7 +609,7 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	ip := remoteIP(r)
-	wait, ok := s.auth.attempt(ip, body.Username)
+	wait, ok := a.attempt(ip, body.Username)
 	if !ok {
 		w.Header().Set("Retry-After", strconv.Itoa(int((wait+time.Second-1)/time.Second)))
 		writeJSONResp(w, http.StatusTooManyRequests, map[string]string{"error": "too many failed logins; try again shortly"})
@@ -611,18 +617,18 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	}
 	// A username over maxUsernameBytes is never in the map (parseUsers refuses
 	// one), so it takes the unknown-user path with the same dummy compare.
-	u, known := s.auth.users[body.Username]
+	u, known := a.users[body.Username]
 	hash := dummyHash
 	if known {
 		hash = []byte(u.PasswordBcrypt)
 	}
 	if err := bcrypt.CompareHashAndPassword(hash, []byte(body.Password)); err != nil || !known {
-		s.auth.settle(ip, body.Username, false)
+		a.settle(ip, body.Username, false)
 		writeJSONResp(w, http.StatusUnauthorized, map[string]string{"error": errBadCredentials})
 		return
 	}
-	s.auth.settle(ip, body.Username, true)
-	token, err := s.auth.create(u)
+	a.settle(ip, body.Username, true)
+	token, err := a.create(u)
 	if err != nil {
 		writeJSONResp(w, http.StatusInternalServerError, map[string]string{"error": "cannot create session"})
 		return
@@ -640,12 +646,16 @@ func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
+	s.auth.handleLogout(w, r)
+}
+
+func (a *authState) handleLogout(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "POST required", http.StatusMethodNotAllowed)
 		return
 	}
 	if c, err := r.Cookie(sessionCookie); err == nil {
-		s.auth.end(c.Value)
+		a.end(c.Value)
 	}
 	http.SetCookie(w, &http.Cookie{
 		Name: sessionCookie, Value: "", Path: "/", MaxAge: -1, HttpOnly: true,
@@ -659,6 +669,11 @@ func (s *Server) handleMe(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
+	handleMe(w, r)
+}
+
+// handleMe is GET /api/me for the session authorize resolved.
+func handleMe(w http.ResponseWriter, r *http.Request) {
 	sess := sessionFrom(r)
 	if sess == nil {
 		writeJSONResp(w, http.StatusUnauthorized, map[string]string{"error": errLoginRequired})
