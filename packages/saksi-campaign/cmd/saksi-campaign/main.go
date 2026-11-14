@@ -252,7 +252,7 @@ func serve(args []string) {
 	fmt.Printf("  phase timeout %s\n", *timeout)
 	fmt.Printf("  saksi-demo %s\n", *demoBin)
 	if *webDir != "" {
-		fmt.Printf("  apps      %s -> %s://%s/board/, /trustee/ and /admin/\n", *webDir, scheme, displayHost(*addr))
+		fmt.Printf("  apps      %s -> %s://%s/board/, /trustee/, /admin/ and /vote/\n", *webDir, scheme, displayHost(*addr))
 	}
 	if *authFile != "" {
 		fmt.Printf("  auth      on, users from %s\n", *authFile)

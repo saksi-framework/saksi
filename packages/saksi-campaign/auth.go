@@ -111,6 +111,8 @@ var routeAccess = map[string]access{
 	"/trustee":          accessPublic,
 	"/admin/":           accessPublic,
 	"/admin":            accessPublic,
+	"/vote/":            accessPublic,
+	"/vote":             accessPublic,
 	"/api/login":        accessPublic,
 	"/api/logout":       accessPublic,
 	"/api/me":           accessPublic,

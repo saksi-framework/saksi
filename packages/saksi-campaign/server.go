@@ -193,8 +193,11 @@ func NewServer(store *RunStore, exec *Executor, hub *Hub, fabric FabricConfig, a
 }
 
 // mountWebDir serves the browser apps the console can host: the public
-// bulletin board at /board/, the trustee console at /trustee/ and the admin
-// console at /admin/, read from <dir>/board, <dir>/trustee and <dir>/admin.
+// bulletin board at /board/, the trustee console at /trustee/, the admin
+// console at /admin/ and the live election's phone app at /vote/, read from
+// <dir>/board, <dir>/trustee, <dir>/admin and <dir>/vote. The phone app must
+// come from the console's own origin: the API sends no CORS headers, and
+// guard() refuses a cross-origin POST.
 // Same origin as the API, so guard()'s cross-origin POST defense keeps
 // protecting the ceremony endpoints, and the session cookie reaches the API.
 //
@@ -206,10 +209,10 @@ func mountWebDir(mux *routeMux, dir string) {
 	if strings.TrimSpace(dir) == "" {
 		return
 	}
-	for _, app := range []string{"board", "trustee", "admin"} {
+	for _, app := range []string{"board", "trustee", "admin", "vote"} {
 		prefix := "/" + app + "/"
 		mux.Handle(prefix, http.StripPrefix(prefix,
-			http.FileServer(http.Dir(filepath.Join(dir, app)))))
+			wasmType(http.FileServer(http.Dir(filepath.Join(dir, app))))))
 		// Without this the bare path falls through to handleIndex's 404.
 		mux.HandleFunc("/"+app, func(w http.ResponseWriter, r *http.Request) {
 			target := r.URL.Path + "/"
@@ -219,6 +222,18 @@ func mountWebDir(mux *routeMux, dir string) {
 			http.Redirect(w, r, target, http.StatusMovedPermanently)
 		})
 	}
+}
+
+// wasmType serves .wasm files as application/wasm whatever the host's MIME
+// table says: browsers refuse to stream-compile WebAssembly under any other
+// type. http.FileServer keeps a Content-Type that is already set.
+func wasmType(h http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, ".wasm") {
+			w.Header().Set("Content-Type", "application/wasm")
+		}
+		h.ServeHTTP(w, r)
+	})
 }
 
 // ServeHTTP makes *Server itself the http.Handler main.go passes to

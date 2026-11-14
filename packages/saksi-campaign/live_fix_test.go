@@ -577,3 +577,44 @@ func TestLiveBallotPostThroughGuard(t *testing.T) {
 		t.Fatalf("ballots recorded: %d, want 1", n)
 	}
 }
+
+// The phone app is served from the console's own origin at /vote/, from
+// <web-dir>/vote: public, behind the same guard, with .wasm as
+// application/wasm.
+func TestVoteAppIsServedFromTheWebDir(t *testing.T) {
+	web := t.TempDir()
+	vote := filepath.Join(web, "vote")
+	if err := os.MkdirAll(filepath.Join(vote, "pkg"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	os.WriteFile(filepath.Join(vote, "index.html"), []byte("<title>vote</title>"), 0o644)
+	wasm := []byte("\x00asm\x01\x00\x00\x00")
+	os.WriteFile(filepath.Join(vote, "pkg", "saksi_live_bg.wasm"), wasm, 0o644)
+	t.Setenv("SAKSI_WEB_DIR", web)
+	fx := newLiveFixture(t)
+	fx.allowHosts = []string{"vote.example:8443"}
+	c := fx.console()
+	get := func(host, path string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		req.Host = host
+		rec := httptest.NewRecorder()
+		c.s.ServeHTTP(rec, req)
+		return rec
+	}
+	if rec := get("vote.example:8443", "/vote/"); rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "<title>vote</title>") {
+		t.Fatalf("/vote/ with no session: %d %s", rec.Code, rec.Body)
+	}
+	rec := get("vote.example:8443", "/vote/pkg/saksi_live_bg.wasm")
+	if rec.Code != http.StatusOK || rec.Header().Get("Content-Type") != "application/wasm" || !bytes.Equal(rec.Body.Bytes(), wasm) {
+		t.Fatalf("wasm: %d %q", rec.Code, rec.Header().Get("Content-Type"))
+	}
+	if rec := get("vote.example:8443", "/vote?x=1"); rec.Code != http.StatusMovedPermanently || rec.Header().Get("Location") != "/vote/?x=1" {
+		t.Fatalf("/vote: %d %q", rec.Code, rec.Header().Get("Location"))
+	}
+	if rec := get("evil.example", "/vote/"); rec.Code != http.StatusForbidden {
+		t.Fatalf("/vote/ on a Host off the allowlist: %d", rec.Code)
+	}
+	if routeAccess["/vote/"] != accessPublic || routeAccess["/vote"] != accessPublic {
+		t.Fatal("/vote/ is not public in routeAccess")
+	}
+}
