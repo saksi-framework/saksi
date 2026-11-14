@@ -29,9 +29,14 @@ import (
 //     (issueMu), and few concurrent sessions (liveMaxSessions, liveSessionTTL),
 //     which keeps the blind-signature ROS attack out of reach.
 
-// issuedRecord is private/issued.json: the accounts that were given a
-// signature, and when. It is the eligibility control.
-type issuedRecord map[string]time.Time
+// issuedRecord is private/issued.json: the set of accounts that were given a
+// signature. It is the eligibility control. It holds no time: the ballots are
+// public in arrival order with their commit times, so a record of when each
+// named account was issued would let whoever reads this file match accounts
+// to ballots. Go writes the keys sorted, so the file's order says nothing
+// about the order of issuance either. (The file's own mtime still shows the
+// last issuance; live.json's updated_at is not touched by an issuance.)
+type issuedRecord map[string]bool
 
 // The issuance paths take the run folder from the public snapshot, never
 // from L.dir, which only mu guards.
@@ -215,14 +220,15 @@ func (L *liveService) sign(ctx context.Context, account, ePrime string) (map[str
 	if err != nil {
 		return nil, err
 	}
-	issued[account] = L.now().UTC()
+	issued[account] = true
 	if err := writeIssued(st.Dir, issued); err != nil {
 		return nil, fmt.Errorf("cannot record the issuance; the signature was not released: %w", err)
 	}
 	L.mu.Lock()
 	if L.st != nil && L.st.RunID == st.RunID {
 		L.st.Issued = len(issued)
-		err = L.save()
+		// No timestamp: updated_at keeps the last transition's time.
+		err = L.saveUntimed()
 	}
 	L.mu.Unlock()
 	if err != nil {

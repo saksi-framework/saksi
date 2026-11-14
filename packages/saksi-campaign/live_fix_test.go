@@ -1,9 +1,13 @@
 package campaign
 
 import (
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"regexp"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -90,5 +94,39 @@ func TestLiveBoardAndViewDoNotWaitOnTheStateLock(t *testing.T) {
 	c.s.live.mu.Unlock()
 	if codes[0] != http.StatusOK || codes[1] != http.StatusOK {
 		t.Fatalf("board and view while mu is held: %v", codes)
+	}
+}
+
+// S2: private/issued.json is a set of account names with no time in it, and
+// an issuance does not move live.json's updated_at.
+func TestLiveIssuedRecordHoldsNoTime(t *testing.T) {
+	fx := newLiveFixture(t)
+	c := fx.console()
+	runID := c.toState(LiveCeremony)
+	c.ceremony(runID)
+	before := c.s.live.snapshot().UpdatedAt
+	c.issue("voter1")
+	c.issue("voter2")
+	data, err := os.ReadFile(filepath.Join(fx.runs, runID, livePrivateDir, liveIssuedFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var set map[string]bool
+	if err := json.Unmarshal(data, &set); err != nil {
+		t.Fatalf("issued.json is not a set of names: %v\n%s", err, data)
+	}
+	if len(set) != 2 || !set["voter1"] || !set["voter2"] {
+		t.Fatalf("issued.json: %s", data)
+	}
+	timeLike := regexp.MustCompile(`\d{4}-\d{2}-\d{2}|\d{2}:\d{2}|\d{9,}`)
+	if timeLike.Match(data) {
+		t.Fatalf("issued.json holds a time-like value: %s", data)
+	}
+	if after := c.s.live.snapshot().UpdatedAt; !after.Equal(before) {
+		t.Fatalf("an issuance moved updated_at from %v to %v", before, after)
+	}
+	var st liveState
+	if err := readJSON(filepath.Join(fx.runs, runID, liveStateFile), &st); err != nil || st.Issued != 2 || !st.UpdatedAt.Equal(before) {
+		t.Fatalf("live.json after two issuances: issued %d, updated_at %v (want %v), %v", st.Issued, st.UpdatedAt, before, err)
 	}
 }

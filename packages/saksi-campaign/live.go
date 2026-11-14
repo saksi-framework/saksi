@@ -404,6 +404,13 @@ func (L *liveService) load() error {
 // Caller holds mu.
 func (L *liveService) save() error {
 	L.st.UpdatedAt = L.now().UTC()
+	return L.saveUntimed()
+}
+
+// saveUntimed is save without touching updated_at: an issuance is saved this
+// way, so no issuance time reaches live.json or the public view. Caller holds
+// mu.
+func (L *liveService) saveUntimed() error {
 	L.publishSnapshotLocked()
 	data, err := json.MarshalIndent(L.st, "", "  ")
 	if err != nil {
