@@ -110,6 +110,7 @@ Every read checks that the secret matches its recorded public point.
 | `trustee-keygen` | trustee `N` | writes its receive key file |
 | `dkg-deal` | trustee `N` | its receive key file |
 | `dkg-receive` | trustee `N` | its receive key file; writes its share file |
+| `dkg-roster` | console (relay), anyone | none |
 | `dkg-transcript` | console | none |
 | `aggregate` | anyone | none |
 | `partial` | trustee `N` | its share file |
@@ -122,7 +123,7 @@ Order of a live election:
 
 ```
 election-params -> CreateElection
-trustee-keygen x n -> (roster of all n receive keys)
+trustee-keygen x n -> (roster of all n receive keys) -> dkg-roster
 dkg-deal x n -> (relay) -> dkg-receive x n -> compare roster_fingerprint
 dkg-transcript -> PublishDKGTranscript -> compare joint key and verification keys
 per voter: voter-begin -> issue-presign -> voter-blind -> issue-sign -> voter-finalize
@@ -548,6 +549,33 @@ shown different rosters report different fingerprints. **Without that
 comparison the relay can substitute keys**: it can show every dealer a roster
 holding its own keys, read every share, and re-mask them to the real
 recipients, which would let it reconstruct the election key.
+
+### `dkg-roster`
+
+The roster check and digest that `dkg-deal` and `dkg-receive` make, with no
+key: what the relay (the console) publishes with the roster, so a trustee can
+compare the digest it was shown with the one it computes and with the other
+trustees'. Input:
+
+```json
+{"params": "<hex ElectionParameters>",
+ "peers": [{"trustee_id": 1, "receive_public_key": "<point>"}, "... the full roster"]}
+```
+
+The roster is checked as in `dkg-deal` (every id `1..=n` once, canonical
+non-identity points, no key twice). Output, peers in id order:
+
+```json
+{"election_id": "live-2026", "threshold": 3, "trustees": 5,
+ "peers": [{"trustee_id": 1, "receive_public_key": "<point>",
+            "fingerprint": "5E6F-7081-1A2B-3C4D-0F1E-2D3C-4B5A-6978"}, "..."],
+ "roster_digest": "<32-byte hex>",
+ "roster_fingerprint": "3C4D-5E6F-7081-1A2B-8E9F-A0B1-C2D3-E4F5"}
+```
+
+`fingerprint` is each key's `trustee-keygen` fingerprint. The digest is only
+as good as where it came from: a trustee still compares it with the digest the
+other trustees' own hosts report (task 4), never only with the relay's.
 
 ### `dkg-receive`
 

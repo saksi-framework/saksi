@@ -296,6 +296,30 @@ fn dkg_as_five_processes() {
     for d in &c.deals {
         assert_eq!(d["roster_digest"], c.deals[0]["roster_digest"]);
     }
+    // The keyless roster op (what the relay publishes) computes the same
+    // digest and each key's fingerprint, whatever order the peers come in.
+    let mut shuffled = c.peers.as_array().unwrap().clone();
+    shuffled.reverse();
+    let roster = ok(
+        "dkg-roster",
+        json!({ "params": c.params, "peers": shuffled }),
+    );
+    assert_eq!(roster["roster_digest"], c.deals[0]["roster_digest"]);
+    assert_eq!(
+        roster["roster_fingerprint"],
+        c.deals[0]["roster_fingerprint"]
+    );
+    assert_eq!(roster["trustees"], json!(N));
+    for (k, peer) in roster["peers"].as_array().unwrap().iter().enumerate() {
+        assert_eq!(peer["trustee_id"], json!(k + 1));
+        assert_eq!(peer["receive_public_key"], c.peers[k]["receive_public_key"]);
+        assert_eq!(peer["fingerprint"].as_str().unwrap().len(), 39);
+    }
+    // It refuses a roster with a key twice, as the dealer would.
+    let mut twice = c.peers.as_array().unwrap().clone();
+    twice[1]["receive_public_key"] = twice[0]["receive_public_key"].clone();
+    let err = live("dkg-roster", &json!({ "params": c.params, "peers": twice })).unwrap_err();
+    assert!(err.contains("repeats another trustee's key"), "{err}");
     // The roster fingerprint shows the digest's first 128 bits, grouped for
     // reading aloud; the full 32-byte digest stays in the output.
     let digest = c.deals[0]["roster_digest"].as_str().unwrap();

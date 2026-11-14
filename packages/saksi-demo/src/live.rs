@@ -46,6 +46,7 @@ pub const OPS: &[&str] = &[
     "trustee-keygen",
     "dkg-deal",
     "dkg-receive",
+    "dkg-roster",
     "dkg-transcript",
     "aggregate",
     "partial",
@@ -102,6 +103,7 @@ fn dispatch(op: &str, input: &str) -> R<Value> {
         "trustee-keygen" => trustee_keygen(parse(input)?),
         "dkg-deal" => dkg_deal(parse(input)?),
         "dkg-receive" => dkg_receive(parse(input)?),
+        "dkg-roster" => dkg_roster(parse(input)?),
         "dkg-transcript" => dkg_transcript(parse(input)?),
         "aggregate" => aggregate(parse(input)?),
         "partial" => partial(parse(input)?),
@@ -470,6 +472,41 @@ fn dkg_deal(i: DealIn) -> R<Value> {
     );
     secret.zeroize();
     to_value(out?)
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RosterIn {
+    params: String,
+    peers: Vec<dkg::Peer>,
+}
+
+/// The roster check and digest `dkg-deal` and `dkg-receive` make, with no key:
+/// what the relay publishes so every trustee can compare the same digest.
+fn dkg_roster(i: RosterIn) -> R<Value> {
+    let (election_id, threshold, trustees) = dkg_config(&i.params)?;
+    let roster = dkg::Roster::new(&election_id, threshold, trustees, &i.peers)?;
+    let mut peers = i.peers;
+    peers.sort_by_key(|p| p.trustee_id);
+    let peers: Vec<Value> = peers
+        .iter()
+        .map(|p| {
+            let key = roster.key(p.trustee_id)?;
+            Ok(json!({
+                "trustee_id": p.trustee_id,
+                "receive_public_key": hex::encode(key.compress().as_bytes()),
+                "fingerprint": dkg::receive_key_fingerprint(key),
+            }))
+        })
+        .collect::<R<_>>()?;
+    Ok(json!({
+        "election_id": election_id,
+        "threshold": threshold,
+        "trustees": trustees,
+        "peers": peers,
+        "roster_digest": roster.digest_hex(),
+        "roster_fingerprint": roster.fingerprint(),
+    }))
 }
 
 #[derive(Deserialize)]
