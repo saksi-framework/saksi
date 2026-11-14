@@ -1219,7 +1219,8 @@ func TestTrusteeIdentityFromTheConsole(t *testing.T) {
 // it goes on to decrypt and sign. Trustee 4's partial is re-posted after the
 // tally was published: the byte-equal partial on the chain counts as posted.
 // Trustee 5 is in the same spot as trustee 2 but the chain shows it a
-// transcript without its keys: that still ends in the alarm.
+// transcript whose first dealer's commitment is replaced: the encoding or
+// joint-key check still ends in the alarm.
 func TestTrusteeLostAnswersAfterPosting(t *testing.T) {
 	var bed atomic.Pointer[trusteeTestBed]
 	var crashMu sync.Mutex

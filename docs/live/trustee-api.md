@@ -238,12 +238,16 @@ The join step is `done` once the transcript on the chain is checked.
 5. **`--min-ballots`.** A position with fewer records is refused (default 2).
 6. Compares `ballots_digest` with every other trustee that has one for this
    election (from its peer page). A difference is alarm `ballots-peer-<id>`.
+   A peer URL that answers as another trustee is listed and not compared.
    A peer that has none yet is listed and not waited for, since each trustee
    reads the set from the chain itself.
 7. Runs `partial` over the chain's ballots with its own share (the output's
    digest must be the recorded one), saves it, and posts it exactly as printed
    (`POST /api/live/partial`). A 409 saying the chain holds a different partial
-   under this trustee's id is alarm `partial-conflict`.
+   under this trustee's id is checked against the chain first: a different
+   partial there shows as alarm `partial-readback` (step 8). Alarm
+   `partial-conflict` appears only when the console reports a conflict that
+   this trustee's own chain read does not show.
 8. **Reads its partial back from the chain**, contest by contest, and compares
    bytes. A difference is alarm `partial-readback`.
    If the console refuses a repeated post (its answer to the first was lost and
@@ -468,8 +472,8 @@ investigating.
 | `transcript` | The transcript on the chain does not carry this trustee's commitments, its joint key or this trustee's verification key | join, decrypt, sign |
 | `chain-changed` | The chain's parameters or transcript differ from the ones checked at the ceremony | decrypt, sign |
 | `ballots-peer-<id>` | Peer `<id>` read another ballot set | decrypt, sign |
-| `partial-conflict` | The chain holds a different partial under this trustee's id | decrypt, sign |
-| `partial-readback` | The partial read back from the chain is not the one computed | decrypt, sign |
+| `partial-conflict` | The console reports a different partial under this trustee's id that this trustee's own chain read does not show (a conflicting partial the chain read does show is `partial-readback`) | decrypt, sign |
+| `partial-readback` | The partial read back from the chain is not the one computed (including a conflicting partial the console reports) | decrypt, sign |
 | `ballots-changed` | The chain's ballot set changed after this trustee used it | sign |
 | `tally-totals` | The console refused the signature: its totals differ from this trustee's | sign |
 | `tally-differs` | The published tally is not this trustee's own combine | (none) |

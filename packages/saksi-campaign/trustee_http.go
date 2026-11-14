@@ -236,7 +236,11 @@ func (T *TrusteeService) request(step string, check func(p *trusteeProgress) err
 				return err
 			}
 			T.mu.Lock()
-			T.view = v
+			// Only when this call filled the slot: otherwise the driver's own
+			// view stands.
+			if T.view == nil && T.p != nil && T.p.ElectionID == v.ElectionID {
+				T.view = v
+			}
 			T.mu.Unlock()
 		}
 	}
