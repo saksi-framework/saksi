@@ -231,14 +231,12 @@ func (s *Server) handleLiveVerify(w http.ResponseWriter, r *http.Request) {
 // --- public --------------------------------------------------------------------
 
 func (s *Server) handleLiveElection(w http.ResponseWriter, r *http.Request) {
-	s.live.mu.Lock()
-	none := s.live.st == nil
-	s.live.mu.Unlock()
-	if none {
+	sn := s.live.snapshot()
+	if sn == nil {
 		liveFail(w, errNotFound{"no live election has been set up"})
 		return
 	}
-	writeJSONResp(w, http.StatusOK, s.live.electionView())
+	writeJSONResp(w, http.StatusOK, s.live.electionViewOf(sn))
 }
 
 func (s *Server) handleLiveLedger(w http.ResponseWriter, r *http.Request) {
@@ -451,43 +449,31 @@ type LiveElectionView struct {
 	UpdatedAt           time.Time         `json:"updated_at"`
 }
 
+// electionView is GET /api/live/election, built from the public snapshot: it
+// never waits on mu, so a transition held up by a slow chain does not freeze
+// it. Caller has checked that an election exists.
 func (L *liveService) electionView() LiveElectionView {
-	L.mu.Lock()
-	st := L.st
+	return L.electionViewOf(L.snapshot())
+}
+
+func (L *liveService) electionViewOf(sn *liveSnapshot) LiveElectionView {
 	v := LiveElectionView{
-		RunID: st.RunID, ElectionID: st.ElectionID, Title: st.Title, State: st.State,
-		Positions: st.Positions, Trustees: st.Trustees, Threshold: st.Threshold,
-		Params: st.Params, ContestIDs: st.ContestIDs, IssuerPublicKey: st.IssuerPublicKey,
-		DKG: st.DKG, JointPublicKey: st.JointPublicKey, JointKeyFingerprint: st.JointKeyFingerprint,
-		CeremonyError: st.CeremonyError, Lifecycle: st.Lifecycle,
-		Totals: st.Totals, VerifyOverall: st.VerifyOverall,
-		CreatedAt: st.CreatedAt, UpdatedAt: st.UpdatedAt,
+		RunID: sn.RunID, ElectionID: sn.ElectionID, Title: sn.Title, State: sn.State,
+		Positions: sn.Positions, Trustees: sn.Trustees, Threshold: sn.Threshold,
+		Params: sn.Params, ContestIDs: sn.ContestIDs, IssuerPublicKey: sn.IssuerPublicKey,
+		DKG: sn.DKG, JointPublicKey: sn.JointPublicKey, JointKeyFingerprint: sn.JointKeyFingerprint,
+		VerificationKeys: sn.VerificationKeys, RosterFingerprint: sn.RosterFingerprint,
+		CeremonyError: sn.CeremonyError, Lifecycle: sn.Lifecycle,
+		Totals: sn.Totals, VerifyOverall: sn.VerifyOverall,
+		CreatedAt: sn.CreatedAt, UpdatedAt: sn.UpdatedAt,
 		Counts: LiveCounts{
-			VotersOnRoll: len(L.voterRoll()), CredentialsIssued: st.Issued,
-			BallotRecords: st.Ballots, BallotRecordsSource: "console",
-			TrusteesDecrypted: L.decryptedLocked(), TallySignatures: len(st.Signatures),
+			VotersOnRoll: len(L.voterRoll()), CredentialsIssued: sn.Issued,
+			BallotRecords: sn.Ballots, BallotRecordsSource: "console",
+			TrusteesDecrypted: len(sn.Decrypted), TallySignatures: len(sn.TallySignatures),
 		},
 	}
-	if st.Transcript != nil {
-		var tr struct {
-			VerificationKeys json.RawMessage `json:"verification_keys"`
-		}
-		if json.Unmarshal(st.Transcript, &tr) == nil {
-			v.VerificationKeys = tr.VerificationKeys
-		}
-	}
-	if st.Roster != nil {
-		var ro struct {
-			RosterFingerprint string `json:"roster_fingerprint"`
-		}
-		if json.Unmarshal(st.Roster, &ro) == nil {
-			v.RosterFingerprint = ro.RosterFingerprint
-		}
-	}
-	electionID, onChain := st.ElectionID, st.stateIndex() >= liveStateIndex(LiveCeremony)
-	L.mu.Unlock()
-	if onChain {
-		if n := L.chainCount(electionID); n >= 0 {
+	if sn.stateIndex() >= liveStateIndex(LiveCeremony) {
+		if n := L.chainCount(sn.ElectionID); n >= 0 {
 			v.Counts.BallotRecords, v.Counts.BallotRecordsSource = n, "chain"
 		}
 	}

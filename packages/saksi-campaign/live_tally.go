@@ -63,16 +63,13 @@ type LiveBallotReceipt struct {
 // relayBallot submits one ballot record as the phone built it. Nothing here
 // knows who sent it: the handler passes only the ballot hex.
 func (L *liveService) relayBallot(ballotHex string) (*LiveBallotReceipt, error) {
-	L.mu.Lock()
-	st := L.st
-	var electionID, state string
-	if st != nil {
-		electionID, state = st.ElectionID, st.State
-	}
-	L.mu.Unlock()
-	if st == nil {
+	// The state check reads the public snapshot: a ballot never waits on mu,
+	// which a transition holds across a chain submit.
+	sn := L.snapshot()
+	if sn == nil {
 		return nil, errNotFound{"no live election has been set up"}
 	}
+	electionID, state := sn.ElectionID, sn.State
 	if state != LiveOpen {
 		return nil, conflictf("the election is %s; ballots are accepted while it is open", state)
 	}
@@ -162,17 +159,11 @@ type LiveLedger struct {
 
 // readLedger reads the election back from the chain, not from the run folder.
 func (L *liveService) readLedger() (*LiveLedger, error) {
-	L.mu.Lock()
-	st := L.st
-	var electionID string
-	var contests, trustees []string
-	if st != nil {
-		electionID, contests, trustees = st.ElectionID, slices.Clone(st.ContestIDs), st.trusteeIDs()
-	}
-	L.mu.Unlock()
-	if st == nil {
+	sn := L.snapshot()
+	if sn == nil {
 		return nil, errNotFound{"no live election has been set up"}
 	}
+	electionID, contests, trustees := sn.ElectionID, sn.ContestIDs, trusteeIDs(sn.Trustees)
 	c, err := L.getChain()
 	if err != nil {
 		return nil, errChain{err}

@@ -68,22 +68,23 @@ func (s *Server) buildLiveBoard(rec RunRecord, dir string) BoardResponse {
 		OpenedAt: rec.CreatedAt, Sealed: true, Artifacts: artifactsIn(dir), Files: []string{},
 		Checks: []Check{},
 	}
-	var st *liveState
+	// The console's current election comes from the public snapshot, so the
+	// board never waits on mu and never reads the live maps; any other live
+	// run is read from its folder.
+	var st *liveSnapshot
 	current := false
 	if s.live != nil {
-		s.live.mu.Lock()
-		if s.live.st != nil && s.live.st.RunID == rec.RunID {
-			cp := *s.live.st
-			st, current = &cp, true
+		if sn := s.live.snapshot(); sn != nil && sn.RunID == rec.RunID {
+			st, current = sn, true
 		}
-		s.live.mu.Unlock()
 	}
 	if st == nil {
-		var err error
-		if st, err = liveRunState(dir); err != nil {
+		disk, err := liveRunState(dir)
+		if err != nil {
 			resp.Partial, resp.PartialReason = true, "live election state unreadable"
 			return resp
 		}
+		st = snapshotOf(disk, dir)
 	}
 	resp.Name = st.Title
 	resp.Status = st.State
@@ -104,31 +105,26 @@ func (s *Server) buildLiveBoard(rec RunRecord, dir string) BoardResponse {
 	if d := rec.Config.Voters * len(st.Positions); d > 0 {
 		resp.Integrity.TurnoutPct = float64(st.Ballots) / float64(d) * 100
 	}
-	decrypted, k := []int{}, 0
-	for _, n := range sortedIDs(st.Partials) {
-		if len(st.Partials[strconv.Itoa(n)]) == len(st.ContestIDs) {
-			decrypted = append(decrypted, n)
-			k++
-		}
-	}
+	k := len(st.Decrypted)
 	resp.Crypto = BoardCrypto{
 		TallyProofVerified: resp.Verified, TrusteesSubmitted: k,
 		TrusteesTotal: st.Trustees, Threshold: st.Threshold, IssuerPublicKey: st.IssuerPublicKey,
 	}
-	issued := st.Issued
 	live := &LiveBoard{
 		State: st.State, Title: st.Title, ContestIDs: st.ContestIDs,
 		JointKeyFingerprint: st.JointKeyFingerprint,
 		Counts: LiveCounts{
-			VotersOnRoll: rec.Config.Voters, CredentialsIssued: issued,
+			VotersOnRoll: rec.Config.Voters, CredentialsIssued: st.Issued,
 			BallotRecords: st.Ballots, BallotRecordsSource: "console",
-			TrusteesDecrypted: k, TallySignatures: len(st.Signatures),
+			TrusteesDecrypted: k, TallySignatures: len(st.TallySignatures),
 		},
 		Decryption: LiveBoardDecryption{
 			TrusteesDecrypted: k, Threshold: st.Threshold, Trustees: st.Trustees,
-			Decrypted: decrypted, TallySignatures: sortedIDs(st.Signatures),
+			Decrypted: st.Decrypted, TallySignatures: st.TallySignatures,
 		},
-		VerifyOverall: st.VerifyOverall,
+		VerifyOverall:     st.VerifyOverall,
+		RosterFingerprint: st.RosterFingerprint,
+		FailedChecks:      st.FailedChecks,
 	}
 	if current {
 		live.Counts.VotersOnRoll = len(s.live.voterRoll())
@@ -136,12 +132,6 @@ func (s *Server) buildLiveBoard(rec RunRecord, dir string) BoardResponse {
 			live.Counts.BallotRecords, live.Counts.BallotRecordsSource = n, "chain"
 			resp.Crypto.CommittedNullifiers = n
 		}
-	}
-	if st.Roster != nil {
-		live.RosterFingerprint = jsonField(st.Roster, "roster_fingerprint")
-	}
-	if st.Verify != nil {
-		live.FailedChecks = failedCheckNames(st.Verify)
 	}
 	ballots, err := liveBoardBallots(dir)
 	if err != nil {
@@ -239,7 +229,7 @@ func liveBoardBallots(dir string) ([]LiveBoardBallot, error) {
 	return out, nil
 }
 
-func liveBoardChecks(st *liveState, live *LiveBoard) []Check {
+func liveBoardChecks(st *liveSnapshot, live *LiveBoard) []Check {
 	var checks []Check
 	if st.DKG != "" {
 		checks = append(checks, pass("The election key was made by the trustees' ceremony",
@@ -254,9 +244,9 @@ func liveBoardChecks(st *liveState, live *LiveBoard) []Check {
 	} else {
 		checks = append(checks, fail("Enough trustees decrypted", dec))
 	}
-	if st.Tally != "" {
+	if st.Tallied {
 		checks = append(checks, pass("The tally was published on the chain",
-			fmt.Sprintf("%d trustee signatures", len(st.Signatures))))
+			fmt.Sprintf("%d trustee signatures", len(st.TallySignatures))))
 	} else {
 		checks = append(checks, fail("The tally was published on the chain", "no tally has been published yet"))
 	}

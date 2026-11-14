@@ -33,9 +33,16 @@ import (
 // signature, and when. It is the eligibility control.
 type issuedRecord map[string]time.Time
 
-func (L *liveService) readIssued() (issuedRecord, error) {
+// The issuance paths take the run folder from the public snapshot, never
+// from L.dir, which only mu guards.
+
+func issuedPath(dir string) string    { return filepath.Join(dir, livePrivateDir, liveIssuedFile) }
+func sessionsDirOf(dir string) string { return filepath.Join(dir, livePrivateDir, liveSessionsDir) }
+func issuerKeyOf(dir string) string   { return filepath.Join(dir, livePrivateDir, liveIssuerKey) }
+
+func readIssued(dir string) (issuedRecord, error) {
 	rec := issuedRecord{}
-	data, err := os.ReadFile(filepath.Join(L.privateDir(), liveIssuedFile))
+	data, err := os.ReadFile(issuedPath(dir))
 	if errors.Is(err, os.ErrNotExist) {
 		return rec, nil
 	}
@@ -48,19 +55,19 @@ func (L *liveService) readIssued() (issuedRecord, error) {
 	return rec, nil
 }
 
-func (L *liveService) writeIssued(rec issuedRecord) error {
+func writeIssued(dir string, rec issuedRecord) error {
 	data, err := json.MarshalIndent(rec, "", "  ")
 	if err != nil {
 		return err
 	}
-	return writeFileAtomic(filepath.Join(L.privateDir(), liveIssuedFile), data, 0o600)
+	return writeFileAtomic(issuedPath(dir), data, 0o600)
 }
 
 // sessionPath is account's session file. The name is a hash of the account,
 // so no account string reaches a path, and each account has one name.
-func (L *liveService) sessionPath(account string) string {
+func sessionPath(dir, account string) string {
 	sum := sha256.Sum256([]byte("saksi.live.session.v1\x00" + account))
-	return filepath.Join(L.sessionsDir(), hex.EncodeToString(sum[:16])+".json")
+	return filepath.Join(sessionsDirOf(dir), hex.EncodeToString(sum[:16])+".json")
 }
 
 // sweepClaimed removes session files issue-sign claimed but did not get to
@@ -85,8 +92,9 @@ func sweepClaimed(dir string) error {
 
 // openSessions counts session files younger than the TTL, removing the stale
 // ones.
-func (L *liveService) openSessions(now time.Time) (int, error) {
-	entries, err := os.ReadDir(L.sessionsDir())
+func openSessions(dir string, now time.Time) (int, error) {
+	sessions := sessionsDirOf(dir)
+	entries, err := os.ReadDir(sessions)
 	if err != nil {
 		return 0, err
 	}
@@ -97,7 +105,7 @@ func (L *liveService) openSessions(now time.Time) (int, error) {
 			continue
 		}
 		if now.Sub(info.ModTime()) > liveSessionTTL {
-			_ = os.Remove(filepath.Join(L.sessionsDir(), e.Name()))
+			_ = os.Remove(filepath.Join(sessions, e.Name()))
 			continue
 		}
 		n++
@@ -110,11 +118,10 @@ type errTooMany struct{ msg string }
 
 func (e errTooMany) Error() string { return e.msg }
 
-// checkIssuable is the shared gate of presign and sign. Caller holds issueMu.
-func (L *liveService) checkIssuable(account string) (*liveState, error) {
-	L.mu.Lock()
-	st := L.st
-	L.mu.Unlock()
+// checkIssuable is the shared gate of presign and sign. It reads the state
+// from the public snapshot, never from the live state. Caller holds issueMu.
+func (L *liveService) checkIssuable(account string) (*liveSnapshot, error) {
+	st := L.snapshot()
 	if st == nil {
 		return nil, errNotFound{"no live election has been set up"}
 	}
@@ -124,7 +131,7 @@ func (L *liveService) checkIssuable(account string) (*liveState, error) {
 	if u, ok := L.s.auth.users[account]; !ok || u.Role != RoleVoter {
 		return nil, errForbidden{"this account is not on the voter roll"}
 	}
-	issued, err := L.readIssued()
+	issued, err := readIssued(st.Dir)
 	if err != nil {
 		return nil, err
 	}
@@ -145,15 +152,15 @@ func (L *liveService) presign(ctx context.Context, account, blindedCommitment st
 	if err != nil {
 		return nil, err
 	}
-	if err := sweepClaimed(L.sessionsDir()); err != nil {
+	if err := sweepClaimed(sessionsDirOf(st.Dir)); err != nil {
 		return nil, err
 	}
-	path := L.sessionPath(account)
+	path := sessionPath(st.Dir, account)
 	// One open session per account: the earlier one is discarded first.
 	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return nil, err
 	}
-	n, err := L.openSessions(L.now())
+	n, err := openSessions(st.Dir, L.now())
 	if err != nil {
 		return nil, err
 	}
@@ -164,7 +171,7 @@ func (L *liveService) presign(ctx context.Context, account, blindedCommitment st
 		R string `json:"r"`
 	}
 	if err := L.opJSON(ctx, "issue-presign", map[string]string{
-		"issuer_key_file": L.issuerKeyPath(), "blinded_commitment": blindedCommitment, "session_file": path,
+		"issuer_key_file": issuerKeyOf(st.Dir), "blinded_commitment": blindedCommitment, "session_file": path,
 	}, &out); err != nil {
 		return nil, badRequestf("%v", err)
 	}
@@ -183,7 +190,7 @@ func (L *liveService) sign(ctx context.Context, account, ePrime string) (map[str
 	if err != nil {
 		return nil, err
 	}
-	path := L.sessionPath(account)
+	path := sessionPath(st.Dir, account)
 	info, err := os.Stat(path)
 	if err != nil {
 		return nil, conflictf("no issuance session is open for this account; start again with presign")
@@ -196,25 +203,27 @@ func (L *liveService) sign(ctx context.Context, account, ePrime string) (map[str
 		SIss string `json:"s_iss"`
 	}
 	signErr := L.opJSON(ctx, "issue-sign", map[string]string{
-		"issuer_key_file": L.issuerKeyPath(), "session_file": path, "e_prime": ePrime,
+		"issuer_key_file": issuerKeyOf(st.Dir), "session_file": path, "e_prime": ePrime,
 	}, &out)
-	_ = sweepClaimed(L.sessionsDir())
+	_ = sweepClaimed(sessionsDirOf(st.Dir))
 	if signErr != nil {
 		return nil, badRequestf("%v", signErr)
 	}
 	// Recorded on disk before the signature leaves: if this write fails the
 	// signature is dropped, and the account may try again.
-	issued, err := L.readIssued()
+	issued, err := readIssued(st.Dir)
 	if err != nil {
 		return nil, err
 	}
 	issued[account] = L.now().UTC()
-	if err := L.writeIssued(issued); err != nil {
+	if err := writeIssued(st.Dir, issued); err != nil {
 		return nil, fmt.Errorf("cannot record the issuance; the signature was not released: %w", err)
 	}
 	L.mu.Lock()
-	L.st.Issued = len(issued)
-	err = L.save()
+	if L.st != nil && L.st.RunID == st.RunID {
+		L.st.Issued = len(issued)
+		err = L.save()
+	}
 	L.mu.Unlock()
 	if err != nil {
 		log.Printf("live: %s save after issuance: %v", st.RunID, err)

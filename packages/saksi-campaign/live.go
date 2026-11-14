@@ -19,6 +19,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	clientsdk "github.com/saksi-framework/saksi/packages/saksi-bulletin/client-sdk"
@@ -165,8 +166,8 @@ func liveStateIndex(s string) int {
 }
 
 // trusteeIDs is "1".."n".
-func (st *liveState) trusteeIDs() []string {
-	ids := make([]string, st.Trustees)
+func trusteeIDs(n int) []string {
+	ids := make([]string, n)
 	for i := range ids {
 		ids[i] = strconv.Itoa(i + 1)
 	}
@@ -277,6 +278,10 @@ type liveService struct {
 	// partialBusy marks a trustee whose partials are in flight (guarded by mu).
 	partialBusy map[string]bool
 
+	// snap is the public view, rebuilt under mu at every save (live_snapshot.go).
+	// Readers that must not wait on mu read it instead of st.
+	snap atomic.Pointer[liveSnapshot]
+
 	// issueMu serializes issuance: one issue-presign or issue-sign at a time,
 	// across all accounts.
 	issueMu sync.Mutex
@@ -349,9 +354,8 @@ func (L *liveService) getChain() (liveChain, error) {
 	return c, nil
 }
 
-func (L *liveService) privateDir() string    { return filepath.Join(L.dir, livePrivateDir) }
-func (L *liveService) issuerKeyPath() string { return filepath.Join(L.privateDir(), liveIssuerKey) }
-func (L *liveService) sessionsDir() string   { return filepath.Join(L.privateDir(), liveSessionsDir) }
+func (L *liveService) privateDir() string  { return filepath.Join(L.dir, livePrivateDir) }
+func (L *liveService) sessionsDir() string { return filepath.Join(L.privateDir(), liveSessionsDir) }
 
 // voterRoll is every voter account, sorted.
 func (L *liveService) voterRoll() []string {
@@ -387,6 +391,7 @@ func (L *liveService) load() error {
 			return fmt.Errorf("live run %s: state schema %q, want %q", rec.RunID, st.Schema, liveStateSchema)
 		}
 		L.st, L.dir = &st, dir
+		L.publishSnapshotLocked()
 		if err := sweepClaimed(L.sessionsDir()); err != nil {
 			log.Printf("live: sweep sessions: %v", err)
 		}
@@ -395,9 +400,11 @@ func (L *liveService) load() error {
 	return nil
 }
 
-// save writes the state atomically. Caller holds mu.
+// save writes the state atomically and republishes the public snapshot.
+// Caller holds mu.
 func (L *liveService) save() error {
 	L.st.UpdatedAt = L.now().UTC()
+	L.publishSnapshotLocked()
 	data, err := json.MarshalIndent(L.st, "", "  ")
 	if err != nil {
 		return err
