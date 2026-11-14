@@ -15,11 +15,15 @@ import (
 // liveFixture is saksi-protocol/test-vectors/live-v1/election.json: one live
 // election (5 trustees, threshold 3, 3 voters x 2 positions x 3 candidates)
 // whose every artifact was produced by the `saksi-demo live` CLI as separate
-// processes. Regenerate with
-//
-//	SAKSI_LIVE_FIXTURE_OUT=$PWD/packages/saksi-protocol/test-vectors/live-v1/election.json \
-//	  cargo test -p saksi-demo --test live_cli full_pipeline_through_the_cli
+// processes. Regenerate with tools/live/regen-chaincode-fixture.sh; the Rust
+// test committed_chaincode_fixture_is_current fails when it is stale.
+const (
+	liveFixtureSchema = "saksi-live-chaincode-fixture-v1"
+	regenerate        = "regenerate it with tools/live/regen-chaincode-fixture.sh"
+)
+
 type liveFixture struct {
+	Schema               string   `json:"schema"`
 	ElectionID           string   `json:"election_id"`
 	Params               string   `json:"params"`
 	DKG                  string   `json:"dkg"`
@@ -40,8 +44,11 @@ func loadLiveFixture(t *testing.T) liveFixture {
 	if err := json.Unmarshal(raw, &f); err != nil {
 		t.Fatalf("parse live fixture: %v", err)
 	}
+	if f.Schema != liveFixtureSchema {
+		t.Fatalf("live fixture schema %q, want %q: %s", f.Schema, liveFixtureSchema, regenerate)
+	}
 	if len(f.Ballots) != 6 || len(f.Partials) != 18 {
-		t.Fatalf("live fixture has %d ballots and %d partials, want 6 and 18", len(f.Ballots), len(f.Partials))
+		t.Fatalf("live fixture has %d ballots and %d partials, want 6 and 18: %s", len(f.Ballots), len(f.Partials), regenerate)
 	}
 	return f
 }
@@ -72,7 +79,7 @@ func TestLiveArtifactsPassTheChaincode(t *testing.T) {
 
 	for i, b := range f.Ballots {
 		if err := sc.SubmitBallot(ctx, b); err != nil {
-			t.Fatalf("SubmitBallot[%d]: %v", i, err)
+			t.Fatalf("SubmitBallot[%d]: %v (if the live wire format changed, %s)", i, err, regenerate)
 		}
 	}
 	if gate := gateIDOf(sc.SubmitBallot(ctx, f.Ballots[0])); gate != "nullifier" {
