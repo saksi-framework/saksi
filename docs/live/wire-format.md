@@ -6,8 +6,13 @@ process (`saksi-campaign trustee --id N`), and the phone's WebAssembly
 (`packages/saksi-wasm`). It matches the code in `packages/saksi-live` (voter
 and dealer steps), `packages/saksi-auditor/src/live.rs` (checks the auditor
 already makes) and `packages/saksi-demo/src/live.rs` (the CLI and its files).
-The tests that hold it to the code are `packages/saksi-demo/tests/live_cli.rs`
-and `packages/saksi-bulletin/chaincode/live_artifacts_test.go`.
+The tests that hold it to the code are `packages/saksi-demo/tests/live_cli.rs`,
+`packages/saksi-bulletin/chaincode/live_artifacts_test.go` and
+`live_wasm_ballots_test.go`, and `tools/live/test-wasm.sh` (the phone's
+WebAssembly run under node).
+
+Format version: `saksi-live-wire-v1` (`saksi_live::WIRE_FORMAT`, reported by
+the phone's `version()`).
 
 This is a later build, not the study build. The study's subcommands and
 outputs are unchanged.
@@ -286,8 +291,10 @@ order.
 
 The phone's WebAssembly calls the same Rust functions directly:
 `saksi_live::issuance::{voter_begin, voter_blind, voter_finalize}`,
-`saksi_live::ballot::build_ballot` and `saksi_live::election::tracking_code`.
-Their argument and result types serialize to exactly the JSON below.
+`saksi_live::ballot::build_ballot_with_opening` (the `ballot` builder, plus
+the Benaloh opening) and `saksi_live::election::tracking_code`. Their argument
+and result types serialize to exactly the JSON below; the exports themselves
+are in **WebAssembly (phone)**.
 
 ### `voter-begin`
 
@@ -766,6 +773,219 @@ Output:
 `verify-live` exits 0 whenever it produced a verdict, pass or fail; it exits 1
 only when the input cannot be read.
 
+## WebAssembly (phone)
+
+`packages/saksi-wasm` is the phone's binding: a `wasm-bindgen` `cdylib` over
+`saksi-live` that adds no cryptography of its own. `tools/live/build-wasm.sh`
+builds it and writes the web package `packages/saksi-wasm/pkg/` (git-ignored),
+named `@saksi/wasm`:
+
+| File | What |
+|---|---|
+| `saksi_wasm_bg.wasm` | the module (release, `opt-level = "s"`, fat LTO, one codegen unit) |
+| `saksi_wasm.js`, `saksi_wasm.d.ts` | `wasm-bindgen` glue for the `web` target: the string API below |
+| `index.js`, `index.d.ts` | the typed wrapper the app imports: plain objects in and out |
+| `wire.d.ts` | TypeScript types of every input and output shape below |
+| `package.json` | `@saksi/wasm`, `type: module`, with the build's git revision |
+
+It also writes `packages/saksi-wasm/pkg-node/` (the `nodejs` target, for the
+tests). `wasm-bindgen-cli` is pinned to the crate's `wasm-bindgen` version
+(`=0.2.130`) and installed into `tools/live/.tools/` (git-ignored) on the
+first build.
+
+### Calling convention (wasm)
+
+- **Strings everywhere.** Every export takes one JS string, the JSON input
+  shown below, and returns one JS string, the JSON output. `begin_issuance()`
+  and `version()` take nothing. The typed wrapper (`index.js`) does the
+  `JSON.stringify` and `JSON.parse`; `@saksi/wasm/raw` is the string API.
+- **Errors** are thrown: a JS `Error` whose `message` is the CLI's error
+  object, `{"error": "<message>"}`, with the same texts as the CLI ops.
+  `errorOf(e)` returns the inner message. No secret appears in an error; a
+  malformed input reports only its category and position.
+- **Randomness** comes from the browser (`crypto.getRandomValues`, through
+  `getrandom`'s `js` feature, enabled in this crate only).
+- **Only voter functions are exported.** No issuer step (`issuer_presign`,
+  `issuer_sign`) and nothing that rebuilds an issuer session.
+
+Importing it from the app (Vite):
+
+```ts
+import init, { version, begin_issuance, build_ballot, errorOf } from "@saksi/wasm";
+await init();            // fetches saksi_wasm_bg.wasm (Vite serves it as an asset)
+console.info(version()); // {name, version, wire_format, protocol_wire_version, git_rev}
+```
+
+Vite should not pre-bundle it (`optimizeDeps: { exclude: ["@saksi/wasm"] }`),
+so the glue's `new URL("saksi_wasm_bg.wasm", import.meta.url)` resolves to the
+package file. `init({ module_or_path })` also takes the module bytes or a URL.
+
+### Exports
+
+#### `version()`
+
+Output `{"name": "saksi-wasm", "version": "0.1.0", "wire_format":
+"saksi-live-wire-v1", "protocol_wire_version": 1, "git_rev": "11c51c5"}`.
+`wire_format` is `saksi_live::WIRE_FORMAT`, the version of this document's
+format; `git_rev` is the saksi commit the build script built from (with
+`-dirty` when `packages/` had uncommitted changes), `null` when built without
+the script. The app shows it and logs it.
+
+#### `begin_issuance()`
+
+The CLI `voter-begin` output: `{"blinded_commitment", "state": {"s_cred",
+"b"}}`. Send `blinded_commitment` to the console (`issue-presign`); keep
+`state` in memory for the next step.
+
+#### `blind_challenge(input)`
+
+The CLI `voter-blind` input and output: `{"state", "r", "issuer_public_key"}`
+-> `{"e_prime", "state": {"s_cred", "r_prime", "alpha", "beta"}}`. Send
+`e_prime` to the console (`issue-sign`); keep `state` for the next step.
+
+#### `finalize_issuance(input)`
+
+The CLI `voter-finalize` input and output: `{"state", "s_iss",
+"issuer_public_key"}` -> `{"credential": {"s_cred", "signature_r",
+"signature_s"}, "commitment"}`. Refuses a response that does not unblind into
+a valid issuer signature.
+
+#### `check_credential(input)`
+
+Rebuilds a stored credential and checks it against the election's issuer key,
+so the app can tell on start whether the credential in IndexedDB is usable
+for this election. Input:
+
+```json
+{"params": "<hex ElectionParameters>",
+ "credential": {"s_cred": "...", "signature_r": "...", "signature_s": "..."}}
+```
+
+Output `{"usable": true, "election_id", "issuer_public_key", "commitment"}`.
+A credential the election's issuer did not sign is refused (thrown):
+`the credential is not signed by this election's issuer`.
+
+#### `election_info(input)`
+
+Input `{"params": "<hex>", "dkg": "<hex DKGTranscript>"}`. Output:
+
+```json
+{"election_id": "live-2026",
+ "positions": [{"id": "president", "candidates": ["alice", "bob", "carol"]}, "..."],
+ "trustees": 5, "threshold": 3,
+ "issuer_public_key": "<point>",
+ "joint_public_key": "<point>",
+ "joint_key_fingerprint": "7A1B-2C3D-4E5F-6071-8293-A4B5-C6D7-E8F9"}
+```
+
+Positions and candidates come from the contest ids, in ballot order. The
+transcript is checked as `ballot` checks it (the election's, one dealer per
+trustee, `t` commitments each, joint key not the identity).
+`joint_key_fingerprint` is the value `dkg-transcript` and every trustee's
+`dkg-receive` show: the phone shows it so people can confirm the ballots are
+encrypted under the key the trustees made.
+
+#### `build_ballot(input)`
+
+Input: the CLI `ballot` input. Output: the CLI `ballot` output, plus
+`opening`:
+
+```json
+{"ballot": "<hex Ballot: the SubmitBallot argument>",
+ "election_id": "live-2026", "position_id": "president",
+ "contest_ids": ["president/alice", "president/bob", "president/carol"],
+ "nullifier": "<32-byte hex>", "tracking_code": "BC-7F3A-92C1",
+ "opening": {"kind": "saksi-live-ballot-opening-v1",
+             "ballot_digest": "<SHA-256 of the ballot bytes, hex>",
+             "contest_ids": ["president/alice", "president/bob", "president/carol"],
+             "choice": 1,
+             "randomness": ["<scalar r_1>", "<scalar r_2>", "<scalar r_3>"]}}
+```
+
+It is `saksi_live::ballot::build_ballot_with_opening`: the same builder as the
+CLI's `ballot`, which only copies each slot's ElGamal randomness out before
+wiping it, so for the same random stream the ballot bytes are identical.
+`opening` is opaque to the app: it hands it back to `benaloh_open` unchanged.
+
+#### `benaloh_open(input)`
+
+Input `{"ballot": "<hex Ballot>", "opening": {...}}`. Refuses an opening made
+for another ballot (`this opening is not for this ballot`, by
+`ballot_digest`). Output, the opened values:
+
+```json
+{"election_id": "live-2026", "position_id": "president",
+ "nullifier": "<32-byte hex>", "tracking_code": "BC-7F3A-92C1",
+ "slots": [{"contest_id": "president/alice", "plaintext": 0, "randomness": "<scalar r_1>"},
+           {"contest_id": "president/bob",   "plaintext": 1, "randomness": "<scalar r_2>"},
+           {"contest_id": "president/carol", "plaintext": 0, "randomness": "<scalar r_3>"}]}
+```
+
+#### `benaloh_check(input)`
+
+Input `{"params", "dkg", "ballot", "opened"}` with `opened` as above. Output
+exactly as the CLI's `benaloh-check` (same function): `{"valid", "position_id",
+"tracking_code", "slots": [{"contest_id", "plaintext", "reproduces"}],
+"encoded_choice", "encoded_candidate"}`. Each slot is re-encrypted under the
+transcript's joint key with the revealed randomness,
+`(r·G, m·G + r·Y)`, and compared with the ballot's `(pad, data)`. `valid` is
+true iff every slot reproduces and exactly one slot holds 1; then
+`encoded_candidate` is the candidate id the ballot encodes. **The app
+compares `encoded_candidate` with the voter's choice** and shows both.
+
+#### `tracking_code(input)`
+
+Input `{"nullifier": "<hex>"}`, output `{"tracking_code": "BC-XXXX-XXXX"}`
+(the board's `formatTrackingCode`).
+
+### The Benaloh challenge
+
+1. The phone builds the ballot (`build_ballot`) and shows the voter its
+   tracking code.
+2. The voter chooses **cast** or **challenge**.
+   - **Cast:** the app submits `ballot` and drops `opening`.
+   - **Challenge:** the app calls `benaloh_open`, then `benaloh_check`, and
+     shows the slots, `valid` and `encoded_candidate` next to the voter's
+     choice. The opened values are plain JSON, so any other implementation
+     can check them too (`saksi-demo live benaloh-check` is one).
+3. **A challenged ballot is never submitted.** Its vote is now readable by
+   whoever sees the opening. The app discards the ballot, the opening and the
+   opened values, and builds a fresh ballot (`build_ballot` again), which
+   draws fresh randomness. The voter may challenge again or cast.
+
+The fresh ballot has **the same nullifier**, and so the same tracking code,
+as the challenged one. The nullifier is a function of the credential, the
+election and the position: one per voter per position, so a voter cannot
+cast twice in a position. That is fine for the challenge because the
+challenged ballot never reaches the chain; the chain sees the nullifier once,
+on the cast ballot. (Were a challenged ballot submitted by mistake, the
+chaincode would accept it, since it is a valid ballot, and then refuse the
+cast one at the `nullifier` gate; the Go test shows that order the other way
+round.) It also means an opening links the challenged choice to the voter's
+tracking code, which is one more reason the opened values stay on the phone.
+
+The check is only as independent as the code that runs it: a phone whose
+wasm lied could lie in its check too. The demo runs both in the same wasm, to
+show the mechanism; the honest version checks the opened values elsewhere.
+
+### What the phone keeps, and what it drops
+
+| Value | Secret? | The app |
+|---|---|---|
+| `begin_issuance().state` | yes (`s_cred`, `b`) | keeps in memory for `blind_challenge`, then drops |
+| `blind_challenge().state` | yes (`s_cred`, `α`, `β`) | keeps in memory for `finalize_issuance`, then drops |
+| `finalize_issuance().credential` | yes (`s_cred` votes) | **the one value it stores** (IndexedDB); never sent to the console |
+| `build_ballot().opening` | yes (reveals the vote) | memory only; dropped once the ballot is cast or opened |
+| `benaloh_open()` output | reveals the challenged vote | shown, then dropped with the challenged ballot |
+| `blinded_commitment`, `e_prime`, `ballot`, `nullifier`, `tracking_code` | no | sent to the console or shown |
+
+The app must never log the inputs or outputs of these exports. Inside the
+crate, every input string is wiped once parsed, every output is serialised
+into an exactly-sized buffer that is wiped once copied into the JS string,
+and the voter-state, credential, opening and opened-value structs wipe their
+strings on drop. JavaScript strings cannot be wiped: dropping every reference
+promptly is all the app can do.
+
 ## Chaincode acceptance
 
 The artifacts above pass the chaincode at `0cdc335` unchanged.
@@ -786,3 +1006,19 @@ both tests' failure messages point to the regenerate script:
 tools/live/regen-chaincode-fixture.sh
 ```
 
+The phone's ballots are held to the same standard. `tools/live/test-wasm.sh`
+runs `@saksi/wasm` under node against the CLI as issuer and trustees, writes a
+fixture of that election (two ballots built in wasm, four by the CLI, a
+challenged wasm ballot), and runs `TestWasmBuiltBallotsPassTheChaincode` over
+it: the wasm ballots are submitted first and accepted, a wasm ballot with one
+changed CDS byte is refused at gate `cds`, the challenged ballot is refused at
+gate `nullifier` once the cast one is recorded, and the 3-signature tally is
+published with the expected totals. The committed copy
+`packages/saksi-protocol/test-vectors/live-v1/wasm-election.json` (schema
+`saksi-live-wasm-fixture-v1`) lets `go test ./...` run that test without node;
+`committed_wasm_fixture_is_current` fails when it is stale. Regenerate it
+with:
+
+```
+tools/live/test-wasm.sh --write-fixture
+```

@@ -238,6 +238,82 @@ pub fn tracking_code(nullifier: &[u8]) -> String {
     format!("BC-{}-{}", &h[..4], &h[4..8])
 }
 
+/// What the phone shows about an election before the voter votes: the
+/// positions and candidates (from the contest ids, in ballot order), the
+/// trustees, and the joint key the ballots will be encrypted under.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ElectionInfo {
+    /// The election id.
+    pub election_id: String,
+    /// Positions in ballot order, each with its candidate ids.
+    pub positions: Vec<Position>,
+    /// Number of trustees `n`.
+    pub trustees: usize,
+    /// Decryption threshold `t`.
+    pub threshold: u32,
+    /// The issuer key the parameters bind (point hex).
+    pub issuer_public_key: String,
+    /// The joint ElGamal key `Y` the transcript gives (point hex).
+    pub joint_public_key: String,
+    /// [`joint_key_fingerprint`] of `Y`, to compare with the trustee pages.
+    pub joint_key_fingerprint: String,
+}
+
+/// `election_info` input.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InfoRequest {
+    /// Hex `ElectionParameters`.
+    pub params: String,
+    /// Hex `DKGTranscript`.
+    pub dkg: String,
+}
+
+/// Reads an election's parameters and transcript as [`ElectionInfo`], with
+/// the checks [`joint_public_key`] makes (the transcript is the election's,
+/// and its joint key is not the identity).
+pub fn election_info(req: &InfoRequest) -> LiveResult<ElectionInfo> {
+    let params: ElectionParameters = codec::message(&req.params, "params")?;
+    let transcript: DKGTranscript = codec::message(&req.dkg, "dkg")?;
+    if params.issuer_public_key.is_empty() {
+        return Err("the election parameters carry no issuer key".into());
+    }
+    let issuer = codec::nonzero_point(
+        &hex::encode(&params.issuer_public_key),
+        "params.issuer_public_key",
+    )?;
+    let joint = joint_public_key(&params, &transcript)?;
+    let mut positions: Vec<Position> = Vec::new();
+    for contest in &params.contest_ids {
+        let (position, candidate) = contest
+            .split_once('/')
+            .ok_or_else(|| format!("contest id {contest:?} is not <position>/<candidate>"))?;
+        match positions.last_mut() {
+            Some(p) if p.id == position => p.candidates.push(candidate.into()),
+            _ => {
+                if positions.iter().any(|p| p.id == position) {
+                    return Err(format!(
+                        "position {position:?}'s contests are not contiguous"
+                    ));
+                }
+                positions.push(Position {
+                    id: position.into(),
+                    candidates: vec![candidate.into()],
+                })
+            }
+        }
+    }
+    Ok(ElectionInfo {
+        election_id: params.election_id.clone(),
+        positions,
+        trustees: params.trustee_ids.len(),
+        threshold: params.threshold,
+        issuer_public_key: codec::point_hex(&issuer),
+        joint_public_key: codec::point_hex(joint.as_point()),
+        joint_key_fingerprint: joint_key_fingerprint(joint.as_point()),
+    })
+}
+
 /// Domain of [`joint_key_fingerprint`].
 pub const JOINT_KEY_FINGERPRINT_DOMAIN: &[u8] = b"saksi.live.joint-key-fingerprint.v1";
 
@@ -298,6 +374,48 @@ pub fn short_fingerprint(digest: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn election_info_lists_positions_and_the_joint_key_fingerprint() {
+        let e = crate::test_support::election("live-info");
+        let info = election_info(&InfoRequest {
+            params: e.params.clone(),
+            dkg: e.dkg.clone(),
+        })
+        .unwrap();
+        assert_eq!(info.election_id, "live-info");
+        assert_eq!(info.trustees, 5);
+        assert_eq!(info.threshold, 3);
+        assert_eq!(
+            info.positions,
+            vec![
+                Position {
+                    id: "president".into(),
+                    candidates: vec!["alice".into(), "bob".into(), "carol".into()],
+                },
+                Position {
+                    id: "secretary".into(),
+                    candidates: vec!["dan".into(), "eve".into(), "fay".into()],
+                },
+            ]
+        );
+        let params: ElectionParameters = codec::message(&e.params, "p").unwrap();
+        let transcript: DKGTranscript = codec::message(&e.dkg, "d").unwrap();
+        let y = joint_public_key(&params, &transcript).unwrap();
+        assert_eq!(info.joint_public_key, codec::point_hex(y.as_point()));
+        assert_eq!(
+            info.joint_key_fingerprint,
+            joint_key_fingerprint(y.as_point())
+        );
+        assert_eq!(info.joint_key_fingerprint.len(), 39);
+        // Another election's transcript is refused.
+        let other = crate::test_support::election("live-info-2");
+        assert!(election_info(&InfoRequest {
+            params: e.params,
+            dkg: other.dkg,
+        })
+        .is_err());
+    }
 
     #[test]
     fn a_fingerprint_shows_128_bits_in_eight_groups() {

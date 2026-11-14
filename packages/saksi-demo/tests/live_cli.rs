@@ -22,6 +22,9 @@ const N: usize = 5;
 /// The committed chaincode fixture and its schema tag.
 const FIXTURE: &str = "../saksi-protocol/test-vectors/live-v1/election.json";
 const FIXTURE_SCHEMA: &str = "saksi-live-chaincode-fixture-v1";
+/// The committed fixture of ballots built by the phone's WebAssembly.
+const WASM_FIXTURE: &str = "../saksi-protocol/test-vectors/live-v1/wasm-election.json";
+const WASM_FIXTURE_SCHEMA: &str = "saksi-live-wasm-fixture-v1";
 
 fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_saksi-demo")
@@ -985,6 +988,39 @@ fn committed_chaincode_fixture_is_current() {
         verdict["overall"], "pass",
         "stale fixture: run tools/live/regen-chaincode-fixture.sh\n{verdict:#}"
     );
+}
+
+/// The committed fixture of wasm-built ballots (written by
+/// `tools/live/test-wasm.sh --write-fixture`, read by the Go test
+/// `TestWasmBuiltBallotsPassTheChaincode`) still passes `verify-live`, and its
+/// challenged ballot still passes the per-ballot checks on its
+/// own (it is a valid ballot that must simply never be submitted).
+#[test]
+fn committed_wasm_fixture_is_current() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(WASM_FIXTURE);
+    let f: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    assert_eq!(
+        f["schema"], WASM_FIXTURE_SCHEMA,
+        "stale fixture: run tools/live/test-wasm.sh --write-fixture"
+    );
+    let n = f["ballots"].as_array().unwrap().len();
+    let verdict = ok(
+        "verify-live",
+        json!({ "record": {
+            "params": f["params"], "dkg": f["dkg"], "issuer_public_key": f["issuer_public_key"],
+            "ballots": f["ballots"], "partial_decryptions": f["partials"],
+            "tally": f["tally_three_signatures"], "expected_ballots": n,
+        }}),
+    );
+    assert_eq!(
+        verdict["overall"], "pass",
+        "stale fixture: run tools/live/test-wasm.sh --write-fixture\n{verdict:#}"
+    );
+    let challenged = ok(
+        "aggregate",
+        json!({ "params": f["params"], "dkg": f["dkg"], "ballots": [f["challenged_ballot"]] }),
+    );
+    assert_eq!(challenged["ballot_count"], json!(1));
 }
 
 /// The Go chaincode test's input: every artifact a live election hands

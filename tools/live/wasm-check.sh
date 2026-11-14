@@ -2,7 +2,7 @@
 # Proves packages/saksi-live compiles and links for wasm32-unknown-unknown.
 #
 # A throwaway consumer crate (outside the workspace) depends on saksi-live and
-# turns on getrandom/js, exactly as packages/saksi-wasm will. saksi-live itself
+# turns on getrandom/js, as packages/saksi-wasm does. saksi-live itself
 # does not enable it, so native builds are unchanged.
 #
 # Needs a rustup toolchain with the wasm32-unknown-unknown target. On the Mac:
