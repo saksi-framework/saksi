@@ -1230,13 +1230,30 @@ func (T *TrusteeService) fetchPeer(ctx context.Context, id int) (*TrusteePeerVie
 		return nil, err
 	}
 	if code != 200 {
-		return nil, fmt.Errorf("answered %d", code)
+		return nil, peerAnswered{fmt.Sprintf("answered %d", code)}
 	}
 	var v TrusteePeerView
 	if err := json.Unmarshal(body, &v); err != nil {
-		return nil, fmt.Errorf("unreadable answer")
+		return nil, peerAnswered{"its answer could not be read"}
 	}
 	return &v, nil
+}
+
+// peerAnswered is a peer that answered, but not with a statement this
+// trustee can use (a non-200 status or an unreadable body). It was reached.
+type peerAnswered struct{ msg string }
+
+func (e peerAnswered) Error() string { return e.msg }
+
+// peerErrDetail says what happened when a peer's page could not be used:
+// "answered 503" for a peer that answered, "not reachable: ..." only for one
+// that did not.
+func peerErrDetail(err error) (detail string, answered bool) {
+	var a peerAnswered
+	if errors.As(err, &a) {
+		return a.msg, true
+	}
+	return "not reachable: " + err.Error(), false
 }
 
 // fetchPeers reads several peers' pages at once, each with its own timeout,
@@ -1302,7 +1319,8 @@ func (T *TrusteeService) checkPeersRoster(ctx context.Context) error {
 		var c peerCheck
 		switch {
 		case err != nil:
-			c = peerCheck{State: "waiting", Detail: "not reachable: " + err.Error()}
+			d, _ := peerErrDetail(err)
+			c = peerCheck{State: "waiting", Detail: d}
 		case v.TrusteeID != peer.TrusteeID:
 			// Most likely a mistake in --peers, so it is waited on (with the
 			// reason shown) rather than ending the election.
@@ -1814,7 +1832,14 @@ func (T *TrusteeService) readPeersBallots(ctx context.Context) (map[string]peerC
 		v, err := views[i], errs[i]
 		switch {
 		case err != nil:
-			checks[key] = peerCheck{State: "unreachable", Detail: "not reachable: " + err.Error()}
+			// A peer that answered is not "unreachable": it is waited on, with
+			// what it answered as the detail.
+			d, answered := peerErrDetail(err)
+			state := "unreachable"
+			if answered {
+				state = "waiting"
+			}
+			checks[key] = peerCheck{State: state, Detail: d}
 		case v.TrusteeID != id:
 			checks[key] = peerCheck{State: "waiting", Detail: fmt.Sprintf("the --peers URL for trustee %d answers as trustee %d", id, v.TrusteeID)}
 		case v.ElectionID != eid || v.BallotsDigest == "":
