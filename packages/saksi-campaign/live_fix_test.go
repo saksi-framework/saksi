@@ -875,3 +875,93 @@ func TestLiveBoardVerifierCheckIsNotCalledIndependent(t *testing.T) {
 		t.Fatalf("no passing verify-live check: %v", board["checks"])
 	}
 }
+
+// Fix round 1, Important 1: a chain read that stalls (a partitioned peer)
+// must not queue the public reads behind it. Callers that find a read in
+// flight return at once: -1 (the console's count) before any read finished,
+// the last count after one; only one read is in flight at a time.
+func TestLiveChainCountNeverWaitsOnAStalledRead(t *testing.T) {
+	fx := newLiveFixture(t)
+	c := fx.console()
+	runID := c.toState(LiveOpen)
+	now := time.Now()
+	var clockMu sync.Mutex
+	clock := func() time.Time { clockMu.Lock(); defer clockMu.Unlock(); return now }
+	advance := func() { clockMu.Lock(); now = now.Add(liveChainCountTTL); clockMu.Unlock() }
+	c.s.live.counts.mu.Lock()
+	c.s.live.counts.now = clock
+	c.s.live.counts.at = time.Time{}
+	c.s.live.counts.mu.Unlock()
+	electionID := c.s.live.snapshot().ElectionID
+
+	stall := func(want int) {
+		t.Helper()
+		gate := make(chan struct{})
+		fx.chain.listGate.Store(&gate)
+		first := make(chan int, 1)
+		go func() { first <- c.s.live.chainCount(electionID) }()
+		deadline := time.Now().Add(5 * time.Second)
+		for fx.chain.listing.Load() != 1 {
+			if time.Now().After(deadline) {
+				t.Fatal("the first read never reached the chain")
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+		const callers = 8
+		got := make(chan int, callers)
+		start := time.Now()
+		var wg sync.WaitGroup
+		for i := 0; i < callers; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				got <- c.s.live.chainCount(electionID)
+			}()
+		}
+		// The public routes too: a view and a board answer while it stalls.
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if code := rawGET(c.s, "/api/live/election"); code != http.StatusOK {
+				t.Errorf("election view during a stalled read: %d", code)
+			}
+			if code := rawGET(c.s, "/api/board/"+runID); code != http.StatusOK {
+				t.Errorf("board during a stalled read: %d", code)
+			}
+		}()
+		done := make(chan struct{})
+		go func() { wg.Wait(); close(done) }()
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+			fx.chain.listGate.Store(nil)
+			close(gate)
+			<-done
+			t.Fatalf("callers waited %v on a stalled read", time.Since(start))
+		}
+		close(got)
+		for n := range got {
+			if n != want {
+				t.Fatalf("a caller during the stalled read got %d, want %d", n, want)
+			}
+		}
+		if n := fx.chain.listing.Load(); n != 1 {
+			t.Fatalf("%d chain reads in flight, want 1", n)
+		}
+		fx.chain.listGate.Store(nil)
+		close(gate)
+		if n := <-first; n < 0 {
+			t.Fatalf("the stalled read, once released: %d", n)
+		}
+	}
+
+	stall(-1) // no count yet: the views fall back to the console's count
+	c.s.live.counts.mu.Lock()
+	last, at := c.s.live.counts.n, c.s.live.counts.at
+	c.s.live.counts.mu.Unlock()
+	if !at.Equal(clock()) {
+		t.Fatalf("stamped %v, want the finish time %v", at, clock())
+	}
+	advance() // the count expires; the next read stalls again
+	stall(last)
+}

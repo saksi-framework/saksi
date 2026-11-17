@@ -313,7 +313,10 @@ entries on the voter list; `checked_in` the entries that signed the list
 (`ballot_records_source: "chain"`), or the console's own count with
 `"console"` when the chain did not answer. The chain count is read at most once
 every 2 seconds and shared by this view and the board, so a count shown can be
-up to 2 seconds old (a failed read is reused for the same 2 seconds). `trustees_decrypted` counts
+up to 2 seconds old (a failed or timed-out read is reused for the same 2
+seconds). Only one chain read runs at a time and no request waits for it: while
+one is in flight, a request gets the last count read (older than 2 seconds if
+the chain is slow), or the console's own count if none was read yet. `trustees_decrypted` counts
 trustees with a partial recorded for every contest. `trustees_joined` counts
 trustees whose receive key is in the key ceremony's roster: 0 after setup, the
 trustee count once the roster is complete, and unchanged for the rest of the

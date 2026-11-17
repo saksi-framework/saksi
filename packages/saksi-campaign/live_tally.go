@@ -783,40 +783,63 @@ func (L *liveService) verify(ctx context.Context) (map[string]any, error) {
 
 // liveChainCountTTL is how long a chain count is reused. The election view
 // and the board are public and polled; without the cache each GET would list
-// every nullifier on the peer. A count shown can be this old.
+// every nullifier on the peer. A count shown can be this old, or older while
+// a read is in flight.
 const liveChainCountTTL = 2 * time.Second
 
-// chainCountCache is the last chain count read, per election.
+// chainCountCache is the last chain count read, per election, and whether a
+// read is in flight.
 type chainCountCache struct {
 	mu         sync.Mutex
 	electionID string
 	n          int
-	at         time.Time
+	at         time.Time // when the last read finished; zero before any
+	inFlight   bool
 	now        func() time.Time
 }
 
+func (cc *chainCountCache) clock() time.Time {
+	if cc.now != nil {
+		return cc.now()
+	}
+	return time.Now()
+}
+
 // chainCount is the chain's committed nullifier count, or -1 if unreadable,
-// read from the chain at most once per liveChainCountTTL. The cache lock is
-// held across the read, so callers that arrive during one share its result.
-// It is never mu.
+// read from the chain at most once per liveChainCountTTL. Only one read runs
+// at a time, and nobody waits for it: a caller that finds a read in flight
+// gets the last count for this election at once, or -1 if there is none (the
+// views then show the console's own count). The time is stamped when the read
+// finishes, and a failed or timed-out read (-1) is reused like any other. The
+// cache lock is never held across the read, and it is never mu.
 func (L *liveService) chainCount(electionID string) int {
 	cc := &L.counts
 	cc.mu.Lock()
-	defer cc.mu.Unlock()
-	now := time.Now
-	if cc.now != nil {
-		now = cc.now
+	last := -1
+	if cc.electionID == electionID && !cc.at.IsZero() {
+		last = cc.n
+		if cc.clock().Sub(cc.at) < liveChainCountTTL {
+			cc.mu.Unlock()
+			return last
+		}
 	}
-	t := now()
-	if cc.electionID == electionID && !cc.at.IsZero() && t.Sub(cc.at) < liveChainCountTTL {
-		return cc.n
+	if cc.inFlight {
+		cc.mu.Unlock()
+		return last
 	}
+	cc.inFlight = true
+	cc.mu.Unlock()
+
 	n := -1
 	if c, err := L.getChain(); err == nil {
 		if all, err := allNullifiers(c, electionID); err == nil {
 			n = len(all)
 		}
 	}
-	cc.electionID, cc.n, cc.at = electionID, n, t
+
+	cc.mu.Lock()
+	cc.inFlight = false
+	cc.electionID, cc.n, cc.at = electionID, n, cc.clock()
+	cc.mu.Unlock()
 	return n
 }
