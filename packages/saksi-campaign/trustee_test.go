@@ -1463,3 +1463,36 @@ func TestTrusteePeerBallotChecksFollowLaterDecrypts(t *testing.T) {
 		t.Fatalf("trustee 1 on peer 5: %+v", c)
 	}
 }
+
+// Final review 4, deferred (rehearsal 3 m9): once the tally is published, a
+// trustee that combined but was not pressed no longer reads "press Sign
+// tally"; its sign step says no signature is needed.
+func TestTrusteeSignTextAfterThePublishedTally(t *testing.T) {
+	b := newTrusteeTestBed(t, fleetOptions{})
+	f := b.f
+	b.setup()
+	f.ceremony()
+	b.vote()
+	b.close()
+	for id := 1; id <= 3; id++ {
+		f.decrypt(id)
+	}
+	for _, id := range []int{4, 5} {
+		st := f.waitFor(id, "its combine", func(st TrusteeStatus) bool { return st.Tally.ReadyToSign })
+		if st.Steps["sign"].Detail != signPressDetail {
+			t.Fatalf("trustee %d before publication: %+v", id, st.Steps["sign"])
+		}
+	}
+	f.sign(1, wantTotals)
+	f.sign(2, wantTotals)
+	if res := f.sign(3, wantTotals); res["published"] != true {
+		t.Fatal("not published after 3 signatures")
+	}
+	for _, id := range []int{4, 5} {
+		st := f.waitFor(id, "the published tally", func(st TrusteeStatus) bool { return st.Tally.Published })
+		st = f.waitFor(id, "the sign text", func(st TrusteeStatus) bool { return st.Steps["sign"].Detail != signPressDetail })
+		if s := st.Steps["sign"]; s.State != stepWaiting || s.Detail != signNotNeededDetail || st.Tally.SignaturePosted {
+			t.Fatalf("trustee %d after publication: %+v", id, s)
+		}
+	}
+}

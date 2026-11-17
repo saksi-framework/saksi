@@ -1887,6 +1887,13 @@ func (T *TrusteeService) refreshPeersBallots(ctx context.Context) {
 
 // --- step 3: combine (automatic) and sign (on the trustee's press) -----------
 
+// The sign step's detail once the combine is ready: before the tally is
+// published, and after it (when no further signature is needed).
+const (
+	signPressDetail     = "your own combine gives the totals shown; press Sign tally to sign them"
+	signNotNeededDetail = "the tally is published; no signature is needed"
+)
+
 // advanceCombine runs this trustee's own combine once at least threshold
 // trustees' partials are on the chain, so the totals can be shown before
 // anything is signed. It runs by itself; errors are shown on the sign step.
@@ -1911,7 +1918,11 @@ func (T *TrusteeService) advanceCombine(ctx context.Context, v *LiveElectionView
 	}
 	switch {
 	case err == nil:
-		T.setStep("sign", stepWaiting, "your own combine gives the totals shown; press Sign tally to sign them", "")
+		detail := signPressDetail
+		if liveStateIndex(v.State) >= liveStateIndex(LiveTallied) {
+			detail = signNotNeededDetail
+		}
+		T.setStep("sign", stepWaiting, detail, "")
 	case errors.As(err, &alarm):
 		T.raise(alarm.code, alarm.msg, alarm.blocks...)
 		T.setStep("sign", stepBlocked, "", alarm.msg)
@@ -2077,7 +2088,15 @@ func (T *TrusteeService) checkPublished(v *LiveElectionView) {
 	if err != nil {
 		return
 	}
-	_ = T.update(func(p *trusteeProgress) { p.TallyPublished, p.TallyTotals = true, totals })
+	_ = T.update(func(p *trusteeProgress) {
+		p.TallyPublished, p.TallyTotals = true, totals
+		// A trustee that combined but was not pressed no longer needs to
+		// sign: say so instead of "press Sign tally".
+		if s := p.step("sign"); s.State == stepWaiting && s.Detail == signPressDetail {
+			s.Detail, s.UpdatedAt = signNotNeededDetail, T.now().UTC()
+			p.Steps["sign"] = s
+		}
+	})
 	if len(p.Totals) > 0 && !slices.Equal(totals, p.Totals) {
 		T.raise("tally-differs", fmt.Sprintf("the tally on the chain %v is not this trustee's own combine %v", totals, p.Totals))
 	}
