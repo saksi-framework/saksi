@@ -51,6 +51,8 @@ type fakeOps struct {
 	// roster makes dkg-roster fail: "fail" is an op error, "no-digest" an
 	// answer without a roster digest; "" = a normal roster.
 	roster string
+	// onKeygen, when set, runs after issuer-keygen wrote the key file.
+	onKeygen func(keyFile string)
 }
 
 func newFakeOps() *fakeOps { return &fakeOps{maxInFlight: map[string]int{}} }
@@ -80,6 +82,9 @@ func (f *fakeOps) run(_ context.Context, op string, input []byte) ([]byte, error
 		}
 		fh.Write(data)
 		fh.Close()
+		if f.onKeygen != nil {
+			f.onKeygen(in["key_file"].(string))
+		}
 		out["public_key"] = pt(0xa1)
 	case "election-params":
 		var contests []string

@@ -717,6 +717,7 @@ func (L *liveService) createElection(ctx context.Context, req LiveElectionReques
 	if err := writeJSON(filepath.Join(dir, RunFile), rec); err != nil {
 		return 0, err
 	}
+	prevSt, prevDir := L.st, L.dir
 	L.st = &liveState{
 		Schema: liveStateSchema, RunID: runID, ElectionID: params.ElectionID, Title: req.Title,
 		Positions: req.Positions, Trustees: req.Trustees, Threshold: req.Threshold,
@@ -729,13 +730,22 @@ func (L *liveService) createElection(ctx context.Context, req LiveElectionReques
 	}
 	// The list and its check-in record are written before live.json: a run
 	// with a live.json always has its list.
+	// If either write fails, the new run folder is removed with the list in
+	// it (no folder holding dates of birth is left behind without a
+	// live.json), and the console keeps the election it had.
+	undo := func(err error) (int, error) {
+		L.st, L.dir = prevSt, prevDir
+		L.publishSnapshotLocked()
+		_ = os.RemoveAll(dir)
+		return 0, err
+	}
 	book, err := newCheckinBook(dir, params.ElectionID, list)
 	if err != nil {
-		return 0, err
+		return undo(err)
 	}
 	L.dir = dir
 	if err := L.save(); err != nil {
-		return 0, err
+		return undo(err)
 	}
 	L.ckMu.Lock()
 	L.ck = book
