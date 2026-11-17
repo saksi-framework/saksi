@@ -829,6 +829,13 @@ func (L *liveService) chainCount(electionID string) int {
 	}
 	cc.inFlight = true
 	cc.mu.Unlock()
+	// Cleared on every way out, a panic in the read included (net/http
+	// recovers it): a flag left set would stop every later read.
+	defer func() {
+		cc.mu.Lock()
+		cc.inFlight = false
+		cc.mu.Unlock()
+	}()
 
 	n := -1
 	if c, err := L.getChain(); err == nil {
@@ -838,7 +845,6 @@ func (L *liveService) chainCount(electionID string) int {
 	}
 
 	cc.mu.Lock()
-	cc.inFlight = false
 	cc.electionID, cc.n, cc.at = electionID, n, cc.clock()
 	cc.mu.Unlock()
 	return n

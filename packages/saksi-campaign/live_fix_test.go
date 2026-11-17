@@ -1007,3 +1007,32 @@ func TestLiveReceiptsCutBackWithTheBallotFiles(t *testing.T) {
 		t.Fatal("the ballot files were not cut back")
 	}
 }
+
+// Fix round 2, minor 1: a read that panics (net/http recovers it in the
+// handler) must not leave the in-flight flag set: the next call reads the
+// chain again.
+func TestLiveChainCountReadsAgainAfterAPanic(t *testing.T) {
+	fx := newLiveFixture(t)
+	c := fx.console()
+	c.toState(LiveOpen)
+	c.s.live.counts.mu.Lock()
+	c.s.live.counts.at = time.Time{}
+	c.s.live.counts.mu.Unlock()
+	electionID := c.s.live.snapshot().ElectionID
+	fx.chain.panicOnce.Store(true)
+	func() {
+		defer func() {
+			if recover() == nil {
+				t.Fatal("the read did not panic")
+			}
+		}()
+		c.s.live.chainCount(electionID)
+	}()
+	before := fx.chain.lists.Load()
+	if n := c.s.live.chainCount(electionID); n < 0 {
+		t.Fatalf("after the panic: %d, want the chain's count", n)
+	}
+	if fx.chain.lists.Load() != before+1 {
+		t.Fatal("the chain was not read again after the panic")
+	}
+}

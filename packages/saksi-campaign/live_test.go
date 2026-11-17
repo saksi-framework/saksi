@@ -216,12 +216,17 @@ type flakyChain struct {
 	lists    atomic.Int64
 	listing  atomic.Int64
 	listGate atomic.Pointer[chan struct{}]
+	// panicOnce makes the next ListNullifiers panic.
+	panicOnce atomic.Bool
 }
 
 // ListNullifiers counts the listings (each is a full read of the set), and
 // blocks on listGate while one is set.
 func (c *flakyChain) ListNullifiers(electionID string, pageSize int, bookmark string) (clientsdk.NullifierPage, error) {
 	c.lists.Add(1)
+	if c.panicOnce.CompareAndSwap(true, false) {
+		panic("test: ListNullifiers panics once")
+	}
 	if g := c.listGate.Load(); g != nil {
 		c.listing.Add(1)
 		<-*g
