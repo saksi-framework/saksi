@@ -995,23 +995,43 @@ func groupFingerprint(h string) string {
 // ballots.csv row and, when rc is set, its SubmitBallot receipt. raw are the
 // bytes the chain holds. Nothing written names an account or an address.
 // Caller holds mu.
-func (L *liveService) appendBallotLocked(raw []byte, rc *clientsdk.Receipt) error {
+//
+// The ndjson line and the CSV row go in together or not at all: if either
+// append or the receipt fails, both files are cut back to their earlier
+// length, so the next ballot's index still names the same line in each.
+func (L *liveService) appendBallotLocked(raw []byte, rc *clientsdk.Receipt) (err error) {
 	index := L.st.Ballots
 	row, err := ballotsCSVRow(index, raw)
 	if err != nil {
 		return err
 	}
-	if err := appendSynced(filepath.Join(L.dir, BallotsFile), []byte(hex.EncodeToString(raw)+"\n")); err != nil {
+	ndjson, csvPath := filepath.Join(L.dir, BallotsFile), filepath.Join(L.dir, BallotsCSV)
+	ndMark, err := markLength(ndjson)
+	if err != nil {
+		return err
+	}
+	csvMark, err := markLength(csvPath)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if err != nil {
+			if rerr := errors.Join(ndMark.restore(), csvMark.restore()); rerr != nil {
+				err = fmt.Errorf("%w (and the ballot files could not be cut back: %v)", err, rerr)
+			}
+		}
+	}()
+	if err := appendSynced(ndjson, []byte(hex.EncodeToString(raw)+"\n")); err != nil {
 		return err
 	}
 	var buf bytes.Buffer
 	w := csv.NewWriter(&buf)
-	if _, err := os.Stat(filepath.Join(L.dir, BallotsCSV)); errors.Is(err, os.ErrNotExist) {
+	if !csvMark.existed {
 		_ = w.Write(ballotsCSVHeader)
 	}
 	_ = w.Write(row)
 	w.Flush()
-	if err := appendSynced(filepath.Join(L.dir, BallotsCSV), buf.Bytes()); err != nil {
+	if err := appendSynced(csvPath, buf.Bytes()); err != nil {
 		return err
 	}
 	if rc != nil {
@@ -1029,6 +1049,54 @@ func (L *liveService) appendBallotLocked(raw []byte, rc *clientsdk.Receipt) erro
 	}
 	L.st.Ballots = index + 1
 	return nil
+}
+
+// fileMark is a file's length before an append, to cut it back to.
+type fileMark struct {
+	path    string
+	existed bool
+	size    int64
+}
+
+func markLength(path string) (fileMark, error) {
+	info, err := os.Stat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return fileMark{path: path}, nil
+	}
+	if err != nil {
+		return fileMark{}, err
+	}
+	return fileMark{path: path, existed: true, size: info.Size()}, nil
+}
+
+// restore cuts the file back to its marked length (removes it if it did not
+// exist), fsynced.
+func (m fileMark) restore() error {
+	if !m.existed {
+		if err := os.Remove(m.path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+		return nil
+	}
+	info, err := os.Stat(m.path)
+	if err != nil {
+		return err
+	}
+	if info.Size() == m.size {
+		return nil
+	}
+	if err := os.Truncate(m.path, m.size); err != nil {
+		return err
+	}
+	f, err := os.OpenFile(m.path, os.O_RDONLY, 0)
+	if err != nil {
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		return err
+	}
+	return f.Close()
 }
 
 // appendLifecycleLocked records a lifecycle transaction's receipt in

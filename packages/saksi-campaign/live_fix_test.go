@@ -2,6 +2,7 @@ package campaign
 
 import (
 	"bytes"
+	"encoding/csv"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -764,5 +765,55 @@ func TestLiveLedgerIsRateLimited(t *testing.T) {
 	now = now.Add(time.Second)
 	if code := rawGET(c.s, "/api/live/ledger"); code != http.StatusOK {
 		t.Fatalf("ledger read after a second: %d", code)
+	}
+}
+
+// Final review 4, finding 4: if the CSV row cannot be written after the
+// ndjson line was, the line is cut back, so the next ballot's index names the
+// same line in both files.
+func TestLiveBallotFilesStayInStepAfterAFailedWrite(t *testing.T) {
+	fx := newLiveFixture(t)
+	c := fx.console()
+	runID := c.toState(LiveOpen)
+	dir := filepath.Join(fx.runs, runID)
+	csvPath := filepath.Join(dir, BallotsCSV)
+	if err := os.Chmod(csvPath, 0o444); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Chmod(csvPath, 0o644) })
+	if code, _ := c.do(http.MethodPost, "/api/live/ballot", "", map[string]string{"ballot": fakeBallot(runID, "secretary", 7, nil)}); code == http.StatusOK {
+		t.Fatal("the ballot was recorded with ballots.csv unwritable")
+	}
+	if err := os.Chmod(csvPath, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	c.ok(http.MethodPost, "/api/live/ballot", "", map[string]string{"ballot": fakeBallot(runID, "secretary", 8, nil)})
+
+	nd, err := os.ReadFile(filepath.Join(dir, BallotsFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.Split(strings.TrimSuffix(string(nd), "\n"), "\n")
+	cf, err := os.Open(csvPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows, err := csv.NewReader(cf).ReadAll()
+	cf.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows)-1 != len(lines) {
+		t.Fatalf("%d ndjson lines, %d CSV rows", len(lines), len(rows)-1)
+	}
+	idx := columnIndex(rows[0])
+	for i, r := range rows[1:] {
+		raw, _ := hex.DecodeString(lines[i])
+		if field(r, idx, "index") != fmt.Sprint(i) || field(r, idx, "ballot_sha256") != sha256Hex(raw) {
+			t.Fatalf("row %d (index %s) does not match ndjson line %d", i, field(r, idx, "index"), i)
+		}
+	}
+	if st := c.s.live.snapshot(); st.Ballots != len(lines) {
+		t.Fatalf("live count %d, %d lines", st.Ballots, len(lines))
 	}
 }

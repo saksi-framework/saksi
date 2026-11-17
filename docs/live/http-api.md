@@ -658,7 +658,7 @@ on a study run and adds `ballot_fingerprint` (live runs only).
 |---|---|---|
 | `run.json` | run record, `config.mode: "live"` | no |
 | `live.json` | the live state, rewritten atomically at every transition and recorded item; no secrets, no voter names (the precinct, the list fingerprint and count only) | no |
-| `ballots.ndjson`, `ballots.csv` | each recorded ballot, as the chain returned it | yes, once tallied (`ballots.ndjson`) |
+| `ballots.ndjson`, `ballots.csv` | each recorded ballot, as the chain returned it; a ballot's line and row are written together or not at all (a failed write cuts both back) | yes, once tallied (`ballots.ndjson`) |
 | `receipts.csv`, `trail.ndjson` | lifecycle and ballot receipts | yes, once tallied |
 | `live-verify.json` | the last verify-live verdict | no |
 | `private/` (0700) | `issuer.key`, `voter-list.json` (the locked list, with dates of birth), `checkin.json` (each entry's check-in state, token hash and signature; no times), `sessions/` (all 0600) | never |
