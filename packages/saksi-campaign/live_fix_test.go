@@ -971,3 +971,39 @@ func TestLiveChainCountNeverWaitsOnAStalledRead(t *testing.T) {
 	advance() // the count expires; the next read stalls again
 	stall(last)
 }
+
+// Fix round 1, minor 2: when the receipt fails after receipts.csv was
+// written to, receipts.csv is cut back with the two ballot files. Here
+// receipts.csv is empty, so opening it writes the header, and trail.ndjson
+// cannot be opened, so the receipt fails after that write.
+func TestLiveReceiptsCutBackWithTheBallotFiles(t *testing.T) {
+	fx := newLiveFixture(t)
+	c := fx.console()
+	runID := c.toState(LiveOpen)
+	dir := filepath.Join(fx.runs, runID)
+	read := func(name string) string {
+		data, err := os.ReadFile(filepath.Join(dir, name))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(data)
+	}
+	if err := os.Truncate(filepath.Join(dir, "receipts.csv"), 0); err != nil {
+		t.Fatal(err)
+	}
+	trail := filepath.Join(dir, trailNDJSONFile)
+	if err := os.Chmod(trail, 0o444); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Chmod(trail, 0o644) })
+	nd, rows := read(BallotsFile), read(BallotsCSV)
+	if code, _ := c.do(http.MethodPost, "/api/live/ballot", "", map[string]string{"ballot": fakeBallot(runID, "secretary", 7, nil)}); code == http.StatusOK {
+		t.Fatal("the ballot was recorded with trail.ndjson unwritable")
+	}
+	if got := read("receipts.csv"); got != "" {
+		t.Fatalf("receipts.csv after the failed receipt: %q", got)
+	}
+	if read(BallotsFile) != nd || read(BallotsCSV) != rows {
+		t.Fatal("the ballot files were not cut back")
+	}
+}

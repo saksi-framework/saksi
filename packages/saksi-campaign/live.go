@@ -1000,9 +1000,10 @@ func groupFingerprint(h string) string {
 // bytes the chain holds. Nothing written names an account or an address.
 // Caller holds mu.
 //
-// The ndjson line and the CSV row go in together or not at all: if either
-// append or the receipt fails, both files are cut back to their earlier
-// length, so the next ballot's index still names the same line in each.
+// The ndjson line, the CSV row and the receipt row go in together or not at
+// all: if either append or the receipt fails, ballots.ndjson, ballots.csv and
+// receipts.csv are cut back to their earlier length, so the next ballot's
+// index still names the same line in each and no receipt index repeats.
 func (L *liveService) appendBallotLocked(raw []byte, rc *clientsdk.Receipt) (err error) {
 	index := L.st.Ballots
 	row, err := ballotsCSVRow(index, raw)
@@ -1018,9 +1019,13 @@ func (L *liveService) appendBallotLocked(raw []byte, rc *clientsdk.Receipt) (err
 	if err != nil {
 		return err
 	}
+	rcMark, err := markLength(filepath.Join(L.dir, "receipts.csv"))
+	if err != nil {
+		return err
+	}
 	defer func() {
 		if err != nil {
-			if rerr := errors.Join(ndMark.restore(), csvMark.restore()); rerr != nil {
+			if rerr := errors.Join(ndMark.restore(), csvMark.restore(), rcMark.restore()); rerr != nil {
 				err = fmt.Errorf("%w (and the ballot files could not be cut back: %v)", err, rerr)
 			}
 		}
