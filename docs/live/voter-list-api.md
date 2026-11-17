@@ -441,8 +441,10 @@ date of birth. Changes nothing and sets no cookie. Answer 200:
 | 429 `rate-limited` | too many tries from this address; `Retry-After` in seconds |
 
 Order of the checks: the rate limit (a try is spent even on a malformed
-body), the body, the election (404, `not-open`, `no-voter-list`), the date's
-form (`bad-date`), then the lookup (`not-on-list`, `already-checked-in`).
+body), the body (400 or 413 with no `code`), the election (no election 404,
+then `no-voter-list`, then `not-open`), a name's length (`bad-request`), the
+date's form (`bad-date`), then the lookup (`not-on-list`, then
+`already-checked-in`).
 
 ### `POST /api/live/checkin/declare` (phone; open; rate limited)
 
@@ -465,9 +467,11 @@ gets 409 `already-checked-in` and no cookie.
 | as for find | `not-on-list`, `already-checked-in`, `bad-date`, `bad-request`, `not-open`, `no-voter-list`, 404, 400 and 413 with no `code` (an extra field, such as `middle_name`), `rate-limited` |
 
 Order of the checks: the rate limit (a try is spent first, even when the
-declaration is missing), the body, `declaration-required`, the election
-(404, `not-open`, `no-voter-list`), `checkin-in-progress`, the date's form,
-then the lookup.
+declaration is missing), the body (400 or 413 with no `code`),
+`declaration-required`, the election (no election 404, then
+`no-voter-list`, then `not-open`), `checkin-in-progress`, a name's length
+(`bad-request`), the date's form (`bad-date`), then the lookup
+(`not-on-list`, then `already-checked-in`).
 
 ### `GET /api/live/checkin` (phone)
 
