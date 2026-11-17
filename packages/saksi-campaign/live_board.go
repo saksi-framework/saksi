@@ -138,8 +138,9 @@ func (s *Server) buildLiveBoard(rec RunRecord, dir string) BoardResponse {
 		live.VoterListFingerprint, live.VoterListFingerprintShort = st.VoterListFingerprint, fingerprintShort(st.VoterListFingerprint)
 		live.VoterListNote = voterListNote
 	}
+	// Both counts come from the issuance record itself (live_issue.go).
 	if c, ok := s.live.checkinCountsOf(rec.RunID, dir); ok {
-		live.Counts.CheckedIn = c.CheckedIn
+		live.Counts.CheckedIn, live.Counts.CredentialsIssued = c.CheckedIn, c.Issued
 	}
 	if current {
 		if n := s.live.chainCount(st.ElectionID); n >= 0 {

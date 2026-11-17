@@ -687,6 +687,14 @@ func TestLiveSignDoesNotWaitOnAStalledClose(t *testing.T) {
 	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "s_iss") {
 		t.Fatalf("sign during Close: %d %s", rec.Code, rec.Body)
 	}
+	// The public count shows the issuance while Close still holds mu.
+	vrec := httptest.NewRecorder()
+	c.s.ServeHTTP(vrec, httptest.NewRequest(http.MethodGet, "/api/live/election", nil))
+	if !strings.Contains(vrec.Body.String(), `"credentials_issued":2`) {
+		close(release)
+		<-closed
+		t.Fatalf("election view during Close: %s", vrec.Body)
+	}
 	close(release)
 	if err := <-closed; err != nil {
 		t.Fatalf("close: %v", err)

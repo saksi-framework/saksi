@@ -676,8 +676,10 @@ func (L *liveService) electionViewOf(sn *liveSnapshot) LiveElectionView {
 		v.Precinct, v.PrecinctLabel = sn.Precinct, precinctLabel(sn.Precinct)
 		v.VoterListFingerprint, v.VoterListFingerprintShort = sn.VoterListFingerprint, fingerprintShort(sn.VoterListFingerprint)
 	}
+	// Both counts come from the issuance record itself: an issuance that
+	// could not take mu (live_issue.go) still shows at once.
 	if c, ok := L.checkinCountsOf(sn.RunID, sn.Dir); ok {
-		v.Counts.CheckedIn = c.CheckedIn
+		v.Counts.CheckedIn, v.Counts.CredentialsIssued = c.CheckedIn, c.Issued
 	}
 	if sn.stateIndex() >= liveStateIndex(LiveCeremony) {
 		if n := L.chainCount(sn.ElectionID); n >= 0 {
