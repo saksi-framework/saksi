@@ -1515,8 +1515,14 @@ func TestTrusteeSignTextAfterThePublishedTally(t *testing.T) {
 	for _, id := range []int{4, 5} {
 		st := f.waitFor(id, "the published tally", func(st TrusteeStatus) bool { return st.Tally.Published })
 		st = f.waitFor(id, "the sign text", func(st TrusteeStatus) bool { return st.Steps["sign"].Detail != signPressDetail })
-		if s := st.Steps["sign"]; s.State != stepWaiting || s.Detail != signNotNeededDetail || st.Tally.SignaturePosted {
+		// Rehearsal 4 m12: the state word agrees with the detail (and with
+		// the page's stepper, which draws done-without-signature as "not
+		// needed"): not "waiting" with "no signature is needed".
+		if s := st.Steps["sign"]; s.State != stepDone || s.Detail != signNotNeededDetail || st.Tally.SignaturePosted {
 			t.Fatalf("trustee %d after publication: %+v", id, s)
+		}
+		if st.Step == "sign" {
+			t.Fatalf("trustee %d: the current step is still sign after publication", id)
 		}
 	}
 }

@@ -1948,11 +1948,13 @@ func (T *TrusteeService) advanceCombine(ctx context.Context, v *LiveElectionView
 	}
 	switch {
 	case err == nil:
-		detail := signPressDetail
 		if liveStateIndex(v.State) >= liveStateIndex(LiveTallied) {
-			detail = signNotNeededDetail
+			// Nothing is left for this trustee to sign: the step is done,
+			// so its state word agrees with the detail (rehearsal 4 m12).
+			T.setStep("sign", stepDone, signNotNeededDetail, "")
+		} else {
+			T.setStep("sign", stepWaiting, signPressDetail, "")
 		}
-		T.setStep("sign", stepWaiting, detail, "")
 	case errors.As(err, &alarm):
 		T.raise(alarm.code, alarm.msg, alarm.blocks...)
 		T.setStep("sign", stepBlocked, "", alarm.msg)
@@ -2121,9 +2123,10 @@ func (T *TrusteeService) checkPublished(v *LiveElectionView) {
 	_ = T.update(func(p *trusteeProgress) {
 		p.TallyPublished, p.TallyTotals = true, totals
 		// A trustee that combined but was not pressed no longer needs to
-		// sign: say so instead of "press Sign tally".
+		// sign: the step is done, and says so instead of "press Sign tally"
+		// (not "waiting" with "no signature is needed", rehearsal 4 m12).
 		if s := p.step("sign"); s.State == stepWaiting && s.Detail == signPressDetail {
-			s.Detail, s.UpdatedAt = signNotNeededDetail, T.now().UTC()
+			s.State, s.Detail, s.UpdatedAt = stepDone, signNotNeededDetail, T.now().UTC()
 			p.Steps["sign"] = s
 		}
 	})
