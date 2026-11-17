@@ -440,12 +440,24 @@ func (L *liveService) save() error {
 // way, so no issuance time reaches live.json or the public view. Caller holds
 // mu.
 func (L *liveService) saveUntimed() error {
+	L.syncIssuedLocked()
 	L.publishSnapshotLocked()
 	data, err := json.MarshalIndent(L.st, "", "  ")
 	if err != nil {
 		return err
 	}
 	return writeFileAtomic(filepath.Join(L.dir, liveStateFile), data, 0o644)
+}
+
+// syncIssuedLocked copies the issued count from the published check-in
+// counts, the issuance record's own (live_issue.go). Caller holds mu.
+func (L *liveService) syncIssuedLocked() {
+	if L.st == nil {
+		return
+	}
+	if v := L.ckView.Load(); v != nil && v.RunID == L.st.RunID {
+		L.st.Issued = v.Counts.Issued
+	}
 }
 
 // writeFileAtomic writes data to path through a temporary file in the same

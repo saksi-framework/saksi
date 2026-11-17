@@ -209,9 +209,14 @@ type flakyChain struct {
 	*oracleChain
 	down atomic.Bool
 	lose atomic.Value // fn whose receipts are lost after the commit
+	// before, if set, runs before each submit (a test holds a submit with it).
+	before atomic.Pointer[func(fn string)]
 }
 
 func (c *flakyChain) Submit(fn string, args ...string) (clientsdk.Receipt, error) {
+	if f := c.before.Load(); f != nil {
+		(*f)(fn)
+	}
 	if c.down.Load() {
 		return clientsdk.Receipt{}, errors.New("dial tcp: connection refused")
 	}

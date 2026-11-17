@@ -637,3 +637,64 @@ func TestVoteAppIsServedFromTheWebDir(t *testing.T) {
 		t.Fatal("/vote/ is not public in routeAccess")
 	}
 }
+
+// Final review 4, finding 1: the presenter presses Close while a phone's
+// final issuance step is in flight. The entry is credential_issued on disk
+// before the reply, so the reply must not wait on mu, which Close holds
+// across a chain submit that can stall: a phone that timed out there could
+// never be issued again. The count still reaches live.json, through Close's
+// own save.
+func TestLiveSignDoesNotWaitOnAStalledClose(t *testing.T) {
+	fx := newLiveFixture(t)
+	c := fx.console()
+	runID := c.toState(LiveOpen)
+	c.checkIn("voter2") // voter1 was issued on the way to open
+	c.ok(http.MethodPost, "/api/live/issue/presign", "phone:voter2", map[string]string{"blinded_commitment": pt(0x10)})
+
+	entered, release := make(chan struct{}), make(chan struct{})
+	hold := func(fn string) {
+		if fn == "CloseElection" {
+			close(entered)
+			<-release
+		}
+	}
+	fx.chain.before.Store(&hold)
+	closed := make(chan error, 1)
+	go func() {
+		_, err := c.s.live.close()
+		closed <- err
+	}()
+	<-entered // Close now holds mu across its submit
+
+	signed := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		data, _ := json.Marshal(map[string]string{"e_prime": pt(0x11)})
+		req := httptest.NewRequest(http.MethodPost, "/api/live/issue/sign", bytes.NewReader(data))
+		req.AddCookie(&http.Cookie{Name: checkinCookie, Value: fx.phones["voter2"]})
+		rec := httptest.NewRecorder()
+		c.s.ServeHTTP(rec, req)
+		signed <- rec
+	}()
+	var rec *httptest.ResponseRecorder
+	select {
+	case rec = <-signed:
+	case <-time.After(5 * time.Second):
+		close(release)
+		<-closed
+		t.Fatal("issue/sign waited on the state lock a stalled Close holds")
+	}
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "s_iss") {
+		t.Fatalf("sign during Close: %d %s", rec.Code, rec.Body)
+	}
+	close(release)
+	if err := <-closed; err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	if c.state() != LiveClosed || c.s.live.snapshot().Issued != 2 {
+		t.Fatalf("after close: %s, issued %d", c.state(), c.s.live.snapshot().Issued)
+	}
+	var st liveState
+	if err := readJSON(filepath.Join(fx.runs, runID, liveStateFile), &st); err != nil || st.Issued != 2 {
+		t.Fatalf("live.json after close: issued %d, %v", st.Issued, err)
+	}
+}

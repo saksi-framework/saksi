@@ -211,18 +211,24 @@ func (L *liveService) sign(ctx context.Context, token, ePrime string) (map[strin
 		return nil, errInternal{"the issuance could not be recorded; the signature was not released"}
 	}
 	L.publishCheckinLocked()
-	issued := b.counts().Issued
 	L.ckMu.Unlock()
 
-	L.mu.Lock()
-	if L.st != nil && L.st.RunID == st.RunID {
-		L.st.Issued = issued
-		// No timestamp: updated_at keeps the last transition's time.
-		err = L.saveUntimed()
-	}
-	L.mu.Unlock()
-	if err != nil {
-		log.Printf("live: %s save after issuance: %v", st.RunID, err)
+	// The entry is credential_issued on disk, so the signature is released
+	// now, whatever else happens. The count in live.json is only a copy of
+	// the check-in record's: it is saved here when mu is free, and otherwise
+	// by the transition that holds mu (every save takes the count from the
+	// published check-in counts, saveUntimed). The reply never waits on mu,
+	// which a Close holds across a chain submit that can stall for minutes:
+	// a phone that timed out there could never be issued again.
+	if L.mu.TryLock() {
+		if L.st != nil && L.st.RunID == st.RunID {
+			// No timestamp: updated_at keeps the last transition's time.
+			err = L.saveUntimed()
+		}
+		L.mu.Unlock()
+		if err != nil {
+			log.Printf("live: %s save after issuance: %v", st.RunID, err)
+		}
 	}
 	return map[string]string{"s_iss": out.SIss, "issuer_public_key": st.IssuerPublicKey}, nil
 }
