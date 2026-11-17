@@ -1592,7 +1592,28 @@ func (T *TrusteeService) chainBallots(eid string) ([]string, error) {
 		return nil, fmt.Errorf("read %d ballot records, but the chain's nullifier count is %d (then %d): refusing to decrypt a set that does not match the chain's count",
 			len(ballots), len(nullifiers), len(again))
 	}
+	if ballots == nil {
+		// A nil slice marshals as JSON null, which the ops' input structs
+		// refuse with a parser message (rehearsal 4 m1): an empty chain is [].
+		ballots = []string{}
+	}
 	return ballots, nil
+}
+
+// minBallotRecords is the fewest ballot records the chain must hold before
+// this trustee decrypts: --min-ballots for each position, since a voter's
+// ballot is one record per position. 0 when no position is known.
+func (T *TrusteeService) minBallotRecords(contestIDs []string) int {
+	return T.minBallots * len(positionsOf(contestIDs))
+}
+
+// tooFewBallots is the plain refusal when the chain holds fewer than min
+// ballot records, built from the count this trustee read.
+func tooFewBallots(n, min int) error {
+	if n == 1 {
+		return refusedf("1 ballot record is on the chain; decryption needs at least %d.", min)
+	}
+	return refusedf("%d ballot records are on the chain; decryption needs at least %d.", n, min)
 }
 
 // chainParamsDKG reads the parameters and the transcript from the chain and
@@ -1681,6 +1702,11 @@ func (T *TrusteeService) advanceDecrypt(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
+		// Too few records for every position to reach --min-ballots: refused
+		// before any op runs, in words (rehearsal 4 m1).
+		if m := T.minBallotRecords(p.ContestIDs); len(ballots) < m {
+			return tooFewBallots(len(ballots), m)
+		}
 		var set ballotSet
 		if err := T.op(ctx, "aggregate", map[string]any{"params": params, "dkg": dkg, "ballots": ballots}, &set); err != nil {
 			return err
@@ -1694,7 +1720,7 @@ func (T *TrusteeService) advanceDecrypt(ctx context.Context) error {
 		}
 		for _, pos := range positionsOf(p.ContestIDs) {
 			if n := set.BallotsByPosition[pos]; n < T.minBallots {
-				return refusedf("position %s has %d ballot record(s), fewer than --min-ballots %d: its aggregate would show individual votes", pos, n, T.minBallots)
+				return refusedf("Position %s has %d ballot record(s) on the chain; decryption needs at least %d for each position, so that no total shows one voter's choice.", pos, n, T.minBallots)
 			}
 		}
 		if err := T.update(func(p *trusteeProgress) {

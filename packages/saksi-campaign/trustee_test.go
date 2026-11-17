@@ -782,10 +782,18 @@ func TestTrusteeDecryptRefusals(t *testing.T) {
 	}
 	b.close()
 
-	// Under --min-ballots.
-	f.press(4, "decrypt", nil)
+	// Under --min-ballots (4 for each of 2 positions): the press is refused
+	// at once from the chain's count, and so is the driver.
+	const fewer = "6 ballot records are on the chain; decryption needs at least 8."
+	if code, out := f.call(f.procs[3], http.MethodPost, "/api/trustee/decrypt", nil); code != http.StatusConflict || out["error"] != fewer {
+		t.Fatalf("min-ballots press: %d %v", code, out)
+	}
+	if err := f.procs[3].T.update(func(p *trusteeProgress) { p.DecryptRequested = true }); err != nil {
+		t.Fatal(err)
+	}
+	f.procs[3].T.poke()
 	st := f.waitFor(4, "the refusal", func(st TrusteeStatus) bool { return st.Steps["decrypt"].State == stepRefused })
-	if !strings.Contains(st.Steps["decrypt"].Error, "fewer than --min-ballots 4") || st.Decryption.PartialComputed {
+	if st.Steps["decrypt"].Error != fewer || st.Decryption.PartialComputed {
 		t.Fatalf("min-ballots: %+v", st.Steps["decrypt"])
 	}
 
@@ -1510,6 +1518,66 @@ func TestTrusteeSignTextAfterThePublishedTally(t *testing.T) {
 		if s := st.Steps["sign"]; s.State != stepWaiting || s.Detail != signNotNeededDetail || st.Tally.SignaturePosted {
 			t.Fatalf("trustee %d after publication: %+v", id, s)
 		}
+	}
+}
+
+// Rehearsal 4 m1: an election closed with fewer ballot records than
+// decryption needs (--min-ballots for each position) is refused in one plain
+// sentence built from the chain's count, at the press and in the driver; no
+// op's parser text reaches the status. Before the fix the press was taken and
+// the aggregate op failed on `"ballots":null`.
+func TestTrusteeDecryptRefusesTooFewBallotRecords(t *testing.T) {
+	b := newTrusteeTestBed(t, fleetOptions{})
+	f := b.f
+	b.setup()
+	f.ceremony()
+	b.close() // no ballots
+
+	const want = "0 ballot records are on the chain; decryption needs at least 4."
+	st := f.status(1)
+	if st.Decryption.MinBallotRecords != 4 {
+		t.Fatalf("min_ballot_records = %d, want 4 (2 positions x --min-ballots 2)", st.Decryption.MinBallotRecords)
+	}
+	code, out := f.call(f.procs[0], http.MethodPost, "/api/trustee/decrypt", nil)
+	if code != http.StatusConflict || out["error"] != want {
+		t.Fatalf("decrypt with no ballots: %d %v", code, out)
+	}
+	if st := f.status(1); st.Steps["decrypt"].State != stepIdle {
+		t.Fatalf("a refused press changed the step: %+v", st.Steps["decrypt"])
+	}
+
+	// The driver refuses the same way if the step was asked for anyway (a
+	// press taken before this check existed, kept in the progress file).
+	if err := f.procs[1].T.update(func(p *trusteeProgress) { p.DecryptRequested = true }); err != nil {
+		t.Fatal(err)
+	}
+	f.procs[1].T.poke()
+	st = f.waitFor(2, "the refusal", func(st TrusteeStatus) bool {
+		s := st.Steps["decrypt"].State
+		return s == stepRefused || s == stepFailed
+	})
+	if s := st.Steps["decrypt"]; s.State != stepRefused || s.Error != want || st.Decryption.PartialComputed {
+		t.Fatalf("driver decrypt with no ballots: %+v", s)
+	}
+	for _, body := range f.bodies {
+		if strings.Contains(body, "aggregate:") || strings.Contains(body, "wrong shape") || strings.Contains(body, "line 1, column") {
+			t.Fatalf("an op's error text reached a response: %s", body)
+		}
+	}
+}
+
+// The ballot list handed to the ops is never JSON null: an empty chain gives
+// [] (the ops' input structs do not take null for a list).
+func TestTrusteeChainBallotsEmptyIsAList(t *testing.T) {
+	chain := newOracleChain(t, "")
+	T := &TrusteeService{idStr: "1", stateDir: t.TempDir(),
+		dial: func() (trusteeChain, error) { return chain, nil }}
+	ballots, err := T.chainBallots("e1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if data, _ := json.Marshal(map[string]any{"ballots": ballots}); string(data) != `{"ballots":[]}` {
+		t.Fatalf("empty ballot list marshals as %s", data)
 	}
 }
 

@@ -226,6 +226,10 @@ The join step is `done` once the transcript on the chain is checked.
 2. Reads every ballot from the chain: every page of `ListNullifiers`, then
    `GetBallots`, then `ListNullifiers` again. **The number of records must equal
    the chain's nullifier count**, before and after; otherwise the step fails.
+   **Fewer records than `decryption.min_ballot_records`** (`--min-ballots` for
+   each position, since a voter's ballot is one record per position) is
+   refused here, before any op runs, in one sentence built from the count read:
+   `0 ballot records are on the chain; decryption needs at least 4.`
 3. Runs `aggregate` over them for the ballot set's fields: `ballot_count`,
    `ballots_by_position` and **`ballots_digest`**, the wire format's
    order-independent digest:
@@ -235,7 +239,9 @@ The join step is `done` once the transcript on the chain is checked.
    this election and the chain now gives another, the step is refused. A retry
    over the same set re-posts the same partial (the console answers an
    already-recorded partial as success).
-5. **`--min-ballots`.** A position with fewer records is refused (default 2).
+5. **`--min-ballots`.** A position with fewer records is refused (default 2):
+   `Position <id> has <n> ballot record(s) on the chain; decryption needs at
+   least <m> for each position, so that no total shows one voter's choice.`
 6. Compares `ballots_digest` with every other trustee that has one for this
    election (from its peer page). A difference is alarm `ballots-peer-<id>`.
    A peer URL that answers as another trustee is listed and not compared.
@@ -379,7 +385,7 @@ Everything a screen needs, in one read. Poll it (every 1 to 2 seconds).
     "transcript_published": true, "transcript_check": "ok", "ceremony_error": ""
   },
   "decryption": {
-    "min_ballots": 2, "ballot_count": 6,
+    "min_ballots": 2, "min_ballot_records": 4, "ballot_count": 6,
     "ballots_by_position": {"president": 3, "secretary": 3},
     "ballots_digest": "<64 hex>",
     "peer_checks": [{"trustee_id": 1, "state": "ok"}, {"trustee_id": 3, "state": "waiting", "detail": "..."}],
@@ -411,6 +417,7 @@ Fields:
 | `ceremony.roster[].peer_check` | `self`; `pending` (not checked yet); `ok`; `waiting` (with `detail`); `mismatch` (with `detail`, and an alarm). |
 | `ceremony.transcript_check` | `""` (not yet), `ok`, `mismatch`. |
 | `decryption.peer_checks[].state` | `ok` (same set); `waiting` (the peer has no set for this election yet, or its `--peers` URL answers as another trustee; not waited for); `reported` (the peer states a set and this trustee has none of its own to compare; `detail` names the peer's set); `unreachable` (no statement from the peer: `detail` is `not reachable: ...` when it did not answer, or `answered 503` / `its answer could not be read` when it answered without a usable statement); `mismatch` (with an alarm). Read again from every peer on each poll from the close on (one `GET /api/trustee/peer` per other trustee per poll, 3 s timeout), and at this trustee's own decrypt. |
+| `decryption.min_ballot_records` | The fewest ballot records the chain must hold before Decrypt can run: `min_ballots` × the number of positions; `0` until the positions are known. A page compares it with `election.ballot_records` (the console's count) to leave Decrypt out; the press is refused on the trustee's own chain count either way. |
 | `decryption.partial_read_back` | `""`, `ok`, `mismatch`. |
 | `tally.totals` | This trustee's own combine, in `contest_ids` order; `[]` until it ran. |
 | `tally.ready_to_sign` | Totals are shown, Sign was not pressed, nothing blocks it. |
@@ -424,8 +431,13 @@ was `refused` starts again. Refusals, before anything starts:
 - **409** no election yet; a blocking alarm (`blocked by an alarm: ...`); the
   token is not this trustee's; join after the ceremony is over; decrypt before
   the transcript was checked; **decrypt while the chain does not say
-  `closed`** (`the chain says the election is open, not closed`);
-- **502** decrypt, when the chain status cannot be read.
+  `closed`** (`the chain says the election is open, not closed`); **decrypt
+  while the chain holds fewer ballot records than `decryption.min_ballot_records`**
+  (`0 ballot records are on the chain; decryption needs at least 4.`, from the
+  trustee's own `ListNullifiers` read; the step stays `idle`). An election
+  closed with too few records cannot be decrypted at all: no later press
+  changes that, since the chain takes no ballot after `CloseElection`;
+- **502** decrypt, when the chain status or the ballot list cannot be read.
 
 ### `POST /api/trustee/sign`
 

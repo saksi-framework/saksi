@@ -303,10 +303,47 @@ func (T *TrusteeService) RequestDecrypt() error {
 	if !closed {
 		return fmt.Errorf("the chain says the election is %s, not closed: decryption waits for CloseElection", status)
 	}
+	if err := T.enoughBallotRecords(); err != nil {
+		return err
+	}
 	return T.request("decrypt", func(p *trusteeProgress) error {
 		p.DecryptRequested = true
 		return nil
 	})
+}
+
+// enoughBallotRecords refuses the Decrypt press at once when the chain holds
+// fewer ballot records than decryption needs (rehearsal 4 m1), in the same
+// sentence the driver gives. A partial already computed was computed over
+// enough records, so it is not counted again.
+func (T *TrusteeService) enoughBallotRecords() error {
+	T.mu.Lock()
+	p := T.p
+	var (
+		eid      string
+		contests []string
+		computed bool
+	)
+	if p != nil {
+		eid, contests, computed = p.ElectionID, slices.Clone(p.ContestIDs), len(p.Partial) > 0
+	}
+	T.mu.Unlock()
+	m := T.minBallotRecords(contests)
+	if p == nil || computed || m == 0 {
+		return nil
+	}
+	c, err := T.getChain()
+	if err != nil {
+		return tChainErr{"the ballot list", err}
+	}
+	nullifiers, err := allNullifiers(c, eid)
+	if err != nil {
+		return tChainErr{"the ballot list", err}
+	}
+	if len(nullifiers) < m {
+		return tooFewBallots(len(nullifiers), m)
+	}
+	return nil
 }
 
 // RequestSign is the Sign tally button: totals must be the ones the status
@@ -402,7 +439,11 @@ type TrusteePeerBallotCheck struct {
 }
 
 type TrusteeDecryption struct {
-	MinBallots        int                      `json:"min_ballots"`
+	MinBallots int `json:"min_ballots"`
+	// MinBallotRecords is the fewest ballot records the chain must hold
+	// before Decrypt can run: MinBallots for each position (a voter's ballot
+	// is one record per position). 0 until the positions are known.
+	MinBallotRecords  int                      `json:"min_ballot_records"`
 	BallotCount       int                      `json:"ballot_count"`
 	BallotsByPosition map[string]int           `json:"ballots_by_position"`
 	BallotsDigest     string                   `json:"ballots_digest,omitempty"`
@@ -468,6 +509,7 @@ func (T *TrusteeService) Status() TrusteeStatus {
 		st.Decryption.TrusteesDecrypted = v.Counts.TrusteesDecrypted
 	}
 	st.Decryption.Threshold = st.Election.Threshold
+	st.Decryption.MinBallotRecords = T.minBallotRecords(st.Election.ContestIDs)
 	for n, s := range p.Steps {
 		st.Steps[n] = s
 	}
