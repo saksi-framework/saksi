@@ -597,4 +597,6 @@ there is the voter's handwritten strokes). The console learns which list
 entry received a credential; it never learns which ballot belongs to which
 entry: the ballot relay drops the cookie, logs nothing, and the credential
 is blind. A restart reloads both files: every state and every cookie stays
-valid. `tools/live-reset.sh` deletes the run folder and with it the list.
+valid. `tools/live-reset.sh` moves the run folder, and with it the list, the
+check-in state and the signatures, into `archive/`; it deletes nothing, so the
+archive must be deleted by hand when the data is no longer needed.
