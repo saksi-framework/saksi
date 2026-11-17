@@ -943,6 +943,11 @@ func TestTrusteeFollowsANewElection(t *testing.T) {
 		f.start(f.procs[id-1])
 	}
 	second := b.setup()
+	// Trustee 5 was never restarted: press only once its own poll has seen
+	// the new election, or the press is checked against the abandoned one.
+	f.waitFor(5, "the new election", func(st TrusteeStatus) bool {
+		return st.Election != nil && st.Election.ElectionID == second
+	})
 	f.press(5, "join", nil)
 	for id := 1; id <= 5; id++ {
 		st := f.waitStep(id, "join", stepDone)
