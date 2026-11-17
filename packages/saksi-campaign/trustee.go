@@ -1774,6 +1774,10 @@ func (T *TrusteeService) readBackPartial() error {
 	if err := json.Unmarshal(p.Partial, &out); err != nil {
 		return err
 	}
+	// Nothing to compare is not a match: an empty list must never read "ok".
+	if len(out.Partials) == 0 {
+		return errors.New("this trustee's recorded partial decryption lists no contest; nothing was read back")
+	}
 	c, err := T.getChain()
 	if err != nil {
 		return tChainErr{"this trustee's partial decryption", err}

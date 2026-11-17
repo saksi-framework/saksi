@@ -1496,3 +1496,18 @@ func TestTrusteeSignTextAfterThePublishedTally(t *testing.T) {
 		}
 	}
 }
+
+// Final review 4, deferred: a recorded partial that lists no contest is not
+// read back as "ok".
+func TestTrusteeReadBackRefusesAnEmptyPartial(t *testing.T) {
+	chain := newOracleChain(t, "")
+	T := &TrusteeService{idStr: "1", stateDir: t.TempDir(),
+		dial: func() (trusteeChain, error) { return chain, nil }}
+	T.p = &trusteeProgress{ElectionID: "e1", Partial: json.RawMessage(`{"partials":[]}`)}
+	if err := os.MkdirAll(T.electionDir("e1"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := T.readBackPartial(); err == nil || T.p.PartialReadBack == "ok" {
+		t.Fatalf("an empty partial read back: %v, %q", err, T.p.PartialReadBack)
+	}
+}
