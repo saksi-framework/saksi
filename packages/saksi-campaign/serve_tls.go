@@ -16,7 +16,18 @@ type ServeOptions struct {
 	TLSKey   string
 	Live     bool
 	AuthFile string
+	// Trustee marks a live trustee process (saksi-campaign trustee).
+	Trustee bool
 }
+
+// The live console and the trustee processes bound how long a client may take
+// to send a request, and how long a kept-alive connection may sit idle, so a
+// slow body cannot hold a goroutine open. There is no write timeout: it would
+// cut the event stream (/events). A study serve keeps Go's defaults.
+const (
+	liveReadTimeout = 30 * time.Second
+	liveIdleTimeout = 120 * time.Second
+)
 
 // TLS reports whether the console serves HTTPS.
 func (o ServeOptions) TLS() bool { return o.TLSCert != "" && o.TLSKey != "" }
@@ -70,9 +81,20 @@ func NewHTTPServer(h http.Handler) *http.Server {
 	}
 }
 
+// serverFor is the http.Server Serve uses for o: NewHTTPServer, with the
+// read and idle timeouts for a live console or a trustee process.
+func serverFor(o ServeOptions, h http.Handler) *http.Server {
+	srv := NewHTTPServer(h)
+	if o.Live || o.Trustee {
+		srv.ReadTimeout = liveReadTimeout
+		srv.IdleTimeout = liveIdleTimeout
+	}
+	return srv
+}
+
 // Serve serves h on ln, over TLS when o says so.
 func Serve(ln net.Listener, o ServeOptions, h http.Handler) error {
-	srv := NewHTTPServer(h)
+	srv := serverFor(o, h)
 	if o.TLS() {
 		return srv.ServeTLS(ln, o.TLSCert, o.TLSKey)
 	}

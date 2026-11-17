@@ -32,6 +32,10 @@ saksi-campaign serve --live --auth-file accounts.json --trustee-tokens tokens.js
 
 - `--tls-cert` and `--tls-key` together serve HTTPS (TLS 1.2 minimum). The
   session cookie is then `Secure`.
+- With `--live`, a client has 10 seconds to send a request's headers and 30
+  seconds to send the whole request, and a kept-alive connection is closed
+  after 120 seconds idle. There is no write timeout, so `/events` streams stay
+  open. A study `serve` (no `--live`) keeps only the 10-second header limit.
 - `--live` refuses to start without `--auth-file`. Without TLS it starts only
   on a loopback `--addr` (`127.0.0.1`, `::1`, `localhost`) and prints a
   warning.

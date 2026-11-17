@@ -323,7 +323,7 @@ func trustee(args []string) {
 	fabricChaincode := fs.String("fabric-chaincode", "saksi-bulletin", "deployed chaincode name")
 	_ = fs.Parse(args)
 
-	opts := campaign.ServeOptions{Addr: *addr, TLSCert: *tlsCert, TLSKey: *tlsKey}
+	opts := campaign.ServeOptions{Addr: *addr, TLSCert: *tlsCert, TLSKey: *tlsKey, Trustee: true}
 	warning, err := campaign.CheckTrusteeServeOptions(opts)
 	if err != nil {
 		fatal("%v", err)

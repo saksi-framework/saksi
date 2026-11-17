@@ -89,7 +89,7 @@ saksi-campaign trustee --id 2 \
 |---|---|---|
 | `--id N` | required | This trustee's id, `1..n`. |
 | `--addr` | `127.0.0.1:9001` | Bind address. |
-| `--tls-cert`, `--tls-key` | none | Serve HTTPS (TLS 1.2 or later). Given together or not at all. **Without them the process starts only on a loopback `--addr`** and prints a warning. |
+| `--tls-cert`, `--tls-key` | none | Serve HTTPS (TLS 1.2 or later). Given together or not at all. **Without them the process starts only on a loopback `--addr`** and prints a warning. Either way a client has 10 s for a request's headers and 30 s for the whole request, and an idle kept-alive connection closes after 120 s (no write timeout). |
 | `--allow-host` | none | Accepted `Host` header, repeatable. A host without a port gets `--addr`'s port, so `t2.vancornelio.dev` with `--addr 0.0.0.0:9002` allows `t2.vancornelio.dev:9002`. Loopback names are always allowed. |
 | `--auth-file` | required | This process's own accounts file (the users-file format of `http-api.md`): **only trustee accounts with this `--id`**. Any other account (an admin, a voter, another trustee) refuses the start. |
 | `--console` | required | The console's base URL, `https://<host>:<port>`. **The host and port must be in the console's `--allow-host` list, and the name must be on the console's certificate**: `https://localhost:8443` against a `vote.vancornelio.dev` certificate fails. TLS is verified against the system roots. |

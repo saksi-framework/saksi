@@ -817,3 +817,31 @@ func TestLiveBallotFilesStayInStepAfterAFailedWrite(t *testing.T) {
 		t.Fatalf("live count %d, %d lines", st.Ballots, len(lines))
 	}
 }
+
+// Final review 4, finding 5: the live console and the trustee processes get
+// read and idle timeouts; no write timeout (it would cut /events); a study
+// serve keeps Go's defaults, as before.
+func TestLiveServerTimeouts(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		o    ServeOptions
+		live bool
+	}{
+		{"study", ServeOptions{Addr: "127.0.0.1:8090"}, false},
+		{"study with auth", ServeOptions{Addr: "127.0.0.1:8090", AuthFile: "u"}, false},
+		{"live", ServeOptions{Addr: "127.0.0.1:8090", Live: true, AuthFile: "u"}, true},
+		{"trustee", ServeOptions{Addr: "127.0.0.1:9001", Trustee: true}, true},
+	} {
+		srv := serverFor(tc.o, http.NotFoundHandler())
+		if srv.WriteTimeout != 0 || srv.ReadHeaderTimeout != 10*time.Second {
+			t.Fatalf("%s: write %v, header %v", tc.name, srv.WriteTimeout, srv.ReadHeaderTimeout)
+		}
+		read, idle := time.Duration(0), time.Duration(0)
+		if tc.live {
+			read, idle = 30*time.Second, 120*time.Second
+		}
+		if srv.ReadTimeout != read || srv.IdleTimeout != idle {
+			t.Fatalf("%s: read %v idle %v, want %v %v", tc.name, srv.ReadTimeout, srv.IdleTimeout, read, idle)
+		}
+	}
+}
