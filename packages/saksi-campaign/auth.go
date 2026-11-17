@@ -33,8 +33,10 @@ import (
 const (
 	RoleAdmin   = "admin"
 	RoleTrustee = "trustee"
-	// RoleVoter is a live-election voter account (live.go). The voter accounts
-	// are the voter roll: each may obtain one credential per election.
+	// RoleVoter is an older live-election voter account. A users file that
+	// still has some loads, but the role grants nothing: live voters are on
+	// the precinct's voter list and obtain their credential through check-in
+	// (live_checkin.go), never through an account.
 	RoleVoter = "voter"
 
 	sessionCookie      = "saksi_session"
@@ -74,7 +76,6 @@ const (
 	accessPublic          // anyone, signed in or not
 	accessSignedIn        // any trustee or admin (not a voter)
 	accessTrustee         // trustees only; the handler also checks share ownership
-	accessVoter           // live-election voters only; the handler acts on the caller's own account
 	// accessTrusteeToken is a trustee process calling server to server with
 	// its own bearer token (live_tokens.go). authorize resolves the token to
 	// one trustee id and the handler acts as that trustee only.
@@ -126,9 +127,16 @@ var routeAccess = map[string]access{
 	"/api/live/election": accessPublic,
 	"/api/live/ledger":   accessPublic,
 	"/api/live/ballot":   accessAnonymous,
-	// live election: a voter's own credential issuance
-	"/api/live/issue/presign": accessVoter,
-	"/api/live/issue/sign":    accessVoter,
+	// live election: the phone's check-in and its credential issuance. Public
+	// by role: each handler acts only on the check-in the phone's
+	// saksi_checkin cookie is bound to (live_checkin.go), and find and declare
+	// are limited per address.
+	"/api/live/checkin":         accessPublic,
+	"/api/live/checkin/find":    accessPublic,
+	"/api/live/checkin/declare": accessPublic,
+	"/api/live/checkin/sign":    accessPublic,
+	"/api/live/issue/presign":   accessPublic,
+	"/api/live/issue/sign":      accessPublic,
 	// live election: trustee processes, each with its own bearer token
 	"/api/live/dkg/receive-key": accessTrusteeToken,
 	"/api/live/dkg/roster":      accessTrusteeToken,
@@ -143,6 +151,12 @@ var routeAccess = map[string]access{
 	"/api/live/tally/publish": accessAdmin,
 	"/api/live/verify":        accessAdmin,
 	"/api/live/abandon":       accessAdmin,
+	// live election: the presenter's voter list and the Electoral Board's desk
+	"/api/live/voter-list":         accessAdmin,
+	"/api/live/voter-list/preview": accessAdmin,
+	"/api/live/desk/approve":       accessAdmin,
+	"/api/live/desk/refuse":        accessAdmin,
+	"/api/live/desk/reset":         accessAdmin,
 
 	// trustee or admin
 	"/ceremony/publish": accessSignedIn,
@@ -197,11 +211,6 @@ func (a access) denial(sess *session) (int, string) {
 		// (the run event stream, the ceremony's publish) were never meant for it.
 		if sess.Role != RoleAdmin && sess.Role != RoleTrustee {
 			return http.StatusForbidden, "trustee or admin role required"
-		}
-		return 0, ""
-	case accessVoter:
-		if sess.Role != RoleVoter {
-			return http.StatusForbidden, "only a voter account may obtain a credential"
 		}
 		return 0, ""
 	case accessTrustee:

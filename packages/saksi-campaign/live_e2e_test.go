@@ -322,6 +322,42 @@ func (h *liveE2E) login(user, pw string) *http.Client {
 	return c
 }
 
+// phone is a new phone: its own cookie jar, no account.
+func (h *liveE2E) phone() *http.Client {
+	jar, _ := cookiejar.New(nil)
+	return &http.Client{Jar: jar, Transport: h.srv.Client().Transport}
+}
+
+// enrol checks voter v (1..3 of testVoters) in on a phone of its own (find,
+// declaration, the desk's approval, a signature), then runs the blind
+// issuance over that check-in. It returns the credential and the phone.
+func (h *liveE2E) enrol(admin *http.Client, v int, el map[string]any) (any, *http.Client) {
+	h.t.Helper()
+	name := fmt.Sprintf("voter%d", v)
+	d := testVoters[name]
+	ph := h.phone()
+	found := h.must(ph, http.MethodPost, "/api/live/checkin/find", "", detailsBody(d, false))
+	seq := found["entry"].(map[string]any)["seq"]
+	if seq != float64(testSeqs[name]) {
+		h.t.Fatalf("%s found as entry %v", name, seq)
+	}
+	h.must(ph, http.MethodPost, "/api/live/checkin/declare", "", detailsBody(d, true))
+	h.must(admin, http.MethodPost, "/api/live/desk/approve", "", map[string]any{"seq": seq})
+	h.must(ph, http.MethodPost, "/api/live/checkin/sign", "", map[string]any{"strokes": [][][]int{{{100, 100}, {200, 150}, {300, 120}}}})
+	if st := h.must(ph, http.MethodGet, "/api/live/checkin", "", nil); st["state"] != CheckinSigned {
+		h.t.Fatalf("%s's check-in: %v", name, st)
+	}
+	begin := h.cliOp("voter-begin", map[string]any{})
+	pre := h.must(ph, http.MethodPost, "/api/live/issue/presign", "", map[string]any{"blinded_commitment": begin["blinded_commitment"]})
+	blind := h.cliOp("voter-blind", map[string]any{"state": begin["state"], "r": pre["r"], "issuer_public_key": el["issuer_public_key"]})
+	sig := h.must(ph, http.MethodPost, "/api/live/issue/sign", "", map[string]any{"e_prime": blind["e_prime"]})
+	fin := h.cliOp("voter-finalize", map[string]any{"state": blind["state"], "s_iss": sig["s_iss"], "issuer_public_key": sig["issuer_public_key"]})
+	if st := h.must(ph, http.MethodGet, "/api/live/checkin", "", nil); st["state"] != CheckinIssued {
+		h.t.Fatalf("%s after issuance: %v", name, st)
+	}
+	return fin["credential"], ph
+}
+
 func hashFor(t *testing.T, pw string) string {
 	h, err := HashPassword(strings.NewReader(pw + "\n"))
 	if err != nil {
@@ -330,8 +366,9 @@ func hashFor(t *testing.T, pw string) string {
 	return h
 }
 
-// newLiveE2E builds a console with live mode on over chain, three voters, an
-// admin and five trustee tokens.
+// newLiveE2E builds a console with live mode on over chain, an admin, three
+// old-style voter accounts (which must obtain nothing) and five trustee
+// tokens. The voters are the test list's.
 func newLiveE2E(t *testing.T, demo string, dial func() (liveChain, error)) *liveE2E {
 	t.Helper()
 	h := &liveE2E{t: t, demo: demo, work: t.TempDir(), runsDir: t.TempDir(), phoneSent: map[string]bool{}}
@@ -391,12 +428,17 @@ func runLiveElection(t *testing.T, h *liveE2E) string {
 	admin := h.login("ban", "admin-pw")
 
 	// Setup.
+	preview := h.must(admin, http.MethodPost, "/api/live/voter-list/preview", "", map[string]any{"csv": testVoterList})
+	if preview["valid"] != true || preview["count"] != 5.0 {
+		t.Fatalf("voter list preview: %v", preview)
+	}
 	el := h.must(admin, http.MethodPost, "/api/live/elections", "", map[string]any{
 		"title": "Live demo election",
 		"positions": []map[string]any{
 			{"id": "president", "candidates": []string{"alice", "bob", "carol"}},
 			{"id": "secretary", "candidates": []string{"dan", "eve", "fay"}},
 		},
+		"voter_list": testVoterList, "voter_list_fingerprint": preview["fingerprint"],
 	})
 	runID := el["run_id"].(string)
 	if el["state"] != LiveCeremony || el["trustees"] != 5.0 || el["threshold"] != 3.0 {
@@ -416,23 +458,28 @@ func runLiveElection(t *testing.T, h *liveE2E) string {
 	}
 	step("ceremony: 5 receive keys, 5 deals, 5 acks, PublishDKGTranscript recorded, state open")
 
-	// Enrolment, three phones.
+	// Check-in and enrolment, three phones.
 	creds := make([]any, 3)
 	voters := make([]*http.Client, 3)
 	for v := 0; v < 3; v++ {
-		voters[v] = h.login(fmt.Sprintf("voter%d", v+1), "voter-pw")
-		begin := h.cliOp("voter-begin", map[string]any{})
-		pre := h.must(voters[v], http.MethodPost, "/api/live/issue/presign", "", map[string]any{"blinded_commitment": begin["blinded_commitment"]})
-		blind := h.cliOp("voter-blind", map[string]any{"state": begin["state"], "r": pre["r"], "issuer_public_key": el["issuer_public_key"]})
-		sig := h.must(voters[v], http.MethodPost, "/api/live/issue/sign", "", map[string]any{"e_prime": blind["e_prime"]})
-		fin := h.cliOp("voter-finalize", map[string]any{"state": blind["state"], "s_iss": sig["s_iss"], "issuer_public_key": sig["issuer_public_key"]})
-		creds[v] = fin["credential"]
+		creds[v], voters[v] = h.enrol(admin, v+1, el)
 	}
-	// A second signature for an issued account is refused.
-	if code, out := h.call(voters[0], http.MethodPost, "/api/live/issue/presign", "", map[string]any{"blinded_commitment": strings.Repeat("e2", 32)}); code != http.StatusConflict {
+	// A second signature for an issued entry is refused.
+	if code, out := h.call(voters[0], http.MethodPost, "/api/live/issue/presign", "", map[string]any{"blinded_commitment": strings.Repeat("e2", 32)}); code != http.StatusConflict || out["code"] != "already-issued" {
 		t.Fatalf("second issuance for voter1: %d %v", code, out)
 	}
-	step("enrolment: 3 credentials issued, a second issuance refused (409)")
+	// Another phone in voter1's name is refused at the precinct.
+	if code, out := h.call(h.phone(), http.MethodPost, "/api/live/checkin/declare", "", detailsBody(testVoters["voter1"], true)); code != http.StatusConflict || out["code"] != "already-checked-in" {
+		t.Fatalf("impersonation of voter1: %d %v", code, out)
+	}
+	// An old-style voter account obtains nothing.
+	if code, out := h.call(h.login("voter2", "voter-pw"), http.MethodPost, "/api/live/issue/presign", "", map[string]any{"blinded_commitment": strings.Repeat("e2", 32)}); code != http.StatusForbidden || out["code"] != "no-checkin" {
+		t.Fatalf("issuance to a voter account: %d %v", code, out)
+	}
+	if el := h.must(nil, http.MethodGet, "/api/live/election", "", nil); el["counts"].(map[string]any)["checked_in"] != 3.0 || el["counts"].(map[string]any)["credentials_issued"] != 3.0 {
+		t.Fatalf("counts after enrolment: %v", el["counts"])
+	}
+	step("check-in and enrolment: 3 phones checked in and issued; a second issuance, an impersonation and a voter account refused")
 
 	// Voting: 3 voters x 2 positions; choices give totals [2,1,0, 0,1,2].
 	choices := [3][2]int{{0, 2}, {0, 1}, {1, 2}}
@@ -625,7 +672,9 @@ func tamperCDS(t *testing.T, ballotHex string) string {
 }
 
 // checkSecretsKept asserts the issuer secret is in no response and no file
-// outside the private folder, and the private folder's modes.
+// outside the private folder, no voter's name or date of birth is in a file
+// outside it, no date of birth is in any response or the log, and the
+// private folder's modes.
 func checkSecretsKept(t *testing.T, h *liveE2E, runID string, logs string) {
 	dir := filepath.Join(h.runsDir, runID)
 	var key struct {
@@ -643,6 +692,16 @@ func checkSecretsKept(t *testing.T, h *liveE2E, runID string, logs string) {
 	if strings.Contains(logs, key.Secret) {
 		t.Fatal("the issuer secret appeared in the log")
 	}
+	for _, d := range allDOBs {
+		for _, b := range h.bodies {
+			if strings.Contains(b, d) {
+				t.Fatalf("a response carries a date of birth: %.200s", b)
+			}
+		}
+		if strings.Contains(logs, d) {
+			t.Fatal("the log carries a date of birth")
+		}
+	}
 	_ = filepath.Walk(dir, func(p string, info os.FileInfo, err error) error {
 		if err != nil {
 			return err
@@ -659,9 +718,9 @@ func checkSecretsKept(t *testing.T, h *liveE2E, runID string, logs string) {
 			if bytes.Contains(b, []byte(key.Secret)) {
 				t.Errorf("%s holds the issuer secret", rel)
 			}
-			for _, v := range []string{"voter1", "voter2", "voter3"} {
+			for _, v := range append([]string{"voter1", "voter2", "voter3", "Halimbawa", "Sampol", "Pagsubok"}, allDOBs...) {
 				if bytes.Contains(b, []byte(v)) {
-					t.Errorf("%s names account %s", rel, v)
+					t.Errorf("%s names %s", rel, v)
 				}
 			}
 		}

@@ -4,9 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
-	"fmt"
 	"log"
 	"os"
 	"path/filepath"
@@ -18,60 +16,34 @@ import (
 // voter's blinded commitment and blinded challenge, never the credential.
 //
 // The rules (each is tested):
-//   - only a voter account on the roll, in state open (issuance closes with
-//     the election);
-//   - at most one open session per account: a new presign discards the old
+//   - only for a list entry whose check-in is signed (live_checkin.go), in
+//     state open (issuance closes with the election); the phone shows it by
+//     its saksi_checkin cookie. No account, voter or otherwise, can obtain a
+//     credential;
+//   - at most one open session per entry: a new presign discards the old
 //     session file before the next is written;
-//   - at most one signature per account per election, ever: the account is
-//     recorded in private/issued.json (atomic, fsynced) before the signature
-//     is returned, and there is no route that clears it;
-//   - one issue-presign or issue-sign at a time across every account
-//     (issueMu), and few concurrent sessions (liveMaxSessions, liveSessionTTL),
-//     which keeps the blind-signature ROS attack out of reach.
-
-// issuedRecord is private/issued.json: the set of accounts that were given a
-// signature. It is the eligibility control. It holds no time: the ballots are
-// public in arrival order with their commit times, so a record of when each
-// named account was issued would let whoever reads this file match accounts
-// to ballots. Go writes the keys sorted, so the file's order says nothing
-// about the order of issuance either. (The file's own mtime still shows the
-// last issuance; live.json's updated_at is not touched by an issuance.)
-type issuedRecord map[string]bool
+//   - at most one signature per entry per election, ever: the entry moves to
+//     credential_issued in private/checkin.json (atomic, fsynced) before the
+//     signature is returned, and there is no route back from that state;
+//   - one issue-presign or issue-sign at a time across every entry (issueMu),
+//     and few concurrent sessions (liveMaxSessions, liveSessionTTL), which
+//     keeps the blind-signature ROS attack out of reach.
+//
+// The check-in record holds no time, and an issuance does not move
+// live.json's updated_at: the ballots are public in arrival order with their
+// commit times, so an issuance time per entry would help link entries to
+// ballots. (The record file's own mtime still shows the last change.)
 
 // The issuance paths take the run folder from the public snapshot, never
 // from L.dir, which only mu guards.
 
-func issuedPath(dir string) string    { return filepath.Join(dir, livePrivateDir, liveIssuedFile) }
 func sessionsDirOf(dir string) string { return filepath.Join(dir, livePrivateDir, liveSessionsDir) }
 func issuerKeyOf(dir string) string   { return filepath.Join(dir, livePrivateDir, liveIssuerKey) }
 
-func readIssued(dir string) (issuedRecord, error) {
-	rec := issuedRecord{}
-	data, err := os.ReadFile(issuedPath(dir))
-	if errors.Is(err, os.ErrNotExist) {
-		return rec, nil
-	}
-	if err != nil {
-		return nil, err
-	}
-	if err := json.Unmarshal(data, &rec); err != nil {
-		return nil, fmt.Errorf("issued record is unreadable: %w", err)
-	}
-	return rec, nil
-}
-
-func writeIssued(dir string, rec issuedRecord) error {
-	data, err := json.MarshalIndent(rec, "", "  ")
-	if err != nil {
-		return err
-	}
-	return writeFileAtomic(issuedPath(dir), data, 0o600)
-}
-
-// sessionPath is account's session file. The name is a hash of the account,
-// so no account string reaches a path, and each account has one name.
-func sessionPath(dir, account string) string {
-	sum := sha256.Sum256([]byte("saksi.live.session.v1\x00" + account))
+// sessionPath is a list entry's session file. The name is a hash of the
+// entry's key, so no name reaches a path, and each entry has one file name.
+func sessionPath(dir, key string) string {
+	sum := sha256.Sum256([]byte("saksi.live.session.v1\x00" + key))
 	return filepath.Join(sessionsDirOf(dir), hex.EncodeToString(sum[:16])+".json")
 }
 
@@ -123,45 +95,53 @@ type errTooMany struct{ msg string }
 
 func (e errTooMany) Error() string { return e.msg }
 
-// checkIssuable is the shared gate of presign and sign. It reads the state
+// checkIssuable is the shared gate of presign and sign: the snapshot and the
+// sequence number of the entry token's check-in. It reads the election state
 // from the public snapshot, never from the live state. Caller holds issueMu.
-func (L *liveService) checkIssuable(account string) (*liveSnapshot, error) {
+func (L *liveService) checkIssuable(token string) (*liveSnapshot, int, error) {
 	st := L.snapshot()
 	if st == nil {
-		return nil, errNotFound{"no live election has been set up"}
+		return nil, 0, errNotFound{"no live election has been set up"}
 	}
 	if st.State != LiveOpen {
-		return nil, conflictf("credentials are issued while the election is open; it is %s", st.State)
+		return nil, 0, conflictf("credentials are issued while the election is open; it is %s", st.State)
 	}
-	if u, ok := L.s.auth.users[account]; !ok || u.Role != RoleVoter {
-		return nil, errForbidden{"this account is not on the voter roll"}
-	}
-	issued, err := readIssued(st.Dir)
+	L.ckMu.Lock()
+	defer L.ckMu.Unlock()
+	b, _, err := L.bookLocked(false)
 	if err != nil {
-		return nil, errInternal{"the issued record could not be read"}
+		return nil, 0, err
 	}
-	if _, done := issued[account]; done {
-		return nil, conflictf("this account has been issued its credential for this election already; a lost credential cannot be issued again")
+	i, err := phoneEntryLocked(b, token)
+	if err != nil {
+		return nil, 0, err
 	}
-	return st, nil
+	switch b.rec.Entries[i].State {
+	case CheckinSigned:
+		return st, b.rows[i].Seq, nil
+	case CheckinIssued:
+		return nil, 0, errAlreadyIssued
+	default:
+		return nil, 0, errNotSigned
+	}
 }
 
-// presign starts (or restarts) account's issuance session.
-func (L *liveService) presign(ctx context.Context, account, blindedCommitment string) (map[string]string, error) {
+// presign starts (or restarts) the token's entry's issuance session.
+func (L *liveService) presign(ctx context.Context, token, blindedCommitment string) (map[string]string, error) {
 	if !hex64(blindedCommitment) {
 		return nil, badRequestf("blinded_commitment must be a 64-hex-digit point")
 	}
 	L.issueMu.Lock()
 	defer L.issueMu.Unlock()
-	st, err := L.checkIssuable(account)
+	st, seq, err := L.checkIssuable(token)
 	if err != nil {
 		return nil, err
 	}
 	if err := sweepClaimed(sessionsDirOf(st.Dir)); err != nil {
 		return nil, errInternal{"the issuance sessions could not be swept"}
 	}
-	path := sessionPath(st.Dir, account)
-	// One open session per account: the earlier one is discarded first.
+	path := sessionPath(st.Dir, entrySessionKey(seq))
+	// One open session per entry: the earlier one is discarded first.
 	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return nil, errInternal{"an earlier issuance session could not be removed"}
 	}
@@ -183,22 +163,22 @@ func (L *liveService) presign(ctx context.Context, account, blindedCommitment st
 	return map[string]string{"r": out.R, "issuer_public_key": st.IssuerPublicKey}, nil
 }
 
-// sign completes account's issuance: one signature, recorded before it is
-// returned.
-func (L *liveService) sign(ctx context.Context, account, ePrime string) (map[string]string, error) {
+// sign completes the token's entry's issuance: one signature, recorded before
+// it is returned.
+func (L *liveService) sign(ctx context.Context, token, ePrime string) (map[string]string, error) {
 	if !hex64(ePrime) {
 		return nil, badRequestf("e_prime must be a 64-hex-digit scalar")
 	}
 	L.issueMu.Lock()
 	defer L.issueMu.Unlock()
-	st, err := L.checkIssuable(account)
+	st, seq, err := L.checkIssuable(token)
 	if err != nil {
 		return nil, err
 	}
-	path := sessionPath(st.Dir, account)
+	path := sessionPath(st.Dir, entrySessionKey(seq))
 	info, err := os.Stat(path)
 	if err != nil {
-		return nil, conflictf("no issuance session is open for this account; start again with presign")
+		return nil, conflictf("no issuance session is open for this check-in; start again with presign")
 	}
 	if L.now().Sub(info.ModTime()) > liveSessionTTL {
 		_ = os.Remove(path)
@@ -215,18 +195,28 @@ func (L *liveService) sign(ctx context.Context, account, ePrime string) (map[str
 		return nil, badRequestf("%v", signErr)
 	}
 	// Recorded on disk before the signature leaves: if this write fails the
-	// signature is dropped, and the account may try again.
-	issued, err := readIssued(st.Dir)
-	if err != nil {
-		return nil, errInternal{"the issued record could not be read; the signature was not released"}
+	// signature is dropped, and the entry may try again. issueMu is held, so
+	// no reset ran since checkIssuable.
+	L.ckMu.Lock()
+	b := L.ck
+	i := seq - 1
+	if b == nil || b.dir != st.Dir || b.rec.Entries[i].State != CheckinSigned {
+		L.ckMu.Unlock()
+		return nil, errInternal{"the check-in changed during issuance; the signature was not released"}
 	}
-	issued[account] = true
-	if err := writeIssued(st.Dir, issued); err != nil {
+	e := b.rec.Entries[i]
+	e.State = CheckinIssued
+	if err := b.set(i, e, "", ""); err != nil {
+		L.ckMu.Unlock()
 		return nil, errInternal{"the issuance could not be recorded; the signature was not released"}
 	}
+	L.publishCheckinLocked()
+	issued := b.counts().Issued
+	L.ckMu.Unlock()
+
 	L.mu.Lock()
 	if L.st != nil && L.st.RunID == st.RunID {
-		L.st.Issued = len(issued)
+		L.st.Issued = issued
 		// No timestamp: updated_at keeps the last transition's time.
 		err = L.saveUntimed()
 	}

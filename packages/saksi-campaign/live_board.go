@@ -39,17 +39,23 @@ type LiveBoardDecryption struct {
 
 // LiveBoard is BoardResponse.live.
 type LiveBoard struct {
-	State               string              `json:"state"`
-	Title               string              `json:"title"`
-	Counts              LiveCounts          `json:"counts"`
-	Decryption          LiveBoardDecryption `json:"decryption"`
-	JointKeyFingerprint string              `json:"joint_key_fingerprint,omitempty"`
-	RosterFingerprint   string              `json:"roster_fingerprint,omitempty"`
-	Ballots             []LiveBoardBallot   `json:"ballots"`
-	Totals              []uint64            `json:"totals,omitempty"`
-	ContestIDs          []string            `json:"contest_ids"`
-	VerifyOverall       string              `json:"verify_overall,omitempty"`
-	FailedChecks        []string            `json:"failed_checks,omitempty"`
+	State string `json:"state"`
+	Title string `json:"title"`
+	// The voter list's public facts: never a name or a date.
+	Precinct                  string              `json:"precinct,omitempty"`
+	PrecinctLabel             string              `json:"precinct_label,omitempty"`
+	VoterListFingerprint      string              `json:"voter_list_fingerprint,omitempty"`
+	VoterListFingerprintShort string              `json:"voter_list_fingerprint_short,omitempty"`
+	VoterListNote             string              `json:"voter_list_note,omitempty"`
+	Counts                    LiveCounts          `json:"counts"`
+	Decryption                LiveBoardDecryption `json:"decryption"`
+	JointKeyFingerprint       string              `json:"joint_key_fingerprint,omitempty"`
+	RosterFingerprint         string              `json:"roster_fingerprint,omitempty"`
+	Ballots                   []LiveBoardBallot   `json:"ballots"`
+	Totals                    []uint64            `json:"totals,omitempty"`
+	ContestIDs                []string            `json:"contest_ids"`
+	VerifyOverall             string              `json:"verify_overall,omitempty"`
+	FailedChecks              []string            `json:"failed_checks,omitempty"`
 }
 
 // liveRunState reads a live run's state from its folder (it may not be the
@@ -97,7 +103,7 @@ func (s *Server) buildLiveBoard(rec RunRecord, dir string) BoardResponse {
 	resp.Integrity = BoardIntegrity{
 		Voters: rec.Config.Voters, Positions: len(st.Positions), Candidates: rec.Config.Candidates,
 		BallotRecords: st.Ballots, Verified: 0,
-		TurnoutNote: "turnout is ballot records over voter accounts times positions",
+		TurnoutNote: "turnout is ballot records over voters on the list times positions",
 	}
 	if resp.Verified {
 		resp.Integrity.Verified = st.Ballots
@@ -114,7 +120,7 @@ func (s *Server) buildLiveBoard(rec RunRecord, dir string) BoardResponse {
 		State: st.State, Title: st.Title, ContestIDs: st.ContestIDs,
 		JointKeyFingerprint: st.JointKeyFingerprint,
 		Counts: LiveCounts{
-			VotersOnRoll: rec.Config.Voters, CredentialsIssued: st.Issued,
+			VotersOnRoll: rec.Config.Voters, VotersOnList: rec.Config.Voters, CredentialsIssued: st.Issued,
 			BallotRecords: st.Ballots, BallotRecordsSource: "console",
 			TrusteesDecrypted: k, TallySignatures: len(st.TallySignatures),
 			TrusteesJoined: st.TrusteesJoined,
@@ -127,8 +133,15 @@ func (s *Server) buildLiveBoard(rec RunRecord, dir string) BoardResponse {
 		RosterFingerprint: st.RosterFingerprint,
 		FailedChecks:      st.FailedChecks,
 	}
+	if st.Precinct != "" {
+		live.Precinct, live.PrecinctLabel = st.Precinct, precinctLabel(st.Precinct)
+		live.VoterListFingerprint, live.VoterListFingerprintShort = st.VoterListFingerprint, fingerprintShort(st.VoterListFingerprint)
+		live.VoterListNote = voterListNote
+	}
+	if c, ok := s.live.checkinCountsOf(rec.RunID, dir); ok {
+		live.Counts.CheckedIn = c.CheckedIn
+	}
 	if current {
-		live.Counts.VotersOnRoll = len(s.live.voterRoll())
 		if n := s.live.chainCount(st.ElectionID); n >= 0 {
 			live.Counts.BallotRecords, live.Counts.BallotRecordsSource = n, "chain"
 			resp.Crypto.CommittedNullifiers = n

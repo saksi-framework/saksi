@@ -421,31 +421,26 @@ func newTrusteeTestBed(t *testing.T, fo fleetOptions) *trusteeTestBed {
 }
 
 func (b *trusteeTestBed) setup() string {
-	el := b.h.must(b.admin, http.MethodPost, "/api/live/elections", "", map[string]any{
+	el := b.h.must(b.admin, http.MethodPost, "/api/live/elections", "", listBody(map[string]any{
 		"title": "Trustee test",
 		"positions": []map[string]any{
 			{"id": "president", "candidates": []string{"alice", "bob", "carol"}},
 			{"id": "secretary", "candidates": []string{"dan", "eve", "fay"}},
 		},
-	})
+	}))
 	return el["election_id"].(string)
 }
 
-// vote enrols the three voters and casts their six ballots; the totals are
-// [2,1,0, 0,1,2].
+// vote checks the three voters in, enrols them and casts their six ballots;
+// the totals are [2,1,0, 0,1,2].
 func (b *trusteeTestBed) vote() {
 	h := b.h
 	el := h.must(nil, http.MethodGet, "/api/live/election", "", nil)
 	choices := [3][2]int{{0, 2}, {0, 1}, {1, 2}}
 	for v := 0; v < 3; v++ {
-		c := h.login(fmt.Sprintf("voter%d", v+1), "voter-pw")
-		begin := h.cliOp("voter-begin", map[string]any{})
-		pre := h.must(c, http.MethodPost, "/api/live/issue/presign", "", map[string]any{"blinded_commitment": begin["blinded_commitment"]})
-		blind := h.cliOp("voter-blind", map[string]any{"state": begin["state"], "r": pre["r"], "issuer_public_key": el["issuer_public_key"]})
-		sig := h.must(c, http.MethodPost, "/api/live/issue/sign", "", map[string]any{"e_prime": blind["e_prime"]})
-		fin := h.cliOp("voter-finalize", map[string]any{"state": blind["state"], "s_iss": sig["s_iss"], "issuer_public_key": sig["issuer_public_key"]})
+		cred, _ := h.enrol(b.admin, v+1, el)
 		for p, pos := range []string{"president", "secretary"} {
-			bal := h.cliOp("ballot", map[string]any{"params": el["params"], "dkg": el["dkg"], "credential": fin["credential"], "position_id": pos, "choice": choices[v][p]})
+			bal := h.cliOp("ballot", map[string]any{"params": el["params"], "dkg": el["dkg"], "credential": cred, "position_id": pos, "choice": choices[v][p]})
 			h.must(nil, http.MethodPost, "/api/live/ballot", "", map[string]any{"ballot": bal["ballot"]})
 		}
 	}

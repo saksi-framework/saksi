@@ -229,12 +229,15 @@ type liveFixture struct {
 	chain   *flakyChain
 	// allowHosts is the console's --allow-host list (none: guard skips Host).
 	allowHosts []string
+	// phones holds each test phone's saksi_checkin cookie, across console
+	// restarts, as a phone's browser would.
+	phones map[string]string
 }
 
 func newLiveFixture(t *testing.T) *liveFixture {
 	t.Helper()
 	fx := &liveFixture{t: t, runs: t.TempDir(), ops: newFakeOps(),
-		chain: &flakyChain{oracleChain: newOracleChain(t, "")}}
+		chain: &flakyChain{oracleChain: newOracleChain(t, "")}, phones: map[string]string{}}
 	dir := t.TempDir()
 	h := fixtureHashes()["admin-pw"]
 	users := []User{
@@ -283,9 +286,13 @@ type liveConsole struct {
 	fx       *liveFixture
 	sessions map[string]string
 	bodies   []string
+	// addr, when set, is the requests' remote address.
+	addr string
 }
 
-// do sends a request as who ("" = anonymous, "tN" bearer = trustee token N).
+// do sends a request as who: "" anonymous, "bearer:<token>" a trustee token,
+// "phone:<name>" a phone with its check-in cookie (kept from the answers),
+// anything else that account's session.
 func (c *liveConsole) do(method, path, who string, body any) (int, map[string]any) {
 	c.t.Helper()
 	var rd *bytes.Reader
@@ -302,7 +309,15 @@ func (c *liveConsole) do(method, path, who string, body any) (int, map[string]an
 	}
 	req := httptest.NewRequest(method, path, rd)
 	req.RemoteAddr = "192.0.2.7:51000"
+	if c.addr != "" {
+		req.RemoteAddr = c.addr
+	}
+	phone, isPhone := strings.CutPrefix(who, "phone:")
 	switch {
+	case isPhone:
+		if tok := c.fx.phones[phone]; tok != "" {
+			req.AddCookie(&http.Cookie{Name: checkinCookie, Value: tok})
+		}
 	case strings.HasPrefix(who, "bearer:"):
 		req.Header.Set("Authorization", "Bearer "+strings.TrimPrefix(who, "bearer:"))
 	case who != "":
@@ -319,6 +334,11 @@ func (c *liveConsole) do(method, path, who string, body any) (int, map[string]an
 	rec := httptest.NewRecorder()
 	c.s.ServeHTTP(rec, req)
 	c.bodies = append(c.bodies, rec.Body.String())
+	for _, ck := range rec.Result().Cookies() {
+		if ck.Name == checkinCookie && isPhone {
+			c.fx.phones[phone] = ck.Value
+		}
+	}
 	var out map[string]any
 	_ = json.Unmarshal(rec.Body.Bytes(), &out)
 	return rec.Code, out
@@ -350,9 +370,68 @@ var livePositions = []map[string]any{
 }
 
 func (c *liveConsole) setup() string {
-	out := c.ok(http.MethodPost, "/api/live/elections", "admin", map[string]any{
-		"title": "Test", "positions": livePositions, "trustees": 3, "threshold": 2})
+	out := c.ok(http.MethodPost, "/api/live/elections", "admin", listBody(map[string]any{
+		"title": "Test", "positions": livePositions, "trustees": 3, "threshold": 2}))
 	return out["run_id"].(string)
+}
+
+// testVoterList is the tests' precinct list: fictional voters only. Sorted,
+// it numbers Halimbawa Dos 1, Halimbawa Uno 2, Peña Singko 3, Sampol Kuwatro
+// 4, Sampol Tres 5.
+const testVoterList = "# Fictional voters for the tests. No row is a real person.\n" +
+	"last_name,first_name,middle_name,date_of_birth\n" +
+	"Halimbawa,Uno,Pagsubok,1990-01-01\n" +
+	"Halimbawa,Dos,,1991-02-02\n" +
+	"Sampol,Tres,Pagsubok,1992-03-03\n" +
+	"Sampol,Kuwatro,,1993-04-04\n" +
+	"Peña,Singko,Santos-Reyes,1994-05-05\n"
+
+// testVoters are the phones' typed details, by test phone name.
+var testVoters = map[string]CheckinDetails{
+	"voter1": {LastName: "Halimbawa", FirstName: "Uno", DateOfBirth: "1990-01-01"},
+	"voter2": {LastName: "Halimbawa", FirstName: "Dos", DateOfBirth: "1991-02-02"},
+	"voter3": {LastName: "Sampol", FirstName: "Tres", DateOfBirth: "1992-03-03"},
+	"voter4": {LastName: "Sampol", FirstName: "Kuwatro", DateOfBirth: "1993-04-04"},
+	"voter5": {LastName: "Peña", FirstName: "Singko", DateOfBirth: "1994-05-05"},
+}
+
+var testSeqs = map[string]int{"voter2": 1, "voter1": 2, "voter5": 3, "voter4": 4, "voter3": 5}
+
+// listBody adds the test list and its fingerprint to a setup body.
+func listBody(body map[string]any) map[string]any {
+	p := parseVoterList(testVoterList, DefaultLivePrecinct, time.Now())
+	body["voter_list"] = testVoterList
+	body["voter_list_fingerprint"] = p.Fingerprint
+	return body
+}
+
+func detailsBody(d CheckinDetails, declare bool) map[string]any {
+	b := map[string]any{"last_name": d.LastName, "first_name": d.FirstName, "date_of_birth": d.DateOfBirth}
+	if declare {
+		b["declaration"] = true
+	}
+	return b
+}
+
+// checkIn takes voter's phone through find, declare, the desk's approval and
+// the signature: the entry ends signed.
+func (c *liveConsole) checkIn(voter string) {
+	c.t.Helper()
+	phone := "phone:" + voter
+	c.ok(http.MethodPost, "/api/live/checkin/find", phone, detailsBody(testVoters[voter], false))
+	c.ok(http.MethodPost, "/api/live/checkin/declare", phone, detailsBody(testVoters[voter], true))
+	c.ok(http.MethodPost, "/api/live/desk/approve", "admin", map[string]any{"seq": testSeqs[voter]})
+	out := c.ok(http.MethodPost, "/api/live/checkin/sign", phone, map[string]any{"strokes": [][][]int{{{10, 20}, {30, 40}}}})
+	if out["state"] != CheckinSigned {
+		c.t.Fatalf("check-in of %s: %v", voter, out)
+	}
+}
+
+// presignSign is the phone's issuance over its check-in.
+func (c *liveConsole) presignSign(voter string) {
+	c.t.Helper()
+	c.ok(http.MethodPost, "/api/live/issue/presign", "phone:"+voter, map[string]string{"blinded_commitment": pt(0x10)})
+	c.ok(http.MethodPost, "/api/live/issue/sign", "phone:"+voter, map[string]string{"e_prime": pt(0x11)})
 }
 
 func fakeDeal(electionID string, id, n int) map[string]any {
@@ -384,9 +463,11 @@ func (c *liveConsole) ceremony(electionID string) {
 	}
 }
 
+// issue checks voter in and issues its credential.
 func (c *liveConsole) issue(voter string) {
-	c.ok(http.MethodPost, "/api/live/issue/presign", voter, map[string]string{"blinded_commitment": pt(0x10)})
-	c.ok(http.MethodPost, "/api/live/issue/sign", voter, map[string]string{"e_prime": pt(0x11)})
+	c.t.Helper()
+	c.checkIn(voter)
+	c.presignSign(voter)
 }
 
 func fakeBallot(electionID, position string, n byte, extra []byte) string {
@@ -468,9 +549,16 @@ func TestLiveRoleAccess(t *testing.T) {
 		{http.MethodPost, "/api/live/elections", "t1", 403},
 		{http.MethodPost, "/api/live/close", "voter1", 403},
 		{http.MethodPost, "/api/live/verify", c.tok(1), 401}, // a token is not a session
-		{http.MethodPost, "/api/live/issue/presign", "", 401},
-		{http.MethodPost, "/api/live/issue/presign", "admin", 403},
-		{http.MethodPost, "/api/live/issue/sign", "t1", 403},
+		// Issuance and check-in are public by role; with no election they
+		// are 404, and no account stands in for a check-in (below).
+		{http.MethodPost, "/api/live/checkin/find", "", 404},
+		{http.MethodGet, "/api/live/checkin", "", 404},
+		{http.MethodPost, "/api/live/voter-list/preview", "", 401},
+		{http.MethodPost, "/api/live/voter-list/preview", "voter1", 403},
+		{http.MethodGet, "/api/live/voter-list", "t1", 403},
+		{http.MethodPost, "/api/live/desk/approve", "voter1", 403},
+		{http.MethodPost, "/api/live/desk/reset", "", 401},
+		{http.MethodPost, "/api/live/desk/refuse", c.tok(1), 401},
 		{http.MethodGet, "/api/live/dkg/roster", "", 401},
 		{http.MethodGet, "/api/live/dkg/roster", "t1", 401}, // a trustee login is not a token
 		{http.MethodGet, "/api/live/dkg/roster", "admin", 401},
@@ -502,7 +590,7 @@ func TestLiveHappyPathAndWrongStates(t *testing.T) {
 	if c.state() != LiveCeremony {
 		t.Fatalf("after setup: %s", c.state())
 	}
-	if code, _ := c.do(http.MethodPost, "/api/live/elections", "admin", map[string]any{"title": "x", "positions": livePositions}); code != http.StatusConflict {
+	if code, _ := c.do(http.MethodPost, "/api/live/elections", "admin", listBody(map[string]any{"title": "x", "positions": livePositions})); code != http.StatusConflict {
 		t.Fatalf("second election while one is running: %d", code)
 	}
 	// Wrong state: issuance, ballots, close, partials and signatures wait.
@@ -510,7 +598,7 @@ func TestLiveHappyPathAndWrongStates(t *testing.T) {
 		path, who string
 		body      any
 	}{
-		{"/api/live/issue/presign", "voter1", map[string]any{"blinded_commitment": pt(1)}},
+		{"/api/live/issue/presign", "phone:voter1", map[string]any{"blinded_commitment": pt(1)}},
 		{"/api/live/close", "admin", nil},
 		{"/api/live/partial", c.tok(1), map[string]any{"partials": []any{map[string]string{"contest_id": "x", "partial": "00"}}}},
 		{"/api/live/tally-sig", c.tok(1), map[string]any{"totals": []int{1, 0, 0, 1}, "signature": sig(1)}},
@@ -604,7 +692,7 @@ func TestLiveHappyPathAndWrongStates(t *testing.T) {
 		t.Fatalf("after the ceremony: %s", c.state())
 	}
 	el := c.ok(http.MethodGet, "/api/live/election", "", nil)
-	if el["joint_public_key"] != pt(0xb1) || el["dkg"] == "" || el["issuer_public_key"] != pt(0xa1) || el["counts"].(map[string]any)["voters_on_roll"] != 3.0 {
+	if el["joint_public_key"] != pt(0xb1) || el["dkg"] == "" || el["issuer_public_key"] != pt(0xa1) || el["counts"].(map[string]any)["voters_on_roll"] != 5.0 {
 		t.Fatalf("election view: %v", el)
 	}
 
@@ -634,7 +722,7 @@ func TestLiveHappyPathAndWrongStates(t *testing.T) {
 	if code, _ := c.do(http.MethodPost, "/api/live/ballot", "", map[string]string{"ballot": fakeBallot(runID, "secretary", 3, nil)}); code != http.StatusConflict {
 		t.Fatal("a ballot was relayed after close")
 	}
-	if code, _ := c.do(http.MethodPost, "/api/live/issue/presign", "voter2", map[string]string{"blinded_commitment": pt(1)}); code != http.StatusConflict {
+	if code, _ := c.do(http.MethodPost, "/api/live/issue/presign", "phone:voter1", map[string]string{"blinded_commitment": pt(1)}); code != http.StatusConflict {
 		t.Fatal("issuance stayed open after close")
 	}
 	c.partials(1, liveContests)
@@ -690,7 +778,7 @@ func TestLiveHappyPathAndWrongStates(t *testing.T) {
 		}
 	}
 	// A new election may start once this one is verified.
-	if code, out := c.do(http.MethodPost, "/api/live/elections", "admin", map[string]any{"title": "Next", "positions": livePositions, "trustees": 3, "threshold": 2}); code != http.StatusCreated {
+	if code, out := c.do(http.MethodPost, "/api/live/elections", "admin", listBody(map[string]any{"title": "Next", "positions": livePositions, "trustees": 3, "threshold": 2})); code != http.StatusCreated {
 		t.Fatalf("next election: %d %v", code, out)
 	}
 }
@@ -717,26 +805,30 @@ func TestLiveTrusteeTokenActsOnlyAsItsTrustee(t *testing.T) {
 	// A token beyond the election's trustees acts as nobody.
 	fx2 := newLiveFixture(t)
 	c2 := fx2.console()
-	c2.ok(http.MethodPost, "/api/live/elections", "admin", map[string]any{"title": "Two", "positions": livePositions, "trustees": 2, "threshold": 2})
+	c2.ok(http.MethodPost, "/api/live/elections", "admin", listBody(map[string]any{"title": "Two", "positions": livePositions, "trustees": 2, "threshold": 2}))
 	if code, _ := c2.do(http.MethodPost, "/api/live/dkg/receive-key", c2.tok(3), map[string]any{"receive_public_key": pt(1)}); code != http.StatusForbidden {
 		t.Fatalf("trustee 3 of a 2-trustee election: %d", code)
 	}
 }
 
-func TestLiveIssuanceOncePerAccountEvenAcrossRestart(t *testing.T) {
+func TestLiveIssuanceOncePerEntryEvenAcrossRestart(t *testing.T) {
 	fx := newLiveFixture(t)
 	c := fx.console()
 	c.toState(LiveOpen) // voter1 has its credential
-	if code, out := c.do(http.MethodPost, "/api/live/issue/presign", "voter1", map[string]string{"blinded_commitment": pt(1)}); code != http.StatusConflict {
+	if code, out := c.do(http.MethodPost, "/api/live/issue/presign", "phone:voter1", map[string]string{"blinded_commitment": pt(1)}); code != http.StatusConflict || out["code"] != "already-issued" {
 		t.Fatalf("second presign: %d %v", code, out)
 	}
-	// Restart: the issued record is on disk.
+	// Restart: the check-in record is on disk.
 	c2 := fx.console()
-	if code, _ := c2.do(http.MethodPost, "/api/live/issue/presign", "voter1", map[string]string{"blinded_commitment": pt(1)}); code != http.StatusConflict {
+	if code, out := c2.do(http.MethodPost, "/api/live/issue/presign", "phone:voter1", map[string]string{"blinded_commitment": pt(1)}); code != http.StatusConflict || out["code"] != "already-issued" {
 		t.Fatal("a restart let voter1 be issued again")
 	}
-	if code, _ := c2.do(http.MethodPost, "/api/live/issue/sign", "voter1", map[string]string{"e_prime": pt(1)}); code != http.StatusConflict {
+	if code, _ := c2.do(http.MethodPost, "/api/live/issue/sign", "phone:voter1", map[string]string{"e_prime": pt(1)}); code != http.StatusConflict {
 		t.Fatal("a restart let voter1 be signed again")
+	}
+	// No reset after issuance either.
+	if code, out := c2.do(http.MethodPost, "/api/live/desk/reset", "admin", map[string]any{"seq": testSeqs["voter1"]}); code != http.StatusConflict || out["code"] != "already-issued" {
+		t.Fatalf("reset after issuance: %d %v", code, out)
 	}
 	c2.issue("voter2")
 	if n := len(fx.ops.signed); n != 2 {
@@ -753,18 +845,20 @@ func TestLiveSecondPresignReplacesTheFirst(t *testing.T) {
 	c := fx.console()
 	c.toState(LiveCeremony)
 	c.ceremony(c.s.live.st.ElectionID)
-	c.ok(http.MethodPost, "/api/live/issue/presign", "voter2", map[string]string{"blinded_commitment": pt(1)})
-	c.ok(http.MethodPost, "/api/live/issue/presign", "voter2", map[string]string{"blinded_commitment": pt(2)})
+	c.checkIn("voter2")
+	c.ok(http.MethodPost, "/api/live/issue/presign", "phone:voter2", map[string]string{"blinded_commitment": pt(1)})
+	c.ok(http.MethodPost, "/api/live/issue/presign", "phone:voter2", map[string]string{"blinded_commitment": pt(2)})
 	entries, _ := os.ReadDir(c.s.live.sessionsDir())
 	if len(entries) != 1 {
-		t.Fatalf("%d session files for one account, want 1", len(entries))
+		t.Fatalf("%d session files for one entry, want 1", len(entries))
 	}
-	c.ok(http.MethodPost, "/api/live/issue/sign", "voter2", map[string]string{"e_prime": pt(3)})
+	c.ok(http.MethodPost, "/api/live/issue/sign", "phone:voter2", map[string]string{"e_prime": pt(3)})
 	if got := fx.ops.signed[len(fx.ops.signed)-1]; !strings.Contains(got, "nonce-2") {
 		t.Fatalf("signed with %s, want the second session", got)
 	}
 	// A sign with no session open is refused.
-	if code, _ := c.do(http.MethodPost, "/api/live/issue/sign", "voter3", map[string]string{"e_prime": pt(3)}); code != http.StatusConflict {
+	c.checkIn("voter3")
+	if code, _ := c.do(http.MethodPost, "/api/live/issue/sign", "phone:voter3", map[string]string{"e_prime": pt(3)}); code != http.StatusConflict {
 		t.Fatalf("sign without presign: %d", code)
 	}
 }
@@ -780,7 +874,7 @@ func TestLiveIssuanceIsSerialized(t *testing.T) {
 	fx.ops.mu.Unlock()
 	var wg sync.WaitGroup
 	for _, v := range []string{"voter1", "voter2", "voter3"} {
-		c.do(http.MethodGet, "/api/live/election", v, nil) // mint the session first, not concurrently
+		c.checkIn(v) // check in first, not concurrently
 	}
 	for _, v := range []string{"voter1", "voter2", "voter3"} {
 		wg.Add(1)
@@ -803,7 +897,7 @@ func (c *liveConsole) issueConcurrent(voter string) {
 	for _, step := range []struct{ path, key string }{{"/api/live/issue/presign", "blinded_commitment"}, {"/api/live/issue/sign", "e_prime"}} {
 		data, _ := json.Marshal(map[string]string{step.key: pt(7)})
 		req := httptest.NewRequest(http.MethodPost, step.path, bytes.NewReader(data))
-		req.AddCookie(&http.Cookie{Name: sessionCookie, Value: c.sessions[voter]})
+		req.AddCookie(&http.Cookie{Name: checkinCookie, Value: c.fx.phones[voter]})
 		rec := httptest.NewRecorder()
 		c.s.ServeHTTP(rec, req)
 		if rec.Code != http.StatusOK {
@@ -845,7 +939,7 @@ func TestLiveRestartFinishesWhatTheChainAlreadyHas(t *testing.T) {
 	fx := newLiveFixture(t)
 	c := fx.console()
 	fx.chain.down.Store(true)
-	if code, _ := c.do(http.MethodPost, "/api/live/elections", "admin", map[string]any{"title": "x", "positions": livePositions, "trustees": 3, "threshold": 2}); code != http.StatusBadGateway {
+	if code, _ := c.do(http.MethodPost, "/api/live/elections", "admin", listBody(map[string]any{"title": "x", "positions": livePositions, "trustees": 3, "threshold": 2})); code != http.StatusBadGateway {
 		t.Fatalf("setup with the chain down: %d", code)
 	}
 	if c.state() != LiveSetup {
@@ -928,21 +1022,22 @@ func TestLiveSecretsNeverInResponsesOrLogs(t *testing.T) {
 			t.Fatalf("%s: %v %v", p, err, info.Mode())
 		}
 	}
-	for _, f := range []string{liveIssuerKey, liveIssuedFile} {
+	for _, f := range []string{liveIssuerKey, liveVoterListFile, liveCheckinFile} {
 		if info, err := os.Stat(filepath.Join(priv, f)); err != nil || info.Mode().Perm() != 0o600 {
 			t.Fatalf("%s: %v", f, err)
 		}
 	}
 }
 
-func TestLiveBallotHandlerWritesNothingThatNamesAnAccount(t *testing.T) {
+func TestLiveBallotHandlerWritesNothingThatNamesAVoter(t *testing.T) {
 	logs := captureLog(t)
 	fx := newLiveFixture(t)
 	c := fx.console()
 	runID := c.toState(LiveOpen)
 	c.issue("voter2")
-	// The phone's own session cookie rides along, from a distinctive address.
-	c.ok(http.MethodPost, "/api/live/ballot", "voter2", map[string]string{"ballot": fakeBallot(runID, "president", 9, nil)})
+	// The phone's own check-in cookie rides along, from a distinctive
+	// address; so does an account's session cookie.
+	c.ok(http.MethodPost, "/api/live/ballot", "phone:voter2", map[string]string{"ballot": fakeBallot(runID, "president", 9, nil)})
 	c.ok(http.MethodPost, "/api/live/ballot", "voter2", map[string]string{"ballot": fakeBallot(runID, "secretary", 8, nil)})
 	dir := filepath.Join(fx.runs, runID)
 	err := filepath.Walk(dir, func(p string, info os.FileInfo, err error) error {
@@ -950,10 +1045,11 @@ func TestLiveBallotHandlerWritesNothingThatNamesAnAccount(t *testing.T) {
 			return err
 		}
 		if rel, _ := filepath.Rel(dir, p); strings.HasPrefix(rel, livePrivateDir) {
-			return nil // the issued record names accounts, and links none to a ballot
+			return nil // the list and the check-in record name voters, and link none to a ballot
 		}
 		data, _ := os.ReadFile(p)
-		for _, needle := range []string{"voter1", "voter2", "voter3", "192.0.2.7", c.sessions["voter2"]} {
+		for _, needle := range []string{"voter1", "voter2", "Halimbawa", "Sampol", "Uno", "Dos", "1990-01-01", "1991-02-02",
+			"192.0.2.7", c.sessions["voter2"], fx.phones["voter2"], checkinCookieHash(runID, fx.phones["voter2"])} {
 			if bytes.Contains(data, []byte(needle)) {
 				t.Errorf("%s contains %q", p, needle)
 			}
@@ -963,7 +1059,7 @@ func TestLiveBallotHandlerWritesNothingThatNamesAnAccount(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, needle := range []string{"voter2", "192.0.2.7"} {
+	for _, needle := range []string{"voter2", "Halimbawa", "Dos", "1991-02-02", "192.0.2.7", fx.phones["voter2"]} {
 		if strings.Contains(logs.String(), needle) {
 			t.Errorf("the log contains %q", needle)
 		}
@@ -979,6 +1075,7 @@ func TestLiveBallotHandlerWritesNothingThatNamesAnAccount(t *testing.T) {
 	})
 	req := httptest.NewRequest(http.MethodPost, "/api/live/ballot", nil)
 	req.AddCookie(&http.Cookie{Name: sessionCookie, Value: c.sessions["voter2"]})
+	req.AddCookie(&http.Cookie{Name: checkinCookie, Value: fx.phones["voter2"]})
 	s.authorize(mux).ServeHTTP(httptest.NewRecorder(), req)
 	if sawCookie || sawSession {
 		t.Fatalf("the ballot handler saw cookie=%v session=%v", sawCookie, sawSession)
@@ -1016,14 +1113,36 @@ func TestLiveSetupRefusals(t *testing.T) {
 	fx := newLiveFixture(t)
 	c := fx.console()
 	for name, body := range map[string]map[string]any{
-		"no title":           {"title": " ", "positions": livePositions},
-		"threshold too high": {"title": "x", "positions": livePositions, "trustees": 3, "threshold": 4},
-		"trustee 4 no token": {"title": "x", "positions": livePositions, "trustees": 4, "threshold": 2},
-		"no positions":       {"title": "x", "positions": []any{}, "trustees": 3, "threshold": 2},
+		"no title":           listBody(map[string]any{"title": " ", "positions": livePositions}),
+		"threshold too high": listBody(map[string]any{"title": "x", "positions": livePositions, "trustees": 3, "threshold": 4}),
+		"trustee 4 no token": listBody(map[string]any{"title": "x", "positions": livePositions, "trustees": 4, "threshold": 2}),
+		"no positions":       listBody(map[string]any{"title": "x", "positions": []any{}, "trustees": 3, "threshold": 2}),
 	} {
 		if code, out := c.do(http.MethodPost, "/api/live/elections", "admin", body); code != http.StatusBadRequest {
 			t.Errorf("%s: %d %v", name, code, out)
 		}
+	}
+	// The list: missing, with an error, empty, unconfirmed, or not the one
+	// confirmed.
+	good := parseVoterList(testVoterList, DefaultLivePrecinct, time.Now()).Fingerprint
+	bad := testVoterList + "Sampol,Tres,,1992-03-03\n" // a duplicate
+	for name, tc := range map[string]struct {
+		list, fp, code string
+	}{
+		"no list":        {"", good, "voter-list-missing"},
+		"list in error":  {bad, good, "voter-list-invalid"},
+		"empty list":     {rollHeader, good, "voter-list-invalid"},
+		"no fingerprint": {testVoterList, "", "voter-list-unconfirmed"},
+		"other list":     {testVoterList, strings.Repeat("0", 64), "voter-list-changed"},
+	} {
+		body := map[string]any{"title": "x", "positions": livePositions, "trustees": 3, "threshold": 2,
+			"voter_list": tc.list, "voter_list_fingerprint": tc.fp}
+		if code, out := c.do(http.MethodPost, "/api/live/elections", "admin", body); code != http.StatusBadRequest || out["code"] != tc.code {
+			t.Errorf("%s: %d %v", name, code, out)
+		}
+	}
+	if entries, _ := os.ReadDir(fx.runs); len(entries) != 0 {
+		t.Fatalf("a refused setup left %d run folder(s)", len(entries))
 	}
 	if c.state() != "" {
 		t.Fatalf("a refused setup left state %s", c.state())

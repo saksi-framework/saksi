@@ -9,11 +9,12 @@
 //	                     [--fabric-cert path] [--fabric-key path]
 //	                     [--fabric-channel name] [--fabric-chaincode name]
 //	                     [--tls-cert cert.pem --tls-key key.pem]
-//	                     [--live --trustee-tokens tokens.json]
+//	                     [--live --trustee-tokens tokens.json [--live-precinct 0001A]]
 //
 // --live runs one live election (docs/live/http-api.md): it needs --auth-file
-// (the voter roll and the presenter), --trustee-tokens and, unless the bind is
-// loopback, TLS.
+// (the presenter), --trustee-tokens and, unless the bind is loopback, TLS. Its
+// voters are the precinct's voter list, uploaded at setup
+// (docs/live/voter-list-api.md); --live-precinct is that precinct's number.
 //
 // The same binary is also the campaign driver for an ALREADY-RUNNING console,
 // over that console's own HTTP API — it never reaches into a run folder:
@@ -199,6 +200,8 @@ func serve(args []string) {
 	live := fs.Bool("live", false, "enable the live election routes (/api/live/); needs --auth-file and --trustee-tokens")
 	trusteeTokens := fs.String("trustee-tokens", os.Getenv("SAKSI_TRUSTEE_TOKENS"),
 		"live mode: JSON array of {trustee_id, token_sha256}, one token per trustee process (env SAKSI_TRUSTEE_TOKENS)")
+	livePrecinct := fs.String("live-precinct", campaign.DefaultLivePrecinct,
+		"live mode: the precinct number (four digits and a capital letter), always shown as a demonstration")
 	var allow multiFlag
 	fs.Var(&allow, "allow-host", "additional accepted Host header (repeatable; for LAN)")
 	_ = fs.Parse(args)
@@ -248,7 +251,7 @@ func serve(args []string) {
 		}
 	}
 	if *live {
-		if err := handler.EnableLive(campaign.LiveOptions{TrusteeTokens: *trusteeTokens}); err != nil {
+		if err := handler.EnableLive(campaign.LiveOptions{TrusteeTokens: *trusteeTokens, Precinct: *livePrecinct}); err != nil {
 			fatal("--live: %v", err)
 		}
 	}
@@ -276,7 +279,7 @@ func serve(args []string) {
 		fmt.Printf("  on-chain  (no driver configured — offline mode only)\n")
 	}
 	if *live {
-		fmt.Printf("  live      on: /api/live/ (trustee tokens from %s)\n", *trusteeTokens)
+		fmt.Printf("  live      on: /api/live/ (trustee tokens from %s; precinct %s)\n", *trusteeTokens, *livePrecinct)
 	}
 	if warning != "" {
 		fmt.Fprintln(os.Stderr, warning)

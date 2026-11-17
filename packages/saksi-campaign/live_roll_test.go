@@ -188,16 +188,16 @@ func TestVoterListFingerprintStability(t *testing.T) {
 
 func TestVoterNameKey(t *testing.T) {
 	for in, want := range map[string]string{
-		"  dela   Cruz ":  "DELA CRUZ",
-		"Dela-Cruz":       "DELA CRUZ",
-		"Dela‐Cruz":       "DELA CRUZ", // U+2010
-		"PEÑA":            "PENA",
-		"Peña":      "PENA",
-		"José":            "JOSE",
-		"Ma. Clara":       "MA CLARA",
-		"O'Brien":         "OBRIEN",
-		"O’Brien":         "OBRIEN",
-		" Uno ": "UNO",
+		"  dela   Cruz ": "DELA CRUZ",
+		"Dela-Cruz":      "DELA CRUZ",
+		"Dela‐Cruz":      "DELA CRUZ", // U+2010
+		"PEÑA":           "PENA",
+		"Peña":          "PENA",
+		"José":           "JOSE",
+		"Ma. Clara":      "MA CLARA",
+		"O'Brien":        "OBRIEN",
+		"O’Brien":        "OBRIEN",
+		" Uno ":          "UNO",
 	} {
 		if got := voterNameKey(in); got != want {
 			t.Errorf("voterNameKey(%q) = %q, want %q", in, got, want)

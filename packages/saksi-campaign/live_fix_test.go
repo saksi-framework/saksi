@@ -105,8 +105,8 @@ func TestLiveBoardAndViewDoNotWaitOnTheStateLock(t *testing.T) {
 	}
 }
 
-// S2: private/issued.json is a set of account names with no time in it, and
-// an issuance does not move live.json's updated_at.
+// S2: private/checkin.json, the issuance record, holds no time, and neither
+// a check-in nor an issuance moves live.json's updated_at.
 func TestLiveIssuedRecordHoldsNoTime(t *testing.T) {
 	fx := newLiveFixture(t)
 	c := fx.console()
@@ -115,20 +115,32 @@ func TestLiveIssuedRecordHoldsNoTime(t *testing.T) {
 	before := c.s.live.snapshot().UpdatedAt
 	c.issue("voter1")
 	c.issue("voter2")
-	data, err := os.ReadFile(filepath.Join(fx.runs, runID, livePrivateDir, liveIssuedFile))
+	data, err := os.ReadFile(filepath.Join(fx.runs, runID, livePrivateDir, liveCheckinFile))
 	if err != nil {
 		t.Fatal(err)
 	}
-	var set map[string]bool
-	if err := json.Unmarshal(data, &set); err != nil {
-		t.Fatalf("issued.json is not a set of names: %v\n%s", err, data)
+	var rec checkinRecord
+	if err := json.Unmarshal(data, &rec); err != nil {
+		t.Fatalf("checkin.json: %v\n%s", err, data)
 	}
-	if len(set) != 2 || !set["voter1"] || !set["voter2"] {
-		t.Fatalf("issued.json: %s", data)
+	issued := 0
+	for i, e := range rec.Entries {
+		if e.State == CheckinIssued {
+			issued++
+			if i+1 != testSeqs["voter1"] && i+1 != testSeqs["voter2"] {
+				t.Fatalf("entry %d issued: %s", i+1, data)
+			}
+		}
 	}
+	if issued != 2 {
+		t.Fatalf("checkin.json: %d issued, want 2", issued)
+	}
+	// Cookie hashes are random hex; the rest must hold no date, clock time or
+	// long number.
+	scrub := regexp.MustCompile(`"[0-9a-f]{64}"`).ReplaceAll(data, []byte(`"h"`))
 	timeLike := regexp.MustCompile(`\d{4}-\d{2}-\d{2}|\d{2}:\d{2}|\d{9,}`)
-	if timeLike.Match(data) {
-		t.Fatalf("issued.json holds a time-like value: %s", data)
+	if timeLike.Match(scrub) {
+		t.Fatalf("checkin.json holds a time-like value: %s", data)
 	}
 	if after := c.s.live.snapshot().UpdatedAt; !after.Equal(before) {
 		t.Fatalf("an issuance moved updated_at from %v to %v", before, after)
@@ -293,7 +305,7 @@ func TestLiveBallotForAnotherElectionIsNotRelayed(t *testing.T) {
 func TestLiveCreateRetriesAStuckSetup(t *testing.T) {
 	fx := newLiveFixture(t)
 	c := fx.console()
-	req := map[string]any{"title": "x", "positions": livePositions, "trustees": 3, "threshold": 2}
+	req := listBody(map[string]any{"title": "x", "positions": livePositions, "trustees": 3, "threshold": 2})
 	fx.chain.down.Store(true)
 	if code, _ := c.do(http.MethodPost, "/api/live/elections", "admin", req); code != http.StatusBadGateway {
 		t.Fatalf("setup with the chain down: %d", code)
@@ -389,7 +401,7 @@ func TestLiveAbandon(t *testing.T) {
 	fx3 := newLiveFixture(t)
 	c3 := fx3.console()
 	fx3.chain.down.Store(true)
-	c3.do(http.MethodPost, "/api/live/elections", "admin", map[string]any{"title": "x", "positions": livePositions, "trustees": 3, "threshold": 2})
+	c3.do(http.MethodPost, "/api/live/elections", "admin", listBody(map[string]any{"title": "x", "positions": livePositions, "trustees": 3, "threshold": 2}))
 	c3.ok(http.MethodPost, "/api/live/abandon", "admin", nil)
 	fx3.chain.down.Store(false)
 	if c3.fx.console().state() != LiveAbandoned {
@@ -424,8 +436,8 @@ func TestLiveFailedReverifyStepsBackToTallied(t *testing.T) {
 	}
 }
 
-// M4 and M8: if issued.json cannot be written, the signature is withheld,
-// the 500 names no path, and the account may try again.
+// M4 and M8: if the check-in record cannot be written, the signature is
+// withheld, the 500 names no path, and the entry may try again.
 func TestLiveIssuedWriteFailureWithholdsTheSignature(t *testing.T) {
 	logs := captureLog(t)
 	fx := newLiveFixture(t)
@@ -433,32 +445,38 @@ func TestLiveIssuedWriteFailureWithholdsTheSignature(t *testing.T) {
 	runID := c.toState(LiveCeremony)
 	c.ceremony(runID)
 	priv := filepath.Join(fx.runs, runID, livePrivateDir)
-	c.ok(http.MethodPost, "/api/live/issue/presign", "voter1", map[string]string{"blinded_commitment": pt(0x10)})
+	c.checkIn("voter1")
+	c.ok(http.MethodPost, "/api/live/issue/presign", "phone:voter1", map[string]string{"blinded_commitment": pt(0x10)})
 	if err := os.Chmod(priv, 0o500); err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { os.Chmod(priv, 0o700) })
-	code, out := c.do(http.MethodPost, "/api/live/issue/sign", "voter1", map[string]string{"e_prime": pt(0x11)})
+	code, out := c.do(http.MethodPost, "/api/live/issue/sign", "phone:voter1", map[string]string{"e_prime": pt(0x11)})
 	os.Chmod(priv, 0o700)
 	body := c.bodies[len(c.bodies)-1]
 	if code != http.StatusInternalServerError || out["s_iss"] != nil || strings.Contains(body, pt(0x55)) {
-		t.Fatalf("sign with issued.json unwritable: %d %s", code, body)
+		t.Fatalf("sign with checkin.json unwritable: %d %s", code, body)
 	}
 	if out["error"] != liveInternalError || strings.Contains(body, fx.runs) || strings.Contains(body, "private") {
 		t.Fatalf("the 500 is not generic: %s", body)
 	}
-	if strings.Contains(logs.String(), "sessions/") || strings.Contains(logs.String(), "voter1") {
-		t.Fatalf("the log names a session file or the account: %s", logs.String())
+	for _, needle := range []string{"sessions/", "voter1", "Halimbawa", "Uno", "1990-01-01", "checkin.json"} {
+		if strings.Contains(logs.String(), needle) {
+			t.Fatalf("the log names %q: %s", needle, logs.String())
+		}
 	}
 	if c.s.live.snapshot().Issued != 0 {
 		t.Fatal("a withheld signature was counted")
 	}
-	// Nothing was recorded, so the account starts again.
-	c.issue("voter1")
-	data, _ := os.ReadFile(filepath.Join(priv, liveIssuedFile))
-	var set map[string]bool
-	if json.Unmarshal(data, &set) != nil || len(set) != 1 || !set["voter1"] {
-		t.Fatalf("issued.json after the retry: %s", data)
+	if out := c.ok(http.MethodGet, "/api/live/checkin", "phone:voter1", nil); out["state"] != CheckinSigned {
+		t.Fatalf("after the withheld signature: %v", out)
+	}
+	// Nothing was recorded, so the entry starts again.
+	c.presignSign("voter1")
+	data, _ := os.ReadFile(filepath.Join(priv, liveCheckinFile))
+	var rec checkinRecord
+	if json.Unmarshal(data, &rec) != nil || rec.Entries[testSeqs["voter1"]-1].State != CheckinIssued || c.s.live.snapshot().Issued != 1 {
+		t.Fatalf("checkin.json after the retry: %s", data)
 	}
 }
 
@@ -478,7 +496,8 @@ func TestLiveSessionCapAndTTL(t *testing.T) {
 		}
 		others = append(others, p)
 	}
-	code, out := c.do(http.MethodPost, "/api/live/issue/presign", "voter1", map[string]string{"blinded_commitment": pt(0x10)})
+	c.checkIn("voter1")
+	code, out := c.do(http.MethodPost, "/api/live/issue/presign", "phone:voter1", map[string]string{"blinded_commitment": pt(0x10)})
 	if code != http.StatusTooManyRequests {
 		t.Fatalf("presign with %d sessions open: %d %v", liveMaxSessions, code, out)
 	}
@@ -489,7 +508,7 @@ func TestLiveSessionCapAndTTL(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	c.ok(http.MethodPost, "/api/live/issue/presign", "voter1", map[string]string{"blinded_commitment": pt(0x10)})
+	c.ok(http.MethodPost, "/api/live/issue/presign", "phone:voter1", map[string]string{"blinded_commitment": pt(0x10)})
 	for _, p := range others {
 		if _, err := os.Stat(p); !errors.Is(err, os.ErrNotExist) {
 			t.Fatalf("a stale session file was kept: %s", filepath.Base(p))
@@ -497,7 +516,7 @@ func TestLiveSessionCapAndTTL(t *testing.T) {
 	}
 	// voter1's own session expires before sign.
 	c.s.live.now = func() time.Time { return time.Now().Add(liveSessionTTL + time.Minute) }
-	code, out = c.do(http.MethodPost, "/api/live/issue/sign", "voter1", map[string]string{"e_prime": pt(0x11)})
+	code, out = c.do(http.MethodPost, "/api/live/issue/sign", "phone:voter1", map[string]string{"e_prime": pt(0x11)})
 	c.s.live.now = time.Now
 	if code != http.StatusConflict || !strings.Contains(out["error"].(string), "expired") {
 		t.Fatalf("sign over an expired session: %d %v", code, out)
@@ -505,7 +524,7 @@ func TestLiveSessionCapAndTTL(t *testing.T) {
 	if c.s.live.snapshot().Issued != 0 {
 		t.Fatal("an expired session was signed")
 	}
-	c.issue("voter1") // a fresh presign then works
+	c.presignSign("voter1") // a fresh presign then works
 }
 
 // M4: the Go transcript check refuses the identity as the joint key or as

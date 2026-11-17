@@ -6,6 +6,7 @@ import (
 	"errors"
 	"log"
 	"net/http"
+	"strconv"
 	"time"
 )
 
@@ -17,8 +18,17 @@ func registerLiveRoutes(mux *routeMux, s *Server) {
 	mux.HandleFunc("/api/live/election", s.liveGET(s.handleLiveElection))
 	mux.HandleFunc("/api/live/ledger", s.liveGET(s.handleLiveLedger))
 	mux.HandleFunc("/api/live/ballot", s.handleLiveBallot)
-	mux.HandleFunc("/api/live/issue/presign", s.liveVoter(s.handleLivePresign))
-	mux.HandleFunc("/api/live/issue/sign", s.liveVoter(s.handleLiveSign))
+	mux.HandleFunc("/api/live/issue/presign", s.livePhone(s.handleLivePresign))
+	mux.HandleFunc("/api/live/issue/sign", s.livePhone(s.handleLiveSign))
+	mux.HandleFunc("/api/live/checkin", s.liveGET(s.handleCheckinPoll))
+	mux.HandleFunc("/api/live/checkin/find", s.livePhone(s.handleCheckinFind))
+	mux.HandleFunc("/api/live/checkin/declare", s.livePhone(s.handleCheckinDeclare))
+	mux.HandleFunc("/api/live/checkin/sign", s.livePhone(s.handleCheckinSign))
+	mux.HandleFunc("/api/live/voter-list", s.liveAdmin(s.handleVoterList))
+	mux.HandleFunc("/api/live/voter-list/preview", s.liveAdmin(s.handleVoterListPreview))
+	mux.HandleFunc("/api/live/desk/approve", s.liveAdmin(s.handleDesk("approve")))
+	mux.HandleFunc("/api/live/desk/refuse", s.liveAdmin(s.handleDesk("refuse")))
+	mux.HandleFunc("/api/live/desk/reset", s.liveAdmin(s.handleDesk("reset")))
 	mux.HandleFunc("/api/live/dkg/receive-key", s.liveTrustee(http.MethodPost, s.handleLiveReceiveKey))
 	mux.HandleFunc("/api/live/dkg/roster", s.liveTrustee(http.MethodGet, s.handleLiveRoster))
 	mux.HandleFunc("/api/live/dkg/deal", s.liveTrustee(http.MethodPost, s.handleLiveDeal))
@@ -37,6 +47,11 @@ func registerLiveRoutes(mux *routeMux, s *Server) {
 const liveOpTimeout = 2 * time.Minute
 
 func liveFail(w http.ResponseWriter, err error) {
+	var coded errCoded
+	if errors.As(err, &coded) {
+		writeJSONResp(w, coded.status, map[string]string{"error": coded.msg, "code": coded.code})
+		return
+	}
 	var (
 		conflict  errConflict
 		bad       errBadRequest
@@ -154,17 +169,15 @@ func (s *Server) liveAdmin(h http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
-func (s *Server) liveVoter(h func(http.ResponseWriter, *http.Request, string)) http.HandlerFunc {
+// livePhone is a phone's route: public, acting on the check-in its
+// saksi_checkin cookie is bound to (live_checkin.go). It never reads a
+// session: no account, of any role, stands in for a check-in.
+func (s *Server) livePhone(h func(http.ResponseWriter, *http.Request, string)) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if !s.liveOn(w) {
 			return
 		}
-		sess := sessionFrom(r)
-		if sess == nil || sess.Role != RoleVoter {
-			writeJSONResp(w, http.StatusForbidden, map[string]string{"error": "only a voter account may obtain a credential"})
-			return
-		}
-		h(w, r, sess.Username)
+		h(w, r, checkinToken(r))
 	}
 }
 
@@ -190,7 +203,7 @@ func (s *Server) liveTrustee(method string, h func(http.ResponseWriter, *http.Re
 
 func (s *Server) handleLiveCreate(w http.ResponseWriter, r *http.Request) {
 	var req LiveElectionRequest
-	if !decodeLive(w, r, 64<<10, true, &req) {
+	if !decodeLive(w, r, voterListBodyMax, true, &req) {
 		return
 	}
 	ctx, cancel := liveCtx(r)
@@ -312,9 +325,138 @@ func (s *Server) handleLiveBallot(w http.ResponseWriter, r *http.Request) {
 	writeJSONResp(w, http.StatusOK, rc)
 }
 
-// --- voter ---------------------------------------------------------------------
+// --- voter list and check-in ------------------------------------------------------
 
-func (s *Server) handleLivePresign(w http.ResponseWriter, r *http.Request, account string) {
+func (s *Server) handleVoterListPreview(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		CSV string `json:"csv"`
+	}
+	if !decodeLive(w, r, voterListBodyMax, true, &body) {
+		return
+	}
+	writeJSONResp(w, http.StatusOK, previewOf(parseVoterList(body.CSV, s.live.precinct, s.live.now())))
+}
+
+func (s *Server) handleVoterList(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeJSONResp(w, http.StatusMethodNotAllowed, map[string]string{"error": "GET required"})
+		return
+	}
+	v, err := s.live.voterList()
+	if err != nil {
+		liveFail(w, err)
+		return
+	}
+	writeJSONResp(w, http.StatusOK, v)
+}
+
+func (s *Server) handleDesk(action string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Seq int `json:"seq"`
+		}
+		if !decodeLive(w, r, 1<<10, true, &body) {
+			return
+		}
+		var (
+			v   DeskEntryView
+			err error
+		)
+		switch action {
+		case "approve":
+			v, err = s.live.deskApprove(body.Seq)
+		case "refuse":
+			v, err = s.live.deskEnd(body.Seq, checkinRefused)
+		default:
+			v, err = s.live.deskEnd(body.Seq, checkinReset)
+		}
+		if err != nil {
+			liveFail(w, err)
+			return
+		}
+		writeJSONResp(w, http.StatusOK, v)
+	}
+}
+
+// findAllowed applies the per-address limit of find and declare.
+func (s *Server) findAllowed(w http.ResponseWriter, r *http.Request) bool {
+	ok, wait := s.live.findLimit.allow(remoteIP(r))
+	if !ok {
+		w.Header().Set("Retry-After", strconv.Itoa(int((wait+time.Second-1)/time.Second)))
+		writeJSONResp(w, http.StatusTooManyRequests, map[string]string{"error": "too many tries from this device; wait a moment and try again", "code": "rate-limited"})
+	}
+	return ok
+}
+
+func (s *Server) handleCheckinFind(w http.ResponseWriter, r *http.Request, _ string) {
+	if r.Method != http.MethodPost {
+		writeJSONResp(w, http.StatusMethodNotAllowed, map[string]string{"error": "POST required"})
+		return
+	}
+	if !s.findAllowed(w, r) {
+		return
+	}
+	var d CheckinDetails
+	if !decodeLive(w, r, 4<<10, true, &d) {
+		return
+	}
+	v, err := s.live.checkinFind(d)
+	if err != nil {
+		liveFail(w, err)
+		return
+	}
+	writeJSONResp(w, http.StatusOK, v)
+}
+
+func (s *Server) handleCheckinDeclare(w http.ResponseWriter, r *http.Request, held string) {
+	if r.Method != http.MethodPost {
+		writeJSONResp(w, http.StatusMethodNotAllowed, map[string]string{"error": "POST required"})
+		return
+	}
+	if !s.findAllowed(w, r) {
+		return
+	}
+	var body struct {
+		CheckinDetails
+		Declaration bool `json:"declaration"`
+	}
+	if !decodeLive(w, r, 4<<10, true, &body) {
+		return
+	}
+	v, token, err := s.live.checkinDeclare(body.CheckinDetails, body.Declaration, held)
+	if err != nil {
+		liveFail(w, err)
+		return
+	}
+	setCheckinCookie(w, token)
+	writeJSONResp(w, http.StatusOK, v)
+}
+
+func (s *Server) handleCheckinPoll(w http.ResponseWriter, r *http.Request) {
+	v, err := s.live.checkinPoll(checkinToken(r))
+	if err != nil {
+		liveFail(w, err)
+		return
+	}
+	writeJSONResp(w, http.StatusOK, v)
+}
+
+func (s *Server) handleCheckinSign(w http.ResponseWriter, r *http.Request, token string) {
+	var sig CheckinSignature
+	if !decodeLive(w, r, sigMaxBody, true, &sig) {
+		return
+	}
+	v, err := s.live.checkinSign(token, sig)
+	if err != nil {
+		liveFail(w, err)
+		return
+	}
+	writeJSONResp(w, http.StatusOK, v)
+}
+
+// --- issuance ------------------------------------------------------------------
+
+func (s *Server) handleLivePresign(w http.ResponseWriter, r *http.Request, token string) {
 	var body struct {
 		BlindedCommitment string `json:"blinded_commitment"`
 	}
@@ -323,7 +465,7 @@ func (s *Server) handleLivePresign(w http.ResponseWriter, r *http.Request, accou
 	}
 	ctx, cancel := liveCtx(r)
 	defer cancel()
-	out, err := s.live.presign(ctx, account, body.BlindedCommitment)
+	out, err := s.live.presign(ctx, token, body.BlindedCommitment)
 	if err != nil {
 		liveFail(w, err)
 		return
@@ -331,7 +473,7 @@ func (s *Server) handleLivePresign(w http.ResponseWriter, r *http.Request, accou
 	writeJSONResp(w, http.StatusOK, out)
 }
 
-func (s *Server) handleLiveSign(w http.ResponseWriter, r *http.Request, account string) {
+func (s *Server) handleLiveSign(w http.ResponseWriter, r *http.Request, token string) {
 	var body struct {
 		EPrime string `json:"e_prime"`
 	}
@@ -340,7 +482,7 @@ func (s *Server) handleLiveSign(w http.ResponseWriter, r *http.Request, account 
 	}
 	ctx, cancel := liveCtx(r)
 	defer cancel()
-	out, err := s.live.sign(ctx, account, body.EPrime)
+	out, err := s.live.sign(ctx, token, body.EPrime)
 	if err != nil {
 		liveFail(w, err)
 		return
@@ -446,7 +588,13 @@ func (s *Server) handleLiveTallySig(w http.ResponseWriter, r *http.Request, id s
 
 // LiveCounts are the election's running counts.
 type LiveCounts struct {
-	VotersOnRoll      int `json:"voters_on_roll"`
+	// VotersOnRoll and VotersOnList are both the number of entries on the
+	// voter list (voters_on_roll is the older name, kept for the pages).
+	VotersOnRoll int `json:"voters_on_roll"`
+	VotersOnList int `json:"voters_on_list"`
+	// CheckedIn is the entries that signed the list: signed or
+	// credential_issued.
+	CheckedIn         int `json:"checked_in"`
 	CredentialsIssued int `json:"credentials_issued"`
 	// BallotRecords is the chain's committed nullifier count, or the run
 	// folder's count with BallotRecordsSource "console" if the chain did not
@@ -463,28 +611,33 @@ type LiveCounts struct {
 
 // LiveElectionView is GET /api/live/election.
 type LiveElectionView struct {
-	RunID               string            `json:"run_id"`
-	ElectionID          string            `json:"election_id"`
-	Title               string            `json:"title"`
-	State               string            `json:"state"`
-	Positions           []LivePosition    `json:"positions"`
-	Trustees            int               `json:"trustees"`
-	Threshold           int               `json:"threshold"`
-	Params              string            `json:"params"`
-	ContestIDs          []string          `json:"contest_ids"`
-	IssuerPublicKey     string            `json:"issuer_public_key"`
-	DKG                 string            `json:"dkg,omitempty"`
-	JointPublicKey      string            `json:"joint_public_key,omitempty"`
-	JointKeyFingerprint string            `json:"joint_key_fingerprint,omitempty"`
-	VerificationKeys    json.RawMessage   `json:"verification_keys,omitempty"`
-	RosterFingerprint   string            `json:"roster_fingerprint,omitempty"`
-	CeremonyError       string            `json:"ceremony_error,omitempty"`
-	Counts              LiveCounts        `json:"counts"`
-	Lifecycle           map[string]LiveTx `json:"lifecycle"`
-	Totals              []uint64          `json:"totals,omitempty"`
-	VerifyOverall       string            `json:"verify_overall,omitempty"`
-	CreatedAt           time.Time         `json:"created_at"`
-	UpdatedAt           time.Time         `json:"updated_at"`
+	RunID               string          `json:"run_id"`
+	ElectionID          string          `json:"election_id"`
+	Title               string          `json:"title"`
+	State               string          `json:"state"`
+	Positions           []LivePosition  `json:"positions"`
+	Trustees            int             `json:"trustees"`
+	Threshold           int             `json:"threshold"`
+	Params              string          `json:"params"`
+	ContestIDs          []string        `json:"contest_ids"`
+	IssuerPublicKey     string          `json:"issuer_public_key"`
+	DKG                 string          `json:"dkg,omitempty"`
+	JointPublicKey      string          `json:"joint_public_key,omitempty"`
+	JointKeyFingerprint string          `json:"joint_key_fingerprint,omitempty"`
+	VerificationKeys    json.RawMessage `json:"verification_keys,omitempty"`
+	RosterFingerprint   string          `json:"roster_fingerprint,omitempty"`
+	CeremonyError       string          `json:"ceremony_error,omitempty"`
+	// The voter list's public facts (no names, no dates).
+	Precinct                  string            `json:"precinct,omitempty"`
+	PrecinctLabel             string            `json:"precinct_label,omitempty"`
+	VoterListFingerprint      string            `json:"voter_list_fingerprint,omitempty"`
+	VoterListFingerprintShort string            `json:"voter_list_fingerprint_short,omitempty"`
+	Counts                    LiveCounts        `json:"counts"`
+	Lifecycle                 map[string]LiveTx `json:"lifecycle"`
+	Totals                    []uint64          `json:"totals,omitempty"`
+	VerifyOverall             string            `json:"verify_overall,omitempty"`
+	CreatedAt                 time.Time         `json:"created_at"`
+	UpdatedAt                 time.Time         `json:"updated_at"`
 }
 
 // electionView is GET /api/live/election, built from the public snapshot: it
@@ -505,11 +658,18 @@ func (L *liveService) electionViewOf(sn *liveSnapshot) LiveElectionView {
 		Totals: sn.Totals, VerifyOverall: sn.VerifyOverall,
 		CreatedAt: sn.CreatedAt, UpdatedAt: sn.UpdatedAt,
 		Counts: LiveCounts{
-			VotersOnRoll: len(L.voterRoll()), CredentialsIssued: sn.Issued,
+			VotersOnRoll: sn.VotersOnList, VotersOnList: sn.VotersOnList, CredentialsIssued: sn.Issued,
 			BallotRecords: sn.Ballots, BallotRecordsSource: "console",
 			TrusteesDecrypted: len(sn.Decrypted), TallySignatures: len(sn.TallySignatures),
 			TrusteesJoined: sn.TrusteesJoined,
 		},
+	}
+	if sn.Precinct != "" {
+		v.Precinct, v.PrecinctLabel = sn.Precinct, precinctLabel(sn.Precinct)
+		v.VoterListFingerprint, v.VoterListFingerprintShort = sn.VoterListFingerprint, fingerprintShort(sn.VoterListFingerprint)
+	}
+	if c, ok := L.checkinCountsOf(sn.RunID, sn.Dir); ok {
+		v.Counts.CheckedIn = c.CheckedIn
 	}
 	if sn.stateIndex() >= liveStateIndex(LiveCeremony) {
 		if n := L.chainCount(sn.ElectionID); n >= 0 {

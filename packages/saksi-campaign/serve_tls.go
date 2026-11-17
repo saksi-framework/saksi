@@ -23,8 +23,7 @@ func (o ServeOptions) TLS() bool { return o.TLSCert != "" && o.TLSKey != "" }
 
 // CheckServeOptions refuses a start-up the live election must not run with,
 // and returns a warning to print for one it may run with but should not be
-// left like. Live mode needs accounts (the voter roll and the presenter's
-// login); without TLS it starts only on a loopback bind, where nothing leaves
+// left like. Live mode needs accounts (the presenter's login); without TLS it starts only on a loopback bind, where nothing leaves
 // the machine.
 func CheckServeOptions(o ServeOptions) (warning string, err error) {
 	if (o.TLSCert == "") != (o.TLSKey == "") {
@@ -34,7 +33,7 @@ func CheckServeOptions(o ServeOptions) (warning string, err error) {
 		return "", nil
 	}
 	if o.AuthFile == "" {
-		return "", errors.New("--live needs --auth-file: the voter roll and the presenter's account are in it")
+		return "", errors.New("--live needs --auth-file: the presenter's account is in it")
 	}
 	if o.TLS() {
 		return "", nil

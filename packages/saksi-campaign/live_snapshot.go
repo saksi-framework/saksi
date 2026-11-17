@@ -48,6 +48,10 @@ type liveSnapshot struct {
 	Ballots int
 	Issued  int
 
+	Precinct             string
+	VoterListFingerprint string
+	VotersOnList         int
+
 	// Decrypted is the trustees with a partial recorded for every contest;
 	// TallySignatures the trustees whose tally signature is held.
 	Decrypted       []int
@@ -80,6 +84,7 @@ func snapshotOf(st *liveState, dir string) *liveSnapshot {
 		TrusteesJoined: len(st.ReceiveKeys),
 		Lifecycle:      maps.Clone(st.Lifecycle),
 		Ballots:        st.Ballots, Issued: st.Issued,
+		Precinct: st.Precinct, VoterListFingerprint: st.VoterListFingerprint, VotersOnList: st.VotersOnList,
 		Decrypted:       []int{},
 		TallySignatures: sortedIDs(st.Signatures),
 		Tallied:         st.Tally != "",

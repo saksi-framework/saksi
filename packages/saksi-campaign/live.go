@@ -16,7 +16,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -66,7 +65,6 @@ const (
 	livePrivateDir  = "private"
 	liveIssuerKey   = "issuer.key"
 	liveSessionsDir = "sessions"
-	liveIssuedFile  = "issued.json"
 	// LiveVerifyFile is the verifier's JSON for the last POST /api/live/verify.
 	LiveVerifyFile  = "live-verify.json"
 	liveStateSchema = "saksi-live-console-state-v1"
@@ -115,7 +113,7 @@ type liveSig struct {
 }
 
 // liveState is <run>/live.json. Nothing in it is secret, and nothing in it
-// names a voter account or links a ballot to one.
+// names a voter or links a ballot to one.
 type liveState struct {
 	Schema     string         `json:"schema"`
 	RunID      string         `json:"run_id"`
@@ -149,6 +147,12 @@ type liveState struct {
 
 	Ballots int `json:"ballots"`
 	Issued  int `json:"credentials_issued"`
+
+	// The voter list's public facts: the precinct, the fingerprint and the
+	// number of entries. The list itself is in private/ (live_checkin.go).
+	Precinct             string `json:"precinct,omitempty"`
+	VoterListFingerprint string `json:"voter_list_fingerprint,omitempty"`
+	VotersOnList         int    `json:"voters_on_list,omitempty"`
 
 	Partials   map[string]map[string]LiveTx `json:"partials"`
 	Signatures map[string]liveSig           `json:"signatures"`
@@ -260,6 +264,8 @@ type LiveOptions struct {
 	Dial func() (liveChain, error)
 	// Now is the clock; nil = time.Now.
 	Now func() time.Time
+	// Precinct is --live-precinct; "" = DefaultLivePrecinct.
+	Precinct string
 }
 
 // liveService is the console's one live election.
@@ -288,16 +294,28 @@ type liveService struct {
 	snap atomic.Pointer[liveSnapshot]
 
 	// issueMu serializes issuance: one issue-presign or issue-sign at a time,
-	// across all accounts.
+	// across all list entries. A desk refuse or reset takes it too.
 	issueMu sync.Mutex
+
+	// precinct is the --live-precinct value new elections are set up with.
+	precinct string
+	// ckMu guards ck, the current election's voter list and check-in record
+	// (live_checkin.go). Lock order: issueMu, then mu, then ckMu; ckMu is
+	// never held while taking another.
+	ckMu sync.Mutex
+	ck   *checkinBook
+	// ckView is the published check-in counts, read without ckMu.
+	ckView atomic.Pointer[checkinView]
+	// findLimit limits find and declare per caller address.
+	findLimit *addrLimiter
 }
 
-// EnableLive turns on the live routes. Call it after EnableAuth: the voter
-// roll and the presenter are accounts. It loads the newest live election from
+// EnableLive turns on the live routes. Call it after EnableAuth: the
+// presenter is an account. It loads the newest live election from
 // the run store, if any, and resumes it from disk and the chain.
 func (s *Server) EnableLive(o LiveOptions) error {
 	if s.auth == nil {
-		return errors.New("live mode needs --auth-file: the voter roll and the presenter's account are in it")
+		return errors.New("live mode needs --auth-file: the presenter's account is in it")
 	}
 	if o.TrusteeTokens == "" {
 		return errors.New("live mode needs --trustee-tokens: each trustee process authenticates with its own token")
@@ -306,10 +324,19 @@ func (s *Server) EnableLive(o LiveOptions) error {
 	if err != nil {
 		return err
 	}
+	precinct := o.Precinct
+	if precinct == "" {
+		precinct = DefaultLivePrecinct
+	}
+	if !ValidPrecinct(precinct) {
+		return fmt.Errorf("--live-precinct %q: a precinct is four digits and a capital letter, like %s", precinct, DefaultLivePrecinct)
+	}
 	L := &liveService{
 		s: s, root: s.store.Root(), tokens: tokens,
 		run: o.Runner, dial: o.Dial, now: o.Now,
-		limit: newRateLimiter(5, 30),
+		limit:     newRateLimiter(5, 30),
+		precinct:  precinct,
+		findLimit: newAddrLimiter(findPerSec, findBurst, findMaxAddrs),
 	}
 	if L.run == nil {
 		L.run = execLiveRunner(s.exec.demoBin)
@@ -363,18 +390,6 @@ func (L *liveService) getChain() (liveChain, error) {
 func (L *liveService) privateDir() string  { return filepath.Join(L.dir, livePrivateDir) }
 func (L *liveService) sessionsDir() string { return filepath.Join(L.privateDir(), liveSessionsDir) }
 
-// voterRoll is every voter account, sorted.
-func (L *liveService) voterRoll() []string {
-	var roll []string
-	for name, u := range L.s.auth.users {
-		if u.Role == RoleVoter {
-			roll = append(roll, name)
-		}
-	}
-	sort.Strings(roll)
-	return roll
-}
-
 // load finds the newest live run and reads its state.
 func (L *liveService) load() error {
 	recs, err := L.s.store.List()
@@ -396,8 +411,16 @@ func (L *liveService) load() error {
 		if st.Schema != liveStateSchema {
 			return fmt.Errorf("live run %s: state schema %q, want %q", rec.RunID, st.Schema, liveStateSchema)
 		}
+		book, err := loadCheckinBook(dir)
+		if err != nil {
+			return fmt.Errorf("live run %s: %v", rec.RunID, err)
+		}
 		L.st, L.dir = &st, dir
 		L.publishSnapshotLocked()
+		L.ckMu.Lock()
+		L.ck = book
+		L.publishCheckinLocked()
+		L.ckMu.Unlock()
 		if err := sweepClaimed(L.sessionsDir()); err != nil {
 			log.Printf("live: sweep sessions: %v", err)
 		}
@@ -498,6 +521,12 @@ type LiveElectionRequest struct {
 	Positions []LivePosition `json:"positions"`
 	Trustees  int            `json:"trustees"`
 	Threshold int            `json:"threshold"`
+	// VoterList is the CSV text of the precinct's list; VoterListFingerprint
+	// the fingerprint the presenter confirmed in the preview. The election is
+	// not created unless the list is valid, non-empty and has that
+	// fingerprint.
+	VoterList            string `json:"voter_list"`
+	VoterListFingerprint string `json:"voter_list_fingerprint"`
 }
 
 // errConflict is a request in the wrong state: 409 with this reason.
@@ -616,11 +645,22 @@ func (L *liveService) createElection(ctx context.Context, req LiveElectionReques
 			return 0, badRequestf("trustee %d has no token in the trustee tokens file; the ceremony could never finish", i)
 		}
 	}
-	if len(L.voterRoll()) == 0 {
-		return 0, badRequestf("the accounts file has no voter accounts: nobody could vote")
+	now := L.now().UTC()
+	if strings.TrimSpace(req.VoterList) == "" {
+		return 0, errBadRequest{msg: "the election needs its voter list (voter_list, the CSV text)", code: "voter-list-missing"}
+	}
+	list := parseVoterList(req.VoterList, L.precinct, now)
+	if !list.Valid() {
+		return 0, errBadRequest{msg: fmt.Sprintf("the voter list has %d error(s); preview it to see them", len(list.Errors)), code: "voter-list-invalid"}
+	}
+	switch req.VoterListFingerprint {
+	case list.Fingerprint:
+	case "":
+		return 0, errBadRequest{msg: "confirm the voter list: send the fingerprint the preview gave (voter_list_fingerprint)", code: "voter-list-unconfirmed"}
+	default:
+		return 0, errBadRequest{msg: "the voter list is not the one confirmed in the preview (its fingerprint differs); preview it again", code: "voter-list-changed"}
 	}
 
-	now := L.now().UTC()
 	runID, err := newLiveRunID(now)
 	if err != nil {
 		return 0, err
@@ -672,7 +712,7 @@ func (L *liveService) createElection(ctx context.Context, req LiveElectionReques
 	}
 	rec := RunRecord{RunID: runID, CreatedAt: now, Config: ElectionConfig{
 		Name: req.Title, Mode: ModeLive, Trustees: trustees, Threshold: req.Threshold,
-		Positions: len(req.Positions), Candidates: maxCands, Voters: len(L.voterRoll()),
+		Positions: len(req.Positions), Candidates: maxCands, Voters: len(list.Rows),
 	}}
 	if err := writeJSON(filepath.Join(dir, RunFile), rec); err != nil {
 		return 0, err
@@ -685,14 +725,22 @@ func (L *liveService) createElection(ctx context.Context, req LiveElectionReques
 		Lifecycle: map[string]LiveTx{}, ReceiveKeys: map[string]string{},
 		Deals: map[string]liveDeal{}, Acks: map[string]liveAck{},
 		Partials: map[string]map[string]LiveTx{}, Signatures: map[string]liveSig{},
+		Precinct: L.precinct, VoterListFingerprint: list.Fingerprint, VotersOnList: len(list.Rows),
+	}
+	// The list and its check-in record are written before live.json: a run
+	// with a live.json always has its list.
+	book, err := newCheckinBook(dir, params.ElectionID, list)
+	if err != nil {
+		return 0, err
 	}
 	L.dir = dir
 	if err := L.save(); err != nil {
 		return 0, err
 	}
-	if err := writeFileAtomic(filepath.Join(priv, liveIssuedFile), []byte("{}\n"), 0o600); err != nil {
-		return 0, err
-	}
+	L.ckMu.Lock()
+	L.ck = book
+	L.publishCheckinLocked()
+	L.ckMu.Unlock()
 	log.Printf("live: %s created (setup)", runID)
 	return http.StatusCreated, L.finishSetupLocked()
 }
