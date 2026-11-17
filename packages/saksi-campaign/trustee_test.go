@@ -784,7 +784,7 @@ func TestTrusteeDecryptRefusals(t *testing.T) {
 
 	// Under --min-ballots (4 for each of 2 positions): the press is refused
 	// at once from the chain's count, and so is the driver.
-	const fewer = "6 ballot records are on the chain; decryption needs at least 8."
+	const fewer = "6 ballot records are on the chain; decryption needs at least 8. No more ballot records can be added once the election is closed."
 	if code, out := f.call(f.procs[3], http.MethodPost, "/api/trustee/decrypt", nil); code != http.StatusConflict || out["error"] != fewer {
 		t.Fatalf("min-ballots press: %d %v", code, out)
 	}
@@ -1539,7 +1539,7 @@ func TestTrusteeDecryptRefusesTooFewBallotRecords(t *testing.T) {
 	f.ceremony()
 	b.close() // no ballots
 
-	const want = "0 ballot records are on the chain; decryption needs at least 4."
+	const want = "0 ballot records are on the chain; decryption needs at least 4. No more ballot records can be added once the election is closed."
 	st := f.status(1)
 	if st.Decryption.MinBallotRecords != 4 {
 		t.Fatalf("min_ballot_records = %d, want 4 (2 positions x --min-ballots 2)", st.Decryption.MinBallotRecords)

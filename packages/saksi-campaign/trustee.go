@@ -1611,9 +1611,9 @@ func (T *TrusteeService) minBallotRecords(contestIDs []string) int {
 // ballot records, built from the count this trustee read.
 func tooFewBallots(n, min int) error {
 	if n == 1 {
-		return refusedf("1 ballot record is on the chain; decryption needs at least %d.", min)
+		return refusedf("1 ballot record is on the chain; decryption needs at least %d. No more ballot records can be added once the election is closed.", min)
 	}
-	return refusedf("%d ballot records are on the chain; decryption needs at least %d.", n, min)
+	return refusedf("%d ballot records are on the chain; decryption needs at least %d. No more ballot records can be added once the election is closed.", n, min)
 }
 
 // chainParamsDKG reads the parameters and the transcript from the chain and

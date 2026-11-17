@@ -229,7 +229,9 @@ The join step is `done` once the transcript on the chain is checked.
    **Fewer records than `decryption.min_ballot_records`** (`--min-ballots` for
    each position, since a voter's ballot is one record per position) is
    refused here, before any op runs, in one sentence built from the count read:
-   `0 ballot records are on the chain; decryption needs at least 4.`
+   `0 ballot records are on the chain; decryption needs at least 4. No more
+   ballot records can be added once the election is closed.` (`1 ballot record
+   is on the chain; ...` for one).
 3. Runs `aggregate` over them for the ballot set's fields: `ballot_count`,
    `ballots_by_position` and **`ballots_digest`**, the wire format's
    order-independent digest:
@@ -433,7 +435,8 @@ was `refused` starts again. Refusals, before anything starts:
   the transcript was checked; **decrypt while the chain does not say
   `closed`** (`the chain says the election is open, not closed`); **decrypt
   while the chain holds fewer ballot records than `decryption.min_ballot_records`**
-  (`0 ballot records are on the chain; decryption needs at least 4.`, from the
+  (`0 ballot records are on the chain; decryption needs at least 4. No more
+  ballot records can be added once the election is closed.`, from the
   trustee's own `ListNullifiers` read; the step stays `idle`). An election
   closed with too few records cannot be decrypted at all: no later press
   changes that, since the chain takes no ballot after `CloseElection`;
