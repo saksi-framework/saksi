@@ -264,14 +264,16 @@ func liveBoardChecks(st *liveSnapshot, live *LiveBoard) []Check {
 	} else {
 		checks = append(checks, fail("The tally was published on the chain", "no tally has been published yet"))
 	}
+	// The console runs verify-live itself, so the check does not claim an
+	// independent party; anyone can run verify-live over GET /api/live/ledger.
 	switch st.VerifyOverall {
 	case "pass":
-		checks = append(checks, pass("The independent verifier passed the on-chain record",
+		checks = append(checks, pass(liveVerifierCheck,
 			"every proof verifies and the totals match the published tally"))
 	case "":
-		checks = append(checks, fail("The independent verifier passed the on-chain record", "not verified yet"))
+		checks = append(checks, fail(liveVerifierCheck, "not verified yet"))
 	default:
-		checks = append(checks, fail("The independent verifier passed the on-chain record",
+		checks = append(checks, fail(liveVerifierCheck,
 			"failed: "+strings.Join(live.FailedChecks, ", ")))
 	}
 	return checks
@@ -291,3 +293,6 @@ func (s *Server) serveLiveBoardFile(w http.ResponseWriter, r *http.Request, dir,
 	}
 	http.ServeFile(w, r, filepath.Join(dir, filepath.FromSlash(name)))
 }
+
+// liveVerifierCheck names the board's verifier check on a live run.
+const liveVerifierCheck = "The verifier (verify-live) passed the on-chain record"

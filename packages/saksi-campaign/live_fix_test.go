@@ -845,3 +845,25 @@ func TestLiveServerTimeouts(t *testing.T) {
 		}
 	}
 }
+
+// Final review 4, deferred: the console runs verify-live itself, so the
+// board's check does not call it independent.
+func TestLiveBoardVerifierCheckIsNotCalledIndependent(t *testing.T) {
+	fx := newLiveFixture(t)
+	c := fx.console()
+	runID := c.toState(LiveVerified)
+	board := c.ok(http.MethodGet, "/api/board/"+runID, "", nil)
+	found := false
+	for _, x := range board["checks"].([]any) {
+		name := x.(map[string]any)["name"].(string)
+		if strings.Contains(name, "independent") {
+			t.Fatalf("board check %q", name)
+		}
+		if name == "The verifier (verify-live) passed the on-chain record" {
+			found = x.(map[string]any)["pass"] == true
+		}
+	}
+	if !found {
+		t.Fatalf("no passing verify-live check: %v", board["checks"])
+	}
+}
