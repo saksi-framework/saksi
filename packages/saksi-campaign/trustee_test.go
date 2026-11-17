@@ -897,9 +897,15 @@ func TestTrusteeSignsOnlyOnThePressAndAlarmsOnTotals(t *testing.T) {
 		f.decrypt(id)
 	}
 	for id := 1; id <= 5; id++ {
-		// The sign step's waiting state follows ReadyToSign; wait for both.
+		// The sign step's waiting state follows ReadyToSign; wait for both,
+		// but stop at once on a signature or any later sign state, so the
+		// check below reports it.
 		st := f.waitFor(id, "its combine", func(st TrusteeStatus) bool {
-			return st.Tally.ReadyToSign && st.Steps["sign"].State == stepWaiting
+			s := st.Steps["sign"].State
+			if st.Tally.SignaturePosted || (s != stepIdle && s != stepWaiting) {
+				return true
+			}
+			return st.Tally.ReadyToSign && s == stepWaiting
 		})
 		if st.Tally.SignaturePosted || st.Steps["sign"].State != stepWaiting {
 			t.Fatalf("trustee %d signed without a press: %+v", id, st.Tally)
