@@ -33,6 +33,13 @@ Those of `http-api.md`, plus:
   `{"error": "<one sentence>", "code": "<code>"}`. Pages branch on `code` and
   may show `error` as it is (the phone refusals are the sentences the screens
   use).
+- **Bodies are strict.** Every `POST` here refuses a field it does not list
+  (for example `middle_name` or `declaration` on `find`, `seq` on `declare`)
+  and a value of the wrong JSON type: 400 `{"error": "invalid JSON body"}`,
+  with **no `code`**. A body over the route's cap is 413
+  `{"error": "request body too large"}`, also with no `code`. A route called
+  with the wrong method is 405. These come before anything else the route checks
+  (after the rate limit on `find` and `declare`).
 - **phone** access: public by role (no sign-in), and the route acts only on
   the check-in the phone's `saksi_checkin` cookie is bound to. No account, of
   any role, stands in for a check-in. Voter accounts in the accounts file are
@@ -74,7 +81,8 @@ Two forms of every name:
 
 - **Display form** (shown, stored, fingerprinted): Unicode NFC, surrounding
   white space removed, every run of white space one space. Case and
-  punctuation are kept: `"  Peña ,"` is `Peña`.
+  punctuation are kept: the field `"  Peña  "` is `Peña`, and
+  `"Dela   Cruz"` is `Dela Cruz`.
 - **Match form** (find, and duplicate detection): decompose (NFKD), drop
   every combining mark, upper case, read every hyphen, dash and period as a
   space, drop apostrophes, collapse and trim white space. So `ñ` matches `n`
@@ -274,8 +282,9 @@ state.
 {"csv": "<the file's text>"}
 ```
 
-Body at most 192 KiB (413). Answer 200, always (a list in error is still a
-200 with `valid: false`):
+Body at most 192 KiB. Answer 200 for any text (a list in error is still a
+200 with `valid: false`); 400 `invalid JSON body` (no `code`) for a body
+that is not `{"csv": "<string>"}`, 413 over the cap:
 
 ```json
 {"precinct": "0001A", "precinct_label": "Precinct 0001A (demonstration)",
@@ -370,9 +379,12 @@ drops it and shows its new status.
 
 | Status, `code` | When |
 |---|---|
+| 400 (no `code`) | body not `{"seq": <integer>}` (`invalid JSON body`) |
+| 413 (no `code`) | body over 1 KiB |
 | 404 `no-such-entry` | no entry with that `seq` |
 | 409 `wrong-state` | the entry is not `at_desk` (approved by another tab, refused, reset) |
 | 409 `not-open` | the election is not open |
+| 409 `no-voter-list` | the election has no list |
 
 ### `POST /api/live/desk/refuse` (admin)
 
@@ -381,9 +393,10 @@ drops it and shows its new status.
 ```
 
 `at_desk` → `not_checked_in`; the phone's cookie ends with outcome
-`refused`. Answer 200, the entry (`status: "not_checked_in"`). 404
-`no-such-entry`; 409 `wrong-state` if the entry is not `at_desk`; 409
-`already-issued` for an issued entry.
+`refused`. Answer 200, the entry (`status: "not_checked_in"`). 400 (no
+`code`) for a body that is not `{"seq": <integer>}`; 413 over 1 KiB; 404
+`no-such-entry`; 409 `already-issued` for an issued entry; 409 `wrong-state`
+for any other entry not `at_desk`; 409 `no-voter-list`.
 
 ### `POST /api/live/desk/reset` (admin)
 
@@ -393,8 +406,10 @@ drops it and shows its new status.
 
 `at_desk`, `approved` or `signed` → `not_checked_in`; the signature and any
 open issuance session for the entry are dropped; the phone's cookie ends
-with outcome `reset`. Answer 200, the entry. 404 `no-such-entry`; 409
-`wrong-state` for an entry already `not_checked_in`; **409 `already-issued`
+with outcome `reset`. Answer 200, the entry. 400 (no `code`) for a body that
+is not `{"seq": <integer>}`; 413 over 1 KiB; 404 `no-such-entry`; 409
+`no-voter-list`; 409 `wrong-state` for an entry already `not_checked_in`;
+**409 `already-issued`
 once a credential is issued: there is no reset and no replacement** (the
 rule of the ink). The page asks for an inline confirmation first.
 
@@ -418,8 +433,16 @@ date of birth. Changes nothing and sets no cookie. Answer 200:
 | 409 `already-checked-in` | "This voter has already checked in. See the Electoral Board." (the entry is `at_desk` or later) |
 | 400 `bad-date` | `date_of_birth` is not a `YYYY-MM-DD` date (a form error, said before any lookup) |
 | 400 `bad-request` | a name over 400 bytes |
+| 400 (no `code`) | `invalid JSON body`: an extra field (`middle_name`, `declaration`, ...) or a non-string value |
+| 413 (no `code`) | body over 4 KiB |
 | 409 `not-open` | the election is not open |
+| 409 `no-voter-list` | the election has no list |
+| 404 (no `code`) | no election has been set up |
 | 429 `rate-limited` | too many tries from this address; `Retry-After` in seconds |
+
+Order of the checks: the rate limit (a try is spent even on a malformed
+body), the body, the election (404, `not-open`, `no-voter-list`), the date's
+form (`bad-date`), then the lookup (`not-on-list`, `already-checked-in`).
 
 ### `POST /api/live/checkin/declare` (phone; open; rate limited)
 
@@ -437,9 +460,14 @@ gets 409 `already-checked-in` and no cookie.
 
 | Status, `code` | When |
 |---|---|
-| 400 `declaration-required` | `declaration` absent or not `true` (checked first) |
+| 400 `declaration-required` | `declaration` absent or not `true` |
 | 409 `checkin-in-progress` | this phone already holds a check-in at `at_desk`, `approved` or `signed` |
-| as for find | `not-on-list`, `already-checked-in`, `bad-date`, `not-open`, `rate-limited` |
+| as for find | `not-on-list`, `already-checked-in`, `bad-date`, `bad-request`, `not-open`, `no-voter-list`, 404, 400 and 413 with no `code` (an extra field, such as `middle_name`), `rate-limited` |
+
+Order of the checks: the rate limit (a try is spent first, even when the
+declaration is missing), the body, `declaration-required`, the election
+(404, `not-open`, `no-voter-list`), `checkin-in-progress`, the date's form,
+then the lookup.
 
 ### `GET /api/live/checkin` (phone)
 
@@ -453,14 +481,17 @@ The phone's check-in, for the waiting screen and for a reload:
 
 `state` is the entry's state, or for an ended cookie `refused` or `reset`
 (then no `entry`). 404 `no-checkin` when the phone has no cookie or one the
-console does not know (another election, forged, lost). Poll every 1 to 2 s
-while waiting.
+console does not know (another election, forged, lost); 404 with no `code`
+when no election has been set up; 409 `no-voter-list` for an election with
+no list. Poll every 1 to 2 s while waiting.
 
 Where the phone goes on load or reload:
 
 | Poll answer | Screen |
 |---|---|
-| 404 `no-checkin` | the check-in form |
+| 404 with no `code` | no election yet: "Voting has not started" (read `GET /api/live/election` for the state) |
+| 409 `no-voter-list` | an election without a voter list: check-in is not possible; see the Electoral Board |
+| 404 `no-checkin` | the check-in form (if `GET /api/live/election` says `open`) |
 | `at_desk` | "Waiting for the Electoral Board" |
 | `approved` | the signature screen |
 | `signed` | the credential step (issuance) |
@@ -476,8 +507,10 @@ with `state: "signed"`.
 
 | Status, `code` | When |
 |---|---|
-| 400 `bad-signature` | see **The signature** (also `invalid JSON body` for a non-integer) |
-| 413 | body over 64 KiB |
+| 400 `bad-signature` | see **The signature** |
+| 400 (no `code`) | `invalid JSON body`: a non-integer, a string, or a field other than `strokes` and `cannot_sign` |
+| 413 (no `code`) | body over 64 KiB |
+| 409 `no-voter-list` | the election has no list |
 | 403 `no-checkin` | no check-in, or one the Board ended |
 | 409 `wrong-state` | the check-in is not `approved` |
 | 409 `not-open` | the election is not open |
@@ -496,6 +529,8 @@ before `s_iss` is sent.
 | 409 `already-issued` | the entry has its credential; a lost credential is not reissued |
 | 409 `no-voter-list` | the election has no list |
 | 409 | the election is not open (no `code`, as in `http-api.md`) |
+| 400 (no `code`) | a malformed body or value (`invalid JSON body`, or not 64 hex digits) |
+| 413 (no `code`) | body over 4 KiB |
 
 **Never retry `issue/sign`.** If its answer is lost, the entry is spent with
 no credential and cannot be reset (decision 5: no replacement).
@@ -528,13 +563,17 @@ older name of `voters_on_list` and has the same value.
 ## Rate limit
 
 `find` and `declare` share one token bucket per caller address (the
-connection's address; every loopback address is one): a burst of 20, then
-one more every 3 seconds. Three honest phones behind one address with a few
-typos each stay well inside it (a check-in costs two: find and declare).
-Over it: 429 `rate-limited` with `Retry-After`. The addresses are kept in
+connection's address; every loopback address is one): a burst of 12, then
+one more every 10 seconds. A check-in costs two (find and declare), so a
+phone with a few typos stays inside it, and three phones behind one address
+check in with no typos to spare or a short wait. Over it: 429
+`rate-limited` with `Retry-After` in seconds. The addresses are kept in
 memory only, never logged or written; at 4096 addresses in use a new address
-is refused until buckets refill. A guess at a date of birth costs one try,
-so 36,500 dates take about 30 hours from one address.
+is refused until buckets refill. A guess at a date of birth costs one try:
+a year of dates (365) takes about an hour from one address, 36,500 dates
+about 100 hours. A right guess is told apart from a wrong one (200 or 409
+against 404), so the real members' rows carry a made-up date of birth (run
+sheet).
 
 The typed details are not a secret and are not the security: the Board's
 approval at the desk is the gate, and the list is matched only to find the
@@ -548,8 +587,9 @@ entry.
 | `private/checkin.json` (0600) | per entry: state, the token's hash, the desk order while at the desk, the signature; the ended tokens' hashes with their outcome | never |
 | `live.json` | the precinct, the fingerprint and the list count | no |
 
-Neither private file holds a time, an address, or anything from issuance (no
-commitment, challenge, session or signature). The console learns which list
+Neither private file holds a time, an address, or any blind-signature value
+(no commitment, challenge, session or issuer signature; the only signature
+there is the voter's handwritten strokes). The console learns which list
 entry received a credential; it never learns which ballot belongs to which
 entry: the ballot relay drops the cookie, logs nothing, and the credential
 is blind. A restart reloads both files: every state and every cookie stays
