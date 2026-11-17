@@ -1248,12 +1248,12 @@ func (e peerAnswered) Error() string { return e.msg }
 // peerErrDetail says what happened when a peer's page could not be used:
 // "answered 503" for a peer that answered, "not reachable: ..." only for one
 // that did not.
-func peerErrDetail(err error) (detail string, answered bool) {
+func peerErrDetail(err error) string {
 	var a peerAnswered
 	if errors.As(err, &a) {
-		return a.msg, true
+		return a.msg
 	}
-	return "not reachable: " + err.Error(), false
+	return "not reachable: " + err.Error()
 }
 
 // fetchPeers reads several peers' pages at once, each with its own timeout,
@@ -1319,8 +1319,7 @@ func (T *TrusteeService) checkPeersRoster(ctx context.Context) error {
 		var c peerCheck
 		switch {
 		case err != nil:
-			d, _ := peerErrDetail(err)
-			c = peerCheck{State: "waiting", Detail: d}
+			c = peerCheck{State: "waiting", Detail: peerErrDetail(err)}
 		case v.TrusteeID != peer.TrusteeID:
 			// Most likely a mistake in --peers, so it is waited on (with the
 			// reason shown) rather than ending the election.
@@ -1832,14 +1831,9 @@ func (T *TrusteeService) readPeersBallots(ctx context.Context) (map[string]peerC
 		v, err := views[i], errs[i]
 		switch {
 		case err != nil:
-			// A peer that answered is not "unreachable": it is waited on, with
-			// what it answered as the detail.
-			d, answered := peerErrDetail(err)
-			state := "unreachable"
-			if answered {
-				state = "waiting"
-			}
-			checks[key] = peerCheck{State: state, Detail: d}
+			// No statement from the peer: the detail says whether it did not
+			// answer ("not reachable: ...") or answered unusably ("answered 503").
+			checks[key] = peerCheck{State: "unreachable", Detail: peerErrDetail(err)}
 		case v.TrusteeID != id:
 			checks[key] = peerCheck{State: "waiting", Detail: fmt.Sprintf("the --peers URL for trustee %d answers as trustee %d", id, v.TrusteeID)}
 		case v.ElectionID != eid || v.BallotsDigest == "":

@@ -1449,20 +1449,22 @@ func TestTrusteePeerBallotChecksFollowLaterDecrypts(t *testing.T) {
 		t.Fatalf("trustee 4 alarms: %+v", st.Alarms)
 	}
 	// Trustee 5's host still answers, but with 503 (its process is gone):
-	// the peer was reached, so it is waited on with what it answered, and
-	// nothing says it could not be reached.
+	// no statement from it, and the detail says it answered 503, not that
+	// it could not be reached.
 	f.procs[4].T.Close()
 	f.procs[4].handler.Store(nil)
 	st = f.waitFor(1, "peer 5 answering 503", func(st TrusteeStatus) bool {
-		return peer(st, 5).State == "waiting" && strings.Contains(peer(st, 5).Detail, "answered 503")
+		return peer(st, 5).State == "unreachable" && peer(st, 5).Detail == "answered 503"
 	})
 	if c := peer(st, 5); strings.Contains(strings.ToLower(c.Detail), "not reachable") {
 		t.Fatalf("trustee 1 on peer 5 (answered 503): %+v", c)
 	}
 	// Trustee 5's host stops answering at all: now it cannot be reached.
 	f.procs[4].srv.Close()
-	st = f.waitFor(1, "peer 5 unreachable", func(st TrusteeStatus) bool { return peer(st, 5).State == "unreachable" })
-	if c := peer(st, 5); !strings.Contains(c.Detail, "not reachable") {
+	st = f.waitFor(1, "peer 5 not answering", func(st TrusteeStatus) bool {
+		return peer(st, 5).State == "unreachable" && strings.HasPrefix(peer(st, 5).Detail, "not reachable: ")
+	})
+	if c := peer(st, 5); strings.Contains(c.Detail, "answered") {
 		t.Fatalf("trustee 1 on peer 5: %+v", c)
 	}
 }
