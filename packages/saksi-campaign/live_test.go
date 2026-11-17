@@ -772,7 +772,7 @@ func TestLiveHappyPathAndWrongStates(t *testing.T) {
 	if code, _ := c.do(http.MethodGet, "/api/board/"+runID+"/files/ballots.ndjson", "", nil); code != http.StatusOK {
 		t.Fatalf("public ballots: %d", code)
 	}
-	for _, f := range []string{"live.json", "private/issuer.key", "private/issued.json"} {
+	for _, f := range []string{"live.json", "private/issuer.key", "private/voter-list.json", "private/checkin.json", "private/sessions"} {
 		if code, _ := c.do(http.MethodGet, "/api/board/"+runID+"/files/"+f, "", nil); code != http.StatusNotFound {
 			t.Errorf("%s served: %d", f, code)
 		}

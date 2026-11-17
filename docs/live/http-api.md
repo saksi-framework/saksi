@@ -2,8 +2,9 @@
 
 The console's routes for one live election: the presenter sets it up, the
 trustee processes run the key ceremony and the decryption through it, the
-phones enrol and vote through it, and anyone reads the record back from the
-chain. The phone app (`apps/vote`) and the trustee process
+phones check in, enrol and vote through it, and anyone reads the record back
+from the chain. The voter list, the precinct check-in and the issuance gate
+are specified in `voter-list-api.md`. The phone app (`apps/vote`) and the trustee process
 (`saksi-campaign trustee --id N`, documented in `trustee-api.md`) are written
 from this file.
 
@@ -21,8 +22,13 @@ saksi-campaign serve --live --auth-file accounts.json --trustee-tokens tokens.js
     --allow-host vote.vancornelio.dev \
     --web-dir /path/to/dist-web \
     --demo /path/to/saksi-demo \
-    --fabric-tls-cert ... --fabric-cert ... --fabric-key ...
+    --fabric-tls-cert ... --fabric-cert ... --fabric-key ... \
+    --live-precinct 0001A
 ```
+
+- `--live-precinct` is the precinct number of the election's voter list
+  (four digits and a capital letter; default `0001A`). See
+  `voter-list-api.md`.
 
 - `--tls-cert` and `--tls-key` together serve HTTPS (TLS 1.2 minimum). The
   session cookie is then `Secure`.
@@ -51,17 +57,19 @@ POST whose `Origin` is another origin. Building and copying the app into
 
 ### Accounts (`--auth-file`)
 
-The existing users file, with a third role:
+The existing users file. The presenter is an `admin` account:
 
 ```json
-[{"username": "ban",    "role": "admin",   "password_bcrypt": "$2a$12$..."},
- {"username": "voter1", "role": "voter",   "password_bcrypt": "$2a$12$..."}]
+[{"username": "ban", "role": "admin", "password_bcrypt": "$2a$12$..."}]
 ```
 
-Every `voter` account is on the voter roll. A voter has no `trustee_id`.
-Hashes come from `saksi-campaign hash-password < password`. A voter account
-can use only the issuance routes; it is refused (403) on the study's
-signed-in routes (`/events`, `/ceremony/publish`).
+Hashes come from `saksi-campaign hash-password < password`. **Voters are not
+accounts:** they are the rows of the precinct's voter list, uploaded at
+setup, and a phone obtains its credential through the precinct check-in
+(`voter-list-api.md`). A users file that still has `voter` accounts loads,
+but such an account obtains nothing: it is refused on the issuance routes
+(403 `no-checkin`) and on the study's signed-in routes (`/events`,
+`/ceremony/publish`).
 
 ### Trustee tokens (`--trustee-tokens`)
 
@@ -79,7 +87,8 @@ election with `trustees: n` needs a token for each of `1..n`.
 ## Conventions
 
 - JSON in, JSON out. Errors are `{"error": "<plain reason>"}`, with a
-  stable `code` where one is listed (a ballot for another election). Two
+  stable `code` where one is listed (a ballot for another election, and
+  every voter-list, check-in, desk and issuance refusal). Two
   answers come from `guard`, before any route, and are **plain text, not
   JSON**: `403 forbidden host` (a `Host` off the allowlist) and
   `403 cross-origin request rejected` (a POST whose `Origin` is another
@@ -91,7 +100,8 @@ election with `trustees: n` needs a token for each of `1..n`.
   - **anonymous**: public, and the console drops the `Cookie` header before
     the handler runs, so the request is never linked to a session.
   - **admin**: a signed-in `admin` session (`POST /api/login`).
-  - **voter**: a signed-in `voter` session; the route acts on that account.
+  - **phone**: public by role; the route acts only on the check-in the
+    phone's `saksi_checkin` cookie is bound to (`voter-list-api.md`).
   - **trustee token**: `Authorization: Bearer <token>`; the route acts as
     that token's trustee id only. A trustee's login session is not a token.
 - Browser POSTs must be same-origin (the existing `guard`); a server-to-server
@@ -102,12 +112,12 @@ election with `trustees: n` needs a token for each of `1..n`.
 | 200, 201 | done |
 | 400 | malformed request, or an op refused the input (the op's own message); a ballot for another election (`code: "wrong-election"`) |
 | 401 | no session / no valid trustee token |
-| 403 | wrong role, or a trustee acting for another id |
+| 403 | wrong role, a trustee acting for another id, or no check-in (`no-checkin`) |
 | 404 | live mode off, or no live election set up |
 | 409 | the election is in the wrong state for this, or the request conflicts with what is recorded (or with what the chain holds) |
 | 413 | body too large |
 | 422 | **the chaincode refused the transaction**: see below |
-| 429 | rate limit (ballots) or too many open issuance sessions |
+| 429 | rate limit (ballots; check-in finds per address) or too many open issuance sessions |
 | 500 | an error inside the console (generic message; see the console log) |
 | 502 | the chain did not answer (not a refusal) |
 
@@ -146,7 +156,7 @@ setup -> ceremony -> open -> closed -> tallied -> verified
 |---|---|---|
 | `setup` | `POST elections` made the keys and parameters | `POST elections` again (retries `CreateElection`), `abandon`; a restart also retries |
 | `ceremony` | `CreateElection` recorded | the key-ceremony routes, `abandon` |
-| `open` | `PublishDKGTranscript` recorded | issuance, ballots, close |
+| `open` | `PublishDKGTranscript` recorded | check-in, issuance, ballots, close |
 | `closed` | `CloseElection` recorded | partials, tally signatures, `tally/publish` |
 | `tallied` | `PublishTally` recorded | `verify` |
 | `verified` | `verify-live` passed over the chain record | `verify` again (a fail steps back to `tallied`), a new `POST elections` |
@@ -163,8 +173,17 @@ the state.
 {"title": "Student council 2026",
  "positions": [{"id": "president", "candidates": ["alice", "bob", "carol"]},
                {"id": "secretary", "candidates": ["dan", "eve", "fay"]}],
- "trustees": 5, "threshold": 3}
+ "trustees": 5, "threshold": 3,
+ "voter_list": "<the precinct's CSV text>",
+ "voter_list_fingerprint": "<the preview's fingerprint>"}
 ```
+
+`voter_list` and `voter_list_fingerprint` are required: the election is not
+created unless the list is valid, non-empty and has the fingerprint the
+presenter confirmed in `POST /api/live/voter-list/preview`. The list is then
+locked. See `voter-list-api.md` for the file, the errors (400 with `code`
+`voter-list-missing`, `voter-list-invalid`, `voter-list-unconfirmed`,
+`voter-list-changed`) and the fingerprint. Body at most 192 KiB.
 
 `trustees` and `threshold` default to 5 and 3. Ids follow the wire format
 (1-64 of `[A-Za-z0-9._-]`; contest ids at most 127 bytes). The console makes
@@ -173,7 +192,7 @@ runs `issuer-keygen` (key file in the run's private folder) and
 `election-params`, records `CreateElection`, and answers **201** with the
 `GET /api/live/election` body (state `ceremony`).
 
-Errors: 400 (title, counts, a trustee without a token, no voter accounts, or
+Errors: 400 (title, counts, a trustee without a token, the voter list, or
 `election-params` refused the positions), 409 (an election is running past
 setup), 502 or 422 (the chain; the election stays in `setup`).
 
@@ -273,7 +292,9 @@ Everything the phone's wasm needs, and the counts:
  "verification_keys": [{"trustee_id": "1", "verification_key": "<point>", "fingerprint": "..."}],
  "roster_fingerprint": "3C4D-...",
  "ceremony_error": "...",                      "(only if the transcript was refused)"
- "counts": {"voters_on_roll": 3, "credentials_issued": 3,
+ "precinct": "0001A", "precinct_label": "Precinct 0001A (demonstration)",
+ "voter_list_fingerprint": "<64 hex>", "voter_list_fingerprint_short": "<16 hex>",
+ "counts": {"voters_on_roll": 3, "voters_on_list": 3, "checked_in": 3, "credentials_issued": 3,
             "ballot_records": 6, "ballot_records_source": "chain",
             "trustees_decrypted": 3, "tally_signatures": 3, "trustees_joined": 5},
  "lifecycle": {"CreateElection": {"tx_id": "...", "block_number": 390}, "...": {}},
@@ -282,7 +303,9 @@ Everything the phone's wasm needs, and the counts:
  "created_at": "...", "updated_at": "..."}
 ```
 
-`ballot_records` is the chain's committed nullifier count
+`voters_on_list` (and its older name `voters_on_roll`) is the number of
+entries on the voter list; `checked_in` the entries that signed the list
+(`voter-list-api.md`). `ballot_records` is the chain's committed nullifier count
 (`ballot_records_source: "chain"`), or the console's own count with
 `"console"` when the chain did not answer. `trustees_decrypted` counts
 trustees with a partial recorded for every contest. `trustees_joined` counts
@@ -369,7 +392,7 @@ anyway).
 **Anonymity.** The handler reads no session (the `Cookie` header is removed
 before it runs), no address and no other header. The run folder gets the
 record, its `ballots.csv` row and its `SubmitBallot` receipt, and nothing that
-names an account or an address. The rate limit is one global token bucket
+names a voter, an account or an address. The rate limit is one global token bucket
 (5 per second, burst 30; 429 with `Retry-After`), so no per-caller state is
 kept either.
 
@@ -377,11 +400,14 @@ kept either.
 ballot never leaves the phone before the fresh ballot is recorded
 (`wire-format.md`, **The Benaloh challenge**); there is no server-side check.
 
-## Voter
+## Phone: check-in and issuance
 
-Sign in with `POST /api/login` (`{"username", "password"}`), then:
+The phone checks in first (`POST /api/live/checkin/find`, `declare`, the
+presenter's approval, `checkin/sign`; all in `voter-list-api.md`). The
+`saksi_checkin` cookie `declare` sets is then the phone's only standing for
+issuance: no sign-in, and no account of any role.
 
-### `POST /api/live/issue/presign` (voter; open)
+### `POST /api/live/issue/presign` (phone; open; check-in `signed`)
 
 ```json
 {"blinded_commitment": "<point: begin_issuance().blinded_commitment>"}
@@ -392,9 +418,9 @@ Sign in with `POST /api/login` (`{"username", "password"}`), then:
 ```
 
 Pass `r` and `issuer_public_key` to `blind_challenge`. A new presign for the
-same account discards that account's earlier open session.
+same list entry discards that entry's earlier open session.
 
-### `POST /api/live/issue/sign` (voter; open)
+### `POST /api/live/issue/sign` (phone; open; check-in `signed`)
 
 ```json
 {"e_prime": "<scalar: blind_challenge().e_prime>"}
@@ -407,33 +433,31 @@ same account discards that account's earlier open session.
 Exactly what `finalize_issuance` needs besides the phone's own state. The
 console never receives the credential.
 
-**Never retry `sign`, and never run two issuances for one account at once.**
-The account is recorded as issued before `s_iss` is sent. If that response
-is lost (a dropped connection, a closed tab), or a second tab's presign
-replaces the first tab's session, the account is spent with no credential:
-a retried `sign` is 409, and the voter moves to a spare account. The console
-keeps no copy of `e_prime` or `s_iss` to answer a retry with.
+**Never retry `sign`, and never run two issuances for one check-in at once.**
+The entry is recorded as `credential_issued` before `s_iss` is sent. If that
+response is lost (a dropped connection, a closed tab), or a second tab's
+presign replaces the first tab's session, the entry is spent with no
+credential: a retried `sign` is 409 `already-issued`, and there is no reset
+and no replacement. The console keeps no copy of `e_prime` or `s_iss` to
+answer a retry with.
 
 Rules (each tested):
-- At most one signature per account per election, ever. The account is
-  recorded in the run's private `issued.json` (atomically, fsynced) before
-  `s_iss` is returned, and a restart keeps it. The file is the set of issued
-  account names (a JSON object of name to `true`, keys sorted) with **no
-  time**: the ballots are public in arrival order with their commit times, so
-  an issuance time per account would link accounts to ballots. An issuance
-  does not move `updated_at` either. (A file in the earlier name-to-time
-  format from before this change is not read; start such an election
-  afresh.) If the record cannot be written, the signature is withheld (500)
-  and the account may start again. A second presign or sign for an
-  issued account is 409; there is no reset route. A phone that loses its
-  credential uses a spare account.
-- At most one open session per account; a session lasts 10 minutes; at most 8
-  are open at once (429). `sign` without an open session is 409.
-- One `issue-presign` or `issue-sign` runs at a time across all accounts.
+- Only for a check-in in state `signed` (403 `no-checkin` without one, or for
+  one the Board ended; 409 `not-signed` at the desk or approved).
+- At most one signature per list entry per election, ever. The entry moves
+  to `credential_issued` in the run's private `checkin.json` (atomically,
+  fsynced) before `s_iss` is returned, and a restart keeps it. The record
+  holds **no time**: the ballots are public in arrival order with their
+  commit times, so an issuance time per entry would help link entries to
+  ballots. An issuance does not move `updated_at` either. If the record
+  cannot be written, the signature is withheld (500) and the entry may start
+  again. A second presign or sign for an issued entry is 409
+  `already-issued`; the desk cannot reset it.
+- At most one open session per entry; a session lasts 10 minutes; at most 8
+  are open at once (429). `sign` without an open session is 409. A desk
+  reset removes the entry's open session.
+- One `issue-presign` or `issue-sign` runs at a time across all entries.
 - Issuance is open only in state `open` (it ends with `close`).
-- 401 without a session (`login required`, from the console's route guard,
-  before the handler runs); 403 for a signed-in account that is not a voter
-  (`only a voter account may obtain a credential`).
 
 ## Trustee (bearer token)
 
@@ -590,7 +614,7 @@ For a live run (`mode: "live"`):
 | `sealed` | `true` until `tallied` (an abandoned run stays sealed) |
 | `verified` | the state is `verified` (verify-live passed over the chain record) |
 | `contests` | the published totals, ranked, once tallied |
-| `integrity.voters` | voter accounts; `ballot_records` the recorded ballots; `turnout_pct` ballot records over voters × positions |
+| `integrity.voters` | entries on the voter list; `ballot_records` the recorded ballots; `turnout_pct` ballot records over voters × positions |
 | `crypto.trustees_submitted` | trustees with every contest's partial recorded; `threshold`, `trustees_total`, `issuer_public_key`, `committed_nullifiers` |
 | `checks` | the ceremony, enough trustees decrypted, the tally on the chain, the verifier |
 | `files` | `ballots.ndjson`, `receipts.csv`, `trail.ndjson` once tallied |
@@ -599,7 +623,10 @@ Added for live runs only, under `live`:
 
 ```json
 {"live": {"state": "verified", "title": "...",
-          "counts": {"voters_on_roll": 3, "credentials_issued": 3, "ballot_records": 6,
+          "precinct": "0001A", "precinct_label": "Precinct 0001A (demonstration)",
+          "voter_list_fingerprint": "<64 hex>", "voter_list_fingerprint_short": "<16 hex>",
+          "voter_list_note": "The list is kept by the election console. It is not written to the ledger.",
+          "counts": {"voters_on_roll": 3, "voters_on_list": 3, "checked_in": 3, "credentials_issued": 3, "ballot_records": 6,
                      "ballot_records_source": "chain", "trustees_decrypted": 3, "tally_signatures": 3,
                      "trustees_joined": 5},
           "decryption": {"trustees_decrypted": 3, "threshold": 3, "trustees": 5,
@@ -624,11 +651,11 @@ on a study run and adds `ballot_fingerprint` (live runs only).
 | File | What | Public |
 |---|---|---|
 | `run.json` | run record, `config.mode: "live"` | no |
-| `live.json` | the live state, rewritten atomically at every transition and recorded item; no secrets, no account names | no |
+| `live.json` | the live state, rewritten atomically at every transition and recorded item; no secrets, no voter names (the precinct, the list fingerprint and count only) | no |
 | `ballots.ndjson`, `ballots.csv` | each recorded ballot, as the chain returned it | yes, once tallied (`ballots.ndjson`) |
 | `receipts.csv`, `trail.ndjson` | lifecycle and ballot receipts | yes, once tallied |
 | `live-verify.json` | the last verify-live verdict | no |
-| `private/` (0700) | `issuer.key`, `issued.json` (the set of issued account names, no times), `sessions/` (all 0600) | never |
+| `private/` (0700) | `issuer.key`, `voter-list.json` (the locked list, with dates of birth), `checkin.json` (each entry's check-in state, token hash and signature; no times), `sessions/` (all 0600) | never |
 
 ## Restart
 
@@ -647,8 +674,11 @@ chain:
   them on the chain);
 - `abandoned`: nothing; it stays abandoned.
 
-Issued accounts and open sessions are on disk, so issuance rules survive a
-restart; sign-in sessions do not (log in again). If the chain is unreachable
+The voter list, every check-in (with the phones' cookies), the issued
+entries and the open sessions are on disk, so check-in and issuance rules
+survive a restart; sign-in sessions do not (log in again). An election made
+before voter lists existed loads, but its check-in, desk and issuance routes
+answer 409 `no-voter-list`. If the chain is unreachable
 at start the console still starts and logs the failure; nothing reconciles
 until the next restart. The transitions themselves do not re-read the chain
 first: a setup retry and `close` submit directly and take an "already
