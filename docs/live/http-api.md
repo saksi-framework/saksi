@@ -117,7 +117,7 @@ election with `trustees: n` needs a token for each of `1..n`.
 | 409 | the election is in the wrong state for this, or the request conflicts with what is recorded (or with what the chain holds) |
 | 413 | body too large |
 | 422 | **the chaincode refused the transaction**: see below |
-| 429 | rate limit (ballots; check-in finds per address) or too many open issuance sessions |
+| 429 | rate limit (ballots and ledger reads; check-in finds per address) or too many open issuance sessions |
 | 500 | an error inside the console (generic message; see the console log) |
 | 502 | the chain did not answer (not a refusal) |
 
@@ -307,7 +307,9 @@ Everything the phone's wasm needs, and the counts:
 entries on the voter list; `checked_in` the entries that signed the list
 (`voter-list-api.md`). `ballot_records` is the chain's committed nullifier count
 (`ballot_records_source: "chain"`), or the console's own count with
-`"console"` when the chain did not answer. `trustees_decrypted` counts
+`"console"` when the chain did not answer. The chain count is read at most once
+every 2 seconds and shared by this view and the board, so a count shown can be
+up to 2 seconds old (a failed read is reused for the same 2 seconds). `trustees_decrypted` counts
 trustees with a partial recorded for every contest. `trustees_joined` counts
 trustees whose receive key is in the key ceremony's roster: 0 after setup, the
 trustee count once the roster is complete, and unchanged for the rest of the
@@ -338,6 +340,10 @@ trustee a one-ballot view of the election.
  "partials": [{"trustee_id": "1", "contest_id": "president/alice",
                "partial": "<hex PartialDecryption>"}, "..."]}
 ```
+
+Each read lists and fetches every ballot from the chain, so this route shares
+the ballot route's token bucket (5 per second, burst 30): past it, 429 with
+`Retry-After: 1`. A ledger read and a ballot each take one token.
 
 `ballot_fingerprint` is computed from the raw bytes `GetBallots` returned
 (the wire format's definition), never from a re-marshalled record. Ballots are
@@ -393,8 +399,8 @@ anyway).
 before it runs), no address and no other header. The run folder gets the
 record, its `ballots.csv` row and its `SubmitBallot` receipt, and nothing that
 names a voter, an account or an address. The rate limit is one global token bucket
-(5 per second, burst 30; 429 with `Retry-After`), so no per-caller state is
-kept either.
+(5 per second, burst 30; 429 with `Retry-After`), shared with
+`GET /api/live/ledger`, so no per-caller state is kept either.
 
 **No route accepts a challenged ballot or a Benaloh opening.** A challenged
 ballot never leaves the phone before the fresh ballot is recorded
@@ -615,7 +621,7 @@ For a live run (`mode: "live"`):
 | `verified` | the state is `verified` (verify-live passed over the chain record) |
 | `contests` | the published totals, ranked, once tallied |
 | `integrity.voters` | entries on the voter list; `ballot_records` the recorded ballots; `turnout_pct` ballot records over voters × positions |
-| `crypto.trustees_submitted` | trustees with every contest's partial recorded; `threshold`, `trustees_total`, `issuer_public_key`, `committed_nullifiers` |
+| `crypto.trustees_submitted` | trustees with every contest's partial recorded; `threshold`, `trustees_total`, `issuer_public_key`, `committed_nullifiers` (the chain count, up to 2 seconds old, as in the election view) |
 | `checks` | the ceremony, enough trustees decrypted, the tally on the chain, the verifier |
 | `files` | `ballots.ndjson`, `receipts.csv`, `trail.ndjson` once tallied |
 

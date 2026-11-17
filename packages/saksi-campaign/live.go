@@ -308,6 +308,8 @@ type liveService struct {
 	ckView atomic.Pointer[checkinView]
 	// findLimit limits find and declare per caller address.
 	findLimit *addrLimiter
+	// counts is the chain count the public reads share (live_tally.go).
+	counts chainCountCache
 }
 
 // EnableLive turns on the live routes. Call it after EnableAuth: the

@@ -211,6 +211,14 @@ type flakyChain struct {
 	lose atomic.Value // fn whose receipts are lost after the commit
 	// before, if set, runs before each submit (a test holds a submit with it).
 	before atomic.Pointer[func(fn string)]
+	// lists counts ListNullifiers calls.
+	lists atomic.Int64
+}
+
+// ListNullifiers counts the listings (each is a full read of the set).
+func (c *flakyChain) ListNullifiers(electionID string, pageSize int, bookmark string) (clientsdk.NullifierPage, error) {
+	c.lists.Add(1)
+	return c.oracleChain.ListNullifiers(electionID, pageSize, bookmark)
 }
 
 func (c *flakyChain) Submit(fn string, args ...string) (clientsdk.Receipt, error) {

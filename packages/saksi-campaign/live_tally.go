@@ -781,15 +781,42 @@ func (L *liveService) verify(ctx context.Context) (map[string]any, error) {
 	}, nil
 }
 
-// chainCount is the chain's committed nullifier count, or -1 if unreadable.
+// liveChainCountTTL is how long a chain count is reused. The election view
+// and the board are public and polled; without the cache each GET would list
+// every nullifier on the peer. A count shown can be this old.
+const liveChainCountTTL = 2 * time.Second
+
+// chainCountCache is the last chain count read, per election.
+type chainCountCache struct {
+	mu         sync.Mutex
+	electionID string
+	n          int
+	at         time.Time
+	now        func() time.Time
+}
+
+// chainCount is the chain's committed nullifier count, or -1 if unreadable,
+// read from the chain at most once per liveChainCountTTL. The cache lock is
+// held across the read, so callers that arrive during one share its result.
+// It is never mu.
 func (L *liveService) chainCount(electionID string) int {
-	c, err := L.getChain()
-	if err != nil {
-		return -1
+	cc := &L.counts
+	cc.mu.Lock()
+	defer cc.mu.Unlock()
+	now := time.Now
+	if cc.now != nil {
+		now = cc.now
 	}
-	n, err := allNullifiers(c, electionID)
-	if err != nil {
-		return -1
+	t := now()
+	if cc.electionID == electionID && !cc.at.IsZero() && t.Sub(cc.at) < liveChainCountTTL {
+		return cc.n
 	}
-	return len(n)
+	n := -1
+	if c, err := L.getChain(); err == nil {
+		if all, err := allNullifiers(c, electionID); err == nil {
+			n = len(all)
+		}
+	}
+	cc.electionID, cc.n, cc.at = electionID, n, t
+	return n
 }

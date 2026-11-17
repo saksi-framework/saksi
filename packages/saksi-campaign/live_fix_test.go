@@ -698,3 +698,71 @@ func TestLiveSignDoesNotWaitOnAStalledClose(t *testing.T) {
 		t.Fatalf("live.json after close: issued %d, %v", st.Issued, err)
 	}
 }
+
+// Final review 4, finding 2: the election view and the board are public and
+// polled. The chain count they show is read at most once per
+// liveChainCountTTL, not once per GET, and it still comes from the chain.
+func TestLiveChainCountIsCachedBriefly(t *testing.T) {
+	fx := newLiveFixture(t)
+	c := fx.console()
+	runID := c.toState(LiveOpen)
+	now := time.Now()
+	c.s.live.counts.mu.Lock()
+	c.s.live.counts.now = func() time.Time { return now }
+	c.s.live.counts.at = time.Time{} // start with no count cached
+	c.s.live.counts.mu.Unlock()
+	view := func() map[string]any {
+		return c.ok(http.MethodGet, "/api/live/election", "", nil)["counts"].(map[string]any)
+	}
+	before := fx.chain.lists.Load()
+	first := view()
+	if first["ballot_records_source"] != "chain" {
+		t.Fatalf("the count is not the chain's: %v", first)
+	}
+	for i := 0; i < 5; i++ {
+		view()
+		if code := rawGET(c.s, "/api/board/"+runID); code != http.StatusOK {
+			t.Fatalf("board: %d", code)
+		}
+	}
+	if n := fx.chain.lists.Load() - before; n != 1 {
+		t.Fatalf("%d chain listings for 11 reads inside the cache window, want 1", n)
+	}
+	// A ballot lands; inside the window the old count stands, after it the
+	// chain's new count shows.
+	c.ok(http.MethodPost, "/api/live/ballot", "", map[string]string{"ballot": fakeBallot(runID, "secretary", 9, nil)})
+	if got := view()["ballot_records"]; got != first["ballot_records"] {
+		t.Fatalf("inside the window: %v, want the cached %v", got, first["ballot_records"])
+	}
+	now = now.Add(liveChainCountTTL)
+	if got := view()["ballot_records"].(float64); got != first["ballot_records"].(float64)+1 {
+		t.Fatalf("after the window: %v, want %v + 1", got, first["ballot_records"])
+	}
+	if n := fx.chain.lists.Load() - before; n != 2 {
+		t.Fatalf("%d chain listings, want 2", n)
+	}
+}
+
+// Final review 4, finding 2: GET /api/live/ledger reads every ballot and
+// partial from the chain, so it shares the ballot limiter.
+func TestLiveLedgerIsRateLimited(t *testing.T) {
+	fx := newLiveFixture(t)
+	c := fx.console()
+	c.toState(LiveOpen)
+	now := time.Now()
+	l := newRateLimiter(5, 2)
+	l.now = func() time.Time { return now }
+	c.s.live.limit = l
+	for i := 0; i < 2; i++ {
+		if code := rawGET(c.s, "/api/live/ledger"); code != http.StatusOK {
+			t.Fatalf("ledger read %d: %d", i+1, code)
+		}
+	}
+	if code := rawGET(c.s, "/api/live/ledger"); code != http.StatusTooManyRequests {
+		t.Fatalf("ledger read past the burst: %d, want 429", code)
+	}
+	now = now.Add(time.Second)
+	if code := rawGET(c.s, "/api/live/ledger"); code != http.StatusOK {
+		t.Fatalf("ledger read after a second: %d", code)
+	}
+}
