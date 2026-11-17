@@ -73,9 +73,9 @@ const (
 	sigMaxY            = 400
 	sigMaxBody         = 64 << 10
 
-	// Find and declare, per address: a burst of 20, then one every 3 s.
-	findBurst    = 20
-	findPerSec   = 1.0 / 3
+	// Find and declare, per address: a burst of 12, then one every 10 s.
+	findBurst    = 12
+	findPerSec   = 1.0 / 10
 	findMaxAddrs = 4096
 
 	// voterListBodyMax caps a request that carries the CSV text.

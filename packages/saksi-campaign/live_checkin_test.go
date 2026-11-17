@@ -226,6 +226,7 @@ func mustJSON(v any) []byte {
 // field was wrong.
 func TestCheckinRefusalsAreDistinctAndSayNoField(t *testing.T) {
 	_, c, _ := openConsole(t)
+	c.s.live.findLimit = newAddrLimiter(findPerSec, 100, findMaxAddrs) // many tries from one address
 	var bodies []string
 	for _, d := range []CheckinDetails{
 		{LastName: "Halimbawa", FirstName: "Uno", DateOfBirth: "1990-01-02"},  // wrong date
@@ -556,9 +557,12 @@ func TestCheckinFindIsRateLimitedPerAddress(t *testing.T) {
 	// Another address is not affected.
 	c.addr = "198.51.100.2:4000"
 	c.ok(http.MethodPost, "/api/live/checkin/find", "phone:y", detailsBody(testVoters["voter1"], false))
-	// The first address gets a try back after 3 seconds.
+	// The first address gets a try back after 10 seconds, not before.
 	c.addr = "198.51.100.1:4000"
-	now = now.Add(3 * time.Second)
+	now = now.Add(9 * time.Second)
+	code, out = c.do(http.MethodPost, "/api/live/checkin/find", "phone:x", detailsBody(testVoters["voter1"], false))
+	wantCode(t, "find before the refill", code, out, http.StatusTooManyRequests, "rate-limited")
+	now = now.Add(time.Second)
 	c.ok(http.MethodPost, "/api/live/checkin/find", "phone:x", detailsBody(testVoters["voter1"], false))
 	code, _ = c.do(http.MethodPost, "/api/live/checkin/find", "phone:x", detailsBody(testVoters["voter1"], false))
 	if code != http.StatusTooManyRequests {
