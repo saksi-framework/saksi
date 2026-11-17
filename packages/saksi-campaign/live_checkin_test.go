@@ -632,3 +632,98 @@ func TestLivePrecinctOption(t *testing.T) {
 		t.Fatalf("election: %v", el)
 	}
 }
+
+// A restart between presign and sign: the session and the check-in are on
+// disk, and the sign after the restart issues the one credential.
+func TestIssuanceSurvivesARestartBetweenPresignAndSign(t *testing.T) {
+	fx, c, _ := openConsole(t)
+	c.checkIn("voter1")
+	c.ok(http.MethodPost, "/api/live/issue/presign", "phone:voter1", map[string]string{"blinded_commitment": pt(0x10)})
+	c2 := fx.console()
+	if out := c2.ok(http.MethodGet, "/api/live/checkin", "phone:voter1", nil); out["state"] != CheckinSigned {
+		t.Fatalf("after restart: %v", out)
+	}
+	c2.ok(http.MethodPost, "/api/live/issue/sign", "phone:voter1", map[string]string{"e_prime": pt(0x11)})
+	if out := c2.ok(http.MethodGet, "/api/live/checkin", "phone:voter1", nil); out["state"] != CheckinIssued {
+		t.Fatalf("after sign: %v", out)
+	}
+	if len(fx.ops.signed) != 1 || !strings.Contains(fx.ops.signed[0], "nonce-1") {
+		t.Fatalf("signed with %v, want the session made before the restart", fx.ops.signed)
+	}
+	code, out := c2.do(http.MethodPost, "/api/live/issue/sign", "phone:voter1", map[string]string{"e_prime": pt(0x11)})
+	wantCode(t, "sign again", code, out, http.StatusConflict, "already-issued")
+}
+
+// Two phones declare one entry at the same moment: exactly one holds it.
+func TestCheckinConcurrentDeclareOneWins(t *testing.T) {
+	_, c, _ := openConsole(t)
+	body := mustJSON(detailsBody(testVoters["voter1"], true))
+	const n = 2
+	codes := make([]int, n)
+	cookies := make([]int, n)
+	start := make(chan struct{})
+	done := make(chan struct{})
+	for i := 0; i < n; i++ {
+		go func() {
+			defer func() { done <- struct{}{} }()
+			req := httptest.NewRequest(http.MethodPost, "/api/live/checkin/declare", bytes.NewReader(body))
+			req.RemoteAddr = "198.51.100." + string(rune('1'+i)) + ":4000"
+			rec := httptest.NewRecorder()
+			<-start
+			c.s.ServeHTTP(rec, req)
+			codes[i] = rec.Code
+			for _, k := range rec.Result().Cookies() {
+				if k.Name == checkinCookie {
+					cookies[i]++
+				}
+			}
+		}()
+	}
+	close(start)
+	for i := 0; i < n; i++ {
+		<-done
+	}
+	ok, conflict := 0, 0
+	for i := 0; i < n; i++ {
+		switch {
+		case codes[i] == http.StatusOK && cookies[i] == 1:
+			ok++
+		case codes[i] == http.StatusConflict && cookies[i] == 0:
+			conflict++
+		}
+	}
+	if ok != 1 || conflict != 1 {
+		t.Fatalf("concurrent declares: codes %v, cookies %v", codes, cookies)
+	}
+	list := c.ok(http.MethodGet, "/api/live/voter-list", "admin", nil)
+	if n := list["counts"].(map[string]any)["at_desk"]; n != 1.0 {
+		t.Fatalf("at_desk %v, want 1", n)
+	}
+}
+
+// If live.json cannot be written after the list was, the new run folder (and
+// the list in it) is removed, and the console keeps no half-made election.
+func TestLiveSetupRemovesTheRunFolderWhenLiveJSONFails(t *testing.T) {
+	fx := newLiveFixture(t)
+	c := fx.console()
+	fx.ops.onKeygen = func(keyFile string) {
+		// live.json as a folder: its atomic rename fails after the list is written.
+		_ = os.Mkdir(filepath.Join(filepath.Dir(filepath.Dir(keyFile)), liveStateFile), 0o755)
+	}
+	body := listBody(map[string]any{"title": "x", "positions": livePositions, "trustees": 3, "threshold": 2})
+	code, out := c.do(http.MethodPost, "/api/live/elections", "admin", body)
+	if code != http.StatusInternalServerError {
+		t.Fatalf("setup with live.json unwritable: %d %v", code, out)
+	}
+	if entries, _ := os.ReadDir(fx.runs); len(entries) != 0 {
+		t.Fatalf("the failed setup left %d run folder(s)", len(entries))
+	}
+	if c.s.live.snapshot() != nil || c.state() != "" {
+		t.Fatal("the failed setup left an election in the console")
+	}
+	fx.ops.onKeygen = nil
+	c.setup()
+	if c.state() != LiveCeremony {
+		t.Fatalf("setup after the failure: %s", c.state())
+	}
+}
