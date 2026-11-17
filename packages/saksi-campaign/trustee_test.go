@@ -308,7 +308,11 @@ func (f *trusteeFleet) decrypt(id int) TrusteeStatus {
 // presses Sign tally over them and waits for the signature to be posted.
 func (f *trusteeFleet) sign(id int, want []float64) map[string]any {
 	f.t.Helper()
-	st := f.waitFor(id, "its own combine", func(st TrusteeStatus) bool { return st.Tally.ReadyToSign })
+	// ReadyToSign shows as soon as the totals are saved; the sign step's
+	// waiting state follows, so wait for both.
+	st := f.waitFor(id, "its own combine", func(st TrusteeStatus) bool {
+		return st.Tally.ReadyToSign && st.Steps["sign"].State == stepWaiting
+	})
 	got := make([]float64, len(st.Tally.Totals))
 	for i, x := range st.Tally.Totals {
 		got[i] = float64(x)
@@ -526,7 +530,9 @@ func TestTrusteeProcessesKillAndRestart(t *testing.T) {
 		t.Fatalf("trustee 1 after restart: %+v %+v", st.Tally, st.Steps["sign"])
 	}
 	// Trustee 2 is killed after its signature is made, before it is posted.
-	st := f.waitFor(2, "its combine", func(st TrusteeStatus) bool { return st.Tally.ReadyToSign })
+	st := f.waitFor(2, "its combine", func(st TrusteeStatus) bool {
+		return st.Tally.ReadyToSign && st.Steps["sign"].State == stepWaiting
+	})
 	f.press(2, "sign", map[string]any{"totals": st.Tally.Totals})
 	f.waitFor(2, "the kill at sig-saved", func(TrusteeStatus) bool {
 		crashMu.Lock()
@@ -891,7 +897,10 @@ func TestTrusteeSignsOnlyOnThePressAndAlarmsOnTotals(t *testing.T) {
 		f.decrypt(id)
 	}
 	for id := 1; id <= 5; id++ {
-		st := f.waitFor(id, "its combine", func(st TrusteeStatus) bool { return st.Tally.ReadyToSign })
+		// The sign step's waiting state follows ReadyToSign; wait for both.
+		st := f.waitFor(id, "its combine", func(st TrusteeStatus) bool {
+			return st.Tally.ReadyToSign && st.Steps["sign"].State == stepWaiting
+		})
 		if st.Tally.SignaturePosted || st.Steps["sign"].State != stepWaiting {
 			t.Fatalf("trustee %d signed without a press: %+v", id, st.Tally)
 		}
