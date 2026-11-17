@@ -1478,10 +1478,11 @@ func TestTrusteeSignTextAfterThePublishedTally(t *testing.T) {
 		f.decrypt(id)
 	}
 	for _, id := range []int{4, 5} {
-		st := f.waitFor(id, "its combine", func(st TrusteeStatus) bool { return st.Tally.ReadyToSign })
-		if st.Steps["sign"].Detail != signPressDetail {
-			t.Fatalf("trustee %d before publication: %+v", id, st.Steps["sign"])
-		}
+		// ReadyToSign shows as soon as the totals are saved; the sign text
+		// follows, so wait for it.
+		f.waitFor(id, "its combine and the press text", func(st TrusteeStatus) bool {
+			return st.Tally.ReadyToSign && st.Steps["sign"].State == stepWaiting && st.Steps["sign"].Detail == signPressDetail
+		})
 	}
 	f.sign(1, wantTotals)
 	f.sign(2, wantTotals)
