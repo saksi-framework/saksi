@@ -382,8 +382,17 @@ fn issue_sign(i: SignIn) -> R<Value> {
             ));
         }
     };
-    let k = codec::scalar(&session.k, "session")?;
+    // The nonce is a Copy scalar: wipe this copy too once it has signed, and
+    // the issuer key on every path out.
+    let mut k = match codec::scalar(&session.k, "session") {
+        Ok(k) => k,
+        Err(e) => {
+            sk.zeroize();
+            return Err(e);
+        }
+    };
     let result = issuance::issuer_sign(&sk, k, &i.e_prime);
+    k.zeroize();
     sk.zeroize();
     Ok(json!({ "s_iss": result? }))
 }
