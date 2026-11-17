@@ -277,6 +277,9 @@ type liveService struct {
 	dial   func() (liveChain, error)
 	now    func() time.Time
 	limit  *rateLimiter
+	// ledgerLimit is GET /api/live/ledger's own bucket: a client looping the
+	// ledger cannot use up the ballots' tokens.
+	ledgerLimit *rateLimiter
 
 	chainMu sync.Mutex
 	chain   liveChain
@@ -336,9 +339,10 @@ func (s *Server) EnableLive(o LiveOptions) error {
 	L := &liveService{
 		s: s, root: s.store.Root(), tokens: tokens,
 		run: o.Runner, dial: o.Dial, now: o.Now,
-		limit:     newRateLimiter(5, 30),
-		precinct:  precinct,
-		findLimit: newAddrLimiter(findPerSec, findBurst, findMaxAddrs),
+		limit:       newRateLimiter(5, 30),
+		ledgerLimit: newRateLimiter(2, 10),
+		precinct:    precinct,
+		findLimit:   newAddrLimiter(findPerSec, findBurst, findMaxAddrs),
 	}
 	if L.run == nil {
 		L.run = execLiveRunner(s.exec.demoBin)

@@ -752,16 +752,20 @@ func TestLiveChainCountIsCachedBriefly(t *testing.T) {
 	}
 }
 
-// Final review 4, finding 2: GET /api/live/ledger reads every ballot and
-// partial from the chain, so it shares the ballot limiter.
+// Final review 4, finding 2 (and fix round 1, minor 1): GET /api/live/ledger
+// reads every ballot and partial from the chain, so it is rate limited, by a
+// bucket of its own: an empty ledger bucket leaves the ballots' alone.
 func TestLiveLedgerIsRateLimited(t *testing.T) {
 	fx := newLiveFixture(t)
 	c := fx.console()
-	c.toState(LiveOpen)
+	runID := c.toState(LiveOpen)
 	now := time.Now()
 	l := newRateLimiter(5, 2)
 	l.now = func() time.Time { return now }
-	c.s.live.limit = l
+	c.s.live.ledgerLimit = l
+	ballots := newRateLimiter(5, 1)
+	ballots.now = func() time.Time { return now }
+	c.s.live.limit = ballots
 	for i := 0; i < 2; i++ {
 		if code := rawGET(c.s, "/api/live/ledger"); code != http.StatusOK {
 			t.Fatalf("ledger read %d: %d", i+1, code)
@@ -770,6 +774,8 @@ func TestLiveLedgerIsRateLimited(t *testing.T) {
 	if code := rawGET(c.s, "/api/live/ledger"); code != http.StatusTooManyRequests {
 		t.Fatalf("ledger read past the burst: %d, want 429", code)
 	}
+	// The ledger's bucket is empty; the ballots' one token is still there.
+	c.ok(http.MethodPost, "/api/live/ballot", "", map[string]string{"ballot": fakeBallot(runID, "secretary", 9, nil)})
 	now = now.Add(time.Second)
 	if code := rawGET(c.s, "/api/live/ledger"); code != http.StatusOK {
 		t.Fatalf("ledger read after a second: %d", code)

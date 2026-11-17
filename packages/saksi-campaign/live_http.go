@@ -286,11 +286,11 @@ func (s *Server) handleLiveElection(w http.ResponseWriter, r *http.Request) {
 	writeJSONResp(w, http.StatusOK, s.live.electionViewOf(sn))
 }
 
-// handleLiveLedger reads every ballot and partial from the chain, so it
-// shares the ballot route's limiter: a client looping it cannot load the
-// peer without limit.
+// handleLiveLedger reads every ballot and partial from the chain, so it has
+// a limiter of its own (not the ballots'): a client looping it can neither
+// load the peer without limit nor starve the ballots.
 func (s *Server) handleLiveLedger(w http.ResponseWriter, r *http.Request) {
-	if !s.live.limit.allow() {
+	if !s.live.ledgerLimit.allow() {
 		w.Header().Set("Retry-After", "1")
 		writeJSONResp(w, http.StatusTooManyRequests, map[string]string{"error": "too many requests at once; try again in a moment"})
 		return

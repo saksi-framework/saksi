@@ -348,9 +348,10 @@ trustee a one-ballot view of the election.
                "partial": "<hex PartialDecryption>"}, "..."]}
 ```
 
-Each read lists and fetches every ballot from the chain, so this route shares
-the ballot route's token bucket (5 per second, burst 30): past it, 429 with
-`Retry-After: 1`. A ledger read and a ballot each take one token.
+Each read lists and fetches every ballot from the chain, so this route is
+rate limited by a global token bucket of its own (2 per second, burst 10):
+past it, 429 with `Retry-After: 1`. It is separate from the ballots' bucket, so
+a client looping the ledger cannot starve the ballots.
 
 `ballot_fingerprint` is computed from the raw bytes `GetBallots` returned
 (the wire format's definition), never from a re-marshalled record. Ballots are
@@ -406,8 +407,8 @@ anyway).
 before it runs), no address and no other header. The run folder gets the
 record, its `ballots.csv` row and its `SubmitBallot` receipt, and nothing that
 names a voter, an account or an address. The rate limit is one global token bucket
-(5 per second, burst 30; 429 with `Retry-After`), shared with
-`GET /api/live/ledger`, so no per-caller state is kept either.
+(5 per second, burst 30; 429 with `Retry-After`; `GET /api/live/ledger` has
+its own), so no per-caller state is kept either.
 
 **No route accepts a challenged ballot or a Benaloh opening.** A challenged
 ballot never leaves the phone before the fresh ballot is recorded
