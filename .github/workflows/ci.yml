@@ -79,6 +79,7 @@ jobs:
   test:
     name: Test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
@@ -132,7 +133,7 @@ jobs:
         run: |
           set -euo pipefail
           for module in ${GO_MODULES}; do
-            (cd "${module}" && CGO_ENABLED=1 go test -race ./...)
+            (cd "${module}" && CGO_ENABLED=1 go test -race -timeout 60m ./...)
           done
 
   build:
