@@ -727,3 +727,64 @@ func TestLiveSetupRemovesTheRunFolderWhenLiveJSONFails(t *testing.T) {
 		t.Fatalf("setup after the failure: %s", c.state())
 	}
 }
+
+// The same failure with an earlier election in the console (verified, or
+// abandoned): that election stays the console's, its snapshot, folder,
+// live.json and voter list unchanged, and only the new folder is removed.
+func TestLiveSetupFailureKeepsTheEarlierElection(t *testing.T) {
+	for _, earlier := range []string{LiveVerified, LiveAbandoned} {
+		t.Run(earlier, func(t *testing.T) {
+			fx := newLiveFixture(t)
+			c := fx.console()
+			var runID string
+			if earlier == LiveAbandoned {
+				runID = c.setup()
+				c.ok(http.MethodPost, "/api/live/abandon", "admin", nil)
+			} else {
+				runID = c.toState(LiveVerified)
+			}
+			before := *c.s.live.snapshot()
+			dirBefore := c.s.live.dir
+			stateBefore, _ := os.ReadFile(filepath.Join(dirBefore, liveStateFile))
+			listBefore := c.ok(http.MethodGet, "/api/live/voter-list", "admin", nil)
+			viewBefore := c.ok(http.MethodGet, "/api/live/election", "", nil)
+
+			fx.ops.onKeygen = func(keyFile string) {
+				_ = os.Mkdir(filepath.Join(filepath.Dir(filepath.Dir(keyFile)), liveStateFile), 0o755)
+			}
+			body := listBody(map[string]any{"title": "x", "positions": livePositions, "trustees": 3, "threshold": 2})
+			if code, out := c.do(http.MethodPost, "/api/live/elections", "admin", body); code != http.StatusInternalServerError {
+				t.Fatalf("setup with live.json unwritable: %d %v", code, out)
+			}
+			after := c.s.live.snapshot()
+			if after == nil || after.RunID != runID || after.State != earlier || after.Dir != before.Dir ||
+				!after.UpdatedAt.Equal(before.UpdatedAt) || after.Issued != before.Issued || c.s.live.dir != dirBefore ||
+				c.state() != earlier || c.s.live.st.RunID != runID {
+				t.Fatalf("the earlier election changed: %+v (was %+v)", after, before)
+			}
+			if stateAfter, _ := os.ReadFile(filepath.Join(dirBefore, liveStateFile)); !bytes.Equal(stateAfter, stateBefore) {
+				t.Fatal("the earlier election's live.json changed")
+			}
+			entries, _ := os.ReadDir(fx.runs)
+			if len(entries) != 1 || entries[0].Name() != runID {
+				t.Fatalf("run folders after the failure: %v, want only %s", entries, runID)
+			}
+			listAfter := c.ok(http.MethodGet, "/api/live/voter-list", "admin", nil)
+			viewAfter := c.ok(http.MethodGet, "/api/live/election", "", nil)
+			if a, b := mustJSON(listAfter), mustJSON(listBefore); !bytes.Equal(a, b) {
+				t.Fatalf("voter list changed:\n%s\nwas\n%s", a, b)
+			}
+			if viewAfter["run_id"] != runID || viewAfter["state"] != earlier || viewAfter["updated_at"] != viewBefore["updated_at"] {
+				t.Fatalf("election view changed: %v", viewAfter)
+			}
+			// A restart still loads the earlier election, and the next setup works.
+			if c2 := fx.console(); c2.state() != earlier || c2.s.live.st.RunID != runID {
+				t.Fatalf("restart after the failure: %s %s", c2.state(), c2.s.live.st.RunID)
+			}
+			fx.ops.onKeygen = nil
+			if next := c.setup(); next == runID || c.state() != LiveCeremony {
+				t.Fatalf("setup after the failure: %s %s", next, c.state())
+			}
+		})
+	}
+}
