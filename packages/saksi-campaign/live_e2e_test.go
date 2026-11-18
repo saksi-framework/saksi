@@ -519,6 +519,18 @@ func runLiveElection(t *testing.T, h *liveE2E) string {
 	h.must(admin, http.MethodPost, "/api/live/close", "", nil)
 	step("close: CloseElection recorded")
 
+	// The threshold demonstration before any Decrypt: no partial combines and
+	// no signature is held, so the console sends a tally no trustee signed,
+	// and the chain refuses it at the threshold gate. Nothing changes.
+	code, out = h.call(admin, http.MethodPost, "/api/live/tally/publish", "", nil)
+	if code != http.StatusUnprocessableEntity || out["gate"] != "threshold" {
+		t.Fatalf("unsigned publish: %d %v", code, out)
+	}
+	step("refusal: an unsigned publish before any Decrypt refused at gate threshold: " + truncateErr(out["reason"].(string)))
+	if el := h.must(nil, http.MethodGet, "/api/live/election", "", nil); el["state"] != LiveClosed {
+		t.Fatalf("a refused publish changed the state to %v", el["state"])
+	}
+
 	// Decryption by trustees 1-3, over the ballots read back from the chain.
 	led := h.must(nil, http.MethodGet, "/api/live/ledger", "", nil)
 	if led["nullifier_count"] != 6.0 {

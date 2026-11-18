@@ -50,6 +50,8 @@ type fakeOps struct {
 	verify      string // verify-live overall; "" = pass, "error" = the op fails
 	// verifyGate, when set, holds every verify-live until it is closed.
 	verifyGate chan struct{}
+	// combineFail makes combine fail, as it does below the threshold.
+	combineFail bool
 	// roster makes dkg-roster fail: "fail" is an op error, "no-digest" an
 	// answer without a roster digest; "" = a normal roster.
 	roster string
@@ -164,6 +166,12 @@ func (f *fakeOps) run(_ context.Context, op string, input []byte) ([]byte, error
 		f.mu.Unlock()
 		out["s_iss"] = pt(0x55)
 	case "combine":
+		f.mu.Lock()
+		fail := f.combineFail
+		f.mu.Unlock()
+		if fail {
+			return nil, &liveOpError{op, "too few partial decryptions to combine"}
+		}
 		out["totals"] = []uint64{1, 0, 0, 1}
 	case "tally-assemble":
 		for _, sg := range in["signatures"].([]any) {
@@ -226,6 +234,23 @@ type flakyChain struct {
 	listGate atomic.Pointer[chan struct{}]
 	// panicOnce makes the next ListNullifiers panic.
 	panicOnce atomic.Bool
+	// tallyArg is the last PublishTally argument submitted (guarded by mu).
+	mu       sync.Mutex
+	tallyArg string
+	// acceptTally makes PublishTally succeed without the oracle's gates (a
+	// chain with no threshold gate).
+	acceptTally atomic.Bool
+}
+
+// lastTally decodes the last PublishTally argument submitted.
+func (c *flakyChain) lastTally() *pb.TallyResult {
+	c.mu.Lock()
+	h := c.tallyArg
+	c.mu.Unlock()
+	var tr pb.TallyResult
+	raw, _ := hex.DecodeString(h)
+	_ = proto.Unmarshal(raw, &tr)
+	return &tr
 }
 
 // ListNullifiers counts the listings (each is a full read of the set), and
@@ -249,6 +274,14 @@ func (c *flakyChain) Submit(fn string, args ...string) (clientsdk.Receipt, error
 	}
 	if c.down.Load() {
 		return clientsdk.Receipt{}, errors.New("dial tcp: connection refused")
+	}
+	if fn == "PublishTally" && len(args) > 0 {
+		c.mu.Lock()
+		c.tallyArg = args[0]
+		c.mu.Unlock()
+		if c.acceptTally.Load() {
+			return clientsdk.Receipt{TxID: "tx-accepted", BlockNumber: 999}, nil
+		}
 	}
 	rc, err := c.oracleChain.Submit(fn, args...)
 	if lost, _ := c.lose.Load().(string); err == nil && lost == fn {

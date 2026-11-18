@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net/http"
 	"path/filepath"
 	"slices"
 	"strconv"
@@ -675,7 +676,12 @@ func (L *liveService) tallyOnChainLocked(a *liveAssembled) (map[string]any, erro
 
 // publishNow is the presenter's POST /api/live/tally/publish: publication
 // with whatever signatures exist, so the chain's threshold refusal can be
-// shown. With no signatures yet the totals come from combine.
+// shown. With no signatures yet the totals come from combine; when the
+// partials do not combine yet either, an unsigned tally is sent (see
+// publishUnsignedLocked). The trustees sign by themselves within seconds of
+// the threshold-th Decrypt, so the window with some but too few signatures is
+// seconds long; from the close until then no signature is held, and the
+// demonstration sends an unsigned tally.
 func (L *liveService) publishNow(ctx context.Context) (map[string]any, error) {
 	L.mu.Lock()
 	if err := L.inState(LiveClosed); err != nil {
@@ -701,11 +707,39 @@ func (L *liveService) publishNow(ctx context.Context) (map[string]any, error) {
 			"params": L.st.Params, "dkg": L.st.DKG,
 			"ballots": ledgerBallotHexes(led), "partials": ledgerPartialHexes(led),
 		}, &comb); err != nil {
-			return nil, conflictf("the partials on the chain do not combine yet: %v", err)
+			log.Printf("live: %s publish demonstration: the partials do not combine yet (%v); sending an unsigned tally", L.st.RunID, err)
+			return L.publishUnsignedLocked()
 		}
 		totals = comb.Totals
 	}
 	return L.publishLocked(ctx, led, totals, sigs)
+}
+
+// publishUnsignedLocked is the threshold demonstration before any totals
+// exist: it sends PublishTally with a tally no trustee signed, carrying zero
+// for every contest (the chain checks only the count of totals before its
+// threshold gate, and refuses a tally that carries no trustee signature
+// whatever its totals). The chain's refusal comes back as is (422, gate
+// threshold) and nothing changes. A chain that accepted it would hold a tally
+// nobody signed: that is reported as an error and never recorded as the
+// result (the trustees' later signatures then meet it as a different tally on
+// the chain). Caller holds mu.
+func (L *liveService) publishUnsignedLocked() (map[string]any, error) {
+	st := L.st
+	raw, err := proto.Marshal(&pb.TallyResult{
+		Version: pb.WireVersion, ElectionId: st.ElectionID,
+		Totals: make([]uint64, len(st.ContestIDs)),
+	})
+	if err != nil {
+		return nil, err
+	}
+	_, err = L.chainSubmit("PublishTally", hex.EncodeToString(raw))
+	if err != nil {
+		return nil, err
+	}
+	log.Printf("live: %s ALARM: the chain accepted a tally that no trustee signed", st.RunID)
+	return nil, errCoded{status: http.StatusInternalServerError, code: "accepted-unsigned",
+		msg: "the chain accepted a tally that no trustee signed: stop the demo; it is not recorded as the result"}
 }
 
 // --- verification ------------------------------------------------------------------------

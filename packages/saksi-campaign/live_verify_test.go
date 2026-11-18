@@ -1,7 +1,11 @@
 package campaign
 
 import (
+	"bytes"
 	"net/http"
+	"os"
+	"path/filepath"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -198,3 +202,84 @@ func TestLiveRestartAtTalliedVerifiesOnce(t *testing.T) {
 	}
 }
 
+// The presenter's threshold demonstration (POST /api/live/tally/publish) now
+// that the trustees sign by themselves: from closed, before any partial
+// combines and with no signature held, the console sends a tally no trustee
+// signed (zero for every contest), and the chain refuses it at the threshold
+// gate. Nothing changes; the chain holds no tally.
+func TestLivePublishBeforeAnyTotalsIsRefusedAtThreshold(t *testing.T) {
+	fx := newLiveFixture(t)
+	c := fx.console()
+	runID := c.toState(LiveClosed)
+	c.partials(1, liveContests) // one of two: nothing combines
+	fx.ops.mu.Lock()
+	fx.ops.combineFail = true
+	fx.ops.mu.Unlock()
+	before, _ := os.ReadFile(filepath.Join(fx.runs, runID, liveStateFile))
+	receiptsBefore, _ := os.ReadFile(filepath.Join(fx.runs, runID, "receipts.csv"))
+	submits := len(fx.chain.oracleChain.submits)
+	code, out := c.do(http.MethodPost, "/api/live/tally/publish", "admin", nil)
+	if code != http.StatusUnprocessableEntity || out["gate"] != "threshold" {
+		t.Fatalf("publish before any totals: %d %v", code, out)
+	}
+	after, _ := os.ReadFile(filepath.Join(fx.runs, runID, liveStateFile))
+	receiptsAfter, _ := os.ReadFile(filepath.Join(fx.runs, runID, "receipts.csv"))
+	if !bytes.Equal(before, after) || !bytes.Equal(receiptsBefore, receiptsAfter) || c.state() != LiveClosed {
+		t.Fatal("a refused publish changed the run")
+	}
+	// What was sent: one PublishTally, no signature, a zero for each contest.
+	ch := fx.chain.oracleChain
+	ch.mu.Lock()
+	sent := ch.submits[submits:]
+	_, onChain := ch.tally[runID]
+	ch.mu.Unlock()
+	if len(sent) != 1 || sent[0] != "PublishTally" || onChain {
+		t.Fatalf("submits %v, tally on the chain %v", sent, onChain)
+	}
+	if last := fx.chain.lastTally(); len(last.Signatures) != 0 || !slices.Equal(last.Totals, []uint64{0, 0, 0, 0}) || last.ElectionId != runID {
+		t.Fatalf("the tally sent: %+v", last)
+	}
+	// With a signature held, the demonstration sends it (as before).
+	fx.ops.mu.Lock()
+	fx.ops.combineFail = false
+	fx.ops.mu.Unlock()
+	c.partials(2, liveContests)
+	c.ok(http.MethodPost, "/api/live/tally-sig", c.tok(1), map[string]any{"totals": []int{1, 0, 0, 1}, "signature": sig(1)})
+	if code, out := c.do(http.MethodPost, "/api/live/tally/publish", "admin", nil); code != http.StatusUnprocessableEntity || out["gate"] != "threshold" {
+		t.Fatalf("publish with 1 of 2 signatures: %d %v", code, out)
+	}
+	if last := fx.chain.lastTally(); len(last.Signatures) != 1 {
+		t.Fatalf("the tally sent with one signature held: %+v", last)
+	}
+	// After publication the route is refused in its state, never sent.
+	c.ok(http.MethodPost, "/api/live/tally-sig", c.tok(2), map[string]any{"totals": []int{1, 0, 0, 1}, "signature": sig(2)})
+	c.s.live.waitBackground()
+	submits = len(fx.chain.oracleChain.submits)
+	if code, _ := c.do(http.MethodPost, "/api/live/tally/publish", "admin", nil); code != http.StatusConflict || len(fx.chain.oracleChain.submits) != submits {
+		t.Fatalf("publish after publication: %d", code)
+	}
+}
+
+// A chain that accepted the unsigned demonstration tally: the console says
+// so, records nothing, and stays closed.
+func TestLiveUnsignedPublishAcceptedIsNeverTheResult(t *testing.T) {
+	fx := newLiveFixture(t)
+	c := fx.console()
+	runID := c.toState(LiveClosed)
+	fx.ops.mu.Lock()
+	fx.ops.combineFail = true
+	fx.ops.mu.Unlock()
+	fx.chain.acceptTally.Store(true)
+	before, _ := os.ReadFile(filepath.Join(fx.runs, runID, liveStateFile))
+	code, out := c.do(http.MethodPost, "/api/live/tally/publish", "admin", nil)
+	if code != http.StatusInternalServerError || out["code"] != "accepted-unsigned" {
+		t.Fatalf("an accepted unsigned tally: %d %v", code, out)
+	}
+	after, _ := os.ReadFile(filepath.Join(fx.runs, runID, liveStateFile))
+	if !bytes.Equal(before, after) || c.state() != LiveClosed {
+		t.Fatal("an accepted unsigned tally was recorded")
+	}
+	if el := c.ok(http.MethodGet, "/api/live/election", "", nil); el["totals"] != nil || el["auto_verify"] != nil {
+		t.Fatalf("view after an accepted unsigned tally: %v %v", el["totals"], el["auto_verify"])
+	}
+}
