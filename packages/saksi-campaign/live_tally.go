@@ -665,6 +665,10 @@ func (L *liveService) tallyOnChainLocked(a *liveAssembled) (map[string]any, erro
 	if !slices.Equal(totals, a.Totals) {
 		return nil, conflictf("a different tally is already on the chain: it carries totals %v, the signatures held are over %v", totals, a.Totals)
 	}
+	if !L.signedEnough(tally) {
+		log.Printf("live: %s ALARM: the chain holds a tally with fewer than %d trustee signatures; it is not taken as the result", st.RunID, st.Threshold)
+		return nil, conflictf("the tally on the chain carries fewer than %d trustee signatures; it is not taken as the result", st.Threshold)
+	}
 	st.Tally, st.Totals, st.State = tally, totals, LiveTallied
 	log.Printf("live: %s tallied (the tally was already on the chain)", st.RunID)
 	if err := L.save(); err != nil {

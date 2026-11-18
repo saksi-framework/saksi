@@ -789,7 +789,11 @@ chain:
 - `ceremony` with every acknowledgement in: assembles and publishes the
   transcript (an existing transcript counts as done);
 - `open` and the chain closed: `closed`;
-- `closed` and a tally on the chain: `tallied`;
+- `closed` and a tally on the chain carrying at least `threshold` trustee
+  signatures: `tallied`. A tally with fewer (only a chain without the
+  threshold gate could hold one) is never taken as the result: the console
+  logs an `ALARM` line and stays `closed`, and a later publication meets it
+  as a tally not taken (409, `publish_error`);
 - `tallied` with no verdict recorded: the automatic verification starts
   again, once (see **Verification is automatic**);
 - in every state from `closed`, partials the chain holds but `live.json` does

@@ -2,6 +2,7 @@ package campaign
 
 import (
 	"bytes"
+	"encoding/hex"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -9,6 +10,9 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	pb "github.com/saksi-framework/saksi/packages/saksi-protocol/go/saksiprotocolv1"
+	"google.golang.org/protobuf/proto"
 )
 
 // The console verifies by itself once the tally is published (live_tally.go):
@@ -281,5 +285,45 @@ func TestLiveUnsignedPublishAcceptedIsNeverTheResult(t *testing.T) {
 	}
 	if el := c.ok(http.MethodGet, "/api/live/election", "", nil); el["totals"] != nil || el["auto_verify"] != nil {
 		t.Fatalf("view after an accepted unsigned tally: %v %v", el["totals"], el["auto_verify"])
+	}
+}
+
+// A tally on the chain with fewer than threshold signatures (a chain without
+// the threshold gate took the unsigned demonstration tally) is never adopted
+// at a restart: the election stays closed and nothing is verified. A tally
+// with threshold signatures still is.
+func TestLiveRestartIgnoresAnUnderSignedTallyOnTheChain(t *testing.T) {
+	fx := newLiveFixture(t)
+	c := fx.console()
+	runID := c.toState(LiveClosed)
+	fx.ops.mu.Lock()
+	fx.ops.combineFail = true
+	fx.ops.mu.Unlock()
+	// The chain records whatever it is given (no gate).
+	under := &pb.TallyResult{Version: 1, ElectionId: runID, Totals: []uint64{0, 0, 0, 0},
+		Signatures: []*pb.TrusteeSignature{{TrusteeId: "1"}}}
+	raw, _ := proto.Marshal(under)
+	ch := fx.chain.oracleChain
+	ch.mu.Lock()
+	ch.tally[runID] = hex.EncodeToString(raw)
+	ch.mu.Unlock()
+	c2 := fx.console()
+	c2.s.live.waitBackground()
+	if c2.state() != LiveClosed || fx.ops.verifyCalls() != 0 {
+		t.Fatalf("restart with an under-signed tally on the chain: %s, %d verify runs", c2.state(), fx.ops.verifyCalls())
+	}
+	if el := c2.ok(http.MethodGet, "/api/live/election", "", nil); el["totals"] != nil {
+		t.Fatalf("the under-signed tally's totals are shown: %v", el["totals"])
+	}
+	// The trustees' signatures then meet it as a tally not taken.
+	fx.ops.mu.Lock()
+	fx.ops.combineFail = false
+	fx.ops.mu.Unlock()
+	c2.partials(1, liveContests)
+	c2.partials(2, liveContests)
+	c2.ok(http.MethodPost, "/api/live/tally-sig", c2.tok(1), map[string]any{"totals": []int{0, 0, 0, 0}, "signature": sig(1)})
+	out := c2.ok(http.MethodPost, "/api/live/tally-sig", c2.tok(2), map[string]any{"totals": []int{0, 0, 0, 0}, "signature": sig(2)})
+	if out["published"] != false || c2.state() != LiveClosed {
+		t.Fatalf("signatures over the under-signed tally's totals: %v, state %s", out, c2.state())
 	}
 }

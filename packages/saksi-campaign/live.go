@@ -890,7 +890,12 @@ func (L *liveService) resume(ctx context.Context) error {
 		}
 	}
 	if st.State == LiveClosed {
-		if tally, err := c.GetTally(st.ElectionID); err == nil && tally != "" {
+		if tally, err := c.GetTally(st.ElectionID); err == nil && tally != "" && !L.signedEnough(tally) {
+			// A tally on the chain that fewer than threshold trustees signed
+			// (a chain without the threshold gate took the presenter's
+			// unsigned demonstration tally) is never the result.
+			log.Printf("live: %s ALARM: the chain holds a tally with fewer than %d trustee signatures; it is not taken as the result and the election stays closed", st.RunID, st.Threshold)
+		} else if err == nil && tally != "" {
 			st.Tally = tally
 			st.State = LiveTallied
 			if t, derr := decodeTallyTotals(tally); derr == nil {
@@ -910,6 +915,25 @@ func (L *liveService) resume(ctx context.Context) error {
 		return L.reconcileBallotsLocked(c)
 	}
 	return nil
+}
+
+// signedEnough reports whether a tally's encoding carries at least threshold
+// signatures from distinct trustees. It counts; the chain's gate verified
+// them, and verify-live checks them again.
+func (L *liveService) signedEnough(tallyHex string) bool {
+	raw, err := hex.DecodeString(tallyHex)
+	if err != nil {
+		return false
+	}
+	var t pb.TallyResult
+	if err := proto.Unmarshal(raw, &t); err != nil {
+		return false
+	}
+	ids := map[string]bool{}
+	for _, s := range t.Signatures {
+		ids[s.TrusteeId] = true
+	}
+	return len(ids) >= L.st.Threshold
 }
 
 func decodeTallyTotals(tallyHex string) ([]uint64, error) {
