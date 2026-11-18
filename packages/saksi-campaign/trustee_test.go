@@ -662,7 +662,19 @@ func TestTrusteeRefusesASwappedRosterKey(t *testing.T) {
 	for id := 1; id <= 5; id++ {
 		b.f.press(id, "join", nil)
 	}
-	st := b.f.waitFor(1, "the roster alarm", func(st TrusteeStatus) bool { return st.Steps["join"].State == stepBlocked })
+	// Peer checks refresh per poll: wait until every one has been read as a
+	// mismatch, not only for the alarm.
+	st := b.f.waitFor(1, "the roster alarm and every peer's mismatch", func(st TrusteeStatus) bool {
+		if st.Steps["join"].State != stepBlocked {
+			return false
+		}
+		for _, e := range st.Ceremony.Roster {
+			if e.TrusteeID != 1 && e.PeerCheck != "mismatch" {
+				return false
+			}
+		}
+		return true
+	})
 	// Trustee 3's own host states its real key: that names the swap. (Trustee
 	// 1's digest also differs from every other trustee's.)
 	if len(st.Alarms) == 0 || st.Alarms[0].Code != "roster-peer-3" || !strings.Contains(st.Alarms[0].Message, "trustee 3's own host") {
