@@ -166,15 +166,27 @@ type liveState struct {
 func (st *liveState) stateIndex() int { return liveStateIndex(st.State) }
 
 // minBallotRecords is the console's figure for the fewest ballot records an
-// election with positions positions can be decrypted over: --live-min-ballots
+// election with these contest ids can be decrypted over: --live-min-ballots
 // for each position (a voter's ballot is one record per position), the same
 // rule the trustee process applies with its own --min-ballots. It is shown
 // from open on (0, left out of the JSON, before that and when abandoned).
-func (L *liveService) minBallotRecords(state string, positions int) int {
+//
+// The positions are counted from the contest ids with positionsOf, literally
+// the trustee process's count (TrusteeService.minBallotRecords).
+func (L *liveService) minBallotRecords(state string, contestIDs []string) int {
 	if liveStateIndex(state) < liveStateIndex(LiveOpen) {
 		return 0
 	}
-	return L.minBallots * positions
+	return L.minBallots * len(positionsOf(contestIDs))
+}
+
+// CheckLiveMinBallots refuses a --live-min-ballots value below 1, in one
+// sentence. The command checks the flag with it before EnableLive.
+func CheckLiveMinBallots(n int) error {
+	if n < 1 {
+		return fmt.Errorf("--live-min-ballots is %d; it must be at least 1, the fewest ballot records per position decryption can need", n)
+	}
+	return nil
 }
 
 func liveStateIndex(s string) int {
@@ -278,7 +290,8 @@ type LiveOptions struct {
 	Now func() time.Time
 	// Precinct is --live-precinct; "" = DefaultLivePrecinct.
 	Precinct string
-	// MinBallots is --live-min-ballots; 0 = DefaultMinBallots.
+	// MinBallots is --live-min-ballots. 0 (an unset field, for callers
+	// other than the command) = DefaultMinBallots; below 0 is refused.
 	MinBallots int
 }
 
@@ -358,8 +371,8 @@ func (s *Server) EnableLive(o LiveOptions) error {
 	if minBallots == 0 {
 		minBallots = DefaultMinBallots
 	}
-	if minBallots < 1 {
-		return fmt.Errorf("--live-min-ballots %d: at least 1", minBallots)
+	if err := CheckLiveMinBallots(minBallots); err != nil {
+		return err
 	}
 	L := &liveService{
 		s: s, root: s.store.Root(), tokens: tokens,

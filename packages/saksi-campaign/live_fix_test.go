@@ -1089,6 +1089,51 @@ func TestLiveViewsCarryTheDecryptionMinimum(t *testing.T) {
 	}
 }
 
+// An election abandoned from the ceremony carries no minimum in either view:
+// it is never decrypted.
+func TestLiveAbandonedViewsHaveNoDecryptionMinimum(t *testing.T) {
+	fx := newLiveFixture(t)
+	c := fx.console()
+	runID := c.toState(LiveCeremony)
+	c.ok(http.MethodPost, "/api/live/abandon", "admin", nil)
+	if c.state() != LiveAbandoned {
+		t.Fatalf("state %s, want abandoned", c.state())
+	}
+	el := c.ok(http.MethodGet, "/api/live/election", "", nil)["counts"].(map[string]any)
+	board := c.ok(http.MethodGet, "/api/board/"+runID, "", nil)["live"].(map[string]any)["counts"].(map[string]any)
+	for name, counts := range map[string]map[string]any{"election view": el, "board": board} {
+		if _, ok := counts["min_ballot_records"]; ok {
+			t.Fatalf("abandoned %s has min_ballot_records: %v", name, counts)
+		}
+	}
+}
+
+// The console's figure counts positions exactly as the trustee process does:
+// positionsOf over the contest ids.
+func TestLiveMinBallotRecordsUsesTheTrusteeRule(t *testing.T) {
+	L := &liveService{minBallots: 2}
+	T := &TrusteeService{minBallots: 2}
+	for _, ids := range [][]string{liveContests, {"president/a", "president/b", "vice/c", "vice/d", "secretary/e"}, {"p/x"}} {
+		if got, want := L.minBallotRecords(LiveClosed, ids), T.minBallotRecords(ids); got != want {
+			t.Fatalf("%v: console %d, trustee %d", ids, got, want)
+		}
+	}
+}
+
+// --live-min-ballots below 1 is refused at start in one sentence.
+func TestLiveMinBallotsFlagCheck(t *testing.T) {
+	for _, n := range []int{0, -1} {
+		err := CheckLiveMinBallots(n)
+		want := fmt.Sprintf("--live-min-ballots is %d; it must be at least 1, the fewest ballot records per position decryption can need", n)
+		if err == nil || err.Error() != want {
+			t.Fatalf("CheckLiveMinBallots(%d) = %v", n, err)
+		}
+	}
+	if err := CheckLiveMinBallots(1); err != nil {
+		t.Fatal(err)
+	}
+}
+
 // A console started with a minimum under 1 is refused: the figure is a
 // promise about decryption, so it is never 0.
 func TestLiveMinBallotsOptionMustBePositive(t *testing.T) {

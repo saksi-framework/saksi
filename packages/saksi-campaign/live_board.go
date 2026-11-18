@@ -122,7 +122,7 @@ func (s *Server) buildLiveBoard(rec RunRecord, dir string) BoardResponse {
 		Counts: LiveCounts{
 			VotersOnRoll: rec.Config.Voters, VotersOnList: rec.Config.Voters, CredentialsIssued: st.Issued,
 			BallotRecords: st.Ballots, BallotRecordsSource: "console",
-			MinBallotRecords:  s.live.minBallotRecords(st.State, len(st.Positions)),
+			MinBallotRecords:  s.live.minBallotRecords(st.State, st.ContestIDs),
 			TrusteesDecrypted: k, TallySignatures: len(st.TallySignatures),
 			TrusteesJoined: st.TrusteesJoined,
 		},

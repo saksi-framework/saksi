@@ -674,7 +674,7 @@ func (L *liveService) electionViewOf(sn *liveSnapshot) LiveElectionView {
 		Counts: LiveCounts{
 			VotersOnRoll: sn.VotersOnList, VotersOnList: sn.VotersOnList, CredentialsIssued: sn.Issued,
 			BallotRecords: sn.Ballots, BallotRecordsSource: "console",
-			MinBallotRecords:  L.minBallotRecords(sn.State, len(sn.Positions)),
+			MinBallotRecords:  L.minBallotRecords(sn.State, sn.ContestIDs),
 			TrusteesDecrypted: len(sn.Decrypted), TallySignatures: len(sn.TallySignatures),
 			TrusteesJoined: sn.TrusteesJoined,
 		},

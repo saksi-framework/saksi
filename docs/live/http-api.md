@@ -36,7 +36,10 @@ saksi-campaign serve --live --auth-file accounts.json --trustee-tokens tokens.js
   number of positions as `min_ballot_records`. The console does not learn the
   trustees' `--min-ballots` and nothing checks the two agree: start the
   console with the trustees' value (the kit starts both with the default).
-  Below 1 is refused at start.
+  Below 1 (0 included) is refused at start: `--live-min-ballots is 0; it must
+  be at least 1, the fewest ballot records per position decryption can need`.
+  The positions are counted from the contest ids, as the trustee process
+  counts them.
 
 - `--tls-cert` and `--tls-key` together serve HTTPS (TLS 1.2 minimum). The
   session cookie is then `Secure`.

@@ -203,7 +203,7 @@ func serve(args []string) {
 	livePrecinct := fs.String("live-precinct", campaign.DefaultLivePrecinct,
 		"live mode: the precinct number (four digits and a capital letter), always shown as a demonstration")
 	liveMinBallots := fs.Int("live-min-ballots", campaign.DefaultMinBallots,
-		"live mode: the console's figure for the fewest ballot records per position decryption needs, shown as min_ballot_records; set it to the trustee processes' --min-ballots (not checked)")
+		"live mode: the console's figure for the fewest ballot records per position decryption needs (at least 1), shown as min_ballot_records times the positions; set it to the trustee processes' --min-ballots (not checked)")
 	var allow multiFlag
 	fs.Var(&allow, "allow-host", "additional accepted Host header (repeatable; for LAN)")
 	_ = fs.Parse(args)
@@ -253,6 +253,9 @@ func serve(args []string) {
 		}
 	}
 	if *live {
+		if err := campaign.CheckLiveMinBallots(*liveMinBallots); err != nil {
+			fatal("%v", err)
+		}
 		if err := handler.EnableLive(campaign.LiveOptions{TrusteeTokens: *trusteeTokens, Precinct: *livePrecinct, MinBallots: *liveMinBallots}); err != nil {
 			fatal("--live: %v", err)
 		}
