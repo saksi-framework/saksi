@@ -609,8 +609,14 @@ type LiveCounts struct {
 	// answer.
 	BallotRecords       int    `json:"ballot_records"`
 	BallotRecordsSource string `json:"ballot_records_source"`
-	TrusteesDecrypted   int    `json:"trustees_decrypted"`
-	TallySignatures     int    `json:"tally_signatures"`
+	// MinBallotRecords is the console's figure for the fewest ballot records
+	// decryption needs (--live-min-ballots per position), from open on. A
+	// closed election under it cannot be decrypted: the chain takes no
+	// ballot after CloseElection. Reported only; the console refuses nothing
+	// on it, and the trustee processes check their own --min-ballots.
+	MinBallotRecords  int `json:"min_ballot_records,omitempty"`
+	TrusteesDecrypted int `json:"trustees_decrypted"`
+	TallySignatures   int `json:"tally_signatures"`
 	// TrusteesJoined is the number of trustees whose receive key is in the
 	// election's roster: 0 after setup, the trustee count once the roster is
 	// complete, and unchanged after that.
@@ -668,6 +674,7 @@ func (L *liveService) electionViewOf(sn *liveSnapshot) LiveElectionView {
 		Counts: LiveCounts{
 			VotersOnRoll: sn.VotersOnList, VotersOnList: sn.VotersOnList, CredentialsIssued: sn.Issued,
 			BallotRecords: sn.Ballots, BallotRecordsSource: "console",
+			MinBallotRecords:  L.minBallotRecords(sn.State, len(sn.Positions)),
 			TrusteesDecrypted: len(sn.Decrypted), TallySignatures: len(sn.TallySignatures),
 			TrusteesJoined: sn.TrusteesJoined,
 		},

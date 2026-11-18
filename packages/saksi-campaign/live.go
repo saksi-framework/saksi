@@ -165,6 +165,18 @@ type liveState struct {
 
 func (st *liveState) stateIndex() int { return liveStateIndex(st.State) }
 
+// minBallotRecords is the console's figure for the fewest ballot records an
+// election with positions positions can be decrypted over: --live-min-ballots
+// for each position (a voter's ballot is one record per position), the same
+// rule the trustee process applies with its own --min-ballots. It is shown
+// from open on (0, left out of the JSON, before that and when abandoned).
+func (L *liveService) minBallotRecords(state string, positions int) int {
+	if liveStateIndex(state) < liveStateIndex(LiveOpen) {
+		return 0
+	}
+	return L.minBallots * positions
+}
+
 func liveStateIndex(s string) int {
 	for i, x := range []string{LiveSetup, LiveCeremony, LiveOpen, LiveClosed, LiveTallied, LiveVerified} {
 		if x == s {
@@ -266,6 +278,8 @@ type LiveOptions struct {
 	Now func() time.Time
 	// Precinct is --live-precinct; "" = DefaultLivePrecinct.
 	Precinct string
+	// MinBallots is --live-min-ballots; 0 = DefaultMinBallots.
+	MinBallots int
 }
 
 // liveService is the console's one live election.
@@ -302,6 +316,10 @@ type liveService struct {
 
 	// precinct is the --live-precinct value new elections are set up with.
 	precinct string
+	// minBallots is --live-min-ballots: the console's own figure for the
+	// fewest ballot records per position decryption needs. The trustee
+	// processes apply their own --min-ballots; nothing checks the two agree.
+	minBallots int
 	// ckMu guards ck, the current election's voter list and check-in record
 	// (live_checkin.go). Lock order: issueMu, then mu, then ckMu; ckMu is
 	// never held while taking another.
@@ -336,12 +354,20 @@ func (s *Server) EnableLive(o LiveOptions) error {
 	if !ValidPrecinct(precinct) {
 		return fmt.Errorf("--live-precinct %q: a precinct is four digits and a capital letter, like %s", precinct, DefaultLivePrecinct)
 	}
+	minBallots := o.MinBallots
+	if minBallots == 0 {
+		minBallots = DefaultMinBallots
+	}
+	if minBallots < 1 {
+		return fmt.Errorf("--live-min-ballots %d: at least 1", minBallots)
+	}
 	L := &liveService{
 		s: s, root: s.store.Root(), tokens: tokens,
 		run: o.Runner, dial: o.Dial, now: o.Now,
 		limit:       newRateLimiter(5, 30),
 		ledgerLimit: newRateLimiter(2, 10),
 		precinct:    precinct,
+		minBallots:  minBallots,
 		findLimit:   newAddrLimiter(findPerSec, findBurst, findMaxAddrs),
 	}
 	if L.run == nil {

@@ -264,6 +264,8 @@ type liveFixture struct {
 	// phones holds each test phone's saksi_checkin cookie, across console
 	// restarts, as a phone's browser would.
 	phones map[string]string
+	// minBallots is the console's --live-min-ballots (0 = the default).
+	minBallots int
 }
 
 func newLiveFixture(t *testing.T) *liveFixture {
@@ -306,7 +308,7 @@ func (fx *liveFixture) console() *liveConsole {
 		fx.t.Fatal(err)
 	}
 	if err := s.EnableLive(LiveOptions{TrusteeTokens: fx.tokFile, Runner: fx.ops.run,
-		Dial: func() (liveChain, error) { return fx.chain, nil }}); err != nil {
+		Dial: func() (liveChain, error) { return fx.chain, nil }, MinBallots: fx.minBallots}); err != nil {
 		fx.t.Fatal(err)
 	}
 	return &liveConsole{t: fx.t, s: s, fx: fx, sessions: map[string]string{}}

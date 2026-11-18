@@ -30,6 +30,14 @@ saksi-campaign serve --live --auth-file accounts.json --trustee-tokens tokens.js
   (four digits and a capital letter; default `0001A`). See
   `voter-list-api.md`.
 
+- `--live-min-ballots` (default `2`, the same default as the trustee
+  process's `--min-ballots`) is the console's figure for the fewest ballot
+  records **per position** decryption needs; the views show it times the
+  number of positions as `min_ballot_records`. The console does not learn the
+  trustees' `--min-ballots` and nothing checks the two agree: start the
+  console with the trustees' value (the kit starts both with the default).
+  Below 1 is refused at start.
+
 - `--tls-cert` and `--tls-key` together serve HTTPS (TLS 1.2 minimum). The
   session cookie is then `Secure`.
 - With `--live`, a client has 10 seconds to send a request's headers and 30
@@ -299,7 +307,7 @@ Everything the phone's wasm needs, and the counts:
  "precinct": "0001A", "precinct_label": "Precinct 0001A (demonstration)",
  "voter_list_fingerprint": "<64 hex>", "voter_list_fingerprint_short": "<16 hex>",
  "counts": {"voters_on_roll": 3, "voters_on_list": 3, "checked_in": 3, "credentials_issued": 3,
-            "ballot_records": 6, "ballot_records_source": "chain",
+            "ballot_records": 6, "ballot_records_source": "chain", "min_ballot_records": 4,
             "trustees_decrypted": 3, "tally_signatures": 3, "trustees_joined": 5},
  "lifecycle": {"CreateElection": {"tx_id": "...", "block_number": 390}, "...": {}},
  "totals": [2,1,0,0,1,2],                     "(once tallied)"
@@ -316,7 +324,17 @@ every 2 seconds and shared by this view and the board, so a count shown can be
 up to 2 seconds old (a failed or timed-out read is reused for the same 2
 seconds). Only one chain read runs at a time and no request waits for it: while
 one is in flight, a request gets the last count read (older than 2 seconds if
-the chain is slow), or the console's own count if none was read yet. `trustees_decrypted` counts
+the chain is slow), or the console's own count if none was read yet. `min_ballot_records` is **the
+console's figure** for the fewest ballot records decryption needs:
+`--live-min-ballots` times the number of positions (a voter's ballot is one
+record per position), the same rule each trustee process applies with its own
+`--min-ballots`, which the console does not see or check. It is present from
+`open` on and left out before `open` and when `abandoned`. It is reported only:
+the console does not refuse Close below it and changes no state on it. **A
+closed election with fewer ballot records than this cannot be decrypted** (the
+chain takes no ballot after `CloseElection`, and the trustee processes refuse
+Decrypt), and no route ends it: `abandon` is refused after `ceremony`, so the
+only way on is `tools/live-reset.sh`. `trustees_decrypted` counts
 trustees with a partial recorded for every contest. `trustees_joined` counts
 trustees whose receive key is in the key ceremony's roster: 0 after setup, the
 trustee count once the roster is complete, and unchanged for the rest of the
@@ -641,7 +659,7 @@ Added for live runs only, under `live`:
           "voter_list_fingerprint": "<64 hex>", "voter_list_fingerprint_short": "<16 hex>",
           "voter_list_note": "The list is kept by the election console. It is not written to the ledger.",
           "counts": {"voters_on_roll": 3, "voters_on_list": 3, "checked_in": 3, "credentials_issued": 3, "ballot_records": 6,
-                     "ballot_records_source": "chain", "trustees_decrypted": 3, "tally_signatures": 3,
+                     "ballot_records_source": "chain", "min_ballot_records": 4, "trustees_decrypted": 3, "tally_signatures": 3,
                      "trustees_joined": 5},
           "decryption": {"trustees_decrypted": 3, "threshold": 3, "trustees": 5,
                          "decrypted": [1,2,3], "tally_signatures": [1,2,3]},
@@ -651,6 +669,11 @@ Added for live runs only, under `live`:
           "totals": [2,1,0,0,1,2], "contest_ids": ["president/alice", "..."],
           "verify_overall": "pass", "failed_checks": []}}
 ```
+
+`live.counts` has the election view's fields and rules, `min_ballot_records`
+included (the console's figure, from `open` on; a closed election under it
+cannot be decrypted and can only be reset). On a past run's board it is the
+console's current `--live-min-ballots` times that run's positions.
 
 Each ballot's `ballot_fingerprint` is of the bytes the chain returned, next to
 its tracking code. `GET /api/verify-code/<run>/<code>` works on a live run as

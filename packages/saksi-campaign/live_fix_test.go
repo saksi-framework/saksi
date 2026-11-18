@@ -1036,3 +1036,72 @@ func TestLiveChainCountReadsAgainAfterAPanic(t *testing.T) {
 		t.Fatal("the chain was not read again after the panic")
 	}
 }
+
+// Rehearsal 5 I1/I2: the election view and the board carry the console's
+// figure for the fewest ballot records decryption needs (--live-min-ballots
+// for each position), from open on, beside the ballot-record count. The
+// console only reports it: Close is not refused below it.
+func TestLiveViewsCarryTheDecryptionMinimum(t *testing.T) {
+	for _, tc := range []struct {
+		minBallots, want int
+	}{{0, 4}, {3, 6}} {
+		fx := newLiveFixture(t)
+		fx.minBallots = tc.minBallots
+		c := fx.console()
+		views := func(runID string) (map[string]any, map[string]any) {
+			el := c.ok(http.MethodGet, "/api/live/election", "", nil)["counts"].(map[string]any)
+			board := c.ok(http.MethodGet, "/api/board/"+runID, "", nil)
+			live, _ := board["live"].(map[string]any)
+			if live == nil {
+				t.Fatalf("board has no live part: %v", board)
+			}
+			return el, live["counts"].(map[string]any)
+		}
+		runID := c.toState(LiveCeremony)
+		el, bd := views(runID)
+		if _, ok := el["min_ballot_records"]; ok {
+			t.Fatalf("election view in ceremony has min_ballot_records: %v", el)
+		}
+		if _, ok := bd["min_ballot_records"]; ok {
+			t.Fatalf("board in ceremony has min_ballot_records: %v", bd)
+		}
+		c.ceremony(runID)
+		c.issue("voter1")
+		c.ok(http.MethodPost, "/api/live/ballot", "", map[string]string{"ballot": fakeBallot(runID, "president", 1, nil)})
+		for _, state := range []string{LiveOpen, LiveClosed} {
+			if state == LiveClosed {
+				// Below the minimum: Close is still taken.
+				c.ok(http.MethodPost, "/api/live/close", "admin", nil)
+			}
+			if c.state() != state {
+				t.Fatalf("state %s, want %s", c.state(), state)
+			}
+			el, bd := views(runID)
+			for name, counts := range map[string]map[string]any{"election view": el, "board": bd} {
+				if got, _ := counts["min_ballot_records"].(float64); int(got) != tc.want {
+					t.Fatalf("--live-min-ballots %d, %s at %s: min_ballot_records %v, want %d", tc.minBallots, name, state, counts["min_ballot_records"], tc.want)
+				}
+				if _, ok := counts["ballot_records"]; !ok {
+					t.Fatalf("%s at %s: no ballot_records beside the minimum", name, state)
+				}
+			}
+		}
+	}
+}
+
+// A console started with a minimum under 1 is refused: the figure is a
+// promise about decryption, so it is never 0.
+func TestLiveMinBallotsOptionMustBePositive(t *testing.T) {
+	fx := newLiveFixture(t)
+	fx.minBallots = -1
+	store := NewRunStore(fx.runs)
+	hub := NewHub()
+	exec := NewExecutor(store, hub, "saksi-demo", "", FabricConfig{})
+	s := NewServer(store, exec, hub, FabricConfig{}, nil, time.Minute)
+	if err := s.EnableAuth(fx.users); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.EnableLive(LiveOptions{TrusteeTokens: fx.tokFile, Runner: fx.ops.run, MinBallots: -1}); err == nil {
+		t.Fatal("--live-min-ballots -1 was taken")
+	}
+}
