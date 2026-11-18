@@ -502,15 +502,16 @@ const (
 	// (refused, or still running): this trustee does not sign.
 	signingNotDecrypted = "not_decrypted"
 	// signingWaiting: Decrypt is done; waiting for threshold trustees'
-	// partials and this trustee's own combine (or for the console, while it
-	// does not answer).
+	// partials and this trustee's own combine, or retrying a sign attempt
+	// that failed for a transient cause (sign_problem says which).
 	signingWaiting = "waiting"
 	// signingSigning: the combine is ready; it is signing and posting.
 	signingSigning = "signing"
 	// signingSigned: its signature is posted.
 	signingSigned = "signed"
-	// signingRetry: the signature did not happen for a reason a retry can
-	// cure (sign_problem says which); the Sign tally press retries it.
+	// signingRetry: the signature did not happen (sign_problem says why):
+	// the transient retries are used up, or the cause was not transient; the
+	// Sign tally press retries it.
 	signingRetry = "retry"
 	// signingRefused: the process refused to sign (the ballot set changed
 	// since the combine); no press is offered.
@@ -521,17 +522,25 @@ const (
 	signingNotNeeded = "not_needed"
 )
 
-// tally.sign_problem: why the signature has not happened.
+// tally.sign_problem: why the signature has not happened. A transient cause
+// (see signTransient) is tried again by itself, up to signMaxAttempts
+// attempts in all, while signing is "waiting"; only then is the step failed
+// and the Sign tally press offered ("retry"). A cause that is not transient
+// fails at once and offers the press.
 const (
 	// signProblemConsole: the console did not answer the post (or answered
-	// 502, 503 or 504). The process tries again by itself; no press.
+	// 502, 503 or 504). Transient.
 	signProblemConsole = "console_unreachable"
-	// signProblemPost: the console answered the post with an error a retry
-	// may cure (anything but a 400, which is alarm tally-totals). Press.
+	// signProblemPost: the console answered the post with an error other
+	// than a 400 (which is alarm tally-totals). Transient for a 5xx and for
+	// the 409 "changed while the signature was being checked"; not for any
+	// other answer.
 	signProblemPost = "post_failed"
-	// signProblemChain: the chain could not be read for the signature. Press.
+	// signProblemChain: the chain could not be read for the signature.
+	// Transient.
 	signProblemChain = "chain_unreadable"
-	// signProblemError: anything else (for example sign-tally failed). Press.
+	// signProblemError: anything else (for example sign-tally failed). Not
+	// transient.
 	signProblemError = "error"
 )
 
