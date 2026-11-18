@@ -344,6 +344,18 @@ type liveService struct {
 	findLimit *addrLimiter
 	// counts is the chain count the public reads share (live_tally.go).
 	counts chainCountCache
+
+	// verifyMu guards verifyCall and auto (live_tally.go). Lock order: mu,
+	// then verifyMu; verifyMu is never held while taking another lock.
+	verifyMu sync.Mutex
+	// verifyCall is the verify-live run in flight, or nil: a press that
+	// arrives during a run waits for it and answers its result.
+	verifyCall *liveVerifyCall
+	// auto is the automatic verification's status for the run autoRun.
+	auto    LiveAutoVerify
+	autoRun string
+	// bg counts background work (the automatic verification).
+	bg sync.WaitGroup
 }
 
 // EnableLive turns on the live routes. Call it after EnableAuth: the
@@ -413,6 +425,14 @@ func (s *Server) EnableLive(o LiveOptions) error {
 			// POST elections.
 			log.Printf("live: resume %s: %v", L.st.RunID, err)
 		}
+		// Tallied with no verification result (the console stopped before
+		// or during the automatic run, or the run failed to give a verdict):
+		// start it again, once.
+		L.mu.Lock()
+		if L.st.State == LiveTallied && L.st.VerifyOverall == "" {
+			L.startAutoVerifyLocked()
+		}
+		L.mu.Unlock()
 	}
 	return nil
 }

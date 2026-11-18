@@ -78,8 +78,9 @@ func TestLiveBoardAndViewReadWhileTrusteesPost(t *testing.T) {
 	if polls.Load() == 0 {
 		t.Fatal("the pollers never ran")
 	}
-	if c.state() != LiveTallied {
-		t.Fatalf("state %s, want tallied", c.state())
+	// Tallied, then verified by itself.
+	if s := c.state(); s != LiveTallied && s != LiveVerified {
+		t.Fatalf("state %s, want tallied or verified", s)
 	}
 	board := c.ok(http.MethodGet, "/api/board/"+runID, "", nil)
 	dec := board["live"].(map[string]any)["decryption"].(map[string]any)
@@ -240,7 +241,7 @@ func TestLiveTallyAlreadyOnTheChain(t *testing.T) {
 		t.Fatalf("auto-publish with a lost receipt: %v, state %s", out, c.state())
 	}
 	pub := c.ok(http.MethodPost, "/api/live/tally/publish", "admin", nil)
-	if pub["already_on_chain"] != true || c.state() != LiveTallied {
+	if s := c.state(); pub["already_on_chain"] != true || (s != LiveTallied && s != LiveVerified) {
 		t.Fatalf("publish after a lost receipt: %v, state %s", pub, c.state())
 	}
 

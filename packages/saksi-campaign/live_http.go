@@ -650,8 +650,12 @@ type LiveElectionView struct {
 	Lifecycle                 map[string]LiveTx `json:"lifecycle"`
 	Totals                    []uint64          `json:"totals,omitempty"`
 	VerifyOverall             string            `json:"verify_overall,omitempty"`
-	CreatedAt                 time.Time         `json:"created_at"`
-	UpdatedAt                 time.Time         `json:"updated_at"`
+	// AutoVerify is the automatic verification started when the tally was
+	// published (or at a start that found it tallied with no verdict); null
+	// when none ran since this console started.
+	AutoVerify *LiveAutoVerify `json:"auto_verify"`
+	CreatedAt  time.Time       `json:"created_at"`
+	UpdatedAt  time.Time       `json:"updated_at"`
 }
 
 // electionView is GET /api/live/election, built from the public snapshot: it
@@ -669,7 +673,7 @@ func (L *liveService) electionViewOf(sn *liveSnapshot) LiveElectionView {
 		DKG: sn.DKG, JointPublicKey: sn.JointPublicKey, JointKeyFingerprint: sn.JointKeyFingerprint,
 		VerificationKeys: sn.VerificationKeys, RosterFingerprint: sn.RosterFingerprint,
 		CeremonyError: sn.CeremonyError, Lifecycle: sn.Lifecycle,
-		Totals: sn.Totals, VerifyOverall: sn.VerifyOverall,
+		Totals: sn.Totals, VerifyOverall: sn.VerifyOverall, AutoVerify: L.autoVerifyOf(sn.RunID),
 		CreatedAt: sn.CreatedAt, UpdatedAt: sn.UpdatedAt,
 		Counts: LiveCounts{
 			VotersOnRoll: sn.VotersOnList, VotersOnList: sn.VotersOnList, CredentialsIssued: sn.Issued,

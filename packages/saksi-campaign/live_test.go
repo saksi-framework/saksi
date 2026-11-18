@@ -47,7 +47,9 @@ type fakeOps struct {
 	slow        time.Duration // each issuance op sleeps this long
 	signed      []string      // the nonce each issue-sign consumed
 	nonce       int
-	verify      string // verify-live overall; "" = pass
+	verify      string // verify-live overall; "" = pass, "error" = the op fails
+	// verifyGate, when set, holds every verify-live until it is closed.
+	verifyGate chan struct{}
 	// roster makes dkg-roster fail: "fail" is an op error, "no-digest" an
 	// answer without a roster digest; "" = a normal roster.
 	roster string
@@ -181,8 +183,14 @@ func (f *fakeOps) run(_ context.Context, op string, input []byte) ([]byte, error
 		out = map[string]any{"tally": hex.EncodeToString(raw), "totals": totals, "signatures": len(tr.Signatures)}
 	case "verify-live":
 		f.mu.Lock()
-		v := f.verify
+		v, gate := f.verify, f.verifyGate
 		f.mu.Unlock()
+		if gate != nil {
+			<-gate
+		}
+		if v == "error" {
+			return nil, &liveOpError{op, "fake verify-live failure"}
+		}
 		if v == "" {
 			v = "pass"
 		}
@@ -266,6 +274,8 @@ type liveFixture struct {
 	phones map[string]string
 	// minBallots is the console's --live-min-ballots (0 = the default).
 	minBallots int
+	// consoles is every console started over the fixture.
+	consoles []*liveService
 }
 
 func newLiveFixture(t *testing.T) *liveFixture {
@@ -297,9 +307,14 @@ func newLiveFixture(t *testing.T) *liveFixture {
 	return fx
 }
 
-// console starts a console over the fixture: a restart is a second call.
+// console starts a console over the fixture: a restart is a second call. The
+// previous console's background work (an automatic verification) finishes
+// first, as it would before a real process exits.
 func (fx *liveFixture) console() *liveConsole {
 	fx.t.Helper()
+	for _, prev := range fx.consoles {
+		prev.waitBackground()
+	}
 	store := NewRunStore(fx.runs)
 	hub := NewHub()
 	exec := NewExecutor(store, hub, "saksi-demo", "", FabricConfig{})
@@ -311,7 +326,29 @@ func (fx *liveFixture) console() *liveConsole {
 		Dial: func() (liveChain, error) { return fx.chain, nil }, MinBallots: fx.minBallots}); err != nil {
 		fx.t.Fatal(err)
 	}
+	fx.consoles = append(fx.consoles, s.live)
+	fx.t.Cleanup(s.live.waitBackground)
 	return &liveConsole{t: fx.t, s: s, fx: fx, sessions: map[string]string{}}
+}
+
+// verifyCalls is how many times verify-live ran.
+func (f *fakeOps) verifyCalls() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	n := 0
+	for _, op := range f.calls {
+		if op == "verify-live" {
+			n++
+		}
+	}
+	return n
+}
+
+// setVerify sets verify-live's outcome ("" pass, "fail", "error").
+func (f *fakeOps) setVerify(v string) {
+	f.mu.Lock()
+	f.verify = v
+	f.mu.Unlock()
 }
 
 type liveConsole struct {
@@ -546,9 +583,16 @@ func (c *liveConsole) toState(want string) string {
 	}
 	c.partials(1, liveContests)
 	c.partials(2, liveContests)
+	if want == LiveTallied {
+		// The console verifies by itself on publication; a failed verdict is
+		// what leaves an election tallied.
+		c.fx.ops.setVerify("fail")
+	}
 	c.ok(http.MethodPost, "/api/live/tally-sig", c.tok(1), map[string]any{"totals": []int{1, 0, 0, 1}, "signature": sig(1)})
 	c.ok(http.MethodPost, "/api/live/tally-sig", c.tok(2), map[string]any{"totals": []int{1, 0, 0, 1}, "signature": sig(2)})
+	c.s.live.waitBackground()
 	if want == LiveTallied {
+		c.fx.ops.setVerify("")
 		return runID
 	}
 	c.ok(http.MethodPost, "/api/live/verify", "admin", nil)
@@ -777,10 +821,15 @@ func TestLiveHappyPathAndWrongStates(t *testing.T) {
 		t.Fatal("a second signature from one trustee was accepted")
 	}
 	out = c.ok(http.MethodPost, "/api/live/tally-sig", c.tok(2), map[string]any{"totals": []int{1, 0, 0, 1}, "signature": sig(2)})
-	if out["published"] != true || c.state() != LiveTallied {
+	if out["published"] != true || out["state"] != LiveTallied {
 		t.Fatalf("at threshold: %v (%s)", out, c.state())
 	}
 	c.wantJoined(runID, 3)
+	// The console verifies by itself; the press below re-verifies.
+	c.s.live.waitBackground()
+	if c.state() != LiveVerified {
+		t.Fatalf("state %s after the automatic verification", c.state())
+	}
 	ver := c.ok(http.MethodPost, "/api/live/verify", "admin", nil)
 	if ver["overall"] != "pass" || c.state() != LiveVerified {
 		t.Fatalf("verify: %v", ver)
@@ -1021,8 +1070,8 @@ func TestLiveRefusedPublishChangesNothing(t *testing.T) {
 		t.Fatal("a refused publish changed the run")
 	}
 	// The verifier failing leaves the election tallied, not verified.
+	fx.ops.setVerify("fail")
 	c.ok(http.MethodPost, "/api/live/tally-sig", c.tok(2), map[string]any{"totals": []int{1, 0, 0, 1}, "signature": sig(2)})
-	fx.ops.verify = "fail"
 	ver := c.ok(http.MethodPost, "/api/live/verify", "admin", nil)
 	if ver["overall"] != "fail" || c.state() != LiveTallied {
 		t.Fatalf("failed verify: %v %s", ver["overall"], c.state())

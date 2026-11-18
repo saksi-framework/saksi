@@ -637,6 +637,7 @@ func (L *liveService) publishLocked(ctx context.Context, led *LiveLedger, totals
 	if err := L.save(); err != nil {
 		return nil, err
 	}
+	L.startAutoVerifyLocked()
 	return map[string]any{"published": true, "totals": a.Totals, "signatures_used": len(sigs),
 		"tx_id": rc.TxID, "block_number": rc.BlockNumber}, nil
 }
@@ -668,6 +669,7 @@ func (L *liveService) tallyOnChainLocked(a *liveAssembled) (map[string]any, erro
 	if err := L.save(); err != nil {
 		return nil, err
 	}
+	L.startAutoVerifyLocked()
 	return map[string]any{"published": true, "already_on_chain": true, "totals": totals}, nil
 }
 
@@ -708,10 +710,110 @@ func (L *liveService) publishNow(ctx context.Context) (map[string]any, error) {
 
 // --- verification ------------------------------------------------------------------------
 
-// verify runs verify-live over the election read back from the chain, with
+// The console verifies by itself: as soon as the tally is published (and
+// again, once, at a start that finds the election tallied with no verdict),
+// it runs the same verification a POST /api/live/verify runs. A pass moves
+// the state to verified; a failed verdict is recorded as a press records it
+// and the state stays tallied; an error records nothing but auto_verify's
+// error, and the press retries. Only one verify-live run is in flight at a
+// time: a press during a run waits for it and answers its result.
+
+// liveAutoVerifyTimeout bounds the automatic run, as liveCtx bounds a press.
+const liveAutoVerifyTimeout = liveOpTimeout
+
+// The automatic verification's states (auto_verify.state).
+const (
+	autoVerifyRunning = "running" // the automatic run is in flight
+	autoVerifyDone    = "done"    // it gave a verdict: verify_overall says which
+	autoVerifyError   = "error"   // it gave no verdict: auto_verify.error says why
+)
+
+// LiveAutoVerify is the election view's auto_verify: the automatic
+// verification of the current election. It is not saved: a console restart
+// shows none until it starts one again.
+type LiveAutoVerify struct {
+	State string    `json:"state"`
+	Error string    `json:"error,omitempty"`
+	At    time.Time `json:"at"`
+}
+
+// liveVerifyCall is one verify-live run.
+type liveVerifyCall struct {
+	done chan struct{}
+	out  map[string]any
+	err  error
+}
+
+// startAutoVerifyLocked starts the automatic verification of the current
+// election in the background. Caller holds mu, with the state just set to
+// tallied.
+func (L *liveService) startAutoVerifyLocked() {
+	runID := L.st.RunID
+	L.setAutoVerify(runID, LiveAutoVerify{State: autoVerifyRunning, At: L.now().UTC()})
+	L.bg.Add(1)
+	go func() {
+		defer L.bg.Done()
+		ctx, cancel := context.WithTimeout(context.Background(), liveAutoVerifyTimeout)
+		defer cancel()
+		_, err := L.verify(ctx)
+		a := LiveAutoVerify{State: autoVerifyDone, At: L.now().UTC()}
+		if err != nil {
+			a.State, a.Error = autoVerifyError, err.Error()
+			log.Printf("live: %s automatic verification gave no verdict: %v", runID, err)
+		}
+		L.setAutoVerify(runID, a)
+	}()
+}
+
+func (L *liveService) setAutoVerify(runID string, a LiveAutoVerify) {
+	L.verifyMu.Lock()
+	L.auto, L.autoRun = a, runID
+	L.verifyMu.Unlock()
+}
+
+// autoVerifyOf is the automatic verification's status for runID, or nil.
+func (L *liveService) autoVerifyOf(runID string) *LiveAutoVerify {
+	L.verifyMu.Lock()
+	defer L.verifyMu.Unlock()
+	if L.autoRun != runID || L.auto.State == "" {
+		return nil
+	}
+	a := L.auto
+	return &a
+}
+
+// waitBackground waits for the background work (tests, and a clean stop).
+func (L *liveService) waitBackground() { L.bg.Wait() }
+
+// verify is POST /api/live/verify and the automatic run: one verify-live run
+// at a time. A call while a run is in flight waits for that run and answers
+// its result instead of starting another.
+func (L *liveService) verify(ctx context.Context) (map[string]any, error) {
+	L.verifyMu.Lock()
+	if c := L.verifyCall; c != nil {
+		L.verifyMu.Unlock()
+		select {
+		case <-c.done:
+			return c.out, c.err
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	c := &liveVerifyCall{done: make(chan struct{})}
+	L.verifyCall = c
+	L.verifyMu.Unlock()
+	c.out, c.err = L.verifyRun(ctx)
+	L.verifyMu.Lock()
+	L.verifyCall = nil
+	L.verifyMu.Unlock()
+	close(c.done)
+	return c.out, c.err
+}
+
+// verifyRun runs verify-live over the election read back from the chain, with
 // expected_ballots the chain's nullifier count, and moves to verified only on
 // a pass.
-func (L *liveService) verify(ctx context.Context) (map[string]any, error) {
+func (L *liveService) verifyRun(ctx context.Context) (map[string]any, error) {
 	L.mu.Lock()
 	if err := L.inState(LiveTallied, LiveVerified); err != nil {
 		L.mu.Unlock()
