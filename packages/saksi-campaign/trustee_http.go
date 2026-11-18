@@ -353,6 +353,13 @@ func (T *TrusteeService) enoughBallotRecords() error {
 // been pressed here and finished.
 func (T *TrusteeService) RequestSign(totals []uint64) error {
 	return T.request("sign", func(p *trusteeProgress) error {
+		if v := T.view; v == nil || v.ElectionID != p.ElectionID || v.State != LiveClosed {
+			state := "not known yet"
+			if v != nil && v.ElectionID == p.ElectionID {
+				state = v.State
+			}
+			return fmt.Errorf("the election is %s: a tally is signed only while the election is closed", state)
+		}
 		if !p.signEligible() {
 			return errors.New(signNoDecryptDetail + ": a trustee signs only the tally of an election it decrypted")
 		}
@@ -641,7 +648,7 @@ func (T *TrusteeService) Status() TrusteeStatus {
 	if t.Signing == signingRetry || t.Signing == signingWaiting || t.Signing == signingSigning {
 		t.SignProblem = p.SignProblem
 	}
-	t.ReadyToSign = t.Signing == signingRetry && len(p.Totals) > 0
+	t.ReadyToSign = t.Signing == signingRetry && len(p.Totals) > 0 && v != nil && v.State == LiveClosed
 	t.Published = p.TallyPublished
 	if p.TallyPublished {
 		t.PublishedTotals = slices.Clone(p.TallyTotals)

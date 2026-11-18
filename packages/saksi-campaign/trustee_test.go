@@ -1720,6 +1720,23 @@ func TestTrusteeSignTextAfterThePublishedTally(t *testing.T) {
 			t.Fatalf("trustee %d: the current step is still sign after publication", id)
 		}
 	}
+	// A failed sign step after publication (an abandon or any other way) is
+	// not offered for a retry, and the press is refused: signing happens only
+	// while the election is closed.
+	if err := f.procs[0].T.update(func(p *trusteeProgress) {
+		p.Steps["sign"] = stepStatus{State: stepFailed, Error: "test"}
+		p.SignaturePosted = false
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if st := f.status(1); st.Tally.Signing != signingRetry || st.Tally.ReadyToSign {
+		t.Fatalf("a failed sign step after publication: %+v", st.Tally)
+	}
+	st := f.status(1)
+	if code, out := f.call(f.procs[0], http.MethodPost, "/api/trustee/sign", map[string]any{"totals": st.Tally.Totals}); code != http.StatusConflict ||
+		!strings.Contains(fmt.Sprint(out["error"]), "only while the election is closed") {
+		t.Fatalf("sign press after publication: %d %v", code, out)
+	}
 }
 
 // Rehearsal 4 m1: an election closed with fewer ballot records than

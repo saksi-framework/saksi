@@ -470,7 +470,7 @@ Fields:
 | `tally.totals` | This trustee's own combine, in `contest_ids` order; `[]` until it ran. |
 | `tally.signing` | Where this trustee's own signature stands, in this order of precedence: `signed` (its signature is posted); `blocked` (an alarm blocks signing; no signature is made, no press offered); `not_needed` (the tally was published before this trustee signed: it did not decrypt in time, or others signed first); `not_decrypted` (Decrypt was not pressed here, or it was refused or has not finished: **this trustee does not sign**, and a press is refused); `refused` (the process refused to sign: the ballot set changed since the combine; no press offered); `retry` (a sign attempt failed for a reason a retry can cure: **show Sign tally**); `signing` (its combine is ready; it is signing and posting by itself); `waiting` (Decrypt is done; waiting for `threshold` trustees' partials and its own combine, or for the console to answer). |
 | `tally.sign_problem` | Present only while `signing` is `retry`, `waiting` or `signing`, after an attempt that did not post: `console_unreachable` (no answer, or 502/503/504: **the process posts again by itself**, no press); `post_failed` (the console answered the post with another error); `chain_unreadable` (the chain could not be read for the signature); `error` (anything else, for example `sign-tally` failed). The last three come with `signing` `retry`; `steps.sign.error` has the words. |
-| `tally.ready_to_sign` | **True only when Sign tally may be pressed**: `signing` is `retry` (the sign step `failed`) and the totals are shown. A page shows the Sign tally button only then. It is false in every other case, including all the normal ones: the signature is made without a press. |
+| `tally.ready_to_sign` | **True only when Sign tally may be pressed**: `signing` is `retry` (the sign step `failed`), the totals are shown, and `election.state` is `closed`. A page shows the Sign tally button only then. It is false in every other case, including all the normal ones: the signature is made without a press. |
 | `tally.matches` | `null` until both the published tally and this trustee's combine are known; then whether they are equal. |
 
 ### `POST /api/trustee/join`, `POST /api/trustee/decrypt`
@@ -502,6 +502,8 @@ same sign step again, with every check (it is never a way around one), and
 posts the saved signature if one was made. **202** with the status body.
 **409**, before anything starts:
 - `blocked by an alarm: ...` when an alarm blocks signing;
+- `the election is <state>: a tally is signed only while the election is
+  closed` unless the console's election view (`election.state`) is `closed`;
 - `this trustee did not decrypt this election, so it does not sign: ...` when
   Decrypt was not pressed here or did not finish;
 - when there are no totals yet, or they differ from this trustee's own
