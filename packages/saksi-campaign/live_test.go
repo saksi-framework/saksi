@@ -52,6 +52,9 @@ type fakeOps struct {
 	verifyGate chan struct{}
 	// combineFail makes combine fail, as it does below the threshold.
 	combineFail bool
+	// assembleRunFail makes the next tally-assemble runs fail to run (a
+	// crash), this many times.
+	assembleRunFail int
 	// roster makes dkg-roster fail: "fail" is an op error, "no-digest" an
 	// answer without a roster digest; "" = a normal roster.
 	roster string
@@ -174,6 +177,15 @@ func (f *fakeOps) run(_ context.Context, op string, input []byte) ([]byte, error
 		}
 		out["totals"] = []uint64{1, 0, 0, 1}
 	case "tally-assemble":
+		f.mu.Lock()
+		crash := f.assembleRunFail > 0
+		if crash {
+			f.assembleRunFail--
+		}
+		f.mu.Unlock()
+		if crash {
+			return nil, &liveRunError{op, "signal: killed"}
+		}
 		for _, sg := range in["signatures"].([]any) {
 			if sg.(map[string]any)["signature"] == strings.Repeat("ba", 64) {
 				return nil, &liveOpError{op, "tally signature from trustee does not verify"}

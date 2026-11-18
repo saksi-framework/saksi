@@ -410,6 +410,11 @@ func (L *liveService) finishCeremonyLocked(ctx context.Context) error {
 		}
 		var raw json.RawMessage
 		if err := L.opJSON(ctx, "dkg-transcript", map[string]any{"params": st.Params, "dealers": dealers}, &raw); err != nil {
+			if isRunFailure(err) {
+				// Not a refusal of the transcript: nothing is recorded, and
+				// the next acknowledgement post (or a restart) tries again.
+				return err
+			}
 			st.CeremonyError = err.Error()
 			_ = L.save()
 			return conflictf("the transcript was refused: %v", err)

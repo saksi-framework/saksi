@@ -545,7 +545,10 @@ digest once this trustee computed it, the ballot set once it read it.
 
 ## Alarms
 
-An alarm is something a check caught. It is shown in `alarms` with the steps it
+An alarm is something a check caught. An op that did not run to an answer
+(it crashed, was killed, timed out or could not start, so it gave no
+`{"error"}`) never raises an alarm: the step fails (or, for the signature,
+retries by itself) and is pressed again. It is shown in `alarms` with the steps it
 blocks, and a blocked button answers 409. It stays until the election changes;
 the way past one is the presenter abandoning the ceremony (before voting) or
 investigating.

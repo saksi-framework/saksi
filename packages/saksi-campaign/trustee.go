@@ -1190,6 +1190,9 @@ func (T *TrusteeService) takeRoster(ctx context.Context) error {
 		RosterFingerprint string `json:"roster_fingerprint"`
 	}
 	if err := T.op(ctx, "dkg-roster", map[string]any{"params": p.Params, "peers": r.Peers}, &dr); err != nil {
+		if isRunFailure(err) {
+			return err // dkg-roster did not run: no alarm; join fails and is pressed again
+		}
 		return tAlarm{"roster", "the roster is refused: " + err.Error(), []string{"join", "decrypt", "sign"}}
 	}
 	if !strings.EqualFold(dr.RosterDigest, r.RosterDigest) {

@@ -699,7 +699,11 @@ combined itself from the on-chain partials. The console checks it with
 `tally-assemble` over the chain's ballots and partials (the totals must be
 what the partials decrypt to, and the signature must verify) before keeping
 it: 400 with the op's reason otherwise. One signature per trustee (a
-different second one is 409).
+different second one is 409). If `tally-assemble` did not run to an answer
+(it crashed, was killed, timed out or could not start: no JSON `error` from
+the op), nothing was learnt about the signature: the answer is a plain
+**500**, nothing is kept, and the trustee process tries again by itself. A
+400 always means the op refused the signature.
 
 When `threshold` signatures over the same totals are held, the console
 publishes at once (as `tally/publish`):

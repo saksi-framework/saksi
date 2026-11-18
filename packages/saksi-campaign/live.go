@@ -220,6 +220,23 @@ type liveOpError struct {
 
 func (e *liveOpError) Error() string { return e.Op + ": " + e.Msg }
 
+// liveRunError is a `saksi-demo live` op that did not run to an answer: it
+// crashed, was killed, timed out or could not be started, so stderr carries
+// no JSON {"error"}. It says nothing about the input: callers never turn it
+// into a refusal or an alarm, and a retry may succeed.
+type liveRunError struct {
+	Op  string
+	Msg string
+}
+
+func (e *liveRunError) Error() string { return e.Op + " did not run to an answer: " + e.Msg }
+
+// isRunFailure reports whether err is an op that did not run to an answer.
+func isRunFailure(err error) bool {
+	var r *liveRunError
+	return errors.As(err, &r)
+}
+
 // execLiveRunner is the production LiveRunner over the saksi-demo binary.
 func execLiveRunner(bin string) LiveRunner {
 	return func(ctx context.Context, op string, input []byte) ([]byte, error) {
@@ -231,14 +248,18 @@ func execLiveRunner(bin string) LiveRunner {
 			var body struct {
 				Error string `json:"error"`
 			}
-			msg := strings.TrimSpace(stderr.String())
 			if json.Unmarshal(stderr.Bytes(), &body) == nil && body.Error != "" {
-				msg = body.Error
+				// The op answered: it refused this input.
+				return nil, &liveOpError{Op: op, Msg: body.Error}
 			}
-			if msg == "" {
-				msg = err.Error()
+			msg := err.Error()
+			if ctx.Err() != nil {
+				msg = ctx.Err().Error()
 			}
-			return nil, &liveOpError{Op: op, Msg: msg}
+			if t := strings.TrimSpace(stderr.String()); t != "" {
+				msg += " (" + truncateErr(t) + ")"
+			}
+			return nil, &liveRunError{Op: op, Msg: msg}
 		}
 		return stdout.Bytes(), nil
 	}

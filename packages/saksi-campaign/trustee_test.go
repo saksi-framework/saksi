@@ -63,6 +63,8 @@ type fleetOptions struct {
 	minBallots func(id int) int
 	// crash hook per trustee.
 	crash func(id int, point string) bool
+	// runner wraps trustee id's op runner.
+	runner func(id int, r LiveRunner) LiveRunner
 }
 
 const trusteeTestPassword = "trustee-pw"
@@ -140,6 +142,9 @@ func newTrusteeFleet(t *testing.T, h *liveE2E, dial func(id int) func() (trustee
 		}
 		if fo.crash != nil {
 			p.opts.crash = func(point string) bool { return fo.crash(id, point) }
+		}
+		if fo.runner != nil {
+			p.opts.Runner = fo.runner(id, p.opts.Runner)
 		}
 		p.srvOpts = TrusteeServerOptions{AuthFile: authFile}
 		f.start(p)
@@ -1829,5 +1834,44 @@ func TestTrusteeReadBackRefusesAnEmptyPartial(t *testing.T) {
 	}
 	if err := T.readBackPartial(); err == nil || T.p.PartialReadBack == "ok" {
 		t.Fatalf("an empty partial read back: %v, %q", err, T.p.PartialReadBack)
+	}
+}
+
+// An op that did not run to an answer (a crash, a kill) is not a refusal: it
+// raises no alarm. Trustee 1's dkg-roster, trustee 2's dkg-receive and
+// trustee 3's dkg-transcript each crash once; their joins fail with no alarm
+// and finish when Join is pressed again.
+func TestTrusteeOpRunFailureIsNoAlarm(t *testing.T) {
+	crashOp := map[int]string{1: "dkg-roster", 2: "dkg-receive", 3: "dkg-transcript"}
+	var crashed sync.Map
+	b := newTrusteeTestBed(t, fleetOptions{runner: func(id int, r LiveRunner) LiveRunner {
+		return func(ctx context.Context, op string, in []byte) ([]byte, error) {
+			if op == crashOp[id] {
+				if _, done := crashed.LoadOrStore(id, true); !done {
+					return nil, &liveRunError{op, "signal: killed"}
+				}
+			}
+			return r(ctx, op, in)
+		}
+	}})
+	f := b.f
+	b.setup()
+	for id := 1; id <= 5; id++ {
+		f.press(id, "join", nil)
+	}
+	for id := 1; id <= 3; id++ {
+		st := f.waitFor(id, "the failed join", func(st TrusteeStatus) bool {
+			s := st.Steps["join"].State
+			return s == stepFailed || s == stepBlocked
+		})
+		if st.Steps["join"].State != stepFailed || len(st.Alarms) != 0 || !strings.Contains(st.Steps["join"].Error, "did not run to an answer") {
+			t.Fatalf("trustee %d after its %s crashed: %+v %+v", id, crashOp[id], st.Steps["join"], st.Alarms)
+		}
+		f.press(id, "join", nil)
+	}
+	for id := 1; id <= 5; id++ {
+		if st := f.waitStep(id, "join", stepDone); len(st.Alarms) != 0 || st.Ceremony.TranscriptCheck != "ok" {
+			t.Fatalf("trustee %d: %+v %+v", id, st.Alarms, st.Ceremony)
+		}
 	}
 }

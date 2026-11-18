@@ -2,11 +2,14 @@ package campaign
 
 import (
 	"bytes"
+	"context"
 	"encoding/hex"
+	"errors"
 	"net/http"
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -325,5 +328,69 @@ func TestLiveRestartIgnoresAnUnderSignedTallyOnTheChain(t *testing.T) {
 	out := c2.ok(http.MethodPost, "/api/live/tally-sig", c2.tok(2), map[string]any{"totals": []int{0, 0, 0, 0}, "signature": sig(2)})
 	if out["published"] != false || c2.state() != LiveClosed {
 		t.Fatalf("signatures over the under-signed tally's totals: %v, state %s", out, c2.state())
+	}
+}
+
+// The runner tells an op that refused (a JSON error on stderr) from one that
+// did not run to an answer (killed, crashed, not started).
+func TestExecLiveRunnerTellsARefusalFromARunFailure(t *testing.T) {
+	dir := t.TempDir()
+	script := func(name, body string) string {
+		p := filepath.Join(dir, name)
+		if err := os.WriteFile(p, []byte("#!/bin/sh\ncat >/dev/null\n"+body+"\n"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+	ctx := context.Background()
+	refuse := script("refuse", `echo '{"error":"tally signature from trustee does not verify"}' >&2; exit 1`)
+	if _, err := execLiveRunner(refuse)(ctx, "tally-assemble", []byte("{}")); !errors.As(err, new(*liveOpError)) || isRunFailure(err) {
+		t.Fatalf("a refusal: %T %v", err, err)
+	}
+	crash := script("crash", `echo 'thread main panicked' >&2; kill -SEGV $$`)
+	if _, err := execLiveRunner(crash)(ctx, "tally-assemble", []byte("{}")); !isRunFailure(err) || errors.As(err, new(*liveOpError)) {
+		t.Fatalf("a crash: %T %v", err, err)
+	}
+	plain := script("plain", `echo 'not json' >&2; exit 3`)
+	if _, err := execLiveRunner(plain)(ctx, "tally-assemble", []byte("{}")); !isRunFailure(err) {
+		t.Fatalf("an exit with no JSON error: %T %v", err, err)
+	}
+	if _, err := execLiveRunner(filepath.Join(dir, "missing"))(ctx, "tally-assemble", []byte("{}")); !isRunFailure(err) {
+		t.Fatalf("a binary that does not start: %T %v", err, err)
+	}
+	slow := script("slow", `sleep 5`)
+	tctx, cancel := context.WithTimeout(ctx, 100*time.Millisecond)
+	defer cancel()
+	if _, err := execLiveRunner(slow)(tctx, "tally-assemble", []byte("{}")); !isRunFailure(err) {
+		t.Fatalf("a timeout: %T %v", err, err)
+	}
+}
+
+// A tally-assemble that did not run while the console checks a signature is
+// a plain 500 (the trustee retries) and keeps nothing; a refusal stays 400.
+func TestLiveTallySigRunFailureIsNotARefusal(t *testing.T) {
+	fx := newLiveFixture(t)
+	c := fx.console()
+	c.toState(LiveClosed)
+	c.partials(1, liveContests)
+	c.partials(2, liveContests)
+	fx.ops.mu.Lock()
+	fx.ops.assembleRunFail = 1
+	fx.ops.mu.Unlock()
+	body := map[string]any{"totals": []int{1, 0, 0, 1}, "signature": sig(1)}
+	if code, out := c.do(http.MethodPost, "/api/live/tally-sig", c.tok(1), body); code != http.StatusInternalServerError {
+		t.Fatalf("a crashed tally-assemble: %d %v", code, out)
+	}
+	if n := len(c.s.live.snapshot().TallySignatures); n != 0 {
+		t.Fatalf("%d signatures kept after a crashed check", n)
+	}
+	if code, out := c.do(http.MethodPost, "/api/live/tally-sig", c.tok(1), map[string]any{"totals": []int{1, 0, 0, 1}, "signature": strings.Repeat("ba", 64)}); code != http.StatusBadRequest {
+		t.Fatalf("a refused signature: %d %v", code, out)
+	}
+	if out := c.ok(http.MethodPost, "/api/live/tally-sig", c.tok(1), body); out["published"] != false {
+		t.Fatalf("the retry: %v", out)
+	}
+	if n := len(c.s.live.snapshot().TallySignatures); n != 1 {
+		t.Fatalf("%d signatures kept after the retry", n)
 	}
 }

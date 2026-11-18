@@ -566,6 +566,12 @@ func (L *liveService) postTallySig(ctx context.Context, id string, body LiveTall
 		return nil, conflictf("trustee %s has signed the tally already", id)
 	}
 	if _, err := L.assemble(ctx, led, st, body.Totals, []liveSigIn{{TrusteeID: id, Signature: body.Signature}}); err != nil {
+		if isRunFailure(err) {
+			// tally-assemble did not run to an answer: nothing was learnt
+			// about the signature. A plain error (500), which the trustee
+			// retries; never a 400, which it reads as totals that differ.
+			return nil, fmt.Errorf("checking trustee %s's signature: %w", id, err)
+		}
 		return nil, badRequestf("the signature is refused: %v", err)
 	}
 	st.Signatures[id] = liveSig{Totals: body.Totals, Signature: body.Signature, At: L.now().UTC()}
@@ -711,6 +717,9 @@ func (L *liveService) publishNow(ctx context.Context) (map[string]any, error) {
 			"params": L.st.Params, "dkg": L.st.DKG,
 			"ballots": ledgerBallotHexes(led), "partials": ledgerPartialHexes(led),
 		}, &comb); err != nil {
+			if isRunFailure(err) {
+				return nil, err // combine did not run: nothing is sent
+			}
 			log.Printf("live: %s publish demonstration: the partials do not combine yet (%v); sending an unsigned tally", L.st.RunID, err)
 			return L.publishUnsignedLocked()
 		}
