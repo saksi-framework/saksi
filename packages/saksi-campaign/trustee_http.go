@@ -346,15 +346,24 @@ func (T *TrusteeService) enoughBallotRecords() error {
 	return nil
 }
 
-// RequestSign is the Sign tally button: totals must be the ones the status
-// showed, this trustee's own combine.
+// RequestSign is the Sign tally button. The signature is made by itself
+// after this trustee's own Decrypt (autoSign); the press only retries a sign
+// attempt that failed (step failed: tally.signing "retry"). Totals must be the
+// ones the status showed, this trustee's own combine, and Decrypt must have
+// been pressed here and finished.
 func (T *TrusteeService) RequestSign(totals []uint64) error {
 	return T.request("sign", func(p *trusteeProgress) error {
+		if !p.signEligible() {
+			return errors.New(signNoDecryptDetail + ": a trustee signs only the tally of an election it decrypted")
+		}
 		if len(p.Totals) == 0 {
 			return errors.New("there are no totals to sign yet: this trustee's own combine needs at least threshold trustees' partials on the chain")
 		}
 		if !slices.Equal(totals, p.Totals) {
 			return fmt.Errorf("the totals to sign must be the ones shown, this trustee's own combine %v (got %v)", p.Totals, totals)
+		}
+		if s := p.step("sign"); s.State != stepFailed {
+			return fmt.Errorf("nothing to retry: this trustee signs by itself after its Decrypt, and its sign step is %s", s.State)
 		}
 		p.SignRequested, p.SignTotals = true, slices.Clone(totals)
 		return nil
@@ -457,15 +466,84 @@ type TrusteeDecryption struct {
 }
 
 type TrusteeTally struct {
-	Totals          []uint64              `json:"totals"`
-	Contests        []trusteeContestTotal `json:"contests"`
-	ReadyToSign     bool                  `json:"ready_to_sign"`
-	SignaturePosted bool                  `json:"signature_posted"`
-	SignatureNote   string                `json:"signature_note,omitempty"`
-	Published       bool                  `json:"published"`
-	PublishedTotals []uint64              `json:"published_totals"`
+	Totals   []uint64              `json:"totals"`
+	Contests []trusteeContestTotal `json:"contests"`
+	// Signing is where this trustee's own signature stands (signing* below).
+	Signing string `json:"signing"`
+	// SignProblem says why the signature has not happened yet, when that is
+	// something other than waiting for the partials (signProblem* below).
+	SignProblem string `json:"sign_problem,omitempty"`
+	// ReadyToSign: the Sign tally press is usable, as a retry of a signature
+	// that did not happen for a reason a retry can cure (Signing "retry").
+	ReadyToSign     bool     `json:"ready_to_sign"`
+	SignaturePosted bool     `json:"signature_posted"`
+	SignatureNote   string   `json:"signature_note,omitempty"`
+	Published       bool     `json:"published"`
+	PublishedTotals []uint64 `json:"published_totals"`
 	// Matches is null until both totals are known.
 	Matches *bool `json:"matches"`
+}
+
+// tally.signing: where this trustee's own signature stands.
+const (
+	// signingNotDecrypted: Decrypt was not pressed here, or it did not finish
+	// (refused, or still running): this trustee does not sign.
+	signingNotDecrypted = "not_decrypted"
+	// signingWaiting: Decrypt is done; waiting for threshold trustees'
+	// partials and this trustee's own combine (or for the console, while it
+	// does not answer).
+	signingWaiting = "waiting"
+	// signingSigning: the combine is ready; it is signing and posting.
+	signingSigning = "signing"
+	// signingSigned: its signature is posted.
+	signingSigned = "signed"
+	// signingRetry: the signature did not happen for a reason a retry can
+	// cure (sign_problem says which); the Sign tally press retries it.
+	signingRetry = "retry"
+	// signingRefused: the process refused to sign (the ballot set changed
+	// since the combine); no press is offered.
+	signingRefused = "refused"
+	// signingBlocked: an alarm blocks signing; no signature is made.
+	signingBlocked = "blocked"
+	// signingNotNeeded: the tally was published before this trustee signed.
+	signingNotNeeded = "not_needed"
+)
+
+// tally.sign_problem: why the signature has not happened.
+const (
+	// signProblemConsole: the console did not answer the post (or answered
+	// 502, 503 or 504). The process tries again by itself; no press.
+	signProblemConsole = "console_unreachable"
+	// signProblemPost: the console answered the post with an error a retry
+	// may cure (anything but a 400, which is alarm tally-totals). Press.
+	signProblemPost = "post_failed"
+	// signProblemChain: the chain could not be read for the signature. Press.
+	signProblemChain = "chain_unreadable"
+	// signProblemError: anything else (for example sign-tally failed). Press.
+	signProblemError = "error"
+)
+
+// signing is tally.signing for this progress.
+func (p *trusteeProgress) signing() string {
+	s := p.step("sign")
+	switch {
+	case p.SignaturePosted:
+		return signingSigned
+	case p.blocked("sign") != nil || s.State == stepBlocked:
+		return signingBlocked
+	case s.State == stepDone:
+		// Done with no signature posted: the tally was published first.
+		return signingNotNeeded
+	case !p.signEligible():
+		return signingNotDecrypted
+	case s.State == stepRefused:
+		return signingRefused
+	case s.State == stepFailed:
+		return signingRetry
+	case p.SignRequested && s.State == stepRunning:
+		return signingSigning
+	}
+	return signingWaiting
 }
 
 // Status is the one read a screen needs.
@@ -559,7 +637,11 @@ func (T *TrusteeService) Status() TrusteeStatus {
 		t.Totals, t.Contests = slices.Clone(p.Totals), slices.Clone(p.Contests)
 	}
 	t.SignaturePosted, t.SignatureNote = p.SignaturePosted, p.SignatureNote
-	t.ReadyToSign = len(p.Totals) > 0 && !p.SignRequested && p.blocked("sign") == nil
+	t.Signing = p.signing()
+	if t.Signing == signingRetry || t.Signing == signingWaiting || t.Signing == signingSigning {
+		t.SignProblem = p.SignProblem
+	}
+	t.ReadyToSign = t.Signing == signingRetry && len(p.Totals) > 0
 	t.Published = p.TallyPublished
 	if p.TallyPublished {
 		t.PublishedTotals = slices.Clone(p.TallyTotals)

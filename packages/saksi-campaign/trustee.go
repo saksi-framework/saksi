@@ -30,9 +30,10 @@ import (
 // and the key share, by file path in its own state folder), runs that
 // trustee's `saksi-demo live` ops, reads the ledger itself through its own
 // Fabric gateway connection, and talks to the console only to post what the
-// trustee produced. Its human presses three buttons over an election's life
-// (join, decrypt, sign); a background driver does the rest and keeps a status
-// any page can read.
+// trustee produced. Its human presses two buttons over an election's life
+// (join, decrypt); a background driver does the rest, including the tally
+// signature after this trustee's own Decrypt (Sign tally is only a retry),
+// and keeps a status any page can read.
 //
 // What it trusts the console for: nothing it acts on. The console's
 // GET /api/live/election names the current election id and its state for
@@ -219,6 +220,9 @@ type trusteeProgress struct {
 	Signature       json.RawMessage       `json:"signature,omitempty"`
 	SignaturePosted bool                  `json:"signature_posted"`
 	SignatureNote   string                `json:"signature_note,omitempty"`
+	// SignProblem is why the last sign attempt did not post (signProblem*),
+	// "" once it posted or before any attempt.
+	SignProblem string `json:"sign_problem,omitempty"`
 
 	TallyPublished bool     `json:"tally_published"`
 	TallyTotals    []uint64 `json:"tally_totals,omitempty"`
@@ -246,6 +250,14 @@ func (p *trusteeProgress) blocked(step string) *trusteeAlarm {
 		}
 	}
 	return nil
+}
+
+// signEligible reports whether this trustee may sign this election's tally:
+// its Decrypt was pressed here and finished, with its own partial read back
+// from the chain. A trustee that did not decrypt, or whose Decrypt was
+// refused, blocked or is not finished, never signs, by itself or on a press.
+func (p *trusteeProgress) signEligible() bool {
+	return p.DecryptRequested && p.step("decrypt").State == stepDone && p.PartialReadBack == "ok"
 }
 
 func (p *trusteeProgress) step(name string) stepStatus {
@@ -726,6 +738,9 @@ func (T *TrusteeService) tick(ctx context.Context) error {
 	}
 	if err := T.advanceCombine(ctx, v); errors.Is(err, errTrusteeKilled) {
 		return err
+	}
+	if T.autoSign(v) {
+		sign = true
 	}
 	if sign {
 		if err := T.runStep(ctx, "sign", func() error { return T.advanceSign(ctx) }); err != nil {
@@ -1915,17 +1930,31 @@ func (T *TrusteeService) refreshPeersBallots(ctx context.Context) {
 	}
 }
 
-// --- step 3: combine (automatic) and sign (on the trustee's press) -----------
+// --- step 3: combine and sign (both automatic after this trustee's Decrypt) ---
+//
+// The sign step needs no press. After this trustee's own Decrypt finished, and
+// once threshold trustees' partials are on the chain, the process combines by
+// itself and, only if its combine succeeded and no alarm blocks signing,
+// signs those totals and posts the signature (autoSign, advanceSign). Every
+// check that used to stand before the Sign press still stands before the
+// signature: the transcript check, the chain's parameters and transcript
+// unchanged, the ballot set unchanged, threshold complete partials, and the
+// console accepting the signature (a 400 is alarm tally-totals). A trustee
+// that did not decrypt combines and shows the totals but never signs. The
+// Sign tally press stays as a retry when a sign attempt failed (step
+// failed): see RequestSign.
 
-// The sign step's detail once the combine is ready: before the tally is
-// published, and after it (when no further signature is needed).
+// The sign step's detail: signing by itself, a trustee that does not sign
+// because it did not decrypt here, and after the tally is published (when no
+// further signature is needed).
 const (
-	signPressDetail     = "your own combine gives the totals shown; press Sign tally to sign them"
+	signAutoDetail      = "your own combine gives the totals shown; signing them"
+	signNoDecryptDetail = "this trustee did not decrypt this election, so it does not sign"
 	signNotNeededDetail = "the tally is published; no signature is needed"
 )
 
 // advanceCombine runs this trustee's own combine once at least threshold
-// trustees' partials are on the chain, so the totals can be shown before
+// trustees' partials are on the chain, so the totals are shown before
 // anything is signed. It runs by itself; errors are shown on the sign step.
 func (T *TrusteeService) advanceCombine(ctx context.Context, v *LiveElectionView) error {
 	T.mu.Lock()
@@ -1939,21 +1968,29 @@ func (T *TrusteeService) advanceCombine(ctx context.Context, v *LiveElectionView
 		return nil
 	}
 	err := T.combine(ctx)
+	if err == nil && T.crashed("combine-saved") {
+		return errTrusteeKilled
+	}
 	var alarm tAlarm
 	T.mu.Lock()
 	signState := p.step("sign").State
+	eligible := p.signEligible()
 	T.mu.Unlock()
 	if signState != stepIdle && signState != stepWaiting {
-		return nil // the trustee pressed Sign; that step reports from here on
+		return nil // the sign step was asked for; it reports from here on
 	}
 	switch {
 	case err == nil:
-		if liveStateIndex(v.State) >= liveStateIndex(LiveTallied) {
+		switch {
+		case liveStateIndex(v.State) >= liveStateIndex(LiveTallied):
 			// Nothing is left for this trustee to sign: the step is done,
 			// so its state word agrees with the detail (rehearsal 4 m12).
 			T.setStep("sign", stepDone, signNotNeededDetail, "")
-		} else {
-			T.setStep("sign", stepWaiting, signPressDetail, "")
+		case eligible:
+			// autoSign takes it from here, in this same tick.
+			T.setStep("sign", stepWaiting, signAutoDetail, "")
+		default:
+			T.setStep("sign", stepIdle, signNoDecryptDetail, "")
 		}
 	case errors.As(err, &alarm):
 		T.raise(alarm.code, alarm.msg, alarm.blocks...)
@@ -2028,13 +2065,96 @@ func (T *TrusteeService) combine(ctx context.Context) error {
 	})
 }
 
-// advanceSign signs the totals the trustee approved and posts the signature.
+// autoSign asks for the sign step by itself, over this trustee's own combine,
+// and reports whether it did. Only when: the combine's totals are saved; this
+// trustee's Decrypt was pressed here and finished (signEligible); no alarm
+// blocks signing; the console says closed and the tally is not known to be
+// published (a trustee that decrypts late signs nothing); and the sign step
+// was not already asked for and is not done, failed, refused or blocked (a
+// failed attempt waits for the press). It works from the saved progress
+// alone, so a restart at any point after the combine reaches the same
+// decision, and the signature saved before a kill is the one posted.
+func (T *TrusteeService) autoSign(v *LiveElectionView) bool {
+	T.mu.Lock()
+	defer T.mu.Unlock()
+	p := T.p
+	if p == nil || p.SignRequested || len(p.Totals) == 0 || !p.signEligible() || p.blocked("sign") != nil ||
+		p.TallyPublished || v.ElectionID != p.ElectionID || v.State != LiveClosed {
+		return false
+	}
+	switch p.step("sign").State {
+	case stepDone, stepFailed, stepRefused, stepBlocked:
+		return false
+	}
+	p.SignRequested, p.SignTotals = true, slices.Clone(p.Totals)
+	p.Steps["sign"] = stepStatus{State: stepRunning, Detail: signAutoDetail, UpdatedAt: T.now().UTC()}
+	if err := T.saveLocked(); err != nil {
+		// Not saved: nothing is signed this tick; the next one tries again.
+		p.SignRequested, p.SignTotals = false, nil
+		log.Printf("trustee %d: saving the sign decision: %v", T.id, err)
+		return false
+	}
+	log.Printf("trustee %d: its own combine is ready after its Decrypt; signing %v", T.id, p.Totals)
+	return true
+}
+
+// signConsoleErr and signPostErr mark why a sign attempt did not post, for
+// tally.sign_problem.
+type (
+	signConsoleErr struct{ error } // the console did not answer (a tWait inside)
+	signPostErr    struct{ error } // the console answered the post with an error
+)
+
+func (e signConsoleErr) Unwrap() error { return e.error }
+func (e signPostErr) Unwrap() error    { return e.error }
+
+// advanceSign signs this trustee's own combine and posts the signature, and
+// records why an attempt did not post (tally.sign_problem).
 func (T *TrusteeService) advanceSign(ctx context.Context) error {
+	err := T.signOnce(ctx)
+	problem := ""
+	var (
+		cons    signConsoleErr
+		post    signPostErr
+		chain   tChainErr
+		wait    tWait
+		refused tRefused
+		alarm   tAlarm
+	)
+	switch {
+	case err == nil, errors.Is(err, errTrusteeKilled), ctx.Err() != nil,
+		errors.As(err, &refused), errors.As(err, &alarm):
+	case errors.As(err, &cons):
+		problem = signProblemConsole
+	case errors.As(err, &post):
+		problem = signProblemPost
+	case errors.As(err, &chain):
+		problem = signProblemChain
+	case errors.As(err, &wait):
+	default:
+		problem = signProblemError
+	}
+	if !errors.Is(err, errTrusteeKilled) && ctx.Err() == nil {
+		_ = T.update(func(p *trusteeProgress) { p.SignProblem = problem })
+	}
+	return err
+}
+
+// signOnce signs the totals asked for (this trustee's own combine) and posts
+// the signature. The signature is saved before it is posted, so a retry, or
+// a restart after a kill, posts the same bytes.
+func (T *TrusteeService) signOnce(ctx context.Context) error {
 	T.begin("sign")
 	p := T.p
 	T.mu.Lock()
 	approved := slices.Clone(p.SignTotals)
+	eligible := p.signEligible()
 	T.mu.Unlock()
+	if !eligible {
+		// Also a sign request recorded by an older build, which took a press
+		// from a trustee that had not decrypted.
+		return refusedf("%s", signNoDecryptDetail)
+	}
 	if len(p.Totals) == 0 || !slices.Equal(p.Totals, approved) {
 		return refusedf("the approved totals are not this trustee's own combine")
 	}
@@ -2068,6 +2188,10 @@ func (T *TrusteeService) advanceSign(ctx context.Context) error {
 	if !p.SignaturePosted {
 		code, body, err := T.console.doRaw(ctx, "POST", "/api/live/tally-sig", p.Signature)
 		if err != nil {
+			var wait tWait
+			if errors.As(err, &wait) {
+				return signConsoleErr{err} // still waiting: tried again by itself
+			}
 			return err
 		}
 		text := errorText(body)
@@ -2092,7 +2216,7 @@ func (T *TrusteeService) advanceSign(ctx context.Context) error {
 			})
 			return nil
 		default:
-			return fmt.Errorf("the console refused the signature: %d %s", code, text)
+			return signPostErr{fmt.Errorf("the console refused the signature: %d %s", code, text)}
 		}
 	}
 	return nil
@@ -2122,10 +2246,11 @@ func (T *TrusteeService) checkPublished(v *LiveElectionView) {
 	}
 	_ = T.update(func(p *trusteeProgress) {
 		p.TallyPublished, p.TallyTotals = true, totals
-		// A trustee that combined but was not pressed no longer needs to
-		// sign: the step is done, and says so instead of "press Sign tally"
-		// (not "waiting" with "no signature is needed", rehearsal 4 m12).
-		if s := p.step("sign"); s.State == stepWaiting && s.Detail == signPressDetail {
+		// A trustee that combined but did not sign (it did not decrypt here)
+		// no longer needs to: the step is done, and says so (not "waiting"
+		// with "no signature is needed", rehearsal 4 m12).
+		if s := p.step("sign"); !p.SignRequested && ((s.State == stepIdle && s.Detail == signNoDecryptDetail) ||
+			(s.State == stepWaiting && s.Detail == signAutoDetail)) {
 			s.State, s.Detail, s.UpdatedAt = stepDone, signNotNeededDetail, T.now().UTC()
 			p.Steps["sign"] = s
 		}

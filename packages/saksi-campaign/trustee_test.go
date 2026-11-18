@@ -304,14 +304,18 @@ func (f *trusteeFleet) decrypt(id int) TrusteeStatus {
 	return st
 }
 
-// sign waits for trustee id's own combine, checks its totals are want,
-// presses Sign tally over them and waits for the signature to be posted.
-func (f *trusteeFleet) sign(id int, want []float64) map[string]any {
+// signed waits for trustee id's own signature, which it makes by itself after
+// its own Decrypt once its combine is ready, with no press; checks its totals
+// are want; and waits for the console to publish if publish is set (the
+// signature may be the threshold-th, or arrive after others published).
+func (f *trusteeFleet) signed(id int, want []float64) map[string]any {
 	f.t.Helper()
-	// ReadyToSign shows as soon as the totals are saved; the sign step's
-	// waiting state follows, so wait for both.
-	st := f.waitFor(id, "its own combine", func(st TrusteeStatus) bool {
-		return st.Tally.ReadyToSign && st.Steps["sign"].State == stepWaiting
+	st := f.waitFor(id, "its own signature, made without a press", func(st TrusteeStatus) bool {
+		s := st.Steps["sign"]
+		if s.State == stepFailed || s.State == stepBlocked || s.State == stepRefused {
+			f.t.Fatalf("trustee %d: sign is %s (%s); alarms %v", id, s.State, s.Error, st.Alarms)
+		}
+		return s.State == stepDone && (st.Tally.SignaturePosted || st.Tally.SignatureNote != "")
 	})
 	got := make([]float64, len(st.Tally.Totals))
 	for i, x := range st.Tally.Totals {
@@ -320,10 +324,37 @@ func (f *trusteeFleet) sign(id int, want []float64) map[string]any {
 	if !slices.Equal(got, want) {
 		f.t.Fatalf("trustee %d combined %v, want %v", id, got, want)
 	}
-	f.press(id, "sign", map[string]any{"totals": st.Tally.Totals})
-	st = f.waitStep(id, "sign", stepDone)
+	if st.Tally.ReadyToSign {
+		f.t.Fatalf("trustee %d offers the Sign tally press after its signature: %+v", id, st.Tally)
+	}
 	el := f.h.must(nil, http.MethodGet, "/api/live/election", "", nil)
 	return map[string]any{"published": el["state"] == LiveTallied || el["state"] == LiveVerified, "signature_posted": st.Tally.SignaturePosted}
+}
+
+// waitPublished waits for the console to publish the tally.
+func (f *trusteeFleet) waitPublished() {
+	f.t.Helper()
+	deadline := time.Now().Add(60 * time.Second)
+	for time.Now().Before(deadline) {
+		el := f.h.must(nil, http.MethodGet, "/api/live/election", "", nil)
+		if el["state"] == LiveTallied || el["state"] == LiveVerified {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	f.t.Fatal("timed out waiting for the console to publish the tally")
+}
+
+// consoleSigs is the tally signatures the console holds, by trustee id.
+func (f *trusteeFleet) consoleSigs() map[string]string {
+	L := f.h.s.live
+	L.mu.Lock()
+	defer L.mu.Unlock()
+	out := map[string]string{}
+	for id, s := range L.st.Signatures {
+		out[id] = s.Signature
+	}
+	return out
 }
 
 // secrets is every secret the trustees hold: share scalars, receive key
@@ -519,32 +550,57 @@ func TestTrusteeProcessesKillAndRestart(t *testing.T) {
 	f.restart(2)
 	f.waitStep(2, "decrypt", stepDone)
 	f.decrypt(1)
+	// Between the partial and the signature (below the threshold, so nothing
+	// combines yet): trustees 1 and 2 are killed and restarted.
 	f.restart(1)
+	f.restart(2)
 	f.decrypt(3)
+	// Trustee 2 signs by itself: it is killed once its combine is saved,
+	// before it decides to sign, and once its signature is made, before it is
+	// posted. Trustees 1 and 3 sign meanwhile; the tally waits for trustee 2.
+	for _, point := range []string{"combine-saved", "sig-saved"} {
+		f.waitFor(2, "the kill at "+point, func(TrusteeStatus) bool {
+			crashMu.Lock()
+			defer crashMu.Unlock()
+			return crashed[point]
+		})
+		time.Sleep(50 * time.Millisecond)
+		f.restart(2)
+	}
+	var saved struct {
+		Signature struct {
+			Signature string `json:"signature"`
+		} `json:"signature"`
+	}
+	if err := readJSON(filepath.Join(f.procs[1].T.electionDir(f.status(2).Election.ElectionID), trusteeProgressFile), &saved); err != nil || saved.Signature.Signature == "" {
+		t.Fatalf("trustee 2's saved signature: %v %+v", err, saved)
+	}
+	for id := 1; id <= 3; id++ {
+		f.signed(id, wantTotals)
+	}
+	f.waitPublished()
+	// Exactly one signature from each: trustee 2's is the one it made before
+	// the kill, posted once after the restart; nobody signed twice.
+	sigs := f.consoleSigs()
+	if len(sigs) != 3 || sigs["2"] != saved.Signature.Signature {
+		t.Fatalf("console signatures %v; trustee 2 saved %s", sigs, saved.Signature.Signature)
+	}
+	// A restart after the signature changes nothing.
 	for id := 1; id <= 3; id++ {
 		f.restart(id)
+		if st := f.status(id); !st.Tally.SignaturePosted || st.Steps["sign"].State != stepDone {
+			t.Fatalf("trustee %d after restart: %+v %+v", id, st.Tally, st.Steps["sign"])
+		}
 	}
-	f.sign(1, wantTotals)
-	f.restart(1)
-	if st := f.status(1); !st.Tally.SignaturePosted || st.Steps["sign"].State != stepDone {
-		t.Fatalf("trustee 1 after restart: %+v %+v", st.Tally, st.Steps["sign"])
+	// Trustees 4 and 5 did not decrypt: they never sign.
+	for id := 4; id <= 5; id++ {
+		if st := f.status(id); st.Tally.SignaturePosted {
+			t.Fatalf("trustee %d signed without its own Decrypt: %+v", id, st.Tally)
+		}
 	}
-	// Trustee 2 is killed after its signature is made, before it is posted.
-	st := f.waitFor(2, "its combine", func(st TrusteeStatus) bool {
-		return st.Tally.ReadyToSign && st.Steps["sign"].State == stepWaiting
-	})
-	f.press(2, "sign", map[string]any{"totals": st.Tally.Totals})
-	f.waitFor(2, "the kill at sig-saved", func(TrusteeStatus) bool {
-		crashMu.Lock()
-		defer crashMu.Unlock()
-		return crashed["sig-saved"]
-	})
-	time.Sleep(50 * time.Millisecond)
-	f.restart(2)
-	f.waitStep(2, "sign", stepDone)
-	res := f.sign(3, wantTotals)
-	if res["published"] != true {
-		t.Fatalf("not published after 3 signatures")
+	time.Sleep(200 * time.Millisecond)
+	if sigs := f.consoleSigs(); len(sigs) != 3 || sigs["2"] != saved.Signature.Signature {
+		t.Fatalf("console signatures after the restarts: %v", sigs)
 	}
 	for id := 1; id <= 5; id++ {
 		st := f.waitFor(id, "the published tally", func(st TrusteeStatus) bool { return st.Tally.Published && st.Tally.Matches != nil })
@@ -737,8 +793,11 @@ func TestTrusteeAlarmsOnATranscriptThatDiffersFromItsAck(t *testing.T) {
 		b.f.decrypt(id)
 	}
 	time.Sleep(300 * time.Millisecond)
-	if st := b.f.status(5); len(st.Tally.Totals) != 0 || st.Tally.ReadyToSign {
-		t.Fatalf("a blocked trustee combined: %+v", st.Tally)
+	if st := b.f.status(5); len(st.Tally.Totals) != 0 || st.Tally.ReadyToSign || st.Tally.SignaturePosted || st.Tally.Signing != signingBlocked {
+		t.Fatalf("a blocked trustee combined or signed: %+v", st.Tally)
+	}
+	if _, ok := b.f.consoleSigs()["5"]; ok {
+		t.Fatal("the console holds a signature from the trustee with the transcript alarm")
 	}
 }
 
@@ -840,6 +899,27 @@ func TestTrusteeDecryptRefusals(t *testing.T) {
 	if st := f.status(3); st.Steps["decrypt"].State != stepDone {
 		t.Fatalf("decrypt again: %+v", st.Steps["decrypt"])
 	}
+
+	// Trustee 1 decrypts: the chain holds trustees 1, 2 and 3's partials.
+	// Trustees 1 and 3 sign by themselves. Trustee 2 (its second Decrypt was
+	// refused) and trustee 4 (refused under --min-ballots) pressed Decrypt
+	// but have no finished decryption: neither signs, nor may be pressed to.
+	f.decrypt(1)
+	f.signed(1, wantTotals)
+	f.signed(3, wantTotals)
+	for _, id := range []int{2, 4} {
+		st := f.waitFor(id, "its combine", func(st TrusteeStatus) bool { return len(st.Tally.Totals) > 0 })
+		if st.Tally.SignaturePosted || st.Tally.Signing != signingNotDecrypted || st.Tally.ReadyToSign {
+			t.Fatalf("trustee %d with a refused Decrypt: %+v", id, st.Tally)
+		}
+		if code, _ := f.call(f.procs[id-1], http.MethodPost, "/api/trustee/sign", map[string]any{"totals": st.Tally.Totals}); code != http.StatusConflict {
+			t.Fatalf("trustee %d sign press after a refused Decrypt: %d", id, code)
+		}
+	}
+	time.Sleep(200 * time.Millisecond)
+	if sigs := f.consoleSigs(); len(sigs) != 2 || sigs["1"] == "" || sigs["3"] == "" {
+		t.Fatalf("console signatures: %v, want trustees 1 and 3 only", sigs)
+	}
 }
 
 // The partial read back from the chain is not the one the trustee computed:
@@ -871,10 +951,12 @@ func TestTrusteeAlarmsOnAPartialReadBackMismatch(t *testing.T) {
 	}
 }
 
-// Nothing is signed without the trustee's press, a press must name the
-// totals shown, and a console that refuses the signature (its totals differ)
-// raises an alarm.
-func TestTrusteeSignsOnlyOnThePressAndAlarmsOnTotals(t *testing.T) {
+// A trustee signs by itself only when Decrypt was pressed here and finished
+// and its own combine is ready: below the threshold nobody signs, a trustee
+// that did not decrypt never signs (its press is refused too), and a console
+// that refuses the signature (its totals differ) raises an alarm with no
+// signature kept and no press offered.
+func TestTrusteeSignsOnlyAfterItsOwnDecryptAndAlarmsOnTotals(t *testing.T) {
 	var bed atomic.Pointer[trusteeTestBed]
 	b := newTrusteeTestBed(t, fleetOptions{consoleFor: func(id int) string {
 		if id != 3 {
@@ -901,37 +983,130 @@ func TestTrusteeSignsOnlyOnThePressAndAlarmsOnTotals(t *testing.T) {
 	f.ceremony()
 	b.vote()
 	b.close()
-	for id := 1; id <= 3; id++ {
-		f.decrypt(id)
+	// No totals yet: the press is refused.
+	if code, out := f.call(f.procs[0], http.MethodPost, "/api/trustee/sign", map[string]any{"totals": []int{2, 1, 0, 0, 1, 2}}); code != http.StatusConflict {
+		t.Fatalf("sign before any combine: %d %v", code, out)
 	}
-	for id := 1; id <= 5; id++ {
-		// The sign step's waiting state follows ReadyToSign; wait for both,
-		// but stop at once on a signature or any later sign state, so the
-		// check below reports it.
-		st := f.waitFor(id, "its combine", func(st TrusteeStatus) bool {
-			s := st.Steps["sign"].State
-			if st.Tally.SignaturePosted || (s != stepIdle && s != stepWaiting) {
-				return true
-			}
-			return st.Tally.ReadyToSign && s == stepWaiting
-		})
-		if st.Tally.SignaturePosted || st.Steps["sign"].State != stepWaiting {
-			t.Fatalf("trustee %d signed without a press: %+v", id, st.Tally)
+	// Two of three decrypt: nothing combines, so nothing is signed.
+	f.decrypt(1)
+	f.decrypt(2)
+	time.Sleep(300 * time.Millisecond)
+	for id := 1; id <= 2; id++ {
+		if st := f.status(id); st.Tally.SignaturePosted || len(st.Tally.Totals) != 0 || st.Tally.Signing != signingWaiting || st.Tally.ReadyToSign {
+			t.Fatalf("trustee %d below the threshold: %+v", id, st.Tally)
 		}
 	}
-	time.Sleep(200 * time.Millisecond)
-	if el := b.h.must(nil, http.MethodGet, "/api/live/election", "", nil); el["counts"].(map[string]any)["tally_signatures"] != 0.0 {
-		t.Fatalf("signatures before any press: %v", el["counts"])
+	if len(f.consoleSigs()) != 0 {
+		t.Fatalf("signatures below the threshold: %v", f.consoleSigs())
 	}
-	// A press over other totals is refused.
+	// The third Decrypt: trustees 1 and 2 sign by themselves; trustee 3's
+	// console refuses its signature, so it is blocked with an alarm.
+	f.decrypt(3)
+	f.signed(1, wantTotals)
+	f.signed(2, wantTotals)
+	st := f.waitFor(3, "the totals alarm", func(st TrusteeStatus) bool { return st.Steps["sign"].State == stepBlocked })
+	if st.Alarms[0].Code != "tally-totals" || st.Tally.SignaturePosted || st.Tally.Signing != signingBlocked || st.Tally.ReadyToSign {
+		t.Fatalf("status: %+v %+v", st.Alarms, st.Tally)
+	}
+	// Trustees 4 and 5 did not decrypt: they combine and show the totals, and
+	// never sign; their press is refused.
+	for id := 4; id <= 5; id++ {
+		st := f.waitFor(id, "its combine", func(st TrusteeStatus) bool { return len(st.Tally.Totals) > 0 })
+		if st.Tally.SignaturePosted || st.Tally.Signing != signingNotDecrypted || st.Tally.ReadyToSign ||
+			st.Steps["sign"].State == stepRunning || st.Step == "sign" {
+			t.Fatalf("trustee %d, which did not decrypt: %+v %+v", id, st.Tally, st.Steps["sign"])
+		}
+		code, out := f.call(f.procs[id-1], http.MethodPost, "/api/trustee/sign", map[string]any{"totals": st.Tally.Totals})
+		if code != http.StatusConflict || !strings.Contains(fmt.Sprint(out["error"]), "did not decrypt") {
+			t.Fatalf("trustee %d sign press without its Decrypt: %d %v", id, code, out)
+		}
+	}
+	// A press over other totals is refused; so is a press on a trustee that
+	// signed (nothing to retry) and on the blocked one.
 	if code, _ := f.call(f.procs[0], http.MethodPost, "/api/trustee/sign", map[string]any{"totals": []int{3, 0, 0, 0, 0, 3}}); code != http.StatusConflict {
 		t.Fatalf("sign over other totals: %d", code)
 	}
-	st := f.status(3)
-	f.press(3, "sign", map[string]any{"totals": st.Tally.Totals})
-	st = f.waitFor(3, "the totals alarm", func(st TrusteeStatus) bool { return st.Steps["sign"].State == stepBlocked })
-	if st.Alarms[0].Code != "tally-totals" || st.Tally.SignaturePosted {
-		t.Fatalf("status: %+v %+v", st.Alarms, st.Tally)
+	for _, id := range []int{1, 3} {
+		if code, out := f.call(f.procs[id-1], http.MethodPost, "/api/trustee/sign", map[string]any{"totals": st.Tally.Totals}); code != http.StatusConflict {
+			t.Fatalf("trustee %d press: %d %v", id, code, out)
+		}
+	}
+	time.Sleep(300 * time.Millisecond)
+	sigs := f.consoleSigs()
+	if len(sigs) != 2 || sigs["1"] == "" || sigs["2"] == "" {
+		t.Fatalf("console signatures: %v, want trustees 1 and 2 only", sigs)
+	}
+	if el := b.h.must(nil, http.MethodGet, "/api/live/election", "", nil); el["state"] != LiveClosed {
+		t.Fatalf("published with 2 signatures: %v", el["state"])
+	}
+}
+
+// The Sign tally press is a fallback for a signature that did not happen for
+// a reason a retry cures. A console that answers 503 is waited out and the
+// signature posts by itself; a console that answers 500 fails the step, which
+// waits for the press (no second post until then) and says why; the press
+// posts the same signature.
+func TestTrusteeSignFallbackPress(t *testing.T) {
+	var bed atomic.Pointer[trusteeTestBed]
+	var posts [6]atomic.Int32
+	b := newTrusteeTestBed(t, fleetOptions{consoleFor: func(id int) string {
+		if id != 1 && id != 2 {
+			return ""
+		}
+		proxy := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			b := bed.Load()
+			if b == nil {
+				http.Error(w, "starting", http.StatusServiceUnavailable)
+				return
+			}
+			if r.URL.Path == "/api/live/tally-sig" && posts[id].Add(1) == 1 {
+				code := http.StatusServiceUnavailable
+				if id == 2 {
+					code = http.StatusInternalServerError
+				}
+				writeJSONResp(w, code, map[string]string{"error": "the console is having a bad moment"})
+				return
+			}
+			b.h.s.ServeHTTP(w, r)
+		}))
+		t.Cleanup(proxy.Close)
+		return proxy.URL
+	}})
+	bed.Store(b)
+	f := b.f
+	b.setup()
+	f.ceremony()
+	b.vote()
+	b.close()
+	for id := 1; id <= 3; id++ {
+		f.decrypt(id)
+	}
+	// Trustee 1: the 503 is waited out; it signs with no press.
+	f.signed(1, wantTotals)
+	if n := posts[1].Load(); n != 2 {
+		t.Fatalf("trustee 1 posted %d times, want 2 (the 503, then the signature)", n)
+	}
+	// Trustee 2: the 500 fails the step; the press is offered and says why.
+	st := f.waitFor(2, "the failed post", func(st TrusteeStatus) bool { return st.Steps["sign"].State == stepFailed })
+	if st.Tally.Signing != signingRetry || !st.Tally.ReadyToSign || st.Tally.SignProblem != signProblemPost || st.Tally.SignaturePosted {
+		t.Fatalf("trustee 2 after a 500: %+v", st.Tally)
+	}
+	time.Sleep(300 * time.Millisecond)
+	if n := posts[2].Load(); n != 1 {
+		t.Fatalf("trustee 2 posted %d times before the press, want 1", n)
+	}
+	if _, ok := f.consoleSigs()["2"]; ok {
+		t.Fatal("the console holds trustee 2's signature before the press")
+	}
+	f.press(2, "sign", map[string]any{"totals": st.Tally.Totals})
+	f.signed(2, wantTotals)
+	f.signed(3, wantTotals)
+	f.waitPublished()
+	if n := posts[2].Load(); n != 2 {
+		t.Fatalf("trustee 2 posted %d times, want 2", n)
+	}
+	if st := f.status(2); st.Tally.SignProblem != "" || st.Tally.Signing != signingSigned {
+		t.Fatalf("trustee 2 after the press: %+v", st.Tally)
 	}
 }
 
@@ -1319,17 +1494,27 @@ func TestTrusteeLostAnswersAfterPosting(t *testing.T) {
 	f.press(4, "decrypt", nil)
 	f.waitFor(4, "the kill after the partial", func(TrusteeStatus) bool { return hit(4, "partial-posted") })
 	f.decrypt(1)
-	f.sign(1, wantTotals)
-	f.sign(2, wantTotals) // ...and signs
-	if res := f.sign(3, wantTotals); res["published"] != true {
-		t.Fatal("not published after 3 signatures")
-	}
+	// Partials of 2, 4 and 1 are on the chain: 1 and 2 sign by themselves
+	// (4 is down), and 3 decrypts and signs third.
+	f.signed(1, wantTotals)
+	f.signed(2, wantTotals) // ...and signs
+	f.decrypt(3)
+	f.signed(3, wantTotals)
+	f.waitPublished()
 	// Trustee 4 comes back after publication: the console refuses the re-post
-	// (not closed), and the chain holds its exact partial.
+	// (not closed), and the chain holds its exact partial. It decrypted late:
+	// no signature is needed and none is made.
 	f.restart(4)
 	st = f.waitStep(4, "decrypt", stepDone)
 	if !st.Decryption.PartialRecorded || st.Decryption.PartialReadBack != "ok" {
 		t.Fatalf("trustee 4 after the lost partial answer: %+v", st.Decryption)
+	}
+	st = f.waitFor(4, "its sign step", func(st TrusteeStatus) bool { return st.Steps["sign"].State == stepDone })
+	if st.Tally.SignaturePosted || st.Steps["sign"].Detail != signNotNeededDetail || st.Tally.Signing != signingNotNeeded || st.Tally.ReadyToSign {
+		t.Fatalf("trustee 4, late: %+v %+v", st.Tally, st.Steps["sign"])
+	}
+	if _, ok := f.consoleSigs()["4"]; ok {
+		t.Fatal("the late trustee signed")
 	}
 	for _, id := range []int{1, 2, 3, 4} {
 		st := f.waitFor(id, "the published tally", func(st TrusteeStatus) bool { return st.Tally.Published && st.Tally.Matches != nil })
@@ -1377,6 +1562,21 @@ func TestTrusteeRefusesAPeerWithAnotherBallotSet(t *testing.T) {
 	el := b.h.must(nil, http.MethodGet, "/api/live/election", "", nil)
 	if el["counts"].(map[string]any)["trustees_decrypted"] != 1.0 {
 		t.Fatalf("trustees decrypted: %v", el["counts"])
+	}
+	// Trustees 3 and 4 decrypt: 1, 3 and 4 sign by themselves and the tally
+	// is published. Trustee 2, blocked by the ballot-set alarm, never signs.
+	f.decrypt(3)
+	f.decrypt(4)
+	for _, id := range []int{1, 3, 4} {
+		f.signed(id, wantTotals)
+	}
+	f.waitPublished()
+	st = f.status(2)
+	if st.Tally.SignaturePosted || st.Tally.Signing != signingBlocked || st.Tally.ReadyToSign {
+		t.Fatalf("trustee 2 under the ballot-set alarm: %+v %+v", st.Tally, st.Steps["sign"])
+	}
+	if _, ok := f.consoleSigs()["2"]; ok {
+		t.Fatal("the console holds a signature from trustee 2")
 	}
 }
 
@@ -1488,8 +1688,8 @@ func TestTrusteePeerBallotChecksFollowLaterDecrypts(t *testing.T) {
 }
 
 // Final review 4, deferred (rehearsal 3 m9): once the tally is published, a
-// trustee that combined but was not pressed no longer reads "press Sign
-// tally"; its sign step says no signature is needed.
+// trustee that did not decrypt (so does not sign) has its sign step done,
+// saying no signature is needed.
 func TestTrusteeSignTextAfterThePublishedTally(t *testing.T) {
 	b := newTrusteeTestBed(t, fleetOptions{})
 	f := b.f
@@ -1500,21 +1700,16 @@ func TestTrusteeSignTextAfterThePublishedTally(t *testing.T) {
 	for id := 1; id <= 3; id++ {
 		f.decrypt(id)
 	}
-	for _, id := range []int{4, 5} {
-		// ReadyToSign shows as soon as the totals are saved; the sign text
-		// follows, so wait for it.
-		f.waitFor(id, "its combine and the press text", func(st TrusteeStatus) bool {
-			return st.Tally.ReadyToSign && st.Steps["sign"].State == stepWaiting && st.Steps["sign"].Detail == signPressDetail
-		})
+	for id := 1; id <= 3; id++ {
+		f.signed(id, wantTotals)
 	}
-	f.sign(1, wantTotals)
-	f.sign(2, wantTotals)
-	if res := f.sign(3, wantTotals); res["published"] != true {
-		t.Fatal("not published after 3 signatures")
-	}
+	f.waitPublished()
 	for _, id := range []int{4, 5} {
 		st := f.waitFor(id, "the published tally", func(st TrusteeStatus) bool { return st.Tally.Published })
-		st = f.waitFor(id, "the sign text", func(st TrusteeStatus) bool { return st.Steps["sign"].Detail != signPressDetail })
+		st = f.waitFor(id, "the sign text", func(st TrusteeStatus) bool { return st.Steps["sign"].State == stepDone })
+		if st.Tally.Signing != signingNotNeeded || st.Tally.ReadyToSign {
+			t.Fatalf("trustee %d after publication: %+v", id, st.Tally)
+		}
 		// Rehearsal 4 m12: the state word agrees with the detail (and with
 		// the page's stepper, which draws done-without-signature as "not
 		// needed"): not "waiting" with "no signature is needed".

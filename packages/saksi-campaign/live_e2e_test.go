@@ -556,32 +556,37 @@ func runLiveElection(t *testing.T, h *liveE2E) string {
 	}
 	step("decrypt: 3 trustees x 6 contests SubmitPartialDecryption recorded")
 
-	sign := func(id int) map[string]any {
-		if h.tr != nil {
-			return h.tr.sign(id, want)
+	if h.tr != nil {
+		// The trustee processes sign by themselves after their own Decrypt;
+		// the third signature publishes.
+		for id := 1; id <= 3; id++ {
+			h.tr.signed(id, want)
 		}
-		comb := h.cliOp("combine", map[string]any{"params": led["params"], "dkg": led["dkg"], "ballots": ballots, "partials": partials})
-		sig := h.cliOp("sign-tally", map[string]any{"share_file": filepath.Join(h.tdir(id), "share.json"), "params": led["params"], "dkg": led["dkg"], "ballots": ballots, "partials": partials, "totals": comb["totals"]})
-		return h.must(nil, http.MethodPost, "/api/live/tally-sig", h.tokens[id-1], sig)
-	}
-	sign(1)
-	sign(2)
-	code, out = h.call(admin, http.MethodPost, "/api/live/tally/publish", "", nil)
-	if code != http.StatusUnprocessableEntity || out["gate"] != "threshold" {
-		t.Fatalf("2-signature publish: %d %v", code, out)
-	}
-	step("refusal: a 2-signature publish refused at gate threshold: " + truncateErr(out["reason"].(string)))
-	if el := h.must(nil, http.MethodGet, "/api/live/election", "", nil); el["state"] != LiveClosed {
-		t.Fatalf("a refused publish changed the state to %v", el["state"])
-	}
-	res := sign(3)
-	if res["published"] != true {
-		t.Fatalf("third signature did not publish: %v", res)
+		h.tr.waitPublished()
+	} else {
+		sign := func(id int) map[string]any {
+			comb := h.cliOp("combine", map[string]any{"params": led["params"], "dkg": led["dkg"], "ballots": ballots, "partials": partials})
+			sig := h.cliOp("sign-tally", map[string]any{"share_file": filepath.Join(h.tdir(id), "share.json"), "params": led["params"], "dkg": led["dkg"], "ballots": ballots, "partials": partials, "totals": comb["totals"]})
+			return h.must(nil, http.MethodPost, "/api/live/tally-sig", h.tokens[id-1], sig)
+		}
+		sign(1)
+		sign(2)
+		code, out = h.call(admin, http.MethodPost, "/api/live/tally/publish", "", nil)
+		if code != http.StatusUnprocessableEntity || out["gate"] != "threshold" {
+			t.Fatalf("2-signature publish: %d %v", code, out)
+		}
+		step("refusal: a 2-signature publish refused at gate threshold: " + truncateErr(out["reason"].(string)))
+		if el := h.must(nil, http.MethodGet, "/api/live/election", "", nil); el["state"] != LiveClosed {
+			t.Fatalf("a refused publish changed the state to %v", el["state"])
+		}
+		if res := sign(3); res["published"] != true {
+			t.Fatalf("third signature did not publish: %v", res)
+		}
 	}
 	el = h.must(nil, http.MethodGet, "/api/live/election", "", nil)
 	got, _ := json.Marshal(el["totals"])
 	wantJSON, _ := json.Marshal(want)
-	if el["state"] != LiveTallied || !bytes.Equal(got, wantJSON) {
+	if (el["state"] != LiveTallied && el["state"] != LiveVerified) || !bytes.Equal(got, wantJSON) {
 		t.Fatalf("tallied %v totals %s, want %s", el["state"], got, wantJSON)
 	}
 	step("tally: PublishTally with 3 signatures, totals " + string(got) + " equal the choices")
