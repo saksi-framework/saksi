@@ -172,9 +172,9 @@ setup -> ceremony -> open -> closed -> tallied -> verified
 | `setup` | `POST elections` made the keys and parameters | `POST elections` again (retries `CreateElection`), `abandon`; a restart also retries |
 | `ceremony` | `CreateElection` recorded | the key-ceremony routes, `abandon` |
 | `open` | `PublishDKGTranscript` recorded | check-in, issuance, ballots, close |
-| `closed` | `CloseElection` recorded | partials, tally signatures, `tally/publish` |
-| `tallied` | `PublishTally` recorded | `verify` |
-| `verified` | `verify-live` passed over the chain record | `verify` again (a fail steps back to `tallied`), a new `POST elections` |
+| `closed` | `CloseElection` recorded | partials, tally signatures (the trustee processes post them by themselves), `tally/publish` (the threshold demonstration) |
+| `tallied` | `PublishTally` recorded; the console starts verifying by itself at once | `verify` (a retry; it joins a run in flight) |
+| `verified` | `verify-live` passed over the chain record (the automatic run or a press) | `verify` again (a fail steps back to `tallied`), a new `POST elections` |
 | `abandoned` | `POST abandon` in `setup` or `ceremony` | a new `POST elections`; nothing else. Never shown as tallied or verified |
 
 One live election at a time. A request in the wrong state gets 409 naming
@@ -244,20 +244,56 @@ No body. Records `CloseElection`; answers the election view (state
 
 ### `POST /api/live/tally/publish` (admin; closed)
 
-No body. Publishes now with whatever trustee signatures exist: the largest
-group of signatures over the same totals (with none, the totals `combine`
-gives from the on-chain partials). It runs `tally-assemble` over the ballots
-and partials read from the chain, which refuses totals the partials do not
-decrypt to, and sends `PublishTally`. With fewer than `threshold` signatures
-the chain refuses it: **422, gate `threshold`**, and **nothing changes**
-(state, records and receipts are as before). On success:
+No body. The presenter's **threshold demonstration**: publishes now with
+whatever trustee signatures the console holds, so the chain's threshold
+refusal can be shown. What is sent:
+
+- **Signatures held** (1 to `threshold - 1`): the largest group of signatures
+  over the same totals. It runs `tally-assemble` over the ballots and partials
+  read from the chain, which refuses totals the partials do not decrypt to,
+  and sends `PublishTally`.
+- **No signature held, and the partials combine** (at least `threshold`
+  trustees decrypted, before their signatures arrive): the totals `combine`
+  gives from the on-chain partials, with no signature, through
+  `tally-assemble` as above.
+- **No signature held, and the partials do not combine yet** (from the close
+  until `threshold` trustees have decrypted): a tally **no trustee signed**,
+  carrying **zero for every contest** (no totals exist yet). The chain checks
+  that the election is closed, the number of totals and that no tally is
+  published, and then refuses a tally without trustee signatures at its
+  threshold gate, whatever its totals. If a chain ever accepted it, the
+  answer is **500** "the chain accepted a tally that no trustee signed: stop
+  the demo; it is not recorded as the result", and the console records
+  nothing.
+
+With fewer than `threshold` signatures the chain refuses it: **422, gate
+`threshold`** (reason `tally has 2 valid trustee signatures, threshold is 3`,
+or `tally for election "<id>" carries no trustee signatures`), and **nothing
+changes** (state, records and receipts are as before). On success (only
+reached when the console holds `threshold` signatures whose automatic
+publication failed, so this press retries it):
 
 ```json
 {"published": true, "totals": [2,1,0,0,1,2], "signatures_used": 3,
  "tx_id": "...", "block_number": 417}
 ```
 
-409 if the partials on the chain do not combine yet.
+**When the demonstration can run.** The trustee processes sign by themselves
+after their own Decrypt (`trustee-api.md`), and the console publishes the
+moment it holds `threshold` signatures, so the stretch with some but too few
+signatures now lasts seconds after the `threshold`-th Decrypt, too short to
+press in. The demonstration is meant for the stretch **from the close until
+`threshold` trustees have decrypted**: `state` `closed` and
+`counts.tally_signatures` 0. It then sends the unsigned tally and shows the
+chain refusing a tally no trustee signed: no operator, the console included,
+can publish a result without the trustees. A page enables the row while
+`state` is `closed` and `counts.tally_signatures < threshold`, labelled with
+the count it will send ("Publish with 0 of 3 signatures"), and says before
+sending if the count changed. A press that lands while signatures arrive
+sends what is held at that moment (1 or 2 of 3), still refused at
+`threshold`. At `threshold` signatures the console has already published
+(409, state `tallied`), so it can never publish the real result by accident
+except as the retry above.
 
 If the chain answers that a tally is already published (an earlier
 `PublishTally` committed but the console lost its receipt), the console
@@ -266,13 +302,39 @@ over, it is recorded, the state moves to `tallied`, and the answer is
 `{"published": true, "already_on_chain": true, "totals": [...]}`; other
 totals are 409 naming both.
 
-### `POST /api/live/verify` (admin; tallied or verified)
+### Verification is automatic; `POST /api/live/verify` (admin; tallied or verified) is the retry
 
-No body. Reads the election back from the chain (parameters, transcript,
-every ballot, every partial, the tally), runs `verify-live` with
-`expected_ballots` the chain's nullifier count, stores the verdict as
-`<run>/live-verify.json`, and moves to `verified` only when `overall` is
-`pass`.
+**No press is needed.** As soon as the tally is published (the
+`threshold`-th signature, or a `tally/publish`, or a restart that finds the
+tally on the chain), the console starts the same verification a press runs,
+in the background. While it runs the state is `tallied` and the election
+view's `auto_verify` is `{"state": "running"}`; it usually takes a few
+seconds (`verify-live` checks every ballot's proofs, every partial and the
+tally). Then:
+
+- **pass:** the state becomes `verified`, exactly as after a press;
+  `auto_verify.state` `done`, `verify_overall` `pass`.
+- **fail** (a verdict with failed checks): the state stays `tallied`, with
+  `verify_overall` `fail` and the failed checks recorded exactly as a failed
+  press records them (`live-verify.json`, the board's `failed_checks`);
+  `auto_verify.state` `done`.
+- **no verdict** (the chain could not be read, `verify-live` failed or timed
+  out after 2 minutes): nothing is recorded; the state stays `tallied` with no
+  `verify_overall`; `auto_verify` is `{"state": "error", "error": "<why>"}`.
+
+In the last two cases the **Verify press is the retry**. Only one
+verification runs at a time: a press that arrives while one is in flight
+(automatic or pressed) does not start another; it waits for that run and
+answers its result. **A console restart** at `tallied` with no verdict
+recorded (stopped before or during the automatic run, or a run that gave no
+verdict) starts it again, once; at `tallied` with a failed verdict, or at
+`verified`, it starts nothing.
+
+What a run does, pressed or automatic: reads the election back from the
+chain (parameters, transcript, every ballot, every partial, the tally), runs
+`verify-live` with `expected_ballots` the chain's nullifier count, stores the
+verdict as `<run>/live-verify.json`, and moves to `verified` only when
+`overall` is `pass`. The press answers:
 
 ```json
 {"state": "verified", "overall": "pass", "failed_checks": [],
@@ -315,8 +377,23 @@ Everything the phone's wasm needs, and the counts:
  "lifecycle": {"CreateElection": {"tx_id": "...", "block_number": 390}, "...": {}},
  "totals": [2,1,0,0,1,2],                     "(once tallied)"
  "verify_overall": "pass",
+ "auto_verify": {"state": "done", "at": "..."},  "(null until the console verifies by itself)"
  "created_at": "...", "updated_at": "..."}
 ```
+
+`auto_verify` is the automatic verification of this election since the
+console started: `null` when none ran (before the tally, or after a restart
+that found nothing to verify), else `state` `running`, `done` (a verdict was
+recorded: `verify_overall` says `pass` or `fail`) or `error` (no verdict;
+`error` says why; press Verify to retry), and `at`, when that state began.
+It is not saved: after a restart it is `null` until a new automatic run
+starts. **What a page shows after publication:** `tallied` with
+`auto_verify.state` `running`: "Verifying the result on the chain..." with no
+Verify button; `verified`: the verified result; `tallied` with
+`verify_overall` `fail`: "Result NOT verified" with the failed checks, and
+Verify as a retry; `tallied` with `auto_verify.state` `error` (or `tallied`,
+no `verify_overall` and `auto_verify` `null`): "Not verified yet" with
+`auto_verify.error`, and Verify as a retry.
 
 `voters_on_list` (and its older name `voters_on_roll`) is the number of
 entries on the voter list; `checked_in` the entries that signed the list
@@ -636,6 +713,12 @@ Below threshold: `{"signatures": [1,2], "threshold": 3, "state": "closed",
 "published": false}`. If the automatic publication was refused,
 `publish_error` says why and the signature is still kept.
 
+The trustee processes post their signatures by themselves, with no press,
+after their own Decrypt and once their own combine is ready
+(`trustee-api.md`), so `counts.tally_signatures` goes from 0 to `threshold`
+within seconds of the `threshold`-th trustee's Decrypt, and the state moves
+on to `tallied` and then, by itself, to `verified`.
+
 ## The bulletin board on a live run
 
 `GET /api/board/<run>` keeps its shape and every existing field's meaning.
@@ -707,6 +790,8 @@ chain:
   transcript (an existing transcript counts as done);
 - `open` and the chain closed: `closed`;
 - `closed` and a tally on the chain: `tallied`;
+- `tallied` with no verdict recorded: the automatic verification starts
+  again, once (see **Verification is automatic**);
 - in every state from `closed`, partials the chain holds but `live.json` does
   not are recorded (without a transaction id);
 - in every state from `open`, ballots the chain holds but the run folder does

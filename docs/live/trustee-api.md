@@ -153,7 +153,13 @@ At start the process:
   do not keep out another process running as the same user (**Limits of this
   demo**).
 
-## The three buttons
+## The buttons: Join, Decrypt, and Sign tally only as a retry
+
+A trustee presses twice over an election's life: **Join ceremony** and
+**Decrypt**. The tally signature needs no press: after this trustee's own
+Decrypt has finished, the process combines and signs by itself (see **Combine
+and sign**). **Sign tally** is only a retry, offered when an automatic
+signature did not happen for a reason a retry can cure.
 
 Each button starts a background step and answers at once. The step survives a
 page reload and a process restart: the press is recorded in `progress.json`,
@@ -262,26 +268,65 @@ The join step is `done` once the transcript on the chain is checked.
    the tally has since been published), the process reads the chain first: a
    byte-equal partial under this trustee's id counts as posted.
 
-### Combine (automatic) and Sign tally
+### Combine and sign (both automatic after this trustee's Decrypt)
 
-- **Combine** runs by itself once the console counts at least `threshold`
-  trustees decrypted (or the tally is published): it reads the ballots, every
-  trustee's partials from the chain and checks at least `threshold` trustees
-  have a partial for every contest, then runs `combine` with its own aggregate.
-  The ballot set must be the one this trustee decrypted, if it did (alarm
-  `ballots-changed`); a trustee that did not decrypt records the set here. The
-  totals are shown **before anything is signed** (`tally.totals`,
-  `tally.ready_to_sign`).
-- **Sign tally** (the press) carries the totals shown:
-  `{"totals": [2,1,0,0,1,2]}`. They must equal this trustee's own combine (409
-  otherwise). The process runs `sign-tally` over the same ballots and partials,
-  saves the signature, and posts it (`POST /api/live/tally-sig`). **A 400 means
-  the console's totals differ from this trustee's**: alarm `tally-totals`. If
-  the tally was already published with other trustees' signatures, the step
-  ends `done` with `signature_note` saying so.
+- **Combine** runs by itself, on every trustee, once the console counts at
+  least `threshold` trustees decrypted (or the tally is published): it reads
+  the ballots and every trustee's partials from the chain, checks the chain's
+  parameters and transcript are the ones checked at the ceremony (alarm
+  `chain-changed`), checks at least `threshold` trustees have a partial for
+  every contest, then runs `combine` with its own aggregate. The ballot set
+  must be the one this trustee decrypted, if it did (alarm `ballots-changed`);
+  a trustee that did not decrypt records the set here. The totals are shown
+  (`tally.totals`) before the signature is made. While partials are missing
+  the sign step is `waiting` ("waiting for decryptions: k of t trustees'
+  partials on the chain"), tried again on every poll.
+- **Sign, by itself.** The process signs **only when all of these hold**:
+  1. **Decrypt was pressed on this trustee and finished** (step `decrypt`
+     `done`, its own partial read back from the chain as `ok`). A trustee that
+     did not decrypt, or whose Decrypt was refused, is blocked or is not
+     finished, never signs: not by itself and not on a press.
+  2. **Its own combine succeeded** and its totals are saved.
+  3. **No alarm blocks signing** (`transcript`, `chain-changed`,
+     `ballots-peer-<id>`, `partial-readback`, `partial-conflict`,
+     `ballots-changed`, `tally-totals`, or any alarm of the ceremony).
+  4. **The console says `closed`** and the tally is not known to be published.
+
+  It then runs `sign-tally` over the same ballots and partials (the chain's
+  parameters, transcript and ballot set are read and checked again; a ballot
+  set that changed since the combine is **refused**: nothing is signed),
+  saves the signature, and posts it (`POST /api/live/tally-sig`), with no
+  press. The decision and the signature are saved in `progress.json` before
+  anything is posted, so a kill at any point ends, after the restart, with
+  exactly one signature: the saved one, posted once (the console answers a
+  repeat of the same signature as success).
+- **What the post's answer does.** `200`: `done`, `tally.signature_posted`
+  true. **`400` means the console's totals differ from this trustee's**:
+  alarm `tally-totals`, the step is `blocked`, and no press is offered. `409`
+  "is tallied" or "is verified": the tally was published with other trustees'
+  signatures first; the step ends `done` with `signature_note` saying so. No
+  answer, or `502`/`503`/`504`: the step is `waiting` and the process posts
+  the same signature again by itself on the next poll
+  (`tally.sign_problem` `console_unreachable`). Any other answer (for example
+  `500`, or a `409` such as "the live election changed while the signature
+  was being checked"): the step is `failed` and **waits for the Sign tally
+  press** (`tally.sign_problem` `post_failed`). A chain that cannot be read
+  for the signature, or a `sign-tally` that fails, is also `failed` and waits
+  for the press (`chain_unreadable`, `error`).
+- **A trustee that decrypts late** (after the tally is published) combines,
+  shows the totals, and signs nothing: its sign step is `done` with `detail`
+  "the tally is published; no signature is needed".
 - **Published.** When the console reports the election tallied, the process
   reads the tally from the chain and shows whether it equals its own combine
   (`tally.matches`); a difference is alarm `tally-differs`.
+- **Timing.** The process reads the console every 2 seconds (fixed; not a
+  flag). Once the console counts `threshold` trustees decrypted, each trustee
+  that decrypted combines and signs within about one poll plus the ops' time
+  (`aggregate` twice, `combine`, `sign-tally`, and the chain reads), then the
+  console checks each signature (`tally-assemble`) and publishes when it
+  holds `threshold` signatures over the same totals (one `PublishTally`
+  block). With `threshold` trustees decrypted, the tally is on the chain
+  seconds after the last of them finishes Decrypt, with no further press.
 
 ### Other rules
 
@@ -397,7 +442,8 @@ Everything a screen needs, in one read. Poll it (every 1 to 2 seconds).
   "tally": {
     "totals": [2,1,0,0,1,2],
     "contests": [{"contest_id": "president/alice", "total": 2}, "..."],
-    "ready_to_sign": true, "signature_posted": false, "signature_note": "",
+    "signing": "signing",
+    "ready_to_sign": false, "signature_posted": false, "signature_note": "",
     "published": false, "published_totals": [], "matches": null
   },
   "updated_at": "..."
@@ -412,8 +458,8 @@ Fields:
 | `identity` | `checked: false` until an election exists; `ok: false` with `error` when the token is not this `--id`'s or the console refuses it. Nothing runs until `ok`. |
 | `election` | `null` before the console has an election. `state` is the console's (`setup`, `ceremony`, `open`, `closed`, `tallied`, `verified`, `abandoned`), for display. `params_checked`: the parameters were checked against the chain. `ballot_records`: the console's count of the chain's records. |
 | `step` | The step in progress: the first of `join`, `decrypt`, `sign` that is `running`, else the first `waiting`; `""` when none. |
-| `steps.<step>.state` | `idle` (not pressed), `running`, `waiting` (on someone else; `detail` says on what; it carries on by itself), `done`, `failed` (`error` says why; **press the button again to retry**, for example after a chain read failure), `refused` (`error` says why: not closed, under `--min-ballots`, another ballot set, the ceremony was over before this trustee joined), `blocked` (an alarm blocks it for this election). |
-| `steps.sign` before the press | `waiting` with `detail` "...press Sign tally..." once the combine is ready; once the tally is on the chain, **`done`** with `detail` "the tally is published; no signature is needed" and `tally.signature_posted` false (nothing is left to sign; a page draws it as not needed); `waiting` with `detail` or `error` while the combine waits for partials or cannot read the chain. |
+| `steps.<step>.state` | `idle` (not pressed), `running`, `waiting` (on someone else; `detail` says on what; it carries on by itself), `done`, `failed` (`error` says why; **press the button again to retry**, for example after a chain read failure), `refused` (`error` says why: not closed, under `--min-ballots`, another ballot set, the ceremony was over before this trustee joined, the ballot set changed before signing), `blocked` (an alarm blocks it for this election). |
+| `steps.sign` | Never pressed in the normal flow. `idle` until a combine is tried. `waiting` with `detail` or `error` while the combine waits for partials or cannot read the chain. Once the combine is ready: on a trustee that decrypted, `running` with `detail` "your own combine gives the totals shown; signing them" until the signature is posted (`done`), or `waiting` while the console does not answer, `failed` (press Sign tally to retry), `refused` or `blocked`; on a trustee that did not decrypt, `idle` with `detail` "this trustee did not decrypt this election, so it does not sign". Once the tally is on the chain, a trustee that did not sign is **`done`** with `detail` "the tally is published; no signature is needed" and `tally.signature_posted` false (a page draws it as not needed). `step` is `sign` only while the sign step is `running` or `waiting`. |
 | `alarms[]` | `{code, message, blocks, at}`: see below. Shown until the election changes. |
 | `fingerprints` | 128-bit fingerprints of this trustee's receive key, the roster digest, its key share, the joint key and the ballot set. Compare them aloud with the other trustee pages, the board and the phones. |
 | `ceremony.roster[].peer_check` | `self`; `pending` (not checked yet); `ok`; `waiting` (with `detail`); `mismatch` (with `detail`, and an alarm). |
@@ -422,7 +468,9 @@ Fields:
 | `decryption.min_ballot_records` | The fewest ballot records the chain must hold before Decrypt can run: `min_ballots` × the number of positions; `0` until the positions are known. A page compares it with `election.ballot_records` (the console's count) to leave Decrypt out; the press is refused on the trustee's own chain count either way. |
 | `decryption.partial_read_back` | `""`, `ok`, `mismatch`. |
 | `tally.totals` | This trustee's own combine, in `contest_ids` order; `[]` until it ran. |
-| `tally.ready_to_sign` | Totals are shown, Sign was not pressed, nothing blocks it. |
+| `tally.signing` | Where this trustee's own signature stands, in this order of precedence: `signed` (its signature is posted); `blocked` (an alarm blocks signing; no signature is made, no press offered); `not_needed` (the tally was published before this trustee signed: it did not decrypt in time, or others signed first); `not_decrypted` (Decrypt was not pressed here, or it was refused or has not finished: **this trustee does not sign**, and a press is refused); `refused` (the process refused to sign: the ballot set changed since the combine; no press offered); `retry` (a sign attempt failed for a reason a retry can cure: **show Sign tally**); `signing` (its combine is ready; it is signing and posting by itself); `waiting` (Decrypt is done; waiting for `threshold` trustees' partials and its own combine, or for the console to answer). |
+| `tally.sign_problem` | Present only while `signing` is `retry`, `waiting` or `signing`, after an attempt that did not post: `console_unreachable` (no answer, or 502/503/504: **the process posts again by itself**, no press); `post_failed` (the console answered the post with another error); `chain_unreadable` (the chain could not be read for the signature); `error` (anything else, for example `sign-tally` failed). The last three come with `signing` `retry`; `steps.sign.error` has the words. |
+| `tally.ready_to_sign` | **True only when Sign tally may be pressed**: `signing` is `retry` (the sign step `failed`) and the totals are shown. A page shows the Sign tally button only then. It is false in every other case, including all the normal ones: the signature is made without a press. |
 | `tally.matches` | `null` until both the published tally and this trustee's combine are known; then whether they are equal. |
 
 ### `POST /api/trustee/join`, `POST /api/trustee/decrypt`
@@ -448,10 +496,19 @@ was `refused` starts again. Refusals, before anything starts:
 {"totals": [2,1,0,0,1,2]}
 ```
 
-The totals the screen showed (`tally.totals`). **202** with the status body.
-**409** when there are no totals yet, when they differ from this trustee's own
-combine, or when an alarm blocks signing. Nothing is ever signed without this
-press.
+The totals the screen showed (`tally.totals`). **A retry only**: the signature
+is made without a press after this trustee's own Decrypt. The press runs the
+same sign step again, with every check (it is never a way around one), and
+posts the saved signature if one was made. **202** with the status body.
+**409**, before anything starts:
+- `blocked by an alarm: ...` when an alarm blocks signing;
+- `this trustee did not decrypt this election, so it does not sign: ...` when
+  Decrypt was not pressed here or did not finish;
+- when there are no totals yet, or they differ from this trustee's own
+  combine;
+- `nothing to retry: this trustee signs by itself after its Decrypt, and its
+  sign step is <state>` unless the sign step is `failed` (that is, unless
+  `tally.ready_to_sign` is true).
 
 ### `GET /api/trustee/peer` (public)
 
@@ -501,7 +558,16 @@ investigating.
 - During decryption: the ballot count per position, the ballot set
   fingerprint, the peers' ballot checks, partial recorded and read back, and
   `k of threshold` trustees decrypted.
-- Before signing: the totals per contest and the Sign tally button (which sends
-  them back).
+- After Decrypt: the totals per contest once combined, and where the
+  signature stands (`tally.signing`): "Waiting for k of t trustees' partials"
+  (`waiting`), "Signing your own totals" (`signing`), "Signed" (`signed`),
+  "Not needed: the tally is published" (`not_needed`), "You did not decrypt,
+  so you do not sign" (`not_decrypted`). There is no Sign tally button in the
+  normal flow.
+- The Sign tally button (which sends the totals back) **only when
+  `tally.ready_to_sign` is true** (`signing` `retry`), with `steps.sign.error`
+  as the reason; while `sign_problem` is `console_unreachable` the page says
+  the console is not answering and that the signature will be posted when it
+  does, with no button.
 - After publication: the published totals and whether they match.
 - Alarms prominently, with their message.
