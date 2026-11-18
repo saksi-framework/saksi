@@ -372,7 +372,7 @@ func (T *TrusteeService) RequestSign(totals []uint64) error {
 		if s := p.step("sign"); s.State != stepFailed {
 			return fmt.Errorf("nothing to retry: this trustee signs by itself after its Decrypt, and its sign step is %s", s.State)
 		}
-		p.SignRequested, p.SignTotals = true, slices.Clone(totals)
+		p.SignRequested, p.SignTotals, p.SignAttempts = true, slices.Clone(totals), 0
 		return nil
 	})
 }
@@ -480,6 +480,11 @@ type TrusteeTally struct {
 	// SignProblem says why the signature has not happened yet, when that is
 	// something other than waiting for the partials (signProblem* below).
 	SignProblem string `json:"sign_problem,omitempty"`
+	// SignAttempts is how many sign attempts failed since the last request
+	// (automatic, or the press); SignAttemptsMax is how many the process
+	// makes by itself before it waits for the press.
+	SignAttempts    int `json:"sign_attempts"`
+	SignAttemptsMax int `json:"sign_attempts_max"`
 	// ReadyToSign: the Sign tally press is usable, as a retry of a signature
 	// that did not happen for a reason a retry can cure (Signing "retry").
 	ReadyToSign     bool     `json:"ready_to_sign"`
@@ -566,7 +571,7 @@ func (T *TrusteeService) Status() TrusteeStatus {
 		Ceremony:  TrusteeCeremony{Roster: []TrusteeRosterEntry{}},
 		Decryption: TrusteeDecryption{MinBallots: T.minBallots, BallotsByPosition: map[string]int{},
 			PeerChecks: []TrusteePeerBallotCheck{}},
-		Tally:     TrusteeTally{Totals: []uint64{}, Contests: []trusteeContestTotal{}, PublishedTotals: []uint64{}},
+		Tally:     TrusteeTally{Totals: []uint64{}, Contests: []trusteeContestTotal{}, PublishedTotals: []uint64{}, SignAttemptsMax: signMaxAttempts},
 		UpdatedAt: T.now().UTC(),
 	}
 	for _, n := range []string{"join", "decrypt", "sign"} {
@@ -647,6 +652,9 @@ func (T *TrusteeService) Status() TrusteeStatus {
 	t.Signing = p.signing()
 	if t.Signing == signingRetry || t.Signing == signingWaiting || t.Signing == signingSigning {
 		t.SignProblem = p.SignProblem
+	}
+	if !p.SignaturePosted {
+		t.SignAttempts = p.SignAttempts
 	}
 	t.ReadyToSign = t.Signing == signingRetry && len(p.Totals) > 0 && v != nil && v.State == LiveClosed
 	t.Published = p.TallyPublished

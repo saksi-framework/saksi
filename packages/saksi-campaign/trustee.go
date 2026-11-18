@@ -223,6 +223,9 @@ type trusteeProgress struct {
 	// SignProblem is why the last sign attempt did not post (signProblem*),
 	// "" once it posted or before any attempt.
 	SignProblem string `json:"sign_problem,omitempty"`
+	// SignAttempts counts the sign attempts that failed since the last
+	// request (automatic, or the press); 0 once one posts.
+	SignAttempts int `json:"sign_attempts,omitempty"`
 
 	TallyPublished bool     `json:"tally_published"`
 	TallyTotals    []uint64 `json:"tally_totals,omitempty"`
@@ -2098,51 +2101,113 @@ func (T *TrusteeService) autoSign(v *LiveElectionView) bool {
 	return true
 }
 
+// signMaxAttempts is how many sign attempts the process makes by itself for
+// one request when an attempt fails for a transient cause (see
+// signTransient); after that the step is failed and the Sign tally press is
+// offered. Each attempt runs every check again.
+const signMaxAttempts = 3
+
 // signConsoleErr and signPostErr mark why a sign attempt did not post, for
 // tally.sign_problem.
 type (
 	signConsoleErr struct{ error } // the console did not answer (a tWait inside)
-	signPostErr    struct{ error } // the console answered the post with an error
+	signPostErr    struct {        // the console answered the post with an error
+		code int
+		error
+	}
 )
 
 func (e signConsoleErr) Unwrap() error { return e.error }
 func (e signPostErr) Unwrap() error    { return e.error }
 
-// advanceSign signs this trustee's own combine and posts the signature, and
-// records why an attempt did not post (tally.sign_problem).
+// signChangedWhileChecked is the console's 409 when its election changed
+// while it checked the signature: transient.
+const signChangedWhileChecked = "changed while the signature was being checked"
+
+// signTransient reports whether a failed sign attempt's cause may clear by
+// itself: the console not answering (or 502, 503, 504), the chain not
+// readable, any other 5xx from the console, or its 409 "changed while the
+// signature was being checked". Everything else (another 409 or 4xx, an op
+// failure, a refusal, an alarm) is not retried by itself.
+func signTransient(err error) bool {
+	var (
+		cons  signConsoleErr
+		post  signPostErr
+		chain tChainErr
+	)
+	switch {
+	case errors.As(err, &cons), errors.As(err, &chain):
+		return true
+	case errors.As(err, &post):
+		return post.code >= 500 || (post.code == 409 && strings.Contains(post.Error(), signChangedWhileChecked))
+	}
+	return false
+}
+
+// advanceSign makes one sign attempt, records why it did not post
+// (tally.sign_problem, tally.sign_attempts), and retries a transient failure
+// by itself on the next ticks, up to signMaxAttempts attempts in all: the
+// step waits meanwhile, then fails and the press is offered.
 func (T *TrusteeService) advanceSign(ctx context.Context) error {
 	err := T.signOnce(ctx)
+	if errors.Is(err, errTrusteeKilled) || ctx.Err() != nil {
+		return err
+	}
 	problem := ""
 	var (
 		cons    signConsoleErr
 		post    signPostErr
 		chain   tChainErr
-		wait    tWait
 		refused tRefused
 		alarm   tAlarm
 	)
+	counted := true
 	switch {
-	case err == nil, errors.Is(err, errTrusteeKilled), ctx.Err() != nil,
-		errors.As(err, &refused), errors.As(err, &alarm):
+	case err == nil, errors.As(err, &refused), errors.As(err, &alarm):
+		counted = false
 	case errors.As(err, &cons):
 		problem = signProblemConsole
 	case errors.As(err, &post):
 		problem = signProblemPost
 	case errors.As(err, &chain):
 		problem = signProblemChain
-	case errors.As(err, &wait):
 	default:
 		problem = signProblemError
 	}
-	if !errors.Is(err, errTrusteeKilled) && ctx.Err() == nil {
-		_ = T.update(func(p *trusteeProgress) { p.SignProblem = problem })
+	attempts := 0
+	_ = T.update(func(p *trusteeProgress) {
+		p.SignProblem = problem
+		switch {
+		case err == nil:
+			p.SignAttempts = 0
+		case counted:
+			p.SignAttempts++
+		}
+		attempts = p.SignAttempts
+	})
+	if err == nil || !signTransient(err) {
+		return err
 	}
-	return err
+	if attempts < signMaxAttempts {
+		log.Printf("trustee %d: sign attempt %d of %d did not post (%v); trying again by itself", T.id, attempts, signMaxAttempts, err)
+		return tWait{fmt.Sprintf("the signature was not posted (%s); trying again by itself: attempt %d of %d failed", signErrText(err), attempts, signMaxAttempts)}
+	}
+	log.Printf("trustee %d: sign attempt %d of %d did not post (%v); waiting for the Sign tally press", T.id, attempts, signMaxAttempts, err)
+	return fmt.Errorf("the signature was not posted after %d attempts (%s); press Sign tally to try again", attempts, signErrText(err))
+}
+
+// signErrText is a failed attempt's reason, without a "trying again" the
+// attempt count now says.
+func signErrText(err error) string {
+	return strings.TrimSuffix(err.Error(), "; trying again")
 }
 
 // signOnce signs the totals asked for (this trustee's own combine) and posts
-// the signature. The signature is saved before it is posted, so a retry, or
-// a restart after a kill, posts the same bytes.
+// the signature. Every attempt runs every check again: eligibility, the
+// totals, the chain's parameters and transcript, and the ballot set; a
+// signature already made is posted only if the chain's ballot set is still
+// the one it signed. The signature is saved before it is posted, so a retry,
+// or a restart after a kill, posts the same bytes.
 func (T *TrusteeService) signOnce(ctx context.Context) error {
 	T.begin("sign")
 	p := T.p
@@ -2158,7 +2223,7 @@ func (T *TrusteeService) signOnce(ctx context.Context) error {
 	if len(p.Totals) == 0 || !slices.Equal(p.Totals, approved) {
 		return refusedf("the approved totals are not this trustee's own combine")
 	}
-	if len(p.Signature) == 0 {
+	if !p.SignaturePosted {
 		params, dkg, err := T.chainParamsDKG()
 		if err != nil {
 			return err
@@ -2167,30 +2232,38 @@ func (T *TrusteeService) signOnce(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
-		raw, err := T.opRaw(ctx, "sign-tally", map[string]any{
-			"share_file": T.shareFile(p), "params": params, "dkg": dkg,
-			"ballots": ballots, "partials": p.CombinePartials, "totals": p.Totals,
-		})
-		if err != nil {
-			return err
+		if len(p.Signature) == 0 {
+			raw, err := T.opRaw(ctx, "sign-tally", map[string]any{
+				"share_file": T.shareFile(p), "params": params, "dkg": dkg,
+				"ballots": ballots, "partials": p.CombinePartials, "totals": p.Totals,
+			})
+			if err != nil {
+				return err
+			}
+			var out ballotSet
+			if json.Unmarshal(raw, &out) != nil || !strings.EqualFold(out.BallotsDigest, p.BallotsDigest) {
+				return refusedf("the chain's ballot set changed since this trustee combined; nothing was signed")
+			}
+			if err := T.update(func(p *trusteeProgress) { p.Signature = raw }); err != nil {
+				return err
+			}
+			if T.crashed("sig-saved") {
+				return errTrusteeKilled
+			}
+		} else {
+			var set ballotSet
+			if err := T.op(ctx, "aggregate", map[string]any{"params": params, "dkg": dkg, "ballots": ballots}, &set); err != nil {
+				return err
+			}
+			if !strings.EqualFold(set.BallotsDigest, p.BallotsDigest) {
+				return refusedf("the chain's ballot set changed since this trustee signed; the signature was not posted")
+			}
 		}
-		var out ballotSet
-		if json.Unmarshal(raw, &out) != nil || !strings.EqualFold(out.BallotsDigest, p.BallotsDigest) {
-			return refusedf("the chain's ballot set changed since this trustee combined; nothing was signed")
-		}
-		if err := T.update(func(p *trusteeProgress) { p.Signature = raw }); err != nil {
-			return err
-		}
-		if T.crashed("sig-saved") {
-			return errTrusteeKilled
-		}
-	}
-	if !p.SignaturePosted {
 		code, body, err := T.console.doRaw(ctx, "POST", "/api/live/tally-sig", p.Signature)
 		if err != nil {
 			var wait tWait
 			if errors.As(err, &wait) {
-				return signConsoleErr{err} // still waiting: tried again by itself
+				return signConsoleErr{err}
 			}
 			return err
 		}
@@ -2216,7 +2289,7 @@ func (T *TrusteeService) signOnce(ctx context.Context) error {
 			})
 			return nil
 		default:
-			return signPostErr{fmt.Errorf("the console refused the signature: %d %s", code, text)}
+			return signPostErr{code, fmt.Errorf("the console refused the signature: %d %s", code, text)}
 		}
 	}
 	return nil

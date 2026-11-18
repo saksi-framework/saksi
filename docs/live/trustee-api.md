@@ -304,15 +304,27 @@ The join step is `done` once the transcript on the chain is checked.
   true. **`400` means the console's totals differ from this trustee's**:
   alarm `tally-totals`, the step is `blocked`, and no press is offered. `409`
   "is tallied" or "is verified": the tally was published with other trustees'
-  signatures first; the step ends `done` with `signature_note` saying so. No
-  answer, or `502`/`503`/`504`: the step is `waiting` and the process posts
-  the same signature again by itself on the next poll
-  (`tally.sign_problem` `console_unreachable`). Any other answer (for example
-  `500`, or a `409` such as "the live election changed while the signature
-  was being checked"): the step is `failed` and **waits for the Sign tally
-  press** (`tally.sign_problem` `post_failed`). A chain that cannot be read
-  for the signature, or a `sign-tally` that fails, is also `failed` and waits
-  for the press (`chain_unreadable`, `error`).
+  signatures first; the step ends `done` with `signature_note` saying so.
+- **Retries by itself, at most 3 attempts in all.** An attempt that fails
+  for a **transient** cause is tried again by itself on the next poll: the
+  console not answering, or answering `502`/`503`/`504`
+  (`sign_problem` `console_unreachable`); any other `5xx`, or the `409` "the
+  live election changed while the signature was being checked"
+  (`post_failed`); the chain not readable (`chain_unreadable`). Every attempt
+  runs every check again (eligibility, the totals, the chain's parameters and
+  transcript, the ballot set; a signature already made is posted again only
+  if the chain's ballot set is still the one it signed). While it retries,
+  the step is `waiting` with `detail` "the signature was not posted (...);
+  trying again by itself: attempt n of 3 failed", `tally.signing` is
+  `waiting`, `tally.sign_problem` says why and `tally.sign_attempts` is `n`.
+  After the third failed attempt the step is `failed` (`error` "the
+  signature was not posted after 3 attempts (...); press Sign tally to try
+  again") and **the press is offered** (`signing` `retry`, `ready_to_sign`
+  true). A cause that is **not transient** (another `409` or `4xx`, or
+  `sign-tally` failing: `post_failed` or `error`) is never retried by itself:
+  the step is `failed` after that one attempt and the press is offered. A
+  refusal (`refused`) or an alarm (`blocked`) is final. Each press starts a
+  new request: up to 3 attempts again, each with every check.
 - **A trustee that decrypts late** (after the tally is published) combines,
   shows the totals, and signs nothing: its sign step is `done` with `detail`
   "the tally is published; no signature is needed".
@@ -343,7 +355,8 @@ The join step is `done` once the transcript on the chain is checked.
 - **The console is slow, not refusing.** A console call may wait up to about
   2.5 minutes on the console's state lock while it submits to a stalled chain;
   the process's timeout is 4 minutes, and a timeout, a transport error or a
-  502/503/504 is shown as `waiting` and tried again by itself.
+  502/503/504 is shown as `waiting` and tried again by itself (for the
+  signature post, at most 3 attempts in all: see **Retries by itself**).
 
 ## Local HTTP API
 
@@ -469,7 +482,9 @@ Fields:
 | `decryption.partial_read_back` | `""`, `ok`, `mismatch`. |
 | `tally.totals` | This trustee's own combine, in `contest_ids` order; `[]` until it ran. |
 | `tally.signing` | Where this trustee's own signature stands, in this order of precedence: `signed` (its signature is posted); `blocked` (an alarm blocks signing; no signature is made, no press offered); `not_needed` (the tally was published before this trustee signed: it did not decrypt in time, or others signed first); `not_decrypted` (Decrypt was not pressed here, or it was refused or has not finished: **this trustee does not sign**, and a press is refused); `refused` (the process refused to sign: the ballot set changed since the combine; no press offered); `retry` (a sign attempt failed for a reason a retry can cure: **show Sign tally**); `signing` (its combine is ready; it is signing and posting by itself); `waiting` (Decrypt is done; waiting for `threshold` trustees' partials and its own combine, or for the console to answer). |
-| `tally.sign_problem` | Present only while `signing` is `retry`, `waiting` or `signing`, after an attempt that did not post: `console_unreachable` (no answer, or 502/503/504: **the process posts again by itself**, no press); `post_failed` (the console answered the post with another error); `chain_unreadable` (the chain could not be read for the signature); `error` (anything else, for example `sign-tally` failed). The last three come with `signing` `retry`; `steps.sign.error` has the words. |
+| `tally.sign_problem` | Present only while `signing` is `retry`, `waiting` or `signing`, after an attempt that did not post: `console_unreachable` (no answer, or 502/503/504); `post_failed` (the console answered the post with another error); `chain_unreadable` (the chain could not be read for the signature); `error` (anything else, for example `sign-tally` failed). With `signing` `waiting` the process is still retrying by itself (transient causes only, up to `sign_attempts_max` attempts in all); with `signing` `retry` it has stopped and waits for the press. `steps.sign.detail` (while retrying) or `steps.sign.error` (after) has the words. |
+| `tally.sign_attempts` | Sign attempts that failed since the last request (the automatic one, or the press); `0` before any and once one posts. With `signing` `waiting` and `sign_problem` set, the process is retrying by itself: show "Signature not posted yet (<problem>); trying again, attempt n of `sign_attempts_max`", with no button. |
+| `tally.sign_attempts_max` | `3`: the attempts the process makes by itself for one request before it waits for the press. Always present. |
 | `tally.ready_to_sign` | **True only when Sign tally may be pressed**: `signing` is `retry` (the sign step `failed`), the totals are shown, and `election.state` is `closed`. A page shows the Sign tally button only then. It is false in every other case, including all the normal ones: the signature is made without a press. |
 | `tally.matches` | `null` until both the published tally and this trustee's combine are known; then whether they are equal. |
 
@@ -568,8 +583,8 @@ investigating.
   normal flow.
 - The Sign tally button (which sends the totals back) **only when
   `tally.ready_to_sign` is true** (`signing` `retry`), with `steps.sign.error`
-  as the reason; while `sign_problem` is `console_unreachable` the page says
-  the console is not answering and that the signature will be posted when it
-  does, with no button.
+  as the reason; while `signing` is `waiting` with `sign_problem` set, the page
+  says the signature is not posted yet and that the process is trying again
+  (attempt `sign_attempts` of `sign_attempts_max`), with no button.
 - After publication: the published totals and whether they match.
 - Alarms prominently, with their message.

@@ -1041,16 +1041,19 @@ func TestTrusteeSignsOnlyAfterItsOwnDecryptAndAlarmsOnTotals(t *testing.T) {
 	}
 }
 
-// The Sign tally press is a fallback for a signature that did not happen for
-// a reason a retry cures. A console that answers 503 is waited out and the
-// signature posts by itself; a console that answers 500 fails the step, which
-// waits for the press (no second post until then) and says why; the press
-// posts the same signature.
+// The Sign tally press is a fallback. A sign attempt that fails for a
+// transient cause is tried again by itself, at most 3 attempts in all:
+// trustee 1's console answers 503 then 500, and its third attempt posts with
+// no press. Trustee 2's answers 500 three times: the step fails after the
+// third, says why, posts nothing more until the press, and the press posts.
+// Trustee 3's answers a 409 that is not transient: no second attempt until
+// the press.
 func TestTrusteeSignFallbackPress(t *testing.T) {
 	var bed atomic.Pointer[trusteeTestBed]
 	var posts [6]atomic.Int32
+	fail := map[int][]int{1: {503, 500}, 2: {500, 500, 500}, 3: {409}}
 	b := newTrusteeTestBed(t, fleetOptions{consoleFor: func(id int) string {
-		if id != 1 && id != 2 {
+		if fail[id] == nil {
 			return ""
 		}
 		proxy := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1059,13 +1062,15 @@ func TestTrusteeSignFallbackPress(t *testing.T) {
 				http.Error(w, "starting", http.StatusServiceUnavailable)
 				return
 			}
-			if r.URL.Path == "/api/live/tally-sig" && posts[id].Add(1) == 1 {
-				code := http.StatusServiceUnavailable
-				if id == 2 {
-					code = http.StatusInternalServerError
+			if r.URL.Path == "/api/live/tally-sig" {
+				if n := int(posts[id].Add(1)); n <= len(fail[id]) {
+					msg := "the console is having a bad moment"
+					if fail[id][n-1] == 409 {
+						msg = "the console says no"
+					}
+					writeJSONResp(w, fail[id][n-1], map[string]string{"error": msg})
+					return
 				}
-				writeJSONResp(w, code, map[string]string{"error": "the console is having a bad moment"})
-				return
 			}
 			b.h.s.ServeHTTP(w, r)
 		}))
@@ -1081,32 +1086,45 @@ func TestTrusteeSignFallbackPress(t *testing.T) {
 	for id := 1; id <= 3; id++ {
 		f.decrypt(id)
 	}
-	// Trustee 1: the 503 is waited out; it signs with no press.
+	// Trustee 1: two transient failures, then the signature, with no press.
 	f.signed(1, wantTotals)
-	if n := posts[1].Load(); n != 2 {
-		t.Fatalf("trustee 1 posted %d times, want 2 (the 503, then the signature)", n)
+	if n := posts[1].Load(); n != 3 {
+		t.Fatalf("trustee 1 posted %d times, want 3", n)
 	}
-	// Trustee 2: the 500 fails the step; the press is offered and says why.
-	st := f.waitFor(2, "the failed post", func(st TrusteeStatus) bool { return st.Steps["sign"].State == stepFailed })
-	if st.Tally.Signing != signingRetry || !st.Tally.ReadyToSign || st.Tally.SignProblem != signProblemPost || st.Tally.SignaturePosted {
-		t.Fatalf("trustee 2 after a 500: %+v", st.Tally)
+	if st := f.status(1); st.Tally.SignAttempts != 0 || st.Tally.SignProblem != "" || st.Tally.SignAttemptsMax != 3 {
+		t.Fatalf("trustee 1 after it posted: %+v", st.Tally)
+	}
+	// Trustee 2: three transient failures, then failed, with the press.
+	st := f.waitFor(2, "the third failed attempt", func(st TrusteeStatus) bool { return st.Steps["sign"].State == stepFailed })
+	if st.Tally.Signing != signingRetry || !st.Tally.ReadyToSign || st.Tally.SignProblem != signProblemPost ||
+		st.Tally.SignAttempts != 3 || st.Tally.SignaturePosted || !strings.Contains(st.Steps["sign"].Error, "after 3 attempts") {
+		t.Fatalf("trustee 2 after three 500s: %+v %+v", st.Tally, st.Steps["sign"])
+	}
+	// Trustee 3: a 409 that is not transient fails at once.
+	st3 := f.waitFor(3, "the refused post", func(st TrusteeStatus) bool { return st.Steps["sign"].State == stepFailed })
+	if st3.Tally.Signing != signingRetry || !st3.Tally.ReadyToSign || st3.Tally.SignAttempts != 1 {
+		t.Fatalf("trustee 3 after a 409: %+v", st3.Tally)
 	}
 	time.Sleep(300 * time.Millisecond)
-	if n := posts[2].Load(); n != 1 {
-		t.Fatalf("trustee 2 posted %d times before the press, want 1", n)
+	if n2, n3 := posts[2].Load(), posts[3].Load(); n2 != 3 || n3 != 1 {
+		t.Fatalf("posts before the press: trustee 2 %d (want 3), trustee 3 %d (want 1)", n2, n3)
 	}
-	if _, ok := f.consoleSigs()["2"]; ok {
+	sigs := f.consoleSigs()
+	if _, ok := sigs["2"]; ok {
 		t.Fatal("the console holds trustee 2's signature before the press")
 	}
 	f.press(2, "sign", map[string]any{"totals": st.Tally.Totals})
+	f.press(3, "sign", map[string]any{"totals": st3.Tally.Totals})
 	f.signed(2, wantTotals)
 	f.signed(3, wantTotals)
 	f.waitPublished()
-	if n := posts[2].Load(); n != 2 {
-		t.Fatalf("trustee 2 posted %d times, want 2", n)
+	if n2, n3 := posts[2].Load(), posts[3].Load(); n2 != 4 || n3 != 2 {
+		t.Fatalf("posts after the press: trustee 2 %d (want 4), trustee 3 %d (want 2)", n2, n3)
 	}
-	if st := f.status(2); st.Tally.SignProblem != "" || st.Tally.Signing != signingSigned {
-		t.Fatalf("trustee 2 after the press: %+v", st.Tally)
+	for id := 1; id <= 3; id++ {
+		if st := f.status(id); st.Tally.SignProblem != "" || st.Tally.Signing != signingSigned {
+			t.Fatalf("trustee %d at the end: %+v", id, st.Tally)
+		}
 	}
 }
 
