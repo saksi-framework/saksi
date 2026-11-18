@@ -62,16 +62,20 @@ func TestLiveBoardAndViewReadWhileTrusteesPost(t *testing.T) {
 					bad.Store(fmt.Sprintf("%s: %d", path, code))
 				}
 				polls.Add(1)
+				time.Sleep(time.Millisecond) // yield: never a busy loop
 			}
 		}()
 	}
+	// Stopped even when a step below fails the test, so no poller outlives it.
+	var once sync.Once
+	stopPollers := func() { once.Do(func() { close(stop); wg.Wait() }) }
+	t.Cleanup(stopPollers)
 	for id := 1; id <= 3; id++ {
 		c.partials(id, liveContests)
 	}
 	c.ok(http.MethodPost, "/api/live/tally-sig", c.tok(1), map[string]any{"totals": []int{1, 0, 0, 1}, "signature": sig(1)})
 	c.ok(http.MethodPost, "/api/live/tally-sig", c.tok(2), map[string]any{"totals": []int{1, 0, 0, 1}, "signature": sig(2)})
-	close(stop)
-	wg.Wait()
+	stopPollers()
 	if v := bad.Load(); v != nil {
 		t.Fatalf("a poll failed: %v", v)
 	}
