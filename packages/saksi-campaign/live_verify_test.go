@@ -394,3 +394,35 @@ func TestLiveTallySigRunFailureIsNotARefusal(t *testing.T) {
 		t.Fatalf("%d signatures kept after the retry", n)
 	}
 }
+
+// A byte-equal repeat of a signature at the threshold publishes: the first
+// post kept the signature but its save failed, so its publication never ran.
+func TestLiveRepeatedSignatureAtTheThresholdPublishes(t *testing.T) {
+	fx := newLiveFixture(t)
+	c := fx.console()
+	c.toState(LiveClosed)
+	c.partials(1, liveContests)
+	c.partials(2, liveContests)
+	c.ok(http.MethodPost, "/api/live/tally-sig", c.tok(1), map[string]any{"totals": []int{1, 0, 0, 1}, "signature": sig(1)})
+	// A repeat below the threshold publishes nothing.
+	if out := c.ok(http.MethodPost, "/api/live/tally-sig", c.tok(1), map[string]any{"totals": []int{1, 0, 0, 1}, "signature": sig(1)}); out["published"] != false {
+		t.Fatalf("a repeat below the threshold: %v", out)
+	}
+	// Trustee 2's signature is held (its first post's save failed after it
+	// was kept) and nothing was published.
+	L := c.s.live
+	L.mu.Lock()
+	L.st.Signatures["2"] = liveSig{Totals: []uint64{1, 0, 0, 1}, Signature: sig(2), At: time.Now().UTC()}
+	L.mu.Unlock()
+	if c.state() != LiveClosed {
+		t.Fatalf("state %s", c.state())
+	}
+	out := c.ok(http.MethodPost, "/api/live/tally-sig", c.tok(2), map[string]any{"totals": []int{1, 0, 0, 1}, "signature": sig(2)})
+	if out["published"] != true {
+		t.Fatalf("the repeat at the threshold: %v", out)
+	}
+	c.s.live.waitBackground()
+	if s := c.state(); s != LiveVerified {
+		t.Fatalf("state %s after the repeat, want verified", s)
+	}
+}

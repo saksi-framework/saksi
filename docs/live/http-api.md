@@ -703,7 +703,11 @@ different second one is 409). If `tally-assemble` did not run to an answer
 (it crashed, was killed, timed out or could not start: no JSON `error` from
 the op), nothing was learnt about the signature: the answer is a plain
 **500**, nothing is kept, and the trustee process tries again by itself. A
-400 always means the op refused the signature.
+400 always means the op refused the signature. A byte-equal repeat of a
+signature already held answers 200 with the same status; while `closed` with
+`threshold` signatures over the same totals it publishes as the first post
+would have (so a retry after a first post whose answer or save failed still
+publishes).
 
 When `threshold` signatures over the same totals are held, the console
 publishes at once (as `tally/publish`):

@@ -549,7 +549,7 @@ func (L *liveService) postTallySig(ctx context.Context, id string, body LiveTall
 	}
 	if prev, ok := st.Signatures[id]; ok {
 		if prev.Signature == body.Signature && slices.Equal(prev.Totals, body.Totals) {
-			return L.sigStatusLocked(nil), nil
+			return L.repeatSigLocked(ctx)
 		}
 		return nil, conflictf("trustee %s has signed the tally already", id)
 	}
@@ -577,6 +577,36 @@ func (L *liveService) postTallySig(ctx context.Context, id string, body LiveTall
 	st.Signatures[id] = liveSig{Totals: body.Totals, Signature: body.Signature, At: L.now().UTC()}
 	if err := L.save(); err != nil {
 		return nil, err
+	}
+	totals, sigs := L.bestSignaturesLocked()
+	if len(sigs) < st.Threshold {
+		return L.sigStatusLocked(nil), nil
+	}
+	pub, err := L.publishLocked(ctx, led, totals, sigs)
+	if err != nil {
+		return L.sigStatusLocked(map[string]any{"published": false, "publish_error": err.Error()}), nil
+	}
+	return L.sigStatusLocked(pub), nil
+}
+
+// repeatSigLocked answers a byte-equal repeat of a signature already held.
+// While closed with threshold signatures over the same totals it publishes,
+// as the first post would have: a repeat after a first post whose answer or
+// save failed (the signature was kept, the publication never ran) still
+// publishes. Caller holds mu; it is released while the chain is read.
+func (L *liveService) repeatSigLocked(ctx context.Context) (map[string]any, error) {
+	if _, sigs := L.bestSignaturesLocked(); len(sigs) < L.st.Threshold {
+		return L.sigStatusLocked(nil), nil
+	}
+	st := L.st
+	L.mu.Unlock()
+	led, err := L.readLedger()
+	L.mu.Lock()
+	if err != nil {
+		return nil, err
+	}
+	if st != L.st || st.State != LiveClosed {
+		return L.sigStatusLocked(nil), nil // published (or moved on) meanwhile
 	}
 	totals, sigs := L.bestSignaturesLocked()
 	if len(sigs) < st.Threshold {
