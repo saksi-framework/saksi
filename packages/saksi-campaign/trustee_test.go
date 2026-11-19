@@ -735,7 +735,6 @@ type lyingChain struct {
 	trusteeChain
 	dkg     func(string) (string, error)
 	partial func(eid, contest, trustee string) (string, error)
-	ballots func(eid string, ns []string) ([]string, error)
 	list    func(eid string, size int, bm string) (clientsdk.NullifierPage, error)
 }
 
