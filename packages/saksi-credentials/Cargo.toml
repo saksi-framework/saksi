@@ -25,5 +25,12 @@ rand_core.workspace = true
 sha2 = { version = "0.10", default-features = false }
 prost = "0.13"
 
+[features]
+# Exposes the secret parts of credentials and of the issuance protocol's
+# in-between states, so a stateless caller (the `saksi-demo live` CLI, the
+# phone's WebAssembly) can persist them between steps. Off by default: without
+# it no secret scalar leaves this crate.
+export = []
+
 [dev-dependencies]
 proptest.workspace = true

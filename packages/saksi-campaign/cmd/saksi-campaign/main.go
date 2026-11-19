@@ -8,6 +8,13 @@
 //	                     [--fabric-tls-cert path] [--fabric-msp-id id]
 //	                     [--fabric-cert path] [--fabric-key path]
 //	                     [--fabric-channel name] [--fabric-chaincode name]
+//	                     [--tls-cert cert.pem --tls-key key.pem]
+//	                     [--live --trustee-tokens tokens.json [--live-precinct 0001A]]
+//
+// --live runs one live election (docs/live/http-api.md): it needs --auth-file
+// (the presenter), --trustee-tokens and, unless the bind is loopback, TLS. Its
+// voters are the precinct's voter list, uploaded at setup
+// (docs/live/voter-list-api.md); --live-precinct is that precinct's number.
 //
 // The same binary is also the campaign driver for an ALREADY-RUNNING console,
 // over that console's own HTTP API — it never reaches into a run folder:
@@ -17,10 +24,23 @@
 //	                        [--base-url http://127.0.0.1:8090] [--out summary.csv]
 //	saksi-campaign --ladder [--base-url URL] [--runs dir]
 //
+// One live election trustee process per trustee (docs/live/trustee-api.md):
+//
+//	saksi-campaign trustee --id N --addr :9001 --tls-cert c.pem --tls-key k.pem
+//	                       --allow-host t1.example --auth-file t1-accounts.json
+//	                       --console https://vote.example:8443 --token-file t1.token
+//	                       --state-dir ~/.saksi/trustee-1 --peers 2=https://t2.example:9002,...
+//	                       --demo saksi-demo --web-dir dist-web --fabric-...
+//
 // And it makes the password hashes for a --auth-file users file, reading the
 // password from stdin so it never lands in shell history:
 //
 //	saksi-campaign hash-password < password.txt
+//
+// and a trustee process's token and the hash the --trustee-tokens file holds:
+//
+//	saksi-campaign new-token
+//	saksi-campaign hash-token < token.txt
 package main
 
 import (
@@ -29,7 +49,6 @@ import (
 	"flag"
 	"fmt"
 	"net"
-	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -55,6 +74,8 @@ func main() {
 	switch mode {
 	case "serve":
 		serve(os.Args[2:])
+	case "trustee":
+		trustee(os.Args[2:])
 	case "--repeat":
 		repeat(os.Args[2:])
 	case "--ladder":
@@ -66,11 +87,26 @@ func main() {
 			fatal("hash-password: %v", err)
 		}
 		fmt.Println(h)
+	case "new-token":
+		tok, err := campaign.NewTrusteeToken()
+		if err != nil {
+			fatal("new-token: %v", err)
+		}
+		fmt.Println(tok)
+	case "hash-token":
+		fmt.Fprintln(os.Stderr, "reading one token line from stdin")
+		h, err := campaign.HashTrusteeToken(os.Stdin)
+		if err != nil {
+			fatal("hash-token: %v", err)
+		}
+		fmt.Println(h)
 	default:
 		fmt.Fprintln(os.Stderr, "usage: saksi-campaign serve [flags]")
+		fmt.Fprintln(os.Stderr, "       saksi-campaign trustee --id N [flags]")
 		fmt.Fprintln(os.Stderr, "       saksi-campaign --repeat --config run.json [flags]")
 		fmt.Fprintln(os.Stderr, "       saksi-campaign --ladder [flags]")
 		fmt.Fprintln(os.Stderr, "       saksi-campaign hash-password < password")
+		fmt.Fprintln(os.Stderr, "       saksi-campaign new-token | saksi-campaign hash-token < token")
 		os.Exit(2)
 	}
 }
@@ -159,11 +195,25 @@ func serve(args []string) {
 	fabricChannel := fs.String("fabric-channel", "saksi", "Fabric channel the bulletin board runs on")
 	fabricChaincode := fs.String("fabric-chaincode", "saksi-bulletin", "deployed chaincode name")
 	fabricPeerVolume := fs.String("fabric-peer-volume", "", "host path of the peer's ledger volume (enables perf.csv's ledger_bytes_delta)")
+	tlsCert := fs.String("tls-cert", "", "TLS certificate chain (PEM); with --tls-key the console serves HTTPS (TLS 1.2 or later)")
+	tlsKey := fs.String("tls-key", "", "TLS private key (PEM) for --tls-cert")
+	live := fs.Bool("live", false, "enable the live election routes (/api/live/); needs --auth-file and --trustee-tokens")
+	trusteeTokens := fs.String("trustee-tokens", os.Getenv("SAKSI_TRUSTEE_TOKENS"),
+		"live mode: JSON array of {trustee_id, token_sha256}, one token per trustee process (env SAKSI_TRUSTEE_TOKENS)")
+	livePrecinct := fs.String("live-precinct", campaign.DefaultLivePrecinct,
+		"live mode: the precinct number (four digits and a capital letter), always shown as a demonstration")
+	liveMinBallots := fs.Int("live-min-ballots", campaign.DefaultMinBallots,
+		"live mode: the console's figure for the fewest ballot records per position decryption needs (at least 1), shown as min_ballot_records times the positions; set it to the trustee processes' --min-ballots (not checked)")
 	var allow multiFlag
 	fs.Var(&allow, "allow-host", "additional accepted Host header (repeatable; for LAN)")
 	_ = fs.Parse(args)
 	if *timeout <= 0 {
 		fatal("--phase-timeout must be positive (got %s)", *timeout)
+	}
+	opts := campaign.ServeOptions{Addr: *addr, TLSCert: *tlsCert, TLSKey: *tlsKey, Live: *live, AuthFile: *authFile}
+	warning, err := campaign.CheckServeOptions(opts)
+	if err != nil {
+		fatal("%v", err)
 	}
 
 	fabric := campaign.FabricConfig{
@@ -202,14 +252,26 @@ func serve(args []string) {
 			fatal("--auth-file %s: %v", *authFile, err)
 		}
 	}
+	if *live {
+		if err := campaign.CheckLiveMinBallots(*liveMinBallots); err != nil {
+			fatal("%v", err)
+		}
+		if err := handler.EnableLive(campaign.LiveOptions{TrusteeTokens: *trusteeTokens, Precinct: *livePrecinct, MinBallots: *liveMinBallots}); err != nil {
+			fatal("--live: %v", err)
+		}
+	}
+	scheme := "http"
+	if opts.TLS() {
+		scheme = "https"
+	}
 
 	fmt.Printf("Research Election Console\n")
-	fmt.Printf("  serving   http://%s\n", displayHost(*addr))
+	fmt.Printf("  serving   %s://%s\n", scheme, displayHost(*addr))
 	fmt.Printf("  runs      %s\n", *runsDir)
 	fmt.Printf("  phase timeout %s\n", *timeout)
 	fmt.Printf("  saksi-demo %s\n", *demoBin)
 	if *webDir != "" {
-		fmt.Printf("  apps      %s -> http://%s/board/, /trustee/ and /admin/\n", *webDir, displayHost(*addr))
+		fmt.Printf("  apps      %s -> %s://%s/board/, /trustee/, /admin/ and /vote/\n", *webDir, scheme, displayHost(*addr))
 	}
 	if *authFile != "" {
 		fmt.Printf("  auth      on, users from %s\n", *authFile)
@@ -221,8 +283,123 @@ func serve(args []string) {
 	} else if *consBin == "" {
 		fmt.Printf("  on-chain  (no driver configured — offline mode only)\n")
 	}
+	if *live {
+		fmt.Printf("  live      on: /api/live/ (trustee tokens from %s; precinct %s)\n", *trusteeTokens, *livePrecinct)
+	}
+	if warning != "" {
+		fmt.Fprintln(os.Stderr, warning)
+	}
 	go restorePeerOnSignal(exec)
-	if err := http.ListenAndServe(*addr, handler); err != nil {
+	ln, err := net.Listen("tcp", *addr)
+	if err != nil {
+		fatal("listen %s: %v", *addr, err)
+	}
+	if err := campaign.Serve(ln, opts, handler); err != nil {
+		fmt.Fprintf(os.Stderr, "server error: %v\n", err)
+		os.Exit(1)
+	}
+}
+
+// trustee runs one live election trustee process.
+func trustee(args []string) {
+	fs := flag.NewFlagSet("trustee", flag.ExitOnError)
+	id := fs.Int("id", 0, "this trustee's id, 1..n (required)")
+	addr := fs.String("addr", "127.0.0.1:9001", "bind address (host:port)")
+	tlsCert := fs.String("tls-cert", "", "TLS certificate chain (PEM); with --tls-key this process serves HTTPS. Required unless --addr is loopback")
+	tlsKey := fs.String("tls-key", "", "TLS private key (PEM) for --tls-cert")
+	var allow multiFlag
+	fs.Var(&allow, "allow-host", "accepted Host header (repeatable); a host without a port gets --addr's port")
+	authFile := fs.String("auth-file", "", "this trustee's own accounts file: trustee accounts with this --id only (required)")
+	consoleURL := fs.String("console", "", "the console's base URL, https://<host>:<port> (required). The host and port must be in the console's --allow-host list, and the name must be on the console's certificate (https://localhost:8443 against a vote.example certificate fails)")
+	consoleCA := fs.String("console-ca", "", "extra CA certificate (PEM) trusted for the console and the peers, besides the system roots (tests)")
+	tokenFile := fs.String("token-file", "", "file holding this trustee's bearer token for the console, mode 0600 (required)")
+	stateDir := fs.String("state-dir", "", "this trustee's private folder, mode 0700: receive keys, key shares and progress per election (required)")
+	peers := fs.String("peers", "", "the other trustees' base URLs by id: 1=https://t1.example:9001,2=https://t2.example:9002,...")
+	demoBin := fs.String("demo", "saksi-demo", "path to the saksi-demo binary")
+	webDir := fs.String("web-dir", "", "serve the trustee app at /trustee/ from <dir>/trustee")
+	minBallots := fs.Int("min-ballots", campaign.DefaultMinBallots, "refuse to decrypt a position with fewer ballot records (1 is for rehearsals only: a one-ballot aggregate is that voter's choice)")
+	fabricPeer := fs.String("fabric-peer", "localhost:7051", "Fabric gateway peer endpoint (host:port) this trustee reads the ledger from")
+	fabricGatewayPeer := fs.String("fabric-gateway-peer", "peer0.org1.example.com", "Fabric gateway peer TLS server name")
+	fabricTLSCert := fs.String("fabric-tls-cert", "", "path to the peer TLS CA certificate (required)")
+	fabricMSPID := fs.String("fabric-msp-id", "Org1MSP", "Fabric MSP id of the reading identity")
+	fabricCert := fs.String("fabric-cert", "", "path to the reading identity's certificate (required)")
+	fabricKey := fs.String("fabric-key", "", "path to the reading identity's private key, read in place (required)")
+	fabricChannel := fs.String("fabric-channel", "saksi", "Fabric channel")
+	fabricChaincode := fs.String("fabric-chaincode", "saksi-bulletin", "deployed chaincode name")
+	_ = fs.Parse(args)
+
+	opts := campaign.ServeOptions{Addr: *addr, TLSCert: *tlsCert, TLSKey: *tlsKey, Trustee: true}
+	warning, err := campaign.CheckTrusteeServeOptions(opts)
+	if err != nil {
+		fatal("%v", err)
+	}
+	token, err := campaign.LoadTrusteeTokenFile(*tokenFile)
+	if err != nil {
+		fatal("%v", err)
+	}
+	peerMap, err := campaign.ParseTrusteePeers(*peers)
+	if err != nil {
+		fatal("%v", err)
+	}
+	fabric := campaign.FabricConfig{
+		PeerEndpoint: *fabricPeer, GatewayPeer: *fabricGatewayPeer, TLSCert: *fabricTLSCert,
+		MSPID: *fabricMSPID, Cert: *fabricCert, Key: *fabricKey,
+		Channel: *fabricChannel, Chaincode: *fabricChaincode,
+	}
+	if !fabric.Enabled() {
+		fatal("a trustee reads the ledger itself: --fabric-tls-cert, --fabric-cert and --fabric-key are required")
+	}
+	T, err := campaign.NewTrusteeService(campaign.TrusteeOptions{
+		ID: *id, ConsoleURL: *consoleURL, ConsoleCA: *consoleCA, Token: token,
+		StateDir: *stateDir, Peers: peerMap, MinBallots: *minBallots,
+		Runner: campaign.ExecLiveRunner(*demoBin), Dial: campaign.TrusteeFabricDial(fabric),
+	})
+	if err != nil {
+		fatal("%v", err)
+	}
+	handler, err := campaign.NewTrusteeServer(T, campaign.TrusteeServerOptions{
+		AuthFile: *authFile, AllowHosts: allowedHosts(*addr, allow), WebDir: *webDir,
+	})
+	if err != nil {
+		fatal("%v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	if err := T.ProbeConsole(ctx); err != nil {
+		cancel()
+		fatal("--console: %v", err)
+	}
+	if err := T.CheckIdentity(ctx); err != nil {
+		cancel()
+		fatal("trustee %d: %v", *id, err)
+	}
+	cancel()
+	pctx, pcancel := context.WithTimeout(context.Background(), 20*time.Second)
+	for _, w := range T.PeerWarnings(pctx) {
+		fmt.Fprintln(os.Stderr, w)
+	}
+	pcancel()
+	scheme := "http"
+	if opts.TLS() {
+		scheme = "https"
+	}
+	fmt.Printf("Trustee %d\n", *id)
+	fmt.Printf("  serving   %s://%s\n", scheme, displayHost(*addr))
+	fmt.Printf("  console   %s\n", *consoleURL)
+	fmt.Printf("  state     %s\n", *stateDir)
+	fmt.Printf("  ledger    fabric gateway %s (channel %s), read only\n", fabric.PeerEndpoint, fabric.Channel)
+	if *webDir != "" {
+		fmt.Printf("  app       %s -> /trustee/\n", *webDir)
+	}
+	if warning != "" {
+		fmt.Fprintln(os.Stderr, warning)
+	}
+	// Bind first: a failed bind exits before the driver writes any state.
+	ln, err := net.Listen("tcp", *addr)
+	if err != nil {
+		fatal("listen %s: %v", *addr, err)
+	}
+	T.Start()
+	if err := campaign.Serve(ln, opts, handler); err != nil {
 		fmt.Fprintf(os.Stderr, "server error: %v\n", err)
 		os.Exit(1)
 	}

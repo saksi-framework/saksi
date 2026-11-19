@@ -1,0 +1,33 @@
+[package]
+name = "saksi-wasm"
+version = "0.1.0"
+edition.workspace = true
+# wasm-bindgen =0.2.130 and js-sys 0.3.107 need Rust 1.81, above the
+# workspace's 1.78; the other crates keep the workspace value.
+rust-version = "1.81"
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Saksi: the live election voter's steps (blind issuance, ballot, Benaloh challenge) for the phone's browser, as a thin wasm-bindgen binding over saksi-live."
+publish = false
+
+[lib]
+name = "saksi_wasm"
+path = "src/lib.rs"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+saksi-live = { path = "../saksi-live" }
+saksi-protocol = { path = "../saksi-protocol/rust" }
+# The pinned wasm-bindgen must equal the wasm-bindgen CLI the build script
+# installs (tools/live/build-wasm.sh).
+wasm-bindgen = "=0.2.130"
+serde = { version = "1", features = ["derive", "std"] }
+serde_json = "1"
+hex = "0.4"
+zeroize = { workspace = true, features = ["alloc"] }
+rand_core.workspace = true
+# Browser randomness (crypto.getRandomValues) for OsRng on
+# wasm32-unknown-unknown. Enabled here only; it has no effect on native
+# targets, and no other crate turns it on.
+getrandom = { version = "0.2", features = ["js"] }

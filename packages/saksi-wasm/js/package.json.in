@@ -1,0 +1,17 @@
+{
+  "name": "@saksi/wasm",
+  "version": "@VERSION@",
+  "description": "Saksi live election voter steps (blind issuance, ballot, Benaloh challenge) for the browser. Built by saksi tools/live/build-wasm.sh.",
+  "license": "Apache-2.0",
+  "type": "module",
+  "main": "index.js",
+  "module": "index.js",
+  "types": "index.d.ts",
+  "exports": {
+    ".": { "types": "./index.d.ts", "default": "./index.js" },
+    "./raw": { "types": "./saksi_wasm.d.ts", "default": "./saksi_wasm.js" },
+    "./saksi_wasm_bg.wasm": "./saksi_wasm_bg.wasm"
+  },
+  "files": ["index.js", "index.d.ts", "wire.d.ts", "saksi_wasm.js", "saksi_wasm.d.ts", "saksi_wasm_bg.wasm", "saksi_wasm_bg.wasm.d.ts"],
+  "saksi": { "git_rev": "@GIT_REV@" }
+}

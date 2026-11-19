@@ -123,6 +123,9 @@ type BoardResponse struct {
 	Files         []string `json:"files"`
 	Partial       bool     `json:"partial,omitempty"`
 	PartialReason string   `json:"partial_reason,omitempty"`
+	// Live is set only for a live election (live_board.go); study runs never
+	// carry it.
+	Live *LiveBoard `json:"live,omitempty"`
 }
 
 // --- labels ----------------------------------------------------------------
@@ -349,6 +352,14 @@ func (s *Server) handleBoard(w http.ResponseWriter, r *http.Request) {
 	dir, err := s.store.Dir(runID)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if rec.Config.Mode == ModeLive {
+		if isFile {
+			s.serveLiveBoardFile(w, r, dir, file)
+			return
+		}
+		writeJSONResp(w, http.StatusOK, s.buildLiveBoard(rec, dir))
 		return
 	}
 	if isFile {
@@ -811,17 +822,20 @@ func (s *Server) enrichFromChain(resp *BoardResponse, electionID string) {
 // The position is named for that reason. Nothing here reveals a selection: the
 // nullifier is unlinkable to the choice by construction.
 type VerifyCodeResponse struct {
-	Found            bool       `json:"found"`
-	TrackingCode     string     `json:"tracking_code"`
-	BallotIndex      int        `json:"ballot_index"`
-	PositionID       string     `json:"position_id,omitempty"`
-	PositionLabel    string     `json:"position_label,omitempty"`
-	Nullifier        string     `json:"nullifier,omitempty"`
-	BallotSHA256     string     `json:"ballot_sha256,omitempty"`
-	RecordedAt       *time.Time `json:"recorded_at,omitempty"`
-	BlockNumber      uint64     `json:"block_number,omitempty"`
-	TxID             string     `json:"tx_id,omitempty"`
-	CommittedOnChain bool       `json:"committed_on_chain"`
+	Found         bool   `json:"found"`
+	TrackingCode  string `json:"tracking_code"`
+	BallotIndex   int    `json:"ballot_index"`
+	PositionID    string `json:"position_id,omitempty"`
+	PositionLabel string `json:"position_label,omitempty"`
+	Nullifier     string `json:"nullifier,omitempty"`
+	BallotSHA256  string `json:"ballot_sha256,omitempty"`
+	// BallotFingerprint is set for a live election only: the wire format's
+	// ballot_fingerprint of the recorded bytes, as the phone showed it.
+	BallotFingerprint string     `json:"ballot_fingerprint,omitempty"`
+	RecordedAt        *time.Time `json:"recorded_at,omitempty"`
+	BlockNumber       uint64     `json:"block_number,omitempty"`
+	TxID              string     `json:"tx_id,omitempty"`
+	CommittedOnChain  bool       `json:"committed_on_chain"`
 }
 
 var hexRe = regexp.MustCompile(`^[0-9a-f]{8}$`)
@@ -908,6 +922,9 @@ func (s *Server) handleVerifyCode(w http.ResponseWriter, r *http.Request) {
 		PositionLabel: posLabel(m.PositionID),
 		Nullifier:     m.Nullifier,
 		BallotSHA256:  m.SHA256,
+	}
+	if rec, err := s.record(runID); err == nil && rec.Config.Mode == ModeLive && len(m.SHA256) >= 32 {
+		resp.BallotFingerprint = groupFingerprint(m.SHA256[:32])
 	}
 	if rc := submitBallotReceipt(dir, m.Index); rc != nil {
 		// A SubmitBallot receipt is written only once the transaction has
