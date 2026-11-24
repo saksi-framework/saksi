@@ -223,7 +223,7 @@ func R11DryRun(w io.Writer, c BlackoutConfig) {
 		"preflight  docker ps: " + strings.Join(R11CoreContainers, ", ") + " running, labelled com.docker.compose.project=" + c.ComposeProject,
 		"generate   Executor.Generate: saksi-demo gen --stream <out>/runs/<run>",
 		"window     Executor.Submit: CreateElection (admin), RegisterPrecinctMachine (admin), PublishDKGTranscript, SubmitBallot x N (machine)",
-		fmt.Sprintf("blackout   at commit %d: ChainInfo (height before), docker kill <core + running chaincode containers> in one call;\n"+
+		fmt.Sprintf("blackout   at commit %d: ChainInfo (height before), docker kill <core + the chaincode containers listed at the preflight> in one call;\n"+
 			"           the window stops dispatching %s", c.TriggerCount(), stopText(c.StopWindow)),
 		"classify   each record C (commit status valid), U (submit or commit-status error) or N (not sent)",
 		fmt.Sprintf("downtime   %s from the kill; inspect: every killed container still down", c.Downtime),
@@ -454,6 +454,7 @@ type r11Run struct {
 	boMu      sync.Mutex
 	killAt    time.Time
 	killed    []string // every container the kill named
+	chaincode []string // the chaincode containers running at the preflight
 	post      *BlackoutConn
 	coreKill  bool // the core containers were killed and not yet started
 	coreStart sync.Once
@@ -568,7 +569,26 @@ func (r *r11Run) preflight(ctx context.Context) error {
 			return fmt.Errorf("%s belongs to compose project %q, not %q: refusing to kill it", name, project, r.cfg.ComposeProject)
 		}
 	}
-	return nil
+	// Listed now, so the kill does not wait on a docker ps.
+	r.chaincode, err = r.chaincodeContainers(ctx)
+	return err
+}
+
+// chaincodeContainers lists the running chaincode containers, sorted.
+func (r *r11Run) chaincodeContainers(ctx context.Context) ([]string, error) {
+	running, err := r.runningContainers(ctx)
+	if err != nil {
+		return nil, err
+	}
+	re := chaincodeContainerRE(r.cfg.Chaincode)
+	var out []string
+	for name := range running {
+		if re.MatchString(name) {
+			out = append(out, name)
+		}
+	}
+	sort.Strings(out)
+	return out, nil
 }
 
 // inspect returns whether name is running and its state line.
@@ -591,20 +611,21 @@ func (r *r11Run) boError(format string, a ...any) {
 // reached the trigger, so ballots are in flight when it lands.
 func (r *r11Run) blackout() {
 	ctx := context.Background()
+	// With StopWindow with-kill, nothing more is dispatched from here on.
+	// The window's own cancel comes first so the height read and the
+	// container list below cost no dispatches.
+	if r.cfg.StopWindow == R11StopWithKill {
+		r.winCancel()
+	}
 	h, _, herr := r.winLed.ChainInfo()
 	targets := append([]string(nil), R11CoreContainers...)
-	running, err := r.runningContainers(ctx)
-	if err != nil {
-		r.boError("docker ps before the kill: %v", err)
-	}
-	re := chaincodeContainerRE(r.cfg.Chaincode)
-	var chaincode []string
-	for name := range running {
-		if re.MatchString(name) {
-			chaincode = append(chaincode, name)
+	chaincode := r.chaincode
+	if len(chaincode) == 0 {
+		var err error
+		if chaincode, err = r.chaincodeContainers(ctx); err != nil {
+			r.boError("docker ps before the kill: %v", err)
 		}
 	}
-	sort.Strings(chaincode)
 	targets = append(targets, chaincode...)
 	cmd := append([]string{"kill"}, targets...)
 
@@ -621,13 +642,10 @@ func (r *r11Run) blackout() {
 	}
 
 	// The window stops dispatching: what was not sent stays N. With
-	// StopWithKill it stops at the instant of the kill (the console stops
-	// sending as the network dies, which leaves its window interrupted and
-	// resumable); otherwise only once docker kill has returned, and the
+	// with-kill it already stopped, at the trigger (the console stops sending
+	// as the network dies, which leaves its window interrupted and
+	// resumable); with after-kill only once docker kill has returned, and the
 	// workers keep dispatching into the dead network meanwhile.
-	if r.cfg.StopWindow == R11StopWithKill {
-		r.winCancel()
-	}
 	out, kerr := r.docker(ctx, cmd...)
 	r.winCancel()
 	done := time.Now()
