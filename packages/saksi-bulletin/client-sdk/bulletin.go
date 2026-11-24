@@ -163,6 +163,35 @@ func (b *BulletinClient) CreateElection(paramsHex string) error {
 	return nil
 }
 
+// RegisterPrecinctMachine binds an election to its one precinct machine: from
+// then on the chaincode accepts a SubmitBallot for electionID only from the
+// certificate whose fingerprint is fingerprintHex (CertFingerprint). It must
+// be called by an administrator, after CreateElection and before the first
+// ballot, and only once per election.
+func (b *BulletinClient) RegisterPrecinctMachine(electionID, fingerprintHex string) error {
+	if electionID == "" {
+		return fmt.Errorf("election id is empty")
+	}
+	if fingerprintHex == "" {
+		return fmt.Errorf("machine fingerprint is empty")
+	}
+	if _, err := b.contract.SubmitTransaction("RegisterPrecinctMachine", electionID, fingerprintHex); err != nil {
+		return fmt.Errorf("register precinct machine: %w", err)
+	}
+	return nil
+}
+
+// GetPrecinctMachine evaluates the GetPrecinctMachine query and returns the
+// registered machine's certificate fingerprint, or an error if none is
+// registered.
+func (b *BulletinClient) GetPrecinctMachine(electionID string) (string, error) {
+	out, err := b.contract.EvaluateTransaction("GetPrecinctMachine", electionID)
+	if err != nil {
+		return "", fmt.Errorf("get precinct machine: %w", err)
+	}
+	return string(out), nil
+}
+
 // GetElection evaluates the GetElection query and returns the recorded election
 // parameters as a hex string, or an error if the election is absent.
 func (b *BulletinClient) GetElection(electionID string) (string, error) {
