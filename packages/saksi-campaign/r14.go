@@ -529,7 +529,7 @@ func (r *r14Run) generate(ctx context.Context) error {
 		return err
 	}
 	if n < 2 || r.a.h.N != n {
-		return fmt.Errorf("A holds %d ballot records (header n=%d); need the two to agree and at least 2", n, r.a.h.N)
+		return fmt.Errorf("election A holds %d ballot records (header n=%d); need the two to agree and at least 2", n, r.a.h.N)
 	}
 	r.records = n
 	return scanBallotLines(r.a.dir, func(i int, line string) error {
