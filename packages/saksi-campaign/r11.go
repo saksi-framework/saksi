@@ -68,7 +68,17 @@ const (
 	r11PhaseWindow    = "window"
 	r11PhaseDuplicate = "duplicate"
 	r11PhaseResume    = "resume"
+	r11PhaseFallback  = "fallback"
 	r11PhaseCeremony  = "ceremony"
+)
+
+// Resume paths.
+const (
+	r11PathConsole      = "console"
+	r11PathFallback     = "harness-fallback"
+	r11PathFallbackText = "harness fallback: the console's resume refused the run, so the harness resubmitted " +
+		"every record whose nullifier the chain lacked (ListNullifiers ∩ run) and committed CloseElection " +
+		"through the executor's lifecycle step"
 )
 
 // r11MaxResumes bounds the resume attempts: a resume whose ballots or close
@@ -208,7 +218,8 @@ func R11DryRun(w io.Writer, c BlackoutConfig) {
 		fmt.Sprintf("chaincode  up to %s for the peers to relaunch the chaincode containers; any still down: docker start (recorded)", c.ChaincodeGrace),
 		"after      ChainInfo (height after >= before); ListNullifiers: every C record on the ledger",
 		"duplicate  SubmitBallot(one C record) again: refused at gate nullifier",
-		"resume     Executor.resumeAndClose: ListNullifiers ∩ run decides; submits only the rest, then CloseElection (retried up to 3 times)",
+		"resume     Executor.resumeAndClose: ListNullifiers ∩ run decides; submits only the rest, then CloseElection (retried up to 3 times);\n" +
+			"           if the console refuses (the window ended, not interrupted), the harness resubmits by nullifier and closes, and says so",
 		"ceremony   SubmitPartialDecryption x each, PublishTally (the bundle's, as the console's submit path)",
 		"verify     Executor.verify (ledger dump + local audit), audit-stream over the ledger dump, CountCommittedBallots, ListNullifiers walk",
 		"events     docker events over the run, filtered to the killed containers",
@@ -235,7 +246,7 @@ var r11CheckNames = [][2]string{
 	{"after.committed_kept", "every C record's nullifier on the ledger after the restart"},
 	{"resume.duplicate_refused", "resubmitting one C record is refused at gate nullifier"},
 	{"resume.only_missing", "each resume attempt submits exactly the records the chain lacks"},
-	{"resume.done", "the resume landed every record and closed the election"},
+	{"resume.done", "the resume (console, or the harness fallback when the console refuses) landed every record and closed"},
 	{"final.tally", "partial decryptions and the tally committed"},
 	{"final.count", "CountCommittedBallots = records"},
 	{"final.no_duplicates", "ListNullifiers: records entries, all distinct, none missing, none extra"},
@@ -323,10 +334,11 @@ type R11Duplicate struct {
 
 // R11ResumeAttempt is one call of the executor's resume.
 type R11ResumeAttempt struct {
-	Attempt       int `json:"attempt"`
-	OnChainBefore int `json:"on_chain_before"`
-	Submitted     int `json:"submitted"`
-	Accepted      int `json:"accepted"`
+	Attempt       int    `json:"attempt"`
+	Path          string `json:"path"` // console | harness-fallback
+	OnChainBefore int    `json:"on_chain_before"`
+	Submitted     int    `json:"submitted"`
+	Accepted      int    `json:"accepted"`
 	// SubmittedAlreadyOnChain counts submissions of records the chain held
 	// when the attempt started: the resume must never send one.
 	SubmittedAlreadyOnChain int    `json:"submitted_already_on_chain"`
@@ -354,24 +366,27 @@ type R11Final struct {
 
 // R11Evidence is r11-evidence.json.
 type R11Evidence struct {
-	Schema         string             `json:"schema"`
-	Started        string             `json:"started"`
-	Finished       string             `json:"finished"`
-	Commit         string             `json:"commit"`
-	Binaries       map[string]string  `json:"binary_sha256"`
-	Network        map[string]string  `json:"network"`
-	Election       map[string]any     `json:"election"`
-	RunID          string             `json:"run_id,omitempty"`
-	RunDir         string             `json:"run_dir,omitempty"`
-	ResumePath     string             `json:"resume_path"`
-	Classification R11Classification  `json:"classification"`
-	Blackout       R11Blackout        `json:"blackout"`
-	Duplicate      *R11Duplicate      `json:"duplicate,omitempty"`
-	Resume         []R11ResumeAttempt `json:"resume"`
-	Final          *R11Final          `json:"final,omitempty"`
-	Checks         []R11Check         `json:"checks"`
-	Aborted        string             `json:"aborted,omitempty"`
-	Pass           bool               `json:"pass"`
+	Schema     string            `json:"schema"`
+	Started    string            `json:"started"`
+	Finished   string            `json:"finished"`
+	Commit     string            `json:"commit"`
+	Binaries   map[string]string `json:"binary_sha256"`
+	Network    map[string]string `json:"network"`
+	Election   map[string]any    `json:"election"`
+	RunID      string            `json:"run_id,omitempty"`
+	RunDir     string            `json:"run_dir,omitempty"`
+	ResumePath string            `json:"resume_path"`
+	// ResumeConsoleRefusal is the console resume's refusal when the harness
+	// had to fall back.
+	ResumeConsoleRefusal string             `json:"resume_console_refusal,omitempty"`
+	Classification       R11Classification  `json:"classification"`
+	Blackout             R11Blackout        `json:"blackout"`
+	Duplicate            *R11Duplicate      `json:"duplicate,omitempty"`
+	Resume               []R11ResumeAttempt `json:"resume"`
+	Final                *R11Final          `json:"final,omitempty"`
+	Checks               []R11Check         `json:"checks"`
+	Aborted              string             `json:"aborted,omitempty"`
+	Pass                 bool               `json:"pass"`
 }
 
 // r11Call is one recorded transaction.
@@ -937,11 +952,15 @@ func (r *r11Run) drive(ctx context.Context, ev *R11Evidence) string {
 		r.logf("duplicate: record %d -> %s gate %q", ev.Duplicate.Index, ev.Duplicate.Outcome, ev.Duplicate.Gate)
 	}
 
-	// 4b. The executor's resume.
+	// 4b. The executor's resume. A run the console refuses to resume (its
+	// window ended rather than being interrupted: every record had been
+	// dispatched before the kill) falls back to the harness resubmitting by
+	// nullifier itself, and the evidence says so.
+	refused := ""
 	for attempt := 1; attempt <= r11MaxResumes; attempt++ {
 		before, err := chainCommitted(byNullifier, b, reader)
 		if err != nil {
-			ev.Resume = append(ev.Resume, R11ResumeAttempt{Attempt: attempt, Error: "list nullifiers: " + err.Error()})
+			ev.Resume = append(ev.Resume, R11ResumeAttempt{Attempt: attempt, Path: r11PathConsole, Error: "list nullifiers: " + err.Error()})
 			time.Sleep(cfg.ResumeRetryWait)
 			continue
 		}
@@ -949,6 +968,7 @@ func (r *r11Run) drive(ctx context.Context, ev *R11Evidence) string {
 		r.setPhase(phase)
 		rerr := e.resumeAndClose(ctx, runID, c, post, reader, bundlePath)
 		a := resumeAttempt(attempt, before, byNullifier, r.callsIn(phase))
+		a.Path = r11PathConsole
 		if rerr != nil {
 			a.Error = rerr.Error()
 		}
@@ -958,7 +978,29 @@ func (r *r11Run) drive(ctx context.Context, ev *R11Evidence) string {
 		if rerr == nil || ctx.Err() != nil {
 			break
 		}
+		if strings.Contains(rerr.Error(), "is not interrupted") {
+			refused = rerr.Error()
+			break
+		}
 		time.Sleep(cfg.ResumeRetryWait)
+	}
+	if refused != "" {
+		ev.ResumeConsoleRefusal = refused
+		ev.ResumePath = r11PathFallbackText
+		before, err := chainCommitted(byNullifier, b, reader)
+		if err != nil {
+			return "list nullifiers before the fallback: " + err.Error()
+		}
+		r.setPhase(r11PhaseFallback)
+		ferr := r.fallbackResume(ctx, post, before, bundlePath)
+		a := resumeAttempt(len(ev.Resume)+1, before, byNullifier, r.callsIn(r11PhaseFallback))
+		a.Path = r11PathFallback
+		if ferr != nil {
+			a.Error = ferr.Error()
+		}
+		ev.Resume = append(ev.Resume, a)
+		r.logf("console resume refused (%s): harness fallback: %d on chain before, %d submitted, %d accepted; err %v",
+			refused, a.OnChainBefore, a.Submitted, a.Accepted, ferr)
 	}
 	if n := len(ev.Resume); n == 0 || ev.Resume[n-1].Error != "" {
 		return "the resume did not finish"
@@ -1000,6 +1042,63 @@ func (r *r11Run) duplicate(dir string, status []string) *R11Duplicate {
 	o := observe("SubmitBallot", rec, err)
 	d.Outcome, d.Gate, d.Error, d.TxID = o.Outcome, o.Gate, o.Error, o.TxID
 	return d
+}
+
+// fallbackResume submits every record the chain lacks, then closes the
+// election through the executor's lifecycle step. It is used only when the
+// console's resume refuses the run.
+func (r *r11Run) fallbackResume(ctx context.Context, led clientsdk.Ledger, before []bool, bundlePath string) error {
+	lines := make(chan string)
+	var (
+		wg     sync.WaitGroup
+		mu     sync.Mutex
+		failed int
+		sent   int
+		first  error
+	)
+	for w := 0; w < r.cfg.Concurrency; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for line := range lines {
+				_, _, err := led.Submit("SubmitBallot", line)
+				mu.Lock()
+				sent++
+				if err != nil {
+					failed++
+					if first == nil {
+						first = err
+					}
+				}
+				mu.Unlock()
+			}
+		}()
+	}
+	err := scanBallotLines(r.dir, func(i int, line string) error {
+		if i < len(before) && before[i] {
+			return nil
+		}
+		select {
+		case lines <- line:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	})
+	close(lines)
+	wg.Wait()
+	if err != nil {
+		return err
+	}
+	if failed > 0 {
+		return fmt.Errorf("%d of %d resubmitted records did not commit (first: %s)", failed, sent, clientsdk.ErrorText(first))
+	}
+	b, step, err := r.e.lifecycle(r.runID, led, bundlePath, "submit")
+	if err != nil {
+		return err
+	}
+	defer r.e.closeReceipts(r.runID)
+	return step(ctx, "CloseElection", "", "CloseElection", b.ElectionID)
 }
 
 // ceremony commits the bundle's partial decryptions and the tally through
@@ -1327,23 +1426,25 @@ func r11Checks(ev R11Evidence) []R11Check {
 	} else {
 		add("resume.duplicate_refused", "not run", false)
 	}
-	only := len(ev.Resume) > 0
+	only, clean := len(ev.Resume) > 0, false
 	var parts []string
 	for _, a := range ev.Resume {
-		parts = append(parts, fmt.Sprintf("attempt %d: on chain %d, submitted %d (%d distinct), already on chain %d",
-			a.Attempt, a.OnChainBefore, a.Submitted, a.DistinctSubmitted, a.SubmittedAlreadyOnChain))
+		parts = append(parts, fmt.Sprintf("attempt %d (%s): on chain %d, submitted %d (%d distinct), already on chain %d",
+			a.Attempt, orNone(a.Path), a.OnChainBefore, a.Submitted, a.DistinctSubmitted, a.SubmittedAlreadyOnChain))
+		clean = clean || a.Error == ""
 		// Every record the chain lacked is sent once, and nothing it held.
 		if a.SubmittedAlreadyOnChain != 0 || a.DistinctSubmitted != a.Submitted ||
 			(a.Error == "" && a.Submitted != cls.Records-a.OnChainBefore) {
 			only = false
 		}
 	}
-	add("resume.only_missing", strings.Join(parts, "; "), only)
+	add("resume.only_missing", strings.Join(parts, "; "), only && clean)
 	last := R11ResumeAttempt{Error: "no resume"}
 	if n := len(ev.Resume); n > 0 {
 		last = ev.Resume[n-1]
 	}
-	add("resume.done", fmt.Sprintf("%d attempt(s); last error %q", len(ev.Resume), last.Error), len(ev.Resume) > 0 && last.Error == "")
+	add("resume.done", fmt.Sprintf("%d attempt(s), last by %s; last error %q", len(ev.Resume), orNone(last.Path), last.Error),
+		len(ev.Resume) > 0 && last.Error == "")
 
 	fin := ev.Final
 	if fin == nil {

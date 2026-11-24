@@ -31,6 +31,13 @@ type r11Net struct {
 	dockerLog  []string
 	loseOnKill bool // the kill also drops the last committed ballot: a lost C record
 	lastTx     string
+	// holdFrom > 0 holds every ballot after the first holdFrom in flight
+	// until the kill, which then fails it: every record is dispatched
+	// before the blackout, so the window ends instead of being interrupted.
+	holdFrom int
+	ballots  int
+	killedCh chan struct{}
+	killOnce sync.Once
 }
 
 func newR11Net() *r11Net {
@@ -38,8 +45,9 @@ func newR11Net() *r11Net {
 	n := &r11Net{
 		chain: newR14Chain(admin), adminFP: admin, machineFP: machine,
 		running: map[string]bool{}, project: map[string]string{},
-		ccOrg1: "dev-peer0.org1.example.com-saksi-bulletin_1.0-abc",
-		ccOrg2: "dev-peer0.org2.example.com-saksi-bulletin_1.0-abc",
+		ccOrg1:   "dev-peer0.org1.example.com-saksi-bulletin_1.0-abc",
+		ccOrg2:   "dev-peer0.org2.example.com-saksi-bulletin_1.0-abc",
+		killedCh: make(chan struct{}),
 	}
 	for _, c := range R11CoreContainers {
 		n.running[c], n.project[c] = true, "r14"
@@ -80,7 +88,10 @@ func (n *r11Net) docker(args []string) ([]byte, error) {
 		for _, name := range args[1:] {
 			n.running[name] = false
 		}
+		n.killOnce.Do(func() { close(n.killedCh) })
 		if n.loseOnKill && n.lastTx != "" {
+			n.chain.mu.Lock()
+			defer n.chain.mu.Unlock()
 			for _, e := range n.chain.elections {
 				delete(e.ballots, n.lastTx)
 				for i, x := range e.order {
@@ -120,6 +131,21 @@ func (l r11FakeLedger) fp(fn string) string {
 }
 
 func (l r11FakeLedger) SubmitWithReceipt(fn string, args ...string) ([]byte, clientsdk.Receipt, error) {
+	if fn == "SubmitBallot" && l.n.holdFrom > 0 {
+		l.n.mu.Lock()
+		l.n.ballots++
+		held := l.n.ballots > l.n.holdFrom
+		select {
+		case <-l.n.killedCh:
+			held = false // after the blackout: a normal submission
+		default:
+		}
+		l.n.mu.Unlock()
+		if held {
+			<-l.n.killedCh
+			return nil, clientsdk.Receipt{}, errR11Down
+		}
+	}
 	if !l.n.up(true) {
 		return nil, clientsdk.Receipt{}, errR11Down
 	}
@@ -286,6 +312,33 @@ func readFile(t *testing.T, path string) string {
 		t.Fatal(err)
 	}
 	return string(data)
+}
+
+// When every record was dispatched before the kill, the window ends rather
+// than being interrupted and the console's resume refuses the run; the
+// harness then resubmits by nullifier itself and says so.
+func TestBlackoutFallsBackWhenTheConsoleRefusesToResume(t *testing.T) {
+	cfg, n, log := r11Setup(t, 2)
+	cfg.Concurrency = 8
+	n.holdFrom = cfg.TriggerCount()
+	ev, err := RunBlackoutTest(context.Background(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ev.Pass {
+		t.Fatalf("want a pass, aborted %q\nchecks %+v\nlog:\n%s", ev.Aborted, ev.Checks, log)
+	}
+	cls := ev.Classification
+	if cls.Committed != 2 || cls.Uncertain != 4 || cls.NotSent != 0 {
+		t.Errorf("classification %+v", cls)
+	}
+	if !strings.Contains(ev.ResumeConsoleRefusal, "not interrupted") || !strings.HasPrefix(ev.ResumePath, "harness fallback") {
+		t.Errorf("resume path %q, refusal %q", ev.ResumePath, ev.ResumeConsoleRefusal)
+	}
+	if len(ev.Resume) != 2 || ev.Resume[0].Path != r11PathConsole || ev.Resume[1].Path != r11PathFallback ||
+		ev.Resume[1].Submitted != 4 || ev.Resume[1].SubmittedAlreadyOnChain != 0 {
+		t.Errorf("resume %+v", ev.Resume)
+	}
 }
 
 // A committed record the chain no longer holds after the restart is the
