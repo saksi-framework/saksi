@@ -25,6 +25,33 @@ Hyperledger Fabric chaincode (Contract API) for the BalotaChain bulletin board.
   registered machine and the caller's certificate fingerprint must equal it. The older
   gates follow unchanged.
 
+### Upgrade together
+
+The console and the chaincode must be upgraded together, and only between
+elections. Every console flow calls `RegisterPrecinctMachine` right after
+`CreateElection`, so a console from this build against an older deployed
+chaincode fails election setup (`RegisterPrecinctMachine` is not a function
+there): deploy this chaincode first (`network.sh deploy`, sequence + 1), then
+run this console. In the other direction, this chaincode refuses ballots for
+any election that has no registered machine (gate `caller`). An election
+created before this build has none: if it already holds ballots it can never
+be registered (`machine-window`), so it accepts no further ballots; if it
+holds none, its ballots are refused until an administrator registers a
+machine. A live election resumed from an older build in `ceremony` or `open`
+state is not registered by the console (the console registers only while
+finishing `setup`), so it cannot accept ballots on the new chaincode. Finish or
+abandon running elections before upgrading.
+
+**Remaining ungated transactions (a limit).** Only `CreateElection`,
+`RegisterPrecinctMachine` and `CloseElection` (gate `admin`) and `SubmitBallot`
+(gate `caller`) check the caller. `PublishDKGTranscript`,
+`SubmitPartialDecryption` and `PublishTally` accept any channel member. The
+tally is checked against the trustees' threshold signature, and a partial must
+carry a Chaum-Pedersen proof (verified by the auditor, not on chain), but any
+member can publish the DKG transcript of a newly
+created election before the honest trustees do (the same front-running class
+as the ungated `CreateElection` this build closed).
+
 ## Hybrid verification split (locked)
 
 The chaincode does NOT verify NIZK well-formedness proofs. On submission it performs

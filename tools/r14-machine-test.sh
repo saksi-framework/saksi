@@ -47,23 +47,47 @@
 # The test needs a FRESH test network: Org1 must issue User1, User2 and User3
 # (network.sh sets the cryptogen count from SAKSI_ORG1_USERS, default 3, but
 # only a fresh `up` regenerates the crypto), and the deployed chaincode must
-# be this branch's (admin gate, RegisterPrecinctMachine, caller gate). From a
-# space-free checkout of this branch, with Docker running:
+# be this branch's (admin gate, RegisterPrecinctMachine, caller gate).
 #
-#   # 0. the live demo kit holds the Fabric ports and the same fabric-samples
-#   #    crypto: stop it first (needs the user's go), in balotachain-live:
-#   #      tools/live-up.sh down
-#   cd <repo>
-#   N=packages/saksi-bulletin/network/network.sh
-#   "$N" down                                  # clear any older network and its crypto
+# WARNING: do NOT run `network.sh down` on a machine that holds any other
+# Fabric ledger. fabric-samples' `down` force-removes EVERY container labelled
+# service=hyperledger-fabric (any compose project), runs `compose down
+# --volumes` under the default project name `compose` (deleting any
+# compose_orderer.example.com / compose_peer0.* ledger volumes), and deletes
+# the shared fabric-samples crypto (organizations/peerOrganizations,
+# ordererOrganizations). If COMPOSE_PROJECT_NAME is exported, it deletes that
+# project's volumes instead. Use a project of its own and bring it up by hand.
+#
+# The recipe Task 4 used on the Mac (fabric-samples beside the repo, Docker
+# running, a space-free checkout of this branch):
+#
+#   # 0. stop anything holding the Fabric ports (the live demo kit needs the
+#   #    user's go); back up the shared crypto first:
+#   cp -R "$FABRIC_SAMPLES"/test-network/organizations <backup>/organizations
+#   # 1. remove only STOPPED containers whose fixed names collide
+#   #    (orderer.example.com, peer0.org1/org2.example.com) -- never `rm -v`,
+#   #    never `docker volume rm/prune` or `docker system prune`:
+#   docker rm <ids>
+#   # 2. move the old crypto and channel artifacts aside so `up` regenerates them:
+#   mv "$FABRIC_SAMPLES"/test-network/organizations/{peer,orderer}Organizations <aside>/
+#   mv "$FABRIC_SAMPLES"/test-network/channel-artifacts/* <aside>/
+#   # 3. bring up under a project of its own (keep it set for every later command):
+#   export COMPOSE_PROJECT_NAME=r14 PATH="$FABRIC_SAMPLES/bin:$PATH"
+#   cd <repo>; N=packages/saksi-bulletin/network/network.sh
 #   SAKSI_ORG1_USERS=3 "$N" up                 # configtx + Org1 users, network, channel 'saksi'
+#   docker pull hyperledger/fabric-ccenv:2.5   # chaincode builder images, if missing
+#   docker pull hyperledger/fabric-baseos:2.5
 #   "$N" deploy                                # this branch's chaincode, policy OR('Org1MSP.peer')
 #   ls "$FABRIC_SAMPLES"/test-network/organizations/peerOrganizations/org1.example.com/users
 #   #   -> Admin@ User1@ User2@ User3@ org1.example.com
 #   cargo build --release -p saksi-demo        # if target/release/saksi-demo is stale
+#   tools/r14-machine-test.sh --dry-run        # all four fingerprints resolve
 #   tools/r14-machine-test.sh --out <dir>                    # 20 voters x 3 x 4, 3-of-5
 #   tools/r14-machine-test.sh --out <dir> --voters 1000      # the 1,000-voter run
-#   "$N" down                                  # when finished
+#   # 4. when finished: `docker compose -p r14 ... down` WITHOUT --volumes, or
+#   #    `docker rm -f` the three r14 containers; then the r14_* volumes are
+#   #    this run's alone. Restore the backed-up crypto before restarting any
+#   #    other network that used it.
 #
 # network.sh's default FABRIC_SAMPLES is <repo>/../fabric-samples
 # (~/dev/fabric-samples for ~/dev/saksi-r14). On the Mac, if saksi-demo fails
