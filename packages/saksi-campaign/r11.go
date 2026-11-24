@@ -68,18 +68,11 @@ const (
 	r11PhaseWindow    = "window"
 	r11PhaseDuplicate = "duplicate"
 	r11PhaseResume    = "resume"
-	r11PhaseFallback  = "fallback"
 	r11PhaseCeremony  = "ceremony"
 )
 
-// Resume paths.
-const (
-	r11PathConsole      = "console"
-	r11PathFallback     = "harness-fallback"
-	r11PathFallbackText = "harness fallback: the console's resume refused the run, so the harness resubmitted " +
-		"every record whose nullifier the chain lacked (ListNullifiers ∩ run) and committed CloseElection " +
-		"through the executor's lifecycle step"
-)
+// r11PathConsole names the only resume path: the console executor's own.
+const r11PathConsole = "console"
 
 // r11MaxResumes bounds the resume attempts: a resume whose ballots or close
 // fail (an orderer still electing its leader) stays resumable, and the
@@ -220,7 +213,8 @@ func R11DryRun(w io.Writer, c BlackoutConfig) {
 		c.TriggerCount(), c.Records(), c.BlackoutAt*100, c.Downtime, c.ReadyTimeout)
 	fmt.Fprintf(w, "compose project %q; chaincode containers match %s\n\n", c.ComposeProject, chaincodeContainerRE(c.Chaincode))
 	steps := []string{
-		"preflight  docker ps: " + strings.Join(R11CoreContainers, ", ") + " running, labelled com.docker.compose.project=" + c.ComposeProject,
+		"preflight  docker ps: " + strings.Join(R11CoreContainers, ", ") + " running, labelled com.docker.compose.project=" + c.ComposeProject + ";\n" +
+			"           each chaincode container on a Docker network of those peers",
 		"generate   Executor.Generate: saksi-demo gen --stream <out>/runs/<run>",
 		"window     Executor.Submit: CreateElection (admin), RegisterPrecinctMachine (admin), PublishDKGTranscript, SubmitBallot x N (machine)",
 		fmt.Sprintf("blackout   at commit %d: ChainInfo (height before), docker kill <core + the chaincode containers listed at the preflight> in one call;\n"+
@@ -232,8 +226,8 @@ func R11DryRun(w io.Writer, c BlackoutConfig) {
 		fmt.Sprintf("chaincode  up to %s for the peers to relaunch the chaincode containers; any still down: docker start (recorded)", c.ChaincodeGrace),
 		"after      ChainInfo (height after >= before); ListNullifiers: every C record on the ledger",
 		"duplicate  SubmitBallot(one C record) again: refused at gate nullifier",
-		"resume     Executor.resumeAndClose: ListNullifiers ∩ run decides; submits only the rest, then CloseElection (retried up to 3 times);\n" +
-			"           if the console refuses (the window ended, not interrupted), the harness resubmits by nullifier and closes, and says so",
+		"resume     Executor.resumeAndClose: ListNullifiers ∩ run decides; submits only the rest, then CloseElection (retried up to 3 times;\n" +
+			"           a refusal is not retried and fails the run: there is no harness fallback)",
 		"ceremony   SubmitPartialDecryption x each, PublishTally (the bundle's, as the console's submit path)",
 		"verify     Executor.verify (ledger dump + local audit), audit-stream over the ledger dump, CountCommittedBallots, ListNullifiers walk",
 		"events     docker events over the run, filtered to the killed containers",
@@ -257,17 +251,17 @@ func stopText(mode string) string {
 // r11CheckNames lists every check, in order, with what it expects.
 var r11CheckNames = [][2]string{
 	{"pre.classified", "C + U + N = records; C >= 1 and U + N >= 1 (the blackout fell mid-election)"},
-	{"pre.height", "block height read just before the kill"},
+	{"pre.height_read", "block height read at the trigger, just before the kill (informational: in-flight commits may land after it)"},
 	{"blackout.killed", "every target container killed (orderer, both peers, the chaincode containers)"},
 	{"blackout.down", "every killed container still down at the end of the downtime"},
 	{"blackout.downtime", "downtime >= the configured downtime"},
 	{"blackout.ready", "a query succeeds and the orderer has a Raft leader after the restart"},
 	{"blackout.restarted", "every killed container running again"},
-	{"after.height", "height after the restart >= height before the blackout"},
+	{"after.height", "height after the restart >= height read before the kill, and > the highest block any C record committed in"},
 	{"after.committed_kept", "every C record's nullifier on the ledger after the restart"},
 	{"resume.duplicate_refused", "resubmitting one C record is refused at gate nullifier"},
 	{"resume.only_missing", "each resume attempt submits exactly the records the chain lacks"},
-	{"resume.done", "the resume (console, or the harness fallback when the console refuses) landed every record and closed"},
+	{"resume.done", "the console's resume landed every record and closed the election"},
 	{"final.tally", "partial decryptions and the tally committed"},
 	{"final.count", "CountCommittedBallots = records"},
 	{"final.no_duplicates", "ListNullifiers: records entries, all distinct, none missing, none extra"},
@@ -343,6 +337,9 @@ type R11Classification struct {
 	// CommittedAfterKill counts C records whose valid commit status came back
 	// after the kill was issued (already committed, answer still in flight).
 	CommittedAfterKill int `json:"committed_answer_after_kill"`
+	// MaxCommittedBlock is the highest block number a C record's commit
+	// status named: the chain after the restart must reach past it.
+	MaxCommittedBlock uint64 `json:"max_committed_block"`
 	// After the restart, before the resume.
 	OnChainAfterRestart    int    `json:"on_chain_after_restart"`
 	CommittedMissing       int    `json:"committed_missing_after_restart"`
@@ -366,7 +363,7 @@ type R11Duplicate struct {
 // R11ResumeAttempt is one call of the executor's resume.
 type R11ResumeAttempt struct {
 	Attempt       int    `json:"attempt"`
-	Path          string `json:"path"` // console | harness-fallback
+	Path          string `json:"path"` // console
 	OnChainBefore int    `json:"on_chain_before"`
 	Submitted     int    `json:"submitted"`
 	Accepted      int    `json:"accepted"`
@@ -407,8 +404,7 @@ type R11Evidence struct {
 	RunID      string            `json:"run_id,omitempty"`
 	RunDir     string            `json:"run_dir,omitempty"`
 	ResumePath string            `json:"resume_path"`
-	// ResumeConsoleRefusal is the console resume's refusal when the harness
-	// had to fall back.
+	// ResumeConsoleRefusal is the console resume's refusal, when it refused.
 	ResumeConsoleRefusal string             `json:"resume_console_refusal,omitempty"`
 	Classification       R11Classification  `json:"classification"`
 	Blackout             R11Blackout        `json:"blackout"`
@@ -573,8 +569,46 @@ func (r *r11Run) preflight(ctx context.Context) error {
 		}
 	}
 	// Listed now, so the kill does not wait on a docker ps.
-	r.chaincode, err = r.chaincodeContainers(ctx)
-	return err
+	if r.chaincode, err = r.chaincodeContainers(ctx); err != nil {
+		return err
+	}
+	// The chaincode containers carry no compose label: the peer creates
+	// them. Each must be attached to a Docker network of the project's
+	// peers, which is where its peer launched it; one that is not belongs
+	// to some other network, and nothing is killed.
+	peerNets := map[string]bool{}
+	for _, p := range R11CoreContainers[1:] {
+		nets, err := r.networks(ctx, p)
+		if err != nil {
+			return fmt.Errorf("inspect %s networks: %w", p, err)
+		}
+		for _, n := range nets {
+			peerNets[n] = true
+		}
+	}
+	for _, cc := range r.chaincode {
+		nets, err := r.networks(ctx, cc)
+		if err != nil {
+			return fmt.Errorf("inspect %s networks: %w", cc, err)
+		}
+		linked := false
+		for _, n := range nets {
+			linked = linked || peerNets[n]
+		}
+		if !linked {
+			return fmt.Errorf("chaincode container %s is on networks %v, none of them the %q peers' networks: refusing to kill it", cc, nets, r.cfg.ComposeProject)
+		}
+	}
+	return nil
+}
+
+// networks lists the Docker networks a container is attached to.
+func (r *r11Run) networks(ctx context.Context, name string) ([]string, error) {
+	out, err := r.docker(ctx, "inspect", "-f", "{{range $k, $v := .NetworkSettings.Networks}}{{$k}} {{end}}", name)
+	if err != nil {
+		return nil, err
+	}
+	return strings.Fields(out), nil
 }
 
 // chaincodeContainers lists the running chaincode containers, sorted.
@@ -1041,10 +1075,8 @@ func (r *r11Run) drive(ctx context.Context, ev *R11Evidence) string {
 		r.logf("duplicate: record %d -> %s gate %q", ev.Duplicate.Index, ev.Duplicate.Outcome, ev.Duplicate.Gate)
 	}
 
-	// 4b. The executor's resume. A run the console refuses to resume (its
-	// window ended rather than being interrupted: every record had been
-	// dispatched before the kill) falls back to the harness resubmitting by
-	// nullifier itself, and the evidence says so.
+	// 4b. The executor's resume, the only recovery path: a refusal is not
+	// retried and fails the run.
 	refused := ""
 	for attempt := 1; attempt <= r11MaxResumes; attempt++ {
 		before, err := chainCommitted(byNullifier, b, reader)
@@ -1074,29 +1106,10 @@ func (r *r11Run) drive(ctx context.Context, ev *R11Evidence) string {
 		time.Sleep(cfg.ResumeRetryWait)
 	}
 	if refused != "" {
+		// No harness fallback: a run the console will not resume is a
+		// failed recovery, and the evidence keeps the console's words.
 		ev.ResumeConsoleRefusal = refused
-		ev.ResumePath = r11PathFallbackText
-		for attempt := 1; attempt <= r11MaxResumes; attempt++ {
-			before, err := chainCommitted(byNullifier, b, reader)
-			if err != nil {
-				return "list nullifiers before the fallback: " + err.Error()
-			}
-			phase := fmt.Sprintf("%s-%d", r11PhaseFallback, attempt)
-			r.setPhase(phase)
-			ferr := r.fallbackResume(ctx, post, before, bundlePath)
-			a := resumeAttempt(len(ev.Resume)+1, before, byNullifier, r.callsIn(phase))
-			a.Path = r11PathFallback
-			if ferr != nil {
-				a.Error = ferr.Error()
-			}
-			ev.Resume = append(ev.Resume, a)
-			r.logf("harness fallback %d: %d on chain before, %d submitted, %d accepted; err %v",
-				attempt, a.OnChainBefore, a.Submitted, a.Accepted, ferr)
-			if ferr == nil || ctx.Err() != nil {
-				break
-			}
-			time.Sleep(cfg.ResumeRetryWait)
-		}
+		return "the console refused to resume the run: " + refused
 	}
 	if n := len(ev.Resume); n == 0 || ev.Resume[n-1].Error != "" {
 		return "the resume did not finish"
@@ -1138,67 +1151,6 @@ func (r *r11Run) duplicate(dir string, status []string) *R11Duplicate {
 	o := observe("SubmitBallot", rec, err)
 	d.Outcome, d.Gate, d.Error, d.TxID = o.Outcome, o.Gate, o.Error, o.TxID
 	return d
-}
-
-// fallbackResume submits every record the chain lacks, then closes the
-// election through the executor's lifecycle step. It is used only when the
-// console's resume refuses the run.
-func (r *r11Run) fallbackResume(ctx context.Context, led clientsdk.Ledger, before []bool, bundlePath string) error {
-	lines := make(chan string)
-	var (
-		wg     sync.WaitGroup
-		mu     sync.Mutex
-		failed int
-		sent   int
-		first  error
-	)
-	for w := 0; w < r.cfg.Concurrency; w++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for line := range lines {
-				_, _, err := led.Submit("SubmitBallot", line)
-				mu.Lock()
-				sent++
-				if err != nil {
-					failed++
-					if first == nil {
-						first = err
-					}
-				}
-				mu.Unlock()
-			}
-		}()
-	}
-	err := scanBallotLines(r.dir, func(i int, line string) error {
-		if i < len(before) && before[i] {
-			return nil
-		}
-		select {
-		case lines <- line:
-			return nil
-		case <-ctx.Done():
-			return ctx.Err()
-		}
-	})
-	close(lines)
-	wg.Wait()
-	if err != nil {
-		return err
-	}
-	if failed > 0 {
-		return fmt.Errorf("%d of %d resubmitted records did not commit (first: %s)", failed, sent, clientsdk.ErrorText(first))
-	}
-	b, step, err := r.e.lifecycle(r.runID, led, bundlePath, "submit")
-	if err != nil {
-		return err
-	}
-	defer r.e.closeReceipts(r.runID)
-	err = step(ctx, "CloseElection", "", "CloseElection", b.ElectionID)
-	if err != nil && strings.Contains(clientsdk.ErrorText(err), "is already closed") {
-		return nil // a close that landed while its answer did not reach us
-	}
-	return err
 }
 
 // ceremony commits the bundle's partial decryptions and the tally through
@@ -1285,7 +1237,9 @@ func (r *r11Run) writeEvents(since time.Time) {
 	if err != nil {
 		r.boError("docker events: %v", err)
 	}
-	_ = os.WriteFile(filepath.Join(r.cfg.OutDir, "docker-events.ndjson"), []byte(filterEvents(out, names)), 0o644)
+	if err := os.WriteFile(filepath.Join(r.cfg.OutDir, "docker-events.ndjson"), []byte(filterEvents(out, names)), 0o644); err != nil {
+		r.boError("write docker-events.ndjson: %v", err)
+	}
 }
 
 // filterEvents keeps the event lines naming one of names.
@@ -1335,6 +1289,9 @@ func classifyRecords(records int, byNullifier map[[32]byte]int, calls []r11Call,
 		switch {
 		case c.OK:
 			status[i] = R11Committed
+			if c.Block > cls.MaxCommittedBlock {
+				cls.MaxCommittedBlock = c.Block
+			}
 			afterKill[i] = !killAt.IsZero() && c.done.After(killAt)
 		case status[i] != R11Committed:
 			status[i] = R11Uncertain
@@ -1481,7 +1438,8 @@ func r11Checks(ev R11Evidence) []R11Check {
 		cls.Committed+cls.Uncertain+cls.NotSent, cls.Records),
 		bo.Fired && cls.Records > 0 && cls.Committed+cls.Uncertain+cls.NotSent == cls.Records &&
 			cls.Committed >= 1 && cls.Uncertain+cls.NotSent >= 1)
-	add("pre.height", fmt.Sprintf("height %d (read ok %v)", bo.HeightBefore, bo.HeightBeforeOK), bo.HeightBeforeOK && bo.HeightBefore > 0)
+	add("pre.height_read", fmt.Sprintf("height %d (read ok %v); highest C block %d", bo.HeightBefore, bo.HeightBeforeOK, cls.MaxCommittedBlock),
+		bo.HeightBeforeOK && bo.HeightBefore > 0)
 
 	killedRoles := map[string]int{}
 	for _, c := range bo.Containers {
@@ -1518,8 +1476,10 @@ func r11Checks(ev R11Evidence) []R11Check {
 	add("blackout.restarted", fmt.Sprintf("%d of %d running; %s", up, len(bo.Containers), strings.Join(by, "; ")),
 		len(bo.Containers) > 0 && up == len(bo.Containers))
 
-	add("after.height", fmt.Sprintf("after %d (ok %v) vs before %d", bo.HeightAfter, bo.HeightAfterOK, bo.HeightBefore),
-		bo.HeightAfterOK && bo.HeightBeforeOK && bo.HeightAfter >= bo.HeightBefore)
+	add("after.height", fmt.Sprintf("after %d (ok %v) vs before %d; highest C block %d", bo.HeightAfter, bo.HeightAfterOK,
+		bo.HeightBefore, cls.MaxCommittedBlock),
+		bo.HeightAfterOK && bo.HeightBeforeOK && bo.HeightAfter >= bo.HeightBefore &&
+			cls.Committed >= 1 && bo.HeightAfter > cls.MaxCommittedBlock)
 	add("after.committed_kept", fmt.Sprintf("%d of %d C records missing; %d on chain in all (U on chain %d, U not %d)",
 		cls.CommittedMissing, cls.Committed, cls.OnChainAfterRestart, cls.UncertainOnChain, cls.UncertainNotOnChain),
 		bo.Ready && cls.Committed >= 1 && cls.CommittedMissing == 0 && cls.OnChainAfterRestart >= cls.Committed)

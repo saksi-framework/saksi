@@ -26,6 +26,7 @@ type r11Net struct {
 	mu         sync.Mutex
 	running    map[string]bool
 	project    map[string]string
+	network    map[string]string
 	ccOrg1     string
 	ccOrg2     string
 	dockerLog  []string
@@ -44,7 +45,7 @@ func newR11Net() *r11Net {
 	admin, machine := strings.Repeat("a1", 32), strings.Repeat("b2", 32)
 	n := &r11Net{
 		chain: newR14Chain(admin), adminFP: admin, machineFP: machine,
-		running: map[string]bool{}, project: map[string]string{},
+		running: map[string]bool{}, project: map[string]string{}, network: map[string]string{},
 		ccOrg1:   "dev-peer0.org1.example.com-saksi-bulletin_1.0-abc",
 		ccOrg2:   "dev-peer0.org2.example.com-saksi-bulletin_1.0-abc",
 		killedCh: make(chan struct{}),
@@ -110,6 +111,12 @@ func (n *r11Net) docker(args []string) ([]byte, error) {
 		return nil, nil
 	case "inspect":
 		name := args[len(args)-1]
+		if strings.Contains(args[2], "Networks") {
+			if net, ok := n.network[name]; ok {
+				return []byte(net + " "), nil
+			}
+			return []byte("fabric_test "), nil
+		}
 		return []byte(fmt.Sprintf("%v|status|started x|finished y|exit 137", n.running[name])), nil
 	case "events":
 		return []byte(`{"status":"kill","Actor":{"Attributes":{"name":"orderer.example.com"}}}` + "\n" +
@@ -323,10 +330,10 @@ func readFile(t *testing.T, path string) string {
 	return string(data)
 }
 
-// When every record was dispatched before the kill, the window ends rather
-// than being interrupted and the console's resume refuses the run; the
-// harness then resubmits by nullifier itself and says so.
-func TestBlackoutFallsBackWhenTheConsoleRefusesToResume(t *testing.T) {
+// A network-only outage: the console keeps sending into the dead network,
+// every remaining record is dispatched and fails, and the window ends rather
+// than being interrupted. The console's own resume must take the run.
+func TestBlackoutAfterKillResumesThroughTheConsole(t *testing.T) {
 	cfg, n, log := r11Setup(t, 2)
 	cfg.Concurrency = 8
 	cfg.StopWindow = R11StopAfterKill
@@ -342,12 +349,28 @@ func TestBlackoutFallsBackWhenTheConsoleRefusesToResume(t *testing.T) {
 	if cls.Committed != 2 || cls.Uncertain != 4 || cls.NotSent != 0 {
 		t.Errorf("classification %+v", cls)
 	}
-	if !strings.Contains(ev.ResumeConsoleRefusal, "not interrupted") || !strings.HasPrefix(ev.ResumePath, "harness fallback") {
-		t.Errorf("resume path %q, refusal %q", ev.ResumePath, ev.ResumeConsoleRefusal)
+	if ev.ResumeConsoleRefusal != "" || len(ev.Resume) != 1 || ev.Resume[0].Path != r11PathConsole ||
+		ev.Resume[0].Submitted != 4 || ev.Resume[0].SubmittedAlreadyOnChain != 0 {
+		t.Errorf("resume %+v, refusal %q", ev.Resume, ev.ResumeConsoleRefusal)
 	}
-	if len(ev.Resume) != 2 || ev.Resume[0].Path != r11PathConsole || ev.Resume[1].Path != r11PathFallback ||
-		ev.Resume[1].Submitted != 4 || ev.Resume[1].SubmittedAlreadyOnChain != 0 {
-		t.Errorf("resume %+v", ev.Resume)
+}
+
+// A chaincode container that is not on the project's peers' network is not
+// the project's: the preflight refuses and nothing is killed.
+func TestBlackoutRefusesAChaincodeContainerOffThePeersNetwork(t *testing.T) {
+	cfg, n, _ := r11Setup(t, 20)
+	n.network[n.ccOrg2] = "other_net"
+	ev, err := RunBlackoutTest(context.Background(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ev.Pass || !strings.Contains(ev.Aborted, "refusing to kill") || !strings.Contains(ev.Aborted, n.ccOrg2) {
+		t.Fatalf("aborted %q", ev.Aborted)
+	}
+	for _, l := range n.dockerLog {
+		if strings.HasPrefix(l, "kill") || strings.HasPrefix(l, "start") {
+			t.Errorf("docker %s after a refused preflight", l)
+		}
 	}
 }
 
@@ -396,7 +419,8 @@ func TestClassifyRecords(t *testing.T) {
 	kill := time.Now()
 	calls := []r11Call{
 		{Fn: "CreateElection", OK: true},
-		{Fn: "SubmitBallot", Nullifier: nul(0), OK: true, done: kill.Add(-time.Second)},
+		{Fn: "SubmitBallot", Nullifier: nul(0), OK: true, Block: 7, done: kill.Add(-time.Second)},
+		{Fn: "SubmitBallot", Nullifier: nul(4), OK: false, Block: 9},
 		{Fn: "SubmitBallot", Nullifier: nul(1), OK: true, done: kill.Add(time.Millisecond)},
 		{Fn: "SubmitBallot", Nullifier: nul(2), OK: false, Error: "commit status: unavailable"},
 		{Fn: "SubmitBallot", Nullifier: nul(3), OK: false, Error: "first"},
@@ -404,19 +428,19 @@ func TestClassifyRecords(t *testing.T) {
 		{Fn: "SubmitBallot", Nullifier: "zz", OK: true},
 	}
 	status, cls := classifyRecords(6, idx, calls, kill)
-	want := []string{"C", "C", "U", "C", "N", "N"}
+	want := []string{"C", "C", "U", "C", "U", "N"}
 	for i := range want {
 		if status[i] != want[i] {
 			t.Errorf("record %d = %s, want %s", i, status[i], want[i])
 		}
 	}
-	if cls.Committed != 3 || cls.Uncertain != 1 || cls.NotSent != 2 || cls.CommittedAfterKill != 1 ||
+	if cls.Committed != 3 || cls.Uncertain != 2 || cls.NotSent != 1 || cls.CommittedAfterKill != 1 || cls.MaxCommittedBlock != 7 ||
 		cls.FirstUncertainError != "commit status: unavailable" {
 		t.Errorf("classification %+v", cls)
 	}
 	afterRestart(&cls, status, []bool{true, true, true, false, false, true})
 	if cls.CommittedMissing != 1 || cls.CommittedMissingSample[0] != 3 || cls.UncertainOnChain != 1 ||
-		cls.NotSentOnChain != 1 || cls.OnChainAfterRestart != 4 {
+		cls.UncertainNotOnChain != 1 || cls.NotSentOnChain != 1 || cls.OnChainAfterRestart != 4 {
 		t.Errorf("after restart %+v", cls)
 	}
 }
@@ -486,7 +510,8 @@ func TestR11ChecksVerdicts(t *testing.T) {
 		mut   func(*R11Evidence)
 	}{
 		{"pre.classified", func(e *R11Evidence) { e.Classification.Uncertain, e.Classification.NotSent = 0, 0 }},
-		{"pre.height", func(e *R11Evidence) { e.Blackout.HeightBeforeOK = false }},
+		{"pre.height_read", func(e *R11Evidence) { e.Blackout.HeightBeforeOK = false }},
+		{"after.height", func(e *R11Evidence) { e.Classification.MaxCommittedBlock = 12 }},
 		{"blackout.killed", func(e *R11Evidence) { e.Blackout.Containers = e.Blackout.Containers[:3] }},
 		{"blackout.down", func(e *R11Evidence) { e.Blackout.Containers[1].RunningAtDowntimeEnd = &tr }},
 		{"blackout.downtime", func(e *R11Evidence) { e.Blackout.DowntimeMs = 29000 }},

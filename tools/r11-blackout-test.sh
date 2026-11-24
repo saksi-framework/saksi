@@ -39,11 +39,12 @@
 #   --trustees 5 --threshold 3 --concurrency 32 --compose-project r14
 #   --ready-timeout 5m --chaincode-grace 1m --stamp S --distribution D
 #   --stop-window with-kill|after-kill (default with-kill: the window stops
-#   dispatching at the instant of the kill, as a console that stops sending
-#   when its network dies; after-kill keeps dispatching into the dead network
-#   until docker kill returns, which drops every remaining record, ends the
-#   window instead of interrupting it, and the console's resume then refuses
-#   the run, so the harness falls back to resubmitting by nullifier itself)
+#   dispatching at the instant of the kill, as when the console goes down
+#   with the network; after-kill keeps dispatching into the dead network
+#   until docker kill returns, a network-only outage under a console that
+#   keeps running: every remaining record is sent and fails and the window
+#   ends with drops). Either way the console's own resume is the only
+#   recovery; a refusal fails the run (there is no harness fallback).
 #
 # Environment:
 #   FABRIC_SAMPLES     fabric-samples checkout (default: beside the repo, as network.sh)
@@ -54,7 +55,8 @@
 #
 # The network must already be up (see tools/r14-machine-test.sh for a safe
 # bring-up under a compose project of its own). This script never brings a
-# network up or down. The only docker calls it makes are: ps, inspect,
+# network up or down. It also refuses unless every chaincode container is
+# on a Docker network of the project's peers. The only docker calls it makes are: ps, inspect,
 # logs (the orderer's, for its Raft leader after the restart),
 # events, `kill` of exactly orderer.example.com, peer0.org1.example.com,
 # peer0.org2.example.com and the running dev-peer0.org{1,2}.example.com-
