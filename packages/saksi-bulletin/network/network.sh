@@ -17,6 +17,7 @@
 #   ./network.sh all      # up + deploy
 #   ./network.sh down     # tear everything down
 #   ./network.sh configtx # only install configtx.yaml (used by the tests)
+#   ./network.sh users    # only set Org1's cryptogen user count (used by the tests)
 set -euo pipefail
 
 CHANNEL="${SAKSI_CHANNEL:-saksi}"
@@ -109,9 +110,43 @@ install_configtx() {
 	echo "configtx: saksi orderer parameters installed (BatchTimeout 2s, MaxMessageCount 50, PreferredMaxBytes 2 MB, SnapshotIntervalSize 256 MB)"
 }
 
+# Org1 users cryptogen issues besides Admin. The chaincode binds each precinct
+# election to one registered machine certificate, so the precinct-machine
+# checks need several ordinary Org1 clients: User1 (precinct A's machine),
+# User2 (precinct B's machine) and User3 (a valid Org1 client registered
+# nowhere). Admin@org1.example.com (cryptogen NodeOU "admin") is the
+# administrator that creates elections and registers machines. Override with
+# SAKSI_ORG1_USERS; the stock test-network issues 1.
+ORG1_USERS="${SAKSI_ORG1_USERS:-3}"
+
+# install_org1_users sets Users.Count in the test-network's Org1 cryptogen
+# file. It only takes effect when the network is brought up fresh (cryptogen
+# runs on up, after down removed the old material).
+install_org1_users() {
+	local f="${TEST_NETWORK}/organizations/cryptogen/crypto-config-org1.yaml"
+	case "${ORG1_USERS}" in
+	'' | *[!0-9]* | 0)
+		echo "SAKSI_ORG1_USERS must be a positive integer, got '${ORG1_USERS}'" >&2
+		exit 1
+		;;
+	esac
+	[ -f "${f}" ] || { echo "test-network cryptogen file not found at ${f}" >&2; exit 1; }
+	[ -f "${f}.test-network-default" ] || cp "${f}" "${f}.test-network-default"
+	# The Users block is the only "Users:" key; its Count is the next Count line.
+	awk -v n="${ORG1_USERS}" '
+		/^[[:space:]]*Users:[[:space:]]*$/ { inusers = 1; print; next }
+		inusers && /^[[:space:]]*Count:/ { sub(/Count:.*/, "Count: " n); inusers = 0; done = 1 }
+		{ print }
+		END { if (!done) exit 3 }
+	' "${f}" >"${f}.tmp" || { rm -f "${f}.tmp"; echo "no Users.Count in ${f}" >&2; exit 1; }
+	mv "${f}.tmp" "${f}"
+	echo "cryptogen: Org1 issues Admin plus ${ORG1_USERS} user(s) (User1..User${ORG1_USERS})"
+}
+
 cmd_up() {
 	require_test_network up
 	install_configtx
+	install_org1_users
 	cd "${TEST_NETWORK}"
 	# cryptogen (no -ca): avoids needing fabric-ca-client on PATH for dev.
 	./network.sh up createChannel -c "${CHANNEL}"
@@ -136,6 +171,10 @@ configtx)
 	require_test_network configtx
 	install_configtx
 	;;
+users)
+	require_test_network users
+	install_org1_users
+	;;
 deploy) cmd_deploy ;;
 all)
 	cmd_up
@@ -143,7 +182,7 @@ all)
 	;;
 down) cmd_down ;;
 *)
-	echo "usage: $0 {up|deploy|all|down|configtx}" >&2
+	echo "usage: $0 {up|deploy|all|down|configtx|users}" >&2
 	exit 1
 	;;
 esac
