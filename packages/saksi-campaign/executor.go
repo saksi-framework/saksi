@@ -1801,7 +1801,7 @@ func planResume(dir string, c ElectionConfig) (resumePlan, error) {
 		return p, fmt.Errorf("this run has no readable journal, so there is no checkpoint to resume from: %w", err)
 	}
 	open, resumed := false, false
-	n, committed, endDropped := 0, -1, 0
+	n, committed, endDropped, endCommitted := 0, -1, 0, 0
 	p.Segment = 1 // journals recorded before segment.start existed still resume into a new segment
 	for _, ev := range events {
 		switch jstring(ev, "event") {
@@ -1812,7 +1812,7 @@ func planResume(dir string, c ElectionConfig) (resumePlan, error) {
 		case "stage.ballots.interrupted":
 			open, committed = true, jint(ev, "committed")
 		case "stage.ballots.end":
-			open, endDropped = false, jint(ev, "dropped")
+			open, endDropped, endCommitted = false, jint(ev, "dropped"), jint(ev, "committed")
 		case "segment.start":
 			p.Segment = jint(ev, "index") + 1
 			resumed = resumed || jint(ev, "index") >= 1
@@ -1828,7 +1828,16 @@ func planResume(dir string, c ElectionConfig) (resumePlan, error) {
 		if resumed && endDropped == 0 && !closeRecorded(dir) {
 			return resumePlan{CloseOnly: true}, nil
 		}
-		return resumePlan{}, errors.New("this run's ballot window is not interrupted: there is nothing to resume")
+		// A window that ran to its end with drops and was never closed: the
+		// network went away under a console that kept sending (no fault, no
+		// cancel), so every remaining ballot was dispatched and failed and the
+		// window ended instead of being interrupted. Its election is still
+		// open with ballots missing, which is exactly what a resume is for;
+		// the chain (ListNullifiers ∩ the run) decides what is resubmitted.
+		if endDropped == 0 || closeRecorded(dir) {
+			return resumePlan{}, errors.New("this run's ballot window is not interrupted: there is nothing to resume")
+		}
+		committed = endCommitted
 	}
 	if p.Segment < 1 {
 		p.Segment = 1
