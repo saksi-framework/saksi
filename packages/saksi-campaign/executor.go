@@ -1026,6 +1026,10 @@ func (e *Executor) submitBallots(ctx context.Context, runID string, c ElectionCo
 	var mu sync.Mutex
 	landed := make([]landedTx, 0, count)
 	var readErr error
+	// unavailableDrops counts the window's ballots that failed because the
+	// network could not be reached (gRPC Unavailable), not because the chain
+	// refused them: what lets a resume tell an outage from a failed window.
+	unavailableDrops := 0
 	fault := e.newPeerFault(ctx, runID, j, led, e.armedFault(runID, c), count, func() int {
 		mu.Lock()
 		defer mu.Unlock()
@@ -1046,6 +1050,11 @@ func (e *Executor) submitBallots(ctx context.Context, runID string, c ElectionCo
 		}
 		txID, block, err := led.Submit("SubmitBallot", line)
 		if err != nil {
+			if unavailable(err) {
+				mu.Lock()
+				unavailableDrops++
+				mu.Unlock()
+			}
 			return err
 		}
 		mu.Lock()
@@ -1085,6 +1094,11 @@ func (e *Executor) submitBallots(ctx context.Context, runID string, c ElectionCo
 	}
 	if fault.hasFired() {
 		end["fault"] = FaultPeerRestart
+	}
+	if res.Dropped > 0 {
+		mu.Lock()
+		end["unavailable"] = unavailableDrops
+		mu.Unlock()
 	}
 	if haveEndBytes {
 		end["ledger_bytes"] = endBytes
@@ -1801,7 +1815,7 @@ func planResume(dir string, c ElectionConfig) (resumePlan, error) {
 		return p, fmt.Errorf("this run has no readable journal, so there is no checkpoint to resume from: %w", err)
 	}
 	open, resumed := false, false
-	n, committed, endDropped := 0, -1, 0
+	n, committed, endDropped, endCommitted, endUnavailable := 0, -1, 0, 0, 0
 	p.Segment = 1 // journals recorded before segment.start existed still resume into a new segment
 	for _, ev := range events {
 		switch jstring(ev, "event") {
@@ -1812,7 +1826,8 @@ func planResume(dir string, c ElectionConfig) (resumePlan, error) {
 		case "stage.ballots.interrupted":
 			open, committed = true, jint(ev, "committed")
 		case "stage.ballots.end":
-			open, endDropped = false, jint(ev, "dropped")
+			open, endDropped, endCommitted = false, jint(ev, "dropped"), jint(ev, "committed")
+			endUnavailable = jint(ev, "unavailable")
 		case "segment.start":
 			p.Segment = jint(ev, "index") + 1
 			resumed = resumed || jint(ev, "index") >= 1
@@ -1828,7 +1843,23 @@ func planResume(dir string, c ElectionConfig) (resumePlan, error) {
 		if resumed && endDropped == 0 && !closeRecorded(dir) {
 			return resumePlan{CloseOnly: true}, nil
 		}
-		return resumePlan{}, errors.New("this run's ballot window is not interrupted: there is nothing to resume")
+		// A window that ran to its end with drops because of an outage and
+		// was never closed: the network went away under a console that kept
+		// sending (no fault, no cancel), so every remaining ballot was
+		// dispatched and failed and the window ended instead of being
+		// interrupted. Its election is still open with ballots missing,
+		// which is exactly what a resume is for; the chain (ListNullifiers ∩
+		// the run) decides what is resubmitted.
+		//
+		// An outage is a window whose every drop was the network being
+		// unreachable (stage.ballots.end's "unavailable" equals "dropped").
+		// A window that lost any ballot to a chaincode refusal, a timeout or
+		// an MVCC conflict failed, and stays failed; so does every window
+		// journalled before the count existed (no "unavailable" field).
+		if endDropped == 0 || endUnavailable != endDropped || closeRecorded(dir) {
+			return resumePlan{}, errors.New("this run's ballot window is not interrupted: there is nothing to resume")
+		}
+		committed = endCommitted
 	}
 	if p.Segment < 1 {
 		p.Segment = 1
@@ -1851,6 +1882,13 @@ func planResume(dir string, c ElectionConfig) (resumePlan, error) {
 		p.segments = []Segment{{Index: 0}}
 	}
 	return p, nil
+}
+
+// unavailable reports whether err is the network being unreachable (gRPC
+// code Unavailable: a refused connection, a peer or orderer gone, a stream
+// cut), as opposed to the chain answering with a refusal.
+func unavailable(err error) bool {
+	return err != nil && strings.Contains(clientsdk.ErrorText(err), "code = Unavailable")
 }
 
 // closeRecorded reports whether this console has recorded the election closed:
