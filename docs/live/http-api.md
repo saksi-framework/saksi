@@ -146,9 +146,14 @@ A chaincode refusal (422) is:
 
 `reason` is the chain's text verbatim (the gateway's message and every
 endorser's). `gate` is the chaincode's own `gate=<id>` when it names one
-(`decode`, `shape`, `issuer`, `credential`, `election-exists`,
+(`decode`, `caller`, `shape`, `issuer`, `credential`, `election-exists`,
 `election-open`, `nullifier`, `cds`, `selection`, `election-closed`,
-`membership`, `cp-presence`, `partial-duplicate`, `dkg-duplicate`, ...).
+`membership`, `cp-presence`, `partial-duplicate`, `dkg-duplicate`, `admin`,
+`machine-window`, `machine-duplicate`, ...). `caller` is a ballot from a
+certificate other than the election's registered precinct machine (or for an
+election with none: an unknown election id is refused here, before `shape`);
+`admin` is CreateElection, RegisterPrecinctMachine or CloseElection from a
+non-administrator.
 `PublishTally`'s checks carry no gate id, so the console names them:
 `threshold` (too few valid signatures, or none), `signature` (a signature
 that does not verify, an unknown or repeated signer), `already-published`,
@@ -170,7 +175,7 @@ setup -> ceremony -> open -> closed -> tallied -> verified
 | State | Entered when | Allows |
 |---|---|---|
 | `setup` | `POST elections` made the keys and parameters | `POST elections` again (retries `CreateElection`), `abandon`; a restart also retries |
-| `ceremony` | `CreateElection` recorded | the key-ceremony routes, `abandon` |
+| `ceremony` | `CreateElection` and `RegisterPrecinctMachine` recorded | the key-ceremony routes, `abandon` |
 | `open` | `PublishDKGTranscript` recorded | check-in, issuance, ballots, close |
 | `closed` | `CloseElection` recorded | partials, tally signatures (the trustee processes post them by themselves), `tally/publish` (the threshold demonstration) |
 | `tallied` | `PublishTally` recorded; the console starts verifying by itself at once | `verify` (a retry; it joins a run in flight) |
@@ -204,12 +209,17 @@ locked. See `voter-list-api.md` for the file, the errors (400 with `code`
 (1-64 of `[A-Za-z0-9._-]`; contest ids at most 127 bytes). The console makes
 the election id (`live-<utc yyyymmdd-hhmmss>-<8 hex>`, also the run id),
 runs `issuer-keygen` (key file in the run's private folder) and
-`election-params`, records `CreateElection`, and answers **201** with the
+`election-params`, records `CreateElection` (signed by the administrator
+identity, `--fabric-admin-cert`), then `RegisterPrecinctMachine` naming the
+fingerprint of the console's ballot certificate (`--fabric-machine-cert`): the
+console is the precinct's one registered machine, and the chain refuses a
+ballot from any other certificate. It answers **201** with the
 `GET /api/live/election` body (state `ceremony`).
 
 Errors: 400 (title, counts, a trustee without a token, the voter list, or
 `election-params` refused the positions), 409 (an election is running past
-setup), 502 or 422 (the chain; the election stays in `setup`).
+setup, or the election is already bound to another precinct machine), 502 or
+422 (the chain; the election stays in `setup`).
 
 **While the current election is in `setup`** (its `CreateElection` did not go
 through), the same call retries that `CreateElection` instead of making a new
@@ -793,7 +803,8 @@ on a study run and adds `ballot_fingerprint` (live runs only).
 A console restart loads the newest live election and reconciles with the
 chain:
 - `setup`: records `CreateElection` (an "already exists" answer counts as
-  done);
+  done), then `RegisterPrecinctMachine` (a `machine-duplicate` answer counts as
+  done when the chain names this console's machine; another machine is a 409);
 - `ceremony` with every acknowledgement in: assembles and publishes the
   transcript (an existing transcript counts as done);
 - `open` and the chain closed: `closed`;

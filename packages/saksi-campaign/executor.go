@@ -897,12 +897,16 @@ func (e *Executor) closeReceipts(runID string) error {
 }
 
 // setupOnChain runs the lifecycle prefix that must precede any trustee action:
-// CreateElection, PublishDKGTranscript, every SubmitBallot, then CloseElection.
+// CreateElection, RegisterPrecinctMachine, PublishDKGTranscript, every
+// SubmitBallot, then CloseElection.
 // It stops there — the chaincode only accepts partial decryptions once the
 // election is closed (contract.go's status gate), and the ceremony hands the
 // next move to the trustees.
 func (e *Executor) setupOnChain(ctx context.Context, runID string, c ElectionConfig, b *onChainBundle, led clientsdk.Ledger, step lifecycleStep) error {
 	if err := step(ctx, "CreateElection", "", "CreateElection", b.Params); err != nil {
+		return err
+	}
+	if err := registerMachine(ctx, step, led, b.ElectionID); err != nil {
 		return err
 	}
 	// A security run's pauses (timeline.go). Without an attack plan listing the
@@ -921,6 +925,17 @@ func (e *Executor) setupOnChain(ctx context.Context, runID string, c ElectionCon
 		return err
 	}
 	return e.closeElection(ctx, runID, c, b, led, step)
+}
+
+// registerMachine binds the election just created to the precinct machine
+// that signs led's ballots (RegisterPrecinctMachine, admin-signed, the
+// machine's certificate fingerprint as its argument and as the trail ref). It
+// runs right after CreateElection and before any ballot: the chaincode
+// refuses every ballot of an election with no registered machine, and every
+// ballot from another certificate (gate "caller").
+func registerMachine(ctx context.Context, step lifecycleStep, led clientsdk.Ledger, electionID string) error {
+	fp := led.MachineFingerprint()
+	return step(ctx, "RegisterPrecinctMachine", fp, "RegisterPrecinctMachine", electionID, fp)
 }
 
 // closeElection commits CloseElection and holds at the close attack stage if

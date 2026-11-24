@@ -364,6 +364,11 @@ func (f *fakeLedger) callNames() []string {
 	return out
 }
 
+// fakeMachineFP is the precinct-machine fingerprint every fake ledger reports.
+var fakeMachineFP = strings.Repeat("ab", 32)
+
+func (f *fakeLedger) MachineFingerprint() string { return fakeMachineFP }
+
 func (f *fakeLedger) SubmitWithReceipt(fn string, args ...string) ([]byte, clientsdk.Receipt, error) {
 	if f.beforeCommit != nil {
 		f.beforeCommit(fn)
@@ -509,7 +514,7 @@ func TestSubmitOnChainOrder(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := []string{"CreateElection", "PublishDKGTranscript", "SubmitBallot", "SubmitBallot", "CloseElection", "SubmitPartialDecryption", "SubmitPartialDecryption", "PublishTally"}
+	want := []string{"CreateElection", "RegisterPrecinctMachine", "PublishDKGTranscript", "SubmitBallot", "SubmitBallot", "CloseElection", "SubmitPartialDecryption", "SubmitPartialDecryption", "PublishTally"}
 	if len(led.calls) != len(want) {
 		t.Fatalf("calls = %v", led.calls)
 	}
@@ -528,14 +533,15 @@ func TestSubmitOnChainFailsLoudMidLifecycle(t *testing.T) {
 	if err == nil {
 		t.Fatal("want error when CloseElection fails")
 	}
-	// Partial receipts must be preserved: header + 4 rows (create, dkg, 2 ballots).
+	// Partial receipts must be preserved: header + 5 rows (create, register,
+	// dkg, 2 ballots).
 	data, rerr := os.ReadFile(filepath.Join(dir, "run-1", "receipts.csv"))
 	if rerr != nil {
 		t.Fatalf("receipts.csv not written: %v", rerr)
 	}
 	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
-	if len(lines) != 5 {
-		t.Fatalf("want 5 receipts.csv lines (header + 4 rows), got %d: %q", len(lines), lines)
+	if len(lines) != 6 {
+		t.Fatalf("want 6 receipts.csv lines (header + 5 rows), got %d: %q", len(lines), lines)
 	}
 }
 
@@ -543,9 +549,9 @@ func TestSubmitOnChainFailsLoudMidLifecycle(t *testing.T) {
 // proof that the step closure's SubmitBallot/Lifecycle split actually reaches
 // disk: N ballots, no partial decryptions, and a failure forced at
 // PublishTally so the lifecycle stops right after CloseElection — leaving
-// exactly CreateElection, PublishDKGTranscript, N x SubmitBallot,
-// CloseElection recorded. receipts.csv must have all of them; trail.ndjson
-// must have only the 3 non-ballot events, in order, and never the string
+// exactly CreateElection, RegisterPrecinctMachine, PublishDKGTranscript,
+// N x SubmitBallot, CloseElection recorded. receipts.csv must have all of
+// them; trail.ndjson must have only the 4 non-ballot events, in order, and never the string
 // "SubmitBallot". Flipping the step closure's routing condition (Append vs
 // Lifecycle) fails every assertion below.
 func TestSubmitOnChainRoutesLifecycleEventsToNDJSONOnly(t *testing.T) {
@@ -565,7 +571,7 @@ func TestSubmitOnChainRoutesLifecycleEventsToNDJSONOnly(t *testing.T) {
 		t.Fatalf("receipts.csv not written: %v", rerr)
 	}
 	csvLines := strings.Split(strings.TrimSpace(string(csvData)), "\n")
-	wantCSVLines := nBallots + 4 // header + CreateElection + PublishDKGTranscript + N ballots + CloseElection
+	wantCSVLines := nBallots + 5 // header + CreateElection + RegisterPrecinctMachine + PublishDKGTranscript + N ballots + CloseElection
 	if len(csvLines) != wantCSVLines {
 		t.Fatalf("want %d receipts.csv lines, got %d: %q", wantCSVLines, len(csvLines), csvLines)
 	}
@@ -584,7 +590,7 @@ func TestSubmitOnChainRoutesLifecycleEventsToNDJSONOnly(t *testing.T) {
 		t.Fatalf("trail.ndjson not written: %v", nerr)
 	}
 	ndjsonLines := strings.Split(strings.TrimSpace(string(ndjsonData)), "\n")
-	wantEvents := []string{"CreateElection", "PublishDKGTranscript", "CloseElection"}
+	wantEvents := []string{"CreateElection", "RegisterPrecinctMachine", "PublishDKGTranscript", "CloseElection"}
 	if len(ndjsonLines) != len(wantEvents) {
 		t.Fatalf("want %d trail.ndjson lines, got %d: %q", len(wantEvents), len(ndjsonLines), ndjsonLines)
 	}

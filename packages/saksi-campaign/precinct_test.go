@@ -56,15 +56,15 @@ func TestPrecinctLifecycleRunsTheHookBetweenBallotsAndClose(t *testing.T) {
 	if err != nil || tally != TallyPublished {
 		t.Fatal(tally, err)
 	}
-	want := []string{"CreateElection", "PublishDKGTranscript", "SubmitBallot", "SubmitBallot", "SubmitBallot",
+	want := []string{"CreateElection", "RegisterPrecinctMachine", "PublishDKGTranscript", "SubmitBallot", "SubmitBallot", "SubmitBallot",
 		"CloseElection", "SubmitPartialDecryption", "PublishTally"}
 	if got := led.callNames(); strings.Join(got, ",") != strings.Join(want, ",") {
 		t.Fatalf("calls = %v, want %v", got, want)
 	}
-	if strings.Join(atHook, ",") != strings.Join(want[:5], ",") {
+	if strings.Join(atHook, ",") != strings.Join(want[:6], ",") {
 		t.Fatalf("hook ran after %v, want after the ballots and before CloseElection", atHook)
 	}
-	if strings.Join(atTally, ",") != strings.Join(want[:7], ",") {
+	if strings.Join(atTally, ",") != strings.Join(want[:8], ",") {
 		t.Fatalf("tally hook ran after %v, want after the partials and before PublishTally", atTally)
 	}
 	for _, f := range []string{"latencies.csv", submitMetricsFile, "receipts.csv", "bundle.json", JournalFile} {

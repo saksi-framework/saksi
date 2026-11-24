@@ -413,8 +413,8 @@ func TestSecurityRunPausesAtEachDeclaredMoment(t *testing.T) {
 
 	// dkg: the election exists and is open; its transcript is not yet published.
 	v := waitPause(t, e, "run-1", StageDKG, done)
-	if got := led.callNames(); !reflect.DeepEqual(got, []string{"CreateElection"}) {
-		t.Fatalf("at the dkg pause the chain has seen %v, want only CreateElection", got)
+	if got := led.callNames(); !reflect.DeepEqual(got, []string{"CreateElection", "RegisterPrecinctMachine"}) {
+		t.Fatalf("at the dkg pause the chain has seen %v, want only CreateElection and RegisterPrecinctMachine", got)
 	}
 	if led.electionStatus() != "open" || v.Mount.ElectionStatus != "open" || *v.Mount.BallotsCommitted != 0 ||
 		v.Mount.BlockHeight == nil || !v.Live {

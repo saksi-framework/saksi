@@ -192,6 +192,7 @@ func serve(args []string) {
 	fabricMSPID := fs.String("fabric-msp-id", "Org1MSP", "Fabric MSP id of the acting organization")
 	fabricCert := fs.String("fabric-cert", "", "path to the client identity certificate")
 	fabricKey := fs.String("fabric-key", "", "path to the client identity private key")
+	fabricRoles := campaign.FabricRoleFlags(fs)
 	fabricChannel := fs.String("fabric-channel", "saksi", "Fabric channel the bulletin board runs on")
 	fabricChaincode := fs.String("fabric-chaincode", "saksi-bulletin", "deployed chaincode name")
 	fabricPeerVolume := fs.String("fabric-peer-volume", "", "host path of the peer's ledger volume (enables perf.csv's ledger_bytes_delta)")
@@ -226,6 +227,13 @@ func serve(args []string) {
 		Channel:      *fabricChannel,
 		Chaincode:    *fabricChaincode,
 		PeerVolume:   *fabricPeerVolume,
+	}
+	notes, err := fabricRoles.Apply(&fabric)
+	if err != nil {
+		fatal("%v", err)
+	}
+	for _, n := range notes {
+		fmt.Fprintln(os.Stderr, "fabric:", n)
 	}
 
 	if err := os.MkdirAll(*runsDir, 0o755); err != nil {
