@@ -61,9 +61,7 @@ func TestLiveArtifactsPassTheChaincode(t *testing.T) {
 	f := loadLiveFixture(t)
 	sc, ctx := &SmartContract{}, newContext()
 
-	if err := sc.CreateElection(ctx, f.Params); err != nil {
-		t.Fatalf("CreateElection: %v", err)
-	}
+	createElection(t, sc, ctx, f.Params)
 	if err := sc.PublishDKGTranscript(ctx, f.DKG); err != nil {
 		t.Fatalf("PublishDKGTranscript: %v", err)
 	}

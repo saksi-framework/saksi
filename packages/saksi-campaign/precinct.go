@@ -63,7 +63,8 @@ func (e *Executor) precinctRun(folder string) (ElectionConfig, error) {
 func (e *Executor) SetPrecinctDistribution(d string) { e.precinctDistribution = d }
 
 // PrecinctLifecycle runs the console's on-chain lifecycle for one precinct
-// folder on the configured channel: CreateElection, PublishDKGTranscript, the
+// folder on the configured channel: CreateElection, RegisterPrecinctMachine
+// (the console's machine certificate), PublishDKGTranscript, the
 // measured ballot window (the same closed-loop submitter, receipts,
 // latencies.csv and submit-metrics.json as a console run), CloseElection, the
 // partial decryptions and PublishTally.
@@ -140,6 +141,9 @@ func (e *Executor) precinctLifecycle(ctx context.Context, folder string, c Elect
 	}
 	defer e.closeReceipts(folder)
 	if err := step(ctx, "CreateElection", "", "CreateElection", b.Params); err != nil {
+		return "", err
+	}
+	if err := registerMachine(ctx, step, led, b.ElectionID); err != nil {
 		return "", err
 	}
 	if err := step(ctx, "PublishDKGTranscript", "", "PublishDKGTranscript", b.DKG); err != nil {

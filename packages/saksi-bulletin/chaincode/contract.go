@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/gtank/ristretto255"
+	"github.com/hyperledger/fabric-chaincode-go/shim"
 	"github.com/hyperledger/fabric-contract-api-go/contractapi"
 	"github.com/saksi-framework/saksi/packages/saksi-bulletin/chaincode/cdsverify"
 	"github.com/saksi-framework/saksi/packages/saksi-bulletin/chaincode/credverify"
@@ -97,6 +98,8 @@ type SmartContract struct {
 // hex-encoded canonical protobuf encoding of a saksi.protocol.v1.Ballot.
 //
 // On-chain checks:
+//   - the caller's certificate is the precinct machine registered for the
+//     ballot's election (gate `caller`; checked first, right after decoding);
 //   - the wire version is supported;
 //   - an election id is present;
 //   - at least one ciphertext, each with a correctly shaped pad and data;
@@ -124,6 +127,12 @@ func (s *SmartContract) SubmitBallot(ctx contractapi.TransactionContextInterface
 	var ballot saksiprotocolv1.Ballot
 	if err := proto.Unmarshal(raw, &ballot); err != nil {
 		return rejectAt("decode", "decode ballot: %w", err)
+	}
+
+	// Caller gate, before every other gate: only the precinct machine
+	// registered for this election may submit its ballots.
+	if err := requirePrecinctMachine(ctx, ballot.GetElectionId()); err != nil {
+		return err
 	}
 
 	if ballot.GetVersion() != saksiprotocolv1.WireVersion {
@@ -514,8 +523,12 @@ func (s *SmartContract) GetBallots(
 //
 // On-chain checks: supported wire version, a non-empty election id, at least one
 // contest and one trustee, and a threshold in 1..=trustee_count. The election id
-// must be new — re-creating an existing election is rejected.
+// must be new — re-creating an existing election is rejected. Only an
+// administrator may create an election (gate `admin`, checked first).
 func (s *SmartContract) CreateElection(ctx contractapi.TransactionContextInterface, paramsHex string) error {
+	if err := requireAdmin(ctx, "CreateElection"); err != nil {
+		return err
+	}
 	raw, err := hex.DecodeString(paramsHex)
 	if err != nil {
 		return fmt.Errorf("election parameters are not valid hex: %w", err)
@@ -690,8 +703,12 @@ func (s *SmartContract) GetDKGTranscript(ctx contractapi.TransactionContextInter
 
 // CloseElection transitions an election from open to closed, after which no
 // further ballots are accepted and threshold decryption may begin. The election
-// must exist and not already be closed.
+// must exist and not already be closed. Only an administrator may close an
+// election (gate `admin`, checked first).
 func (s *SmartContract) CloseElection(ctx contractapi.TransactionContextInterface, electionID string) error {
+	if err := requireAdmin(ctx, "CloseElection"); err != nil {
+		return err
+	}
 	stub := ctx.GetStub()
 
 	statusKey, err := stub.CreateCompositeKey(statusIndex, []string{electionID})
@@ -710,6 +727,123 @@ func (s *SmartContract) CloseElection(ctx contractapi.TransactionContextInterfac
 	}
 	if err := stub.PutState(statusKey, []byte(electionStatusClosed)); err != nil {
 		return fmt.Errorf("close election: %w", err)
+	}
+	return nil
+}
+
+// RegisterPrecinctMachine binds an election to the one machine allowed to
+// submit its ballots, identified by the lower-case hex SHA-256 of that
+// machine's certificate DER (64 hex digits).
+//
+// Checks, in order: the caller is an administrator (gate `admin`); the
+// fingerprint is 64 lower-case hex digits (gate `shape`); the election exists
+// (gate `election-exists`); the registration window is still open (gate
+// `machine-window`): the election is not closed and has no recorded ballot;
+// and no machine is registered yet (gate `machine-duplicate`), so a machine
+// cannot be swapped once bound.
+//
+// Elections are open for ballots from CreateElection on, so "before the
+// election opens" is read as "before its first ballot". Since SubmitBallot
+// refuses every ballot of an election with no machine, the ballot check only
+// matters for an election that holds ballots from an older build.
+func (s *SmartContract) RegisterPrecinctMachine(ctx contractapi.TransactionContextInterface, electionID string, fingerprintHex string) error {
+	if err := requireAdmin(ctx, "RegisterPrecinctMachine"); err != nil {
+		return err
+	}
+	if electionID == "" {
+		return rejectAt("shape", "missing election id")
+	}
+	if !isFingerprintHex(fingerprintHex) {
+		return rejectAt("shape", "machine fingerprint must be %d lower-case hex digits (SHA-256 of the certificate DER), got %q", fingerprintHexLen, fingerprintHex)
+	}
+
+	stub := ctx.GetStub()
+	statusKey, err := stub.CreateCompositeKey(statusIndex, []string{electionID})
+	if err != nil {
+		return fmt.Errorf("build status key: %w", err)
+	}
+	status, err := stub.GetState(statusKey)
+	if err != nil {
+		return fmt.Errorf("read election status: %w", err)
+	}
+	if status == nil {
+		return rejectAt("election-exists", "no election found with id %q", electionID)
+	}
+	if string(status) != electionStatusOpen {
+		return rejectAt("machine-window", "election %q is %s; a precinct machine can only be registered before the first ballot", electionID, status)
+	}
+	ballots, err := stub.GetStateByPartialCompositeKey(ballotIndex, []string{electionID})
+	if err != nil {
+		return fmt.Errorf("read election ballots: %w", err)
+	}
+	hasBallot := ballots.HasNext()
+	if err := ballots.Close(); err != nil {
+		return fmt.Errorf("close ballot iterator: %w", err)
+	}
+	if hasBallot {
+		return rejectAt("machine-window", "election %q already has ballots; a precinct machine can only be registered before the first ballot", electionID)
+	}
+
+	machineKey, err := stub.CreateCompositeKey(machineIndex, []string{electionID})
+	if err != nil {
+		return fmt.Errorf("build machine key: %w", err)
+	}
+	existing, err := stub.GetState(machineKey)
+	if err != nil {
+		return fmt.Errorf("read machine state: %w", err)
+	}
+	if existing != nil {
+		return rejectAt("machine-duplicate", "a precinct machine is already registered for election %q", electionID)
+	}
+	if err := stub.PutState(machineKey, []byte(fingerprintHex)); err != nil {
+		return fmt.Errorf("store precinct machine: %w", err)
+	}
+	return nil
+}
+
+// GetPrecinctMachine returns the certificate fingerprint (64 lower-case hex
+// digits) of the machine registered for an election, or an error if none is.
+func (s *SmartContract) GetPrecinctMachine(ctx contractapi.TransactionContextInterface, electionID string) (string, error) {
+	fp, err := registeredMachine(ctx.GetStub(), electionID)
+	if err != nil {
+		return "", err
+	}
+	if fp == "" {
+		return "", fmt.Errorf("no precinct machine registered for election %q", electionID)
+	}
+	return fp, nil
+}
+
+// registeredMachine reads the machine fingerprint bound to electionID, or ""
+// when none is registered.
+func registeredMachine(stub shim.ChaincodeStubInterface, electionID string) (string, error) {
+	key, err := stub.CreateCompositeKey(machineIndex, []string{electionID})
+	if err != nil {
+		return "", fmt.Errorf("build machine key: %w", err)
+	}
+	raw, err := stub.GetState(key)
+	if err != nil {
+		return "", fmt.Errorf("read machine state: %w", err)
+	}
+	return string(raw), nil
+}
+
+// requirePrecinctMachine is the `caller` gate: the election must have a
+// registered machine, and the caller's certificate must be that machine.
+func requirePrecinctMachine(ctx contractapi.TransactionContextInterface, electionID string) error {
+	want, err := registeredMachine(ctx.GetStub(), electionID)
+	if err != nil {
+		return err
+	}
+	if want == "" {
+		return rejectAt("caller", "no precinct machine is registered for election %q; an administrator must call RegisterPrecinctMachine before ballots are accepted", electionID)
+	}
+	caller, err := callerOf(ctx)
+	if err != nil {
+		return rejectAt("caller", "cannot identify the caller: %w", err)
+	}
+	if caller.Fingerprint != want {
+		return rejectAt("caller", "caller is not this precinct's machine for election %q (certificate %s)", electionID, caller.Fingerprint)
 	}
 	return nil
 }

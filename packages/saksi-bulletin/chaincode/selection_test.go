@@ -94,9 +94,7 @@ func withSelectionElection(t *testing.T, sc *SmartContract, ctx *fakeContext, v 
 		Threshold:       1,
 		IssuerPublicKey: issuerPK,
 	}
-	if err := sc.CreateElection(ctx, mustMarshalParams(t, params)); err != nil {
-		t.Fatalf("CreateElection: %v", err)
-	}
+	createElection(t, sc, ctx, mustMarshalParams(t, params))
 	dkg := &saksiprotocolv1.DKGTranscript{
 		Version:    saksiprotocolv1.WireVersion,
 		ElectionId: v.electionID,

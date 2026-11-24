@@ -1086,8 +1086,9 @@ var gateID = regexp.MustCompile(`gate=([a-z][a-z0-9-]*):\s*`)
 // classifyLive decides a live submission's verdict from what the ledger said.
 //
 // The chaincode refuses a submission at the FIRST check it fails, in a fixed
-// order (SubmitBallot: decode, shape, credential signature, election exists,
-// election open, nullifier unspent, then CDS), so a rejection only says
+// order (SubmitBallot: decode, caller (the election's registered precinct
+// machine), shape, credential signature, election exists, election open,
+// nullifier unspent, then CDS), so a rejection only says
 // something about the gate that produced it. A tampered proof submitted to a
 // closed election is refused as "not open for ballots" and never reaches the
 // proof check: that is INCONCLUSIVE, not a pass for the proof gate. A rejection

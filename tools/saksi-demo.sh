@@ -29,10 +29,15 @@ export PATH="${FABRIC_SAMPLES}/bin:${PATH}"
 say() { printf '\n\033[1;36m== %s ==\033[0m\n' "$*"; }
 err() { printf '\033[1;31m%s\033[0m\n' "$*" >&2; }
 
+# console_args names three Org1 identities: User1 is the default identity and
+# the precinct machine that signs every ballot; Admin (cryptogen NodeOU
+# "admin") creates the election, registers User1's certificate as its
+# machine, and closes it. The chaincode refuses those three from anyone else.
 console_args() {
 	local msp="${ORG_DIR}/users/User1@org1.example.com/msp"
-	if [ ! -d "${msp}" ]; then
-		err "Org1 user material not found at ${msp}. Bring the network up first."
+	local admin="${ORG_DIR}/users/Admin@org1.example.com/msp"
+	if [ ! -d "${msp}" ] || [ ! -d "${admin}" ]; then
+		err "Org1 user or admin material not found under ${ORG_DIR}/users. Bring the network up first."
 		return 1
 	fi
 	printf '%s\0' \
@@ -41,6 +46,10 @@ console_args() {
 		--tls-cert "${ORG_DIR}/peers/peer0.org1.example.com/tls/ca.crt" \
 		--cert "$(find "${msp}/signcerts" -type f | head -n1)" \
 		--key "$(find "${msp}/keystore" -type f | head -n1)" \
+		--admin-cert "$(find "${admin}/signcerts" -type f | head -n1)" \
+		--admin-key "$(find "${admin}/keystore" -type f | head -n1)" \
+		--machine-cert "$(find "${msp}/signcerts" -type f | head -n1)" \
+		--machine-key "$(find "${msp}/keystore" -type f | head -n1)" \
 		--msp-id Org1MSP --channel "${CHANNEL}" --chaincode "${CC_NAME}" \
 		--bundle "${BUNDLE}"
 }

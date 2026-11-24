@@ -45,8 +45,9 @@ From this directory:
 ./network.sh down
 ```
 
-`run-one-transaction.sh` stands up the fixture election (CreateElection +
-PublishDKGTranscript via `cmd/saksi-console --setup-only`) and then submits one
+`run-one-transaction.sh` stands up the fixture election (CreateElection as
+`Admin@org1`, RegisterPrecinctMachine naming `User1`'s certificate, then
+PublishDKGTranscript, via `cmd/saksi-console --setup-only`) and then submits one
 REAL ballot from the checked-in bundle fixture
 ([`../../saksi-protocol/test-vectors/bundle-v1.json`](../../saksi-protocol/test-vectors/bundle-v1.json))
 via the client SDK's `cmd/submit-ballot`, using the Org1 `User1` identity the
@@ -65,6 +66,7 @@ fresh `saksi-demo gen` bundle) to re-run. Requires `jq`.
 | `configtx.yaml` | Saksi's declared orderer configuration — the stock test-network file with four batching parameters changed (see its header); `network.sh up` installs it into fabric-samples before the channel is created |
 | `network.sh up` | installs `configtx.yaml`, then starts peers + orderer + CA and creates the `saksi` channel |
 | `network.sh configtx` | installs `configtx.yaml` only (what `configtx_test.sh` exercises) |
+| `network.sh users` | sets Org1's cryptogen `Users.Count` only (what `users_test.sh` exercises); `up` does this too, so Org1 has `Admin` plus `User1`..`User3`: `Admin` (NodeOU `admin`) creates elections and registers machines, `User1` and `User2` are precinct machines, `User3` is a valid client registered nowhere |
 | `network.sh deploy` | packages, installs, approves, and commits the `saksi-bulletin` chaincode (`-ccp ../chaincode -ccl go`) |
 | `run-one-transaction.sh` | submits + reads one ballot through the gateway with Org1 MSP material |
 
@@ -76,6 +78,7 @@ fresh `saksi-demo gen` bundle) to re-run. Requires `jq`.
 | `SAKSI_CHANNEL` | `saksi` | channel name |
 | `SAKSI_CC_NAME` | `saksi-bulletin` | chaincode name |
 | `SAKSI_BUNDLE` | `bundle-v1.json` fixture | election bundle (from `saksi-demo gen`) to set up + submit from |
+| `SAKSI_ORG1_USERS` | `3` | Org1 users cryptogen issues besides `Admin` (the stock test-network issues 1) |
 | `SAKSI_CONFIGTX` | `saksi` | `default` restores the pristine test-network `configtx.yaml` instead of installing ours, for A/B measurement runs |
 
 ## Target topology (per locked architecture)

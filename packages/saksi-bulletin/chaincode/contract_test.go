@@ -2,15 +2,26 @@ package main
 
 import (
 	"bytes"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/sha256"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/binary"
 	"encoding/hex"
 	"fmt"
+	"math/big"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
+	"github.com/hyperledger/fabric-chaincode-go/pkg/cid"
 	"github.com/hyperledger/fabric-chaincode-go/shim"
 	"github.com/hyperledger/fabric-contract-api-go/contractapi"
 	saksiprotocolv1 "github.com/saksi-framework/saksi/packages/saksi-protocol/go/saksiprotocolv1"
@@ -42,14 +53,151 @@ func (f *fakeStub) PutState(key string, value []byte) error {
 	return nil
 }
 
+// GetStateByPartialCompositeKey returns every key under the prefix, in lexical
+// order (RegisterPrecinctMachine's "no ballot yet" check).
+func (f *fakeStub) GetStateByPartialCompositeKey(objectType string, attributes []string) (shim.StateQueryIteratorInterface, error) {
+	it, _, err := f.GetStateByPartialCompositeKeyWithPagination(objectType, attributes, int32(len(f.state)+1), "")
+	return it, err
+}
+
+// fakeIdentity is a settable client identity: an MSP id and a real X.509
+// certificate, so the fingerprint is the SHA-256 of genuine DER bytes.
+type fakeIdentity struct {
+	cid.ClientIdentity
+	mspID string
+	cert  *x509.Certificate
+}
+
+func (i *fakeIdentity) GetMSPID() (string, error)                      { return i.mspID, nil }
+func (i *fakeIdentity) GetX509Certificate() (*x509.Certificate, error) { return i.cert, nil }
+
+// fingerprint is the lower-case hex SHA-256 of the certificate DER.
+func (i *fakeIdentity) fingerprint() string {
+	sum := sha256.Sum256(i.cert.Raw)
+	return hex.EncodeToString(sum[:])
+}
+
+var certSerial atomic.Int64
+
+// newIdentity mints a self-signed certificate with the given common name and
+// OUs under mspID. Every call yields a distinct certificate (fresh key).
+func newIdentity(t testing.TB, mspID, cn string, ous ...string) *fakeIdentity {
+	t.Helper()
+	id, err := mintIdentity(mspID, cn, ous...)
+	if err != nil {
+		t.Fatalf("mint identity: %v", err)
+	}
+	return id
+}
+
+func mintIdentity(mspID, cn string, ous ...string) (*fakeIdentity, error) {
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		return nil, fmt.Errorf("generate key: %w", err)
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber: big.NewInt(certSerial.Add(1)),
+		Subject:      pkix.Name{CommonName: cn, Organization: []string{mspID}, OrganizationalUnit: ous},
+		NotBefore:    time.Unix(0, 0),
+		NotAfter:     time.Unix(1<<32, 0),
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	if err != nil {
+		return nil, fmt.Errorf("create certificate: %w", err)
+	}
+	cert, err := x509.ParseCertificate(der)
+	if err != nil {
+		return nil, fmt.Errorf("parse certificate: %w", err)
+	}
+	return &fakeIdentity{mspID: mspID, cert: cert}, nil
+}
+
+// testOperator is the default identity of newContext: an Org1 administrator
+// that the election helpers also register as the precinct machine, so tests
+// of the older gates run unchanged under the admin and caller gates.
+var testOperator = sync.OnceValue(func() *fakeIdentity {
+	id, err := mintIdentity(adminMSPID, "Admin@org1.example.com", adminOU)
+	if err != nil {
+		panic(err)
+	}
+	return id
+})
+
 type fakeContext struct {
 	contractapi.TransactionContextInterface
-	stub *fakeStub
+	stub     *fakeStub
+	identity *fakeIdentity
 }
 
 func (c *fakeContext) GetStub() shim.ChaincodeStubInterface { return c.stub }
 
-func newContext() *fakeContext { return &fakeContext{stub: newFakeStub()} }
+func (c *fakeContext) GetClientIdentity() cid.ClientIdentity {
+	if c.identity == nil {
+		return nil
+	}
+	return c.identity
+}
+
+// as sets the caller identity for the following calls and returns ctx.
+func (c *fakeContext) as(id *fakeIdentity) *fakeContext {
+	c.identity = id
+	return c
+}
+
+func newContext() *fakeContext {
+	return &fakeContext{stub: newFakeStub(), identity: testOperator()}
+}
+
+// createElection creates an election as the test operator (an administrator)
+// and registers the operator's certificate as its precinct machine, so the
+// test can submit ballots from the same context.
+func createElection(t *testing.T, sc *SmartContract, ctx *fakeContext, paramsHex string) {
+	t.Helper()
+	createElectionFor(t, sc, ctx, paramsHex, testOperator())
+}
+
+// createElectionFor is createElection with machine registered as the
+// election's precinct machine instead of the test operator.
+func createElectionFor(t *testing.T, sc *SmartContract, ctx *fakeContext, paramsHex string, machine *fakeIdentity) {
+	t.Helper()
+	raw, err := hex.DecodeString(paramsHex)
+	if err != nil {
+		t.Fatalf("decode params hex: %v", err)
+	}
+	var params saksiprotocolv1.ElectionParameters
+	if err := proto.Unmarshal(raw, &params); err != nil {
+		t.Fatalf("decode params: %v", err)
+	}
+	prev := ctx.identity
+	ctx.identity = testOperator()
+	if err := sc.CreateElection(ctx, paramsHex); err != nil {
+		t.Fatalf("CreateElection: %v", err)
+	}
+	if err := sc.RegisterPrecinctMachine(ctx, params.GetElectionId(), machine.fingerprint()); err != nil {
+		t.Fatalf("RegisterPrecinctMachine(%q): %v", params.GetElectionId(), err)
+	}
+	ctx.identity = prev
+}
+
+// seededContext is a fresh context whose (absent) election "electionID" has
+// the test operator bound as its machine, for gate tests past `caller`.
+func seededContext(t *testing.T, electionID string) *fakeContext {
+	t.Helper()
+	ctx := newContext()
+	seedMachine(t, ctx, electionID, testOperator())
+	return ctx
+}
+
+// seedMachine writes a machine binding straight into state for an election
+// that does not exist, so shape-gate tests reach the gates after `caller`.
+func seedMachine(t *testing.T, ctx *fakeContext, electionID string, id *fakeIdentity) {
+	t.Helper()
+	key, err := ctx.stub.CreateCompositeKey(machineIndex, []string{electionID})
+	if err != nil {
+		t.Fatalf("build machine key: %v", err)
+	}
+	ctx.stub.state[key] = []byte(id.fingerprint())
+}
 
 func mustMarshal(t *testing.T, ballot *saksiprotocolv1.Ballot) string {
 	t.Helper()
@@ -193,6 +341,13 @@ func withCDSElection(t *testing.T, sc *SmartContract, ctx *fakeContext) {
 // (ElectionParameters.issuer_public_key); nil is a legacy election without one.
 func withCDSElectionIssuer(t *testing.T, sc *SmartContract, ctx *fakeContext, issuerPK []byte) {
 	t.Helper()
+	withCDSElectionMachine(t, sc, ctx, issuerPK, testOperator())
+}
+
+// withCDSElectionMachine is withCDSElectionIssuer with machine registered as
+// the election's precinct machine.
+func withCDSElectionMachine(t *testing.T, sc *SmartContract, ctx *fakeContext, issuerPK []byte, machine *fakeIdentity) {
+	t.Helper()
 	_, contestID, _, pk, _, _, _ := loadCDSVector(t)
 	params := &saksiprotocolv1.ElectionParameters{
 		Version:         saksiprotocolv1.WireVersion,
@@ -202,9 +357,7 @@ func withCDSElectionIssuer(t *testing.T, sc *SmartContract, ctx *fakeContext, is
 		Threshold:       1,
 		IssuerPublicKey: issuerPK,
 	}
-	if err := sc.CreateElection(ctx, mustMarshalParams(t, params)); err != nil {
-		t.Fatalf("CreateElection: %v", err)
-	}
+	createElectionFor(t, sc, ctx, mustMarshalParams(t, params), machine)
 	dkg := &saksiprotocolv1.DKGTranscript{
 		Version:    saksiprotocolv1.WireVersion,
 		ElectionId: "election-2026",
@@ -338,9 +491,7 @@ func TestSubmitBallotRejectsMissingDKG(t *testing.T) {
 		TrusteeIds: []string{"t1"},
 		Threshold:  1,
 	}
-	if err := sc.CreateElection(ctx, mustMarshalParams(t, params)); err != nil {
-		t.Fatalf("CreateElection: %v", err)
-	}
+	createElection(t, sc, ctx, mustMarshalParams(t, params))
 	err := sc.SubmitBallot(ctx, mustMarshal(t, validCDSBallot(t)))
 	if err == nil || !strings.Contains(err.Error(), "gate=dkg-missing: ") {
 		t.Fatalf("expected a missing-DKG error, got: %v", err)
@@ -413,12 +564,12 @@ func TestGetBallotMissingIsError(t *testing.T) {
 
 func TestSubmitBallotRejectsBadHex(t *testing.T) {
 	sc := &SmartContract{}
-	if err := sc.SubmitBallot(newContext(), "nothex!!"); err == nil || !strings.HasPrefix(err.Error(), "gate=decode: ") {
+	if err := sc.SubmitBallot(seededContext(t, "election-2026"), "nothex!!"); err == nil || !strings.HasPrefix(err.Error(), "gate=decode: ") {
 		t.Fatalf("SubmitBallot should reject non-hex input at the decode gate, got: %v", err)
 	}
 	// Valid hex that is not a protobuf Ballot (field 1 with the reserved wire
 	// type 7) is refused at the same gate.
-	if err := sc.SubmitBallot(newContext(), "0f01"); err == nil || !strings.HasPrefix(err.Error(), "gate=decode: decode ballot") {
+	if err := sc.SubmitBallot(seededContext(t, "election-2026"), "0f01"); err == nil || !strings.HasPrefix(err.Error(), "gate=decode: decode ballot") {
 		t.Fatalf("SubmitBallot should reject an undecodable ballot at the decode gate, got: %v", err)
 	}
 }
@@ -432,7 +583,7 @@ func TestSubmitBallotRejectsMissingNullifier(t *testing.T) {
 		},
 	}
 	sc := &SmartContract{}
-	err := sc.SubmitBallot(newContext(), mustMarshal(t, ballot))
+	err := sc.SubmitBallot(seededContext(t, "election-2026"), mustMarshal(t, ballot))
 	if err == nil || !strings.Contains(err.Error(), "nullifier") {
 		t.Fatalf("expected a missing-nullifier error, got: %v", err)
 	}
@@ -451,7 +602,7 @@ func TestSubmitBallotRejectsMalformedCiphertext(t *testing.T) {
 		},
 	}
 	sc := &SmartContract{}
-	err := sc.SubmitBallot(newContext(), mustMarshal(t, ballot))
+	err := sc.SubmitBallot(seededContext(t, "election-2026"), mustMarshal(t, ballot))
 	if err == nil || !strings.Contains(err.Error(), "malformed") {
 		t.Fatalf("expected a malformed-ciphertext error, got: %v", err)
 	}
@@ -470,7 +621,7 @@ func TestSubmitBallotRejectsWrongVersion(t *testing.T) {
 		},
 	}
 	sc := &SmartContract{}
-	err := sc.SubmitBallot(newContext(), mustMarshal(t, ballot))
+	err := sc.SubmitBallot(seededContext(t, "election-2026"), mustMarshal(t, ballot))
 	if err == nil || !strings.Contains(err.Error(), "version") {
 		t.Fatalf("expected an unsupported-version error, got: %v", err)
 	}
@@ -500,9 +651,7 @@ func TestCreateElectionThenGetElectionRoundTrips(t *testing.T) {
 	ctx := newContext()
 	paramsHex := mustMarshalParams(t, validElectionParams())
 
-	if err := sc.CreateElection(ctx, paramsHex); err != nil {
-		t.Fatalf("CreateElection: %v", err)
-	}
+	createElection(t, sc, ctx, paramsHex)
 	got, err := sc.GetElection(ctx, "election-2026")
 	if err != nil {
 		t.Fatalf("GetElection: %v", err)
@@ -609,9 +758,7 @@ func mustMarshalDKG(t *testing.T, d *saksiprotocolv1.DKGTranscript) string {
 // build on it.
 func withElection(t *testing.T, sc *SmartContract, ctx *fakeContext) {
 	t.Helper()
-	if err := sc.CreateElection(ctx, mustMarshalParams(t, validElectionParams())); err != nil {
-		t.Fatalf("CreateElection: %v", err)
-	}
+	createElection(t, sc, ctx, mustMarshalParams(t, validElectionParams()))
 }
 
 func TestPublishDKGTranscriptThenGetRoundTrips(t *testing.T) {
@@ -698,7 +845,7 @@ func TestGetDKGTranscriptMissingIsError(t *testing.T) {
 
 func TestSubmitBallotRejectsUnknownElection(t *testing.T) {
 	sc := &SmartContract{}
-	err := sc.SubmitBallot(newContext(), validBallotHex(t, defaultNullifier()))
+	err := sc.SubmitBallot(seededContext(t, "election-2026"), validBallotHex(t, defaultNullifier()))
 	if err == nil || !strings.Contains(err.Error(), "gate=election-exists: ") {
 		t.Fatalf("expected an unknown-election error, got: %v", err)
 	}
@@ -991,9 +1138,7 @@ func withSignedTallyElection(t *testing.T, sc *SmartContract, ctx *fakeContext, 
 		TrusteeIds: v.trusteeIDs,
 		Threshold:  v.threshold,
 	}
-	if err := sc.CreateElection(ctx, mustMarshalParams(t, params)); err != nil {
-		t.Fatalf("CreateElection: %v", err)
-	}
+	createElection(t, sc, ctx, mustMarshalParams(t, params))
 	if err := sc.PublishDKGTranscript(ctx, v.transcriptHex); err != nil {
 		t.Fatalf("PublishDKGTranscript: %v", err)
 	}
@@ -1198,9 +1343,7 @@ func TestPublishTallyRejectsMissingDKGTranscript(t *testing.T) {
 		TrusteeIds: v.trusteeIDs,
 		Threshold:  v.threshold,
 	}
-	if err := sc.CreateElection(ctx, mustMarshalParams(t, params)); err != nil {
-		t.Fatalf("CreateElection: %v", err)
-	}
+	createElection(t, sc, ctx, mustMarshalParams(t, params))
 	if err := sc.CloseElection(ctx, v.electionID); err != nil {
 		t.Fatalf("CloseElection: %v", err)
 	}

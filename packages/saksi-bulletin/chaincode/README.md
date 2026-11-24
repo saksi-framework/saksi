@@ -10,8 +10,47 @@ Hyperledger Fabric chaincode (Contract API) for the BalotaChain bulletin board.
 | `PublishDKGTranscript` / `GetDKGTranscript` | submit / query | record + read the DKG transcript |
 | `SubmitBallot` / `GetBallot` | submit / query | cast + read a ballot |
 | `CloseElection` / `GetElectionStatus` | submit / query | end voting + read lifecycle status |
+| `RegisterPrecinctMachine` / `GetPrecinctMachine` | submit / query | bind + read the one machine certificate allowed to submit an election's ballots |
 | `SubmitPartialDecryption` / `GetPartialDecryption` | submit / query | record + read a trustee decryption share |
 | `PublishTally` / `GetTally` | submit / query | publish + read the final tally |
+
+## Caller identity gates
+
+- `CreateElection`, `RegisterPrecinctMachine` and `CloseElection` need an administrator:
+  MSP id `Org1MSP` and OU `admin` in the caller's certificate (gate `admin`).
+- `RegisterPrecinctMachine(electionID, fingerprint)` takes the lower-case hex SHA-256 of
+  the machine certificate's DER (64 digits). One machine per election; it must be
+  registered before the election's first ballot and cannot be replaced.
+- `SubmitBallot` checks the caller first (gate `caller`): the election must have a
+  registered machine and the caller's certificate fingerprint must equal it. The older
+  gates follow unchanged.
+
+### Upgrade together
+
+The console and the chaincode must be upgraded together, and only between
+elections. Every console flow calls `RegisterPrecinctMachine` right after
+`CreateElection`, so a console from this build against an older deployed
+chaincode fails election setup (`RegisterPrecinctMachine` is not a function
+there): deploy this chaincode first (`network.sh deploy`, sequence + 1), then
+run this console. In the other direction, this chaincode refuses ballots for
+any election that has no registered machine (gate `caller`). An election
+created before this build has none: if it already holds ballots it can never
+be registered (`machine-window`), so it accepts no further ballots; if it
+holds none, its ballots are refused until an administrator registers a
+machine. A live election resumed from an older build in `ceremony` or `open`
+state is not registered by the console (the console registers only while
+finishing `setup`), so it cannot accept ballots on the new chaincode. Finish or
+abandon running elections before upgrading.
+
+**Remaining ungated transactions (a limit).** Only `CreateElection`,
+`RegisterPrecinctMachine` and `CloseElection` (gate `admin`) and `SubmitBallot`
+(gate `caller`) check the caller. `PublishDKGTranscript`,
+`SubmitPartialDecryption` and `PublishTally` accept any channel member. The
+tally is checked against the trustees' threshold signature, and a partial must
+carry a Chaum-Pedersen proof (verified by the auditor, not on chain), but any
+member can publish the DKG transcript of a newly
+created election before the honest trustees do (the same front-running class
+as the ungated `CreateElection` this build closed).
 
 ## Hybrid verification split (locked)
 

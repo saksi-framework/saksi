@@ -95,29 +95,53 @@ type Ledger interface {
 	// spot-checks each Receipt in sample whose BlockNumber falls in range
 	// against the hash the corresponding block serves now.
 	VerifyChain(from, to uint64, sample []Receipt) (ChainReport, error)
+	// MachineFingerprint is the fingerprint (CertFingerprint) of the
+	// certificate that signs this ledger's SubmitBallot transactions: the
+	// value an election's RegisterPrecinctMachine must name.
+	MachineFingerprint() string
 }
 
 // ledger implements Ledger over an open gateway connection.
 type ledger struct {
-	network  *client.Network
-	contract *client.Contract // the bulletin chaincode
-	qscc     *client.Contract
-	channel  string
+	network *client.Network
+	// contracts is the bulletin chaincode per role (RoleFor); a role
+	// without its own identity is absent and uses RoleDefault's.
+	contracts map[Role]*client.Contract
+	qscc      *client.Contract
+	channel   string
+	machineFP string
 }
 
-// Ledger returns the receipt-bearing view of this connection's channel.
+// Ledger returns the receipt-bearing view of this connection's channel. Its
+// submits are routed like Bulletin's: each function is signed by the identity
+// RoleFor names.
 func (c *Connection) Ledger() Ledger {
 	network := c.gateway.GetNetwork(c.channel)
+	contracts := map[Role]*client.Contract{}
+	for role := range c.gateways {
+		contracts[role] = c.contractFor(role)
+	}
 	return &ledger{
-		network:  network,
-		contract: network.GetContract(c.chaincode),
-		qscc:     network.GetContract("qscc"),
-		channel:  c.channel,
+		network:   network,
+		contracts: contracts,
+		qscc:      network.GetContract("qscc"),
+		channel:   c.channel,
+		machineFP: c.machineFP,
 	}
 }
 
+func (l *ledger) MachineFingerprint() string { return l.machineFP }
+
+// contract is the bulletin chaincode as the identity that signs fn.
+func (l *ledger) contract(fn string) *client.Contract {
+	if c, ok := l.contracts[RoleFor(fn)]; ok {
+		return c
+	}
+	return l.contracts[RoleDefault]
+}
+
 func (l *ledger) SubmitWithReceipt(fn string, args ...string) ([]byte, Receipt, error) {
-	result, commit, err := l.contract.SubmitAsync(fn, client.WithArguments(args...))
+	result, commit, err := l.contract(fn).SubmitAsync(fn, client.WithArguments(args...))
 	if err != nil {
 		return nil, Receipt{}, fmt.Errorf("submit %s: %w", fn, err)
 	}
@@ -139,7 +163,7 @@ func (l *ledger) SubmitWithReceipt(fn string, args ...string) ([]byte, Receipt, 
 // number it landed in. It makes no qscc call, so it is the piece of
 // SubmitWithReceipt safe to put inside a timed window.
 func (l *ledger) Submit(fn string, args ...string) (string, uint64, error) {
-	_, commit, err := l.contract.SubmitAsync(fn, client.WithArguments(args...))
+	_, commit, err := l.contract(fn).SubmitAsync(fn, client.WithArguments(args...))
 	if err != nil {
 		return "", 0, fmt.Errorf("submit %s: %w", fn, err)
 	}

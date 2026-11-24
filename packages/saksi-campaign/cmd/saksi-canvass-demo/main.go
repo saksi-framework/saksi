@@ -68,6 +68,7 @@ func main() {
 	fabricMSPID := fs.String("fabric-msp-id", "Org1MSP", "Fabric MSP id of the acting organization")
 	fabricCert := fs.String("fabric-cert", "", "path to the client identity certificate")
 	fabricKey := fs.String("fabric-key", "", "path to the client identity private key")
+	fabricRoles := campaign.FabricRoleFlags(fs)
 	fabricChannel := fs.String("fabric-channel", "saksi", "Fabric channel the bulletin board runs on")
 	fabricChaincode := fs.String("fabric-chaincode", "saksi-bulletin", "deployed chaincode name")
 	fabricPeerVolume := fs.String("fabric-peer-volume", "", "host path of the peer's ledger volume (enables perf.csv's ledger_bytes_delta)")
@@ -77,6 +78,9 @@ func main() {
 		PeerEndpoint: *fabricPeer, GatewayPeer: *fabricGatewayPeer, TLSCert: *fabricTLSCert,
 		MSPID: *fabricMSPID, Cert: *fabricCert, Key: *fabricKey,
 		Channel: *fabricChannel, Chaincode: *fabricChaincode, PeerVolume: *fabricPeerVolume,
+	}
+	if err := fabricRoles.Apply(&fabric); err != nil {
+		fatal("cannot start: %v", err)
 	}
 	if *dir == "" {
 		fatal("--dir is required")

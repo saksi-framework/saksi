@@ -1,0 +1,5 @@
+{
+  "description": "Precinct-machine fingerprint vector: the SHA-256 of the certificate's DER bytes, lower-case hex. The chaincode (callerOf) and the client SDK (CertFingerprint) must both give fingerprint for cert_pem. Self-signed P-256 test certificate; its key was discarded.",
+  "cert_pem": "-----BEGIN CERTIFICATE-----\nMIIB+zCCAaGgAwIBAgIBATAKBggqhkjOPQQDAjBsMQswCQYDVQQGEwJVUzETMBEG\nA1UECAwKQ2FsaWZvcm5pYTEWMBQGA1UEBwwNU2FuIEZyYW5jaXNjbzEPMA0GA1UE\nCwwGY2xpZW50MR8wHQYDVQQDDBZVc2VyMUBvcmcxLmV4YW1wbGUuY29tMCAXDTI2\nMTEyNDEyMTYzNVoYDzIxMjYxMDMxMTIxNjM1WjBsMQswCQYDVQQGEwJVUzETMBEG\nA1UECAwKQ2FsaWZvcm5pYTEWMBQGA1UEBwwNU2FuIEZyYW5jaXNjbzEPMA0GA1UE\nCwwGY2xpZW50MR8wHQYDVQQDDBZVc2VyMUBvcmcxLmV4YW1wbGUuY29tMFkwEwYH\nKoZIzj0CAQYIKoZIzj0DAQcDQgAEZkYksUpzYP1zjtWEoxjG+LnEXIFxb7xan7Do\n2GvChkWySGZ2naTxeZHXrndPux+wMVoG7QJ7nDWIUxHhkVdwPKMyMDAwHQYDVR0O\nBBYEFOlk1u0pLr8h3/HAlwBSrmz+RPKVMA8GA1UdEwEB/wQFMAMBAf8wCgYIKoZI\nzj0EAwIDSAAwRQIhAOuMv+223WHlVBmLy+H0jxf3q+zFGJmFmweLAdwNpye+AiBm\nhuOSU0ib012i6nKOwlJtGQ8O2Sy3lxvLZMULxdStzQ==\n-----END CERTIFICATE-----\n",
+  "fingerprint": "d891cd7f80a24232aeca408340ea454c5ad9c0c80e18aece7269f980e42e1e7f"
+}

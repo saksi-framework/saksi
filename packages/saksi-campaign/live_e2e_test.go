@@ -52,6 +52,7 @@ type oracleChain struct {
 	order    map[string][]string
 	partials map[string]string // election/contest/trustee -> hex
 	tally    map[string]string
+	machine  map[string]string // election -> registered machine fingerprint
 	block    uint64
 	submits  []string // every function submitted, in order
 	bytesIn  [][]byte // every SubmitBallot argument, decoded
@@ -61,7 +62,22 @@ func newOracleChain(t *testing.T, demo string) *oracleChain {
 	return &oracleChain{t: t, demo: demo,
 		params: map[string]string{}, status: map[string]string{}, dkg: map[string]string{},
 		ballots: map[string]map[string]string{}, order: map[string][]string{},
-		partials: map[string]string{}, tally: map[string]string{}}
+		partials: map[string]string{}, tally: map[string]string{}, machine: map[string]string{}}
+}
+
+// oracleMachineFP is the fingerprint the oracle reports for the console's
+// ballot identity: every submit reaches the oracle as that one machine.
+var oracleMachineFP = strings.Repeat("cd", 32)
+
+func (c *oracleChain) MachineFingerprint() string { return oracleMachineFP }
+
+func (c *oracleChain) GetPrecinctMachine(id string) (string, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if fp, ok := c.machine[id]; ok {
+		return fp, nil
+	}
+	return "", fmt.Errorf("no precinct machine registered for election %q", id)
 }
 
 type oracleRefusal struct{ msg string }
@@ -96,6 +112,18 @@ func (c *oracleChain) apply(fn string, args []string) error {
 		}
 		c.params[p.ElectionId], c.status[p.ElectionId] = args[0], "open"
 		c.ballots[p.ElectionId] = map[string]string{}
+	case "RegisterPrecinctMachine":
+		id, fp := args[0], args[1]
+		if _, ok := c.params[id]; !ok {
+			return refuse("election-exists", "no election found with id %q", id)
+		}
+		if _, ok := c.machine[id]; ok {
+			return refuse("machine-duplicate", "a precinct machine is already registered for election %q", id)
+		}
+		if len(c.ballots[id]) > 0 || c.status[id] != "open" {
+			return refuse("machine-window", "election %q: a precinct machine can only be registered before the first ballot", id)
+		}
+		c.machine[id] = fp
 	case "PublishDKGTranscript":
 		var d pb.DKGTranscript
 		raw, _ := hex.DecodeString(args[0])
@@ -117,6 +145,13 @@ func (c *oracleChain) apply(fn string, args []string) error {
 			return refuse("decode", "decode ballot: %v", err)
 		}
 		id := b.ElectionId
+		// The caller gate: the submitter is always oracleMachineFP.
+		switch fp, ok := c.machine[id]; {
+		case !ok:
+			return refuse("caller", "no precinct machine is registered for election %q", id)
+		case fp != oracleMachineFP:
+			return refuse("caller", "caller is not this precinct's machine for election %q", id)
+		}
 		if c.status[id] != "open" {
 			return refuse("election-open", "election %q is not open", id)
 		}

@@ -116,7 +116,12 @@ resolve_identity() {
   The network may be only partly up. Try: ${0} down, then rerun."
 	[ -n "${CERT}" ] || die "no signing certificate under ${msp}/signcerts"
 	[ -n "${KEY}" ] || die "no private key under ${msp}/keystore"
-	ok "identity resolved (Org1MSP, User1)"
+	# The console signs CreateElection, RegisterPrecinctMachine and
+	# CloseElection as Admin@org1 and ballots as User1 (the precinct machine),
+	# both resolved from --fabric-cert's folder; check Admin is there.
+	[ -n "$(find "${org}/users/Admin@org1.example.com/msp/signcerts" -type f 2>/dev/null | head -n1)" ] ||
+		die "no Admin@org1.example.com certificate under ${org}/users: the chaincode takes election setup only from an administrator"
+	ok "identity resolved (Org1MSP: User1 signs ballots as the precinct machine, Admin sets elections up)"
 }
 
 # --- binaries ---------------------------------------------------------------

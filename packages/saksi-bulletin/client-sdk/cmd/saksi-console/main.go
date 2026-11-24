@@ -11,12 +11,20 @@
 //	  --tls-cert .../tlsca-cert.pem --cert .../cert.pem --key .../priv.pem \
 //	  --msp-id Org1MSP --channel saksi --chaincode saksi-bulletin \
 //	  --bundle /tmp/saksi-bundle.json          # add --auto for non-interactive
+//
+// The chaincode takes CreateElection, RegisterPrecinctMachine and CloseElection
+// only from an administrator, and a ballot only from the election's registered
+// precinct machine. --admin-cert/--admin-key and --machine-cert/--machine-key
+// name those identities; left empty, they default to Admin@<org> and
+// User1@<org> next to --cert in the test-network layout. Creating the
+// election registers the machine's certificate fingerprint right away.
 package main
 
 import (
 	"bufio"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
@@ -55,6 +63,11 @@ func main() {
 	flag.StringVar(&cfg.KeyPath, "key", "", "PEM file with the client identity private key")
 	flag.StringVar(&cfg.Channel, "channel", "saksi", "Fabric channel name")
 	flag.StringVar(&cfg.Chaincode, "chaincode", "saksi-bulletin", "deployed chaincode name")
+	var admin, machine clientsdk.Identity
+	flag.StringVar(&admin.CertPath, "admin-cert", "", "PEM certificate of the administrator that creates, registers and closes (default: Admin@<org> beside --cert)")
+	flag.StringVar(&admin.KeyPath, "admin-key", "", "PEM private key for --admin-cert")
+	flag.StringVar(&machine.CertPath, "machine-cert", "", "PEM certificate of the precinct machine that submits ballots (default: User1@<org> beside --cert)")
+	flag.StringVar(&machine.KeyPath, "machine-key", "", "PEM private key for --machine-cert")
 	bundlePath := flag.String("bundle", "", "path to a demo bundle JSON (from `saksi-demo gen`) (required)")
 	auto := flag.Bool("auto", false, "run the full election cycle non-interactively, then exit")
 	setupOnly := flag.Bool("setup-only", false, "run only CreateElection + PublishDKGTranscript, then exit (leaves the ballot round to an external driver, e.g. Caliper)")
@@ -64,6 +77,22 @@ func main() {
 		log.Fatal("--bundle is required")
 	}
 	b := loadBundle(*bundlePath)
+	for _, r := range []struct {
+		name string
+		id   clientsdk.Identity
+		dst  **clientsdk.Identity
+	}{{"admin", admin, &cfg.Admin}, {"machine", machine, &cfg.Machine}} {
+		if (r.id.CertPath == "") != (r.id.KeyPath == "") {
+			log.Fatalf("--%s-cert and --%s-key go together", r.name, r.name)
+		}
+		if r.id.CertPath != "" {
+			id := r.id
+			*r.dst = &id
+		}
+	}
+	if err := clientsdk.FillTestNetworkRoles(&cfg); err != nil {
+		log.Fatal(rolesError(err))
+	}
 
 	conn, err := clientsdk.Connect(cfg)
 	if err != nil {
@@ -71,6 +100,8 @@ func main() {
 	}
 	defer func() { _ = conn.Close() }()
 	client := conn.Bulletin
+	machineFP := conn.MachineFingerprint()
+	create := func() error { return createElection(client, b, machineFP) }
 
 	fmt.Printf("Connected to %s (channel=%s chaincode=%s)\n", cfg.PeerEndpoint, cfg.Channel, cfg.Chaincode)
 	fmt.Printf("Election %q: %d ballots, %d partial decryptions.\n",
@@ -83,7 +114,7 @@ func main() {
 			name string
 			fn   func() error
 		}{
-			{"CreateElection", func() error { return client.CreateElection(b.Params) }},
+			{"CreateElection+RegisterPrecinctMachine", create},
 			{"PublishDKGTranscript", func() error { return client.PublishDKGTranscript(b.DKG) }},
 		} {
 			fmt.Printf("→ %s ...\n", s.name)
@@ -96,12 +127,42 @@ func main() {
 	}
 
 	if *auto {
-		if err := runFullCycle(client, b); err != nil {
+		if err := runFullCycle(client, b, create); err != nil {
 			log.Fatalf("election cycle failed: %v", err)
 		}
 		return
 	}
-	menu(client, b)
+	menu(client, b, create)
+}
+
+// rolesError turns an unresolved administrator or machine identity into a
+// start-up error naming the flags that set it. Running on would sign that
+// role's transactions with --cert, which the chaincode refuses mid-run.
+func rolesError(err error) string {
+	var ur *clientsdk.UnresolvedRolesError
+	if !errors.As(err, &ur) {
+		return err.Error()
+	}
+	lines := []string{"cannot start: an identity the chaincode requires is missing"}
+	for _, r := range ur.Roles {
+		lines = append(lines, fmt.Sprintf("  %s: %s@<org> not found beside --cert (%v); pass --%s-cert and --%s-key",
+			r.Role, r.User, r.Err, r.Role, r.Role))
+	}
+	return strings.Join(lines, "\n")
+}
+
+// createElection records the election, then registers this console's
+// precinct machine (the certificate that signs its ballots) for it: the
+// chaincode refuses every ballot of an election with no registered machine.
+func createElection(client *clientsdk.BulletinClient, b bundle, machineFP string) error {
+	if err := client.CreateElection(b.Params); err != nil {
+		return err
+	}
+	if err := client.RegisterPrecinctMachine(b.ElectionID, machineFP); err != nil {
+		return err
+	}
+	fmt.Printf("  precinct machine registered: %s\n", machineFP)
+	return nil
 }
 
 func loadBundle(path string) bundle {
@@ -119,13 +180,13 @@ func loadBundle(path string) bundle {
 	return b
 }
 
-func menu(client *clientsdk.BulletinClient, b bundle) {
+func menu(client *clientsdk.BulletinClient, b bundle, create func() error) {
 	in := bufio.NewScanner(os.Stdin)
 	for {
 		fmt.Print(`
 saksi-console
 ─────────────
- 1) Create election
+ 1) Create election (and register the precinct machine)
  2) Publish DKG transcript
  3) Submit ballots
  4) Election status
@@ -141,7 +202,7 @@ select> `)
 		}
 		switch strings.TrimSpace(in.Text()) {
 		case "1":
-			report("CreateElection", client.CreateElection(b.Params))
+			report("CreateElection", create())
 		case "2":
 			report("PublishDKGTranscript", client.PublishDKGTranscript(b.DKG))
 		case "3":
@@ -162,7 +223,7 @@ select> `)
 		case "8":
 			getTally(client, b)
 		case "9":
-			if err := runFullCycle(client, b); err != nil {
+			if err := runFullCycle(client, b, create); err != nil {
 				fmt.Printf("  cycle stopped: %v\n", err)
 			}
 		case "0", "":
@@ -173,12 +234,12 @@ select> `)
 	}
 }
 
-func runFullCycle(client *clientsdk.BulletinClient, b bundle) error {
+func runFullCycle(client *clientsdk.BulletinClient, b bundle, create func() error) error {
 	steps := []struct {
 		name string
 		fn   func() error
 	}{
-		{"CreateElection", func() error { return client.CreateElection(b.Params) }},
+		{"CreateElection", create},
 		{"PublishDKGTranscript", func() error { return client.PublishDKGTranscript(b.DKG) }},
 		{"SubmitBallots", func() error { return submitBallots(client, b) }},
 		{"Reconcile", func() error { return reconcileCommitted(client, b) }},

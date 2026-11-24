@@ -279,6 +279,11 @@ type liveChain interface {
 	GetBallot(electionID, nullifier string) (string, error)
 	GetBallots(electionID string, nullifiers []string) ([]string, error)
 	GetPartialDecryption(electionID, contestID, trusteeID string) (string, error)
+	GetPrecinctMachine(electionID string) (string, error)
+	// MachineFingerprint is the certificate fingerprint of the identity that
+	// signs this chain's SubmitBallot: the console is the live precinct's
+	// registered machine.
+	MachineFingerprint() string
 }
 
 // fabricLiveChain is liveChain over a gateway connection.
@@ -291,6 +296,8 @@ func (c fabricLiveChain) Submit(fn string, args ...string) (clientsdk.Receipt, e
 	_, rc, err := c.led.SubmitWithReceipt(fn, args...)
 	return rc, err
 }
+
+func (c fabricLiveChain) MachineFingerprint() string { return c.led.MachineFingerprint() }
 
 // absentRe matches the chaincode's "no <thing> found" answer to a getter.
 var absentRe = regexp.MustCompile(`no [a-zA-Z ]+ found`)
@@ -853,8 +860,9 @@ func (L *liveService) createElection(ctx context.Context, req LiveElectionReques
 	return http.StatusCreated, L.finishSetupLocked()
 }
 
-// finishSetupLocked records CreateElection and moves to ceremony. Caller holds
-// mu; the state is setup.
+// finishSetupLocked records CreateElection, registers the console as the
+// election's precinct machine, and moves to ceremony. Caller holds mu; the
+// state is setup.
 func (L *liveService) finishSetupLocked() error {
 	rc, err := L.chainSubmit("CreateElection", L.st.Params)
 	var ref errRefused
@@ -869,9 +877,47 @@ func (L *liveService) finishSetupLocked() error {
 		L.st.Lifecycle["CreateElection"] = txOf(rc)
 		L.appendLifecycleLocked("CreateElection", "", rc)
 	}
+	if err := L.registerMachineLocked(); err != nil {
+		return err
+	}
 	L.st.State = LiveCeremony
 	log.Printf("live: %s ceremony", L.st.RunID)
 	return L.save()
+}
+
+// registerMachineLocked binds the live election to the console's precinct
+// machine certificate (RegisterPrecinctMachine, signed by the administrator
+// identity): the chaincode refuses every ballot of an election with no
+// registered machine, and every ballot from another certificate. On a resume,
+// a registration the chain already holds counts as done when it names this
+// console's machine; another machine is an error, since this console's
+// ballots would all be refused. Caller holds mu.
+func (L *liveService) registerMachineLocked() error {
+	c, err := L.getChain()
+	if err != nil {
+		return errChain{err}
+	}
+	fp := c.MachineFingerprint()
+	rc, err := L.chainSubmit("RegisterPrecinctMachine", L.st.ElectionID, fp)
+	var ref errRefused
+	if errors.As(err, &ref) && ref.Gate == "machine-duplicate" {
+		got, gerr := c.GetPrecinctMachine(L.st.ElectionID)
+		if gerr != nil {
+			return errChain{gerr}
+		}
+		if got != fp {
+			return conflictf("election %s is bound to precinct machine %s, not this console's %s: its ballots would be refused", L.st.ElectionID, got, fp)
+		}
+		err = nil
+	}
+	if err != nil {
+		return err
+	}
+	if rc.TxID != "" {
+		L.st.Lifecycle["RegisterPrecinctMachine"] = txOf(rc)
+		L.appendLifecycleLocked("RegisterPrecinctMachine", fp, rc)
+	}
+	return nil
 }
 
 // --- resume ------------------------------------------------------------------
