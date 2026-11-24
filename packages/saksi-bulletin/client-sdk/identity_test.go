@@ -8,7 +8,9 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/hex"
+	"encoding/json"
 	"encoding/pem"
+	"errors"
 	"math/big"
 	"os"
 	"path/filepath"
@@ -204,8 +206,8 @@ func TestFillTestNetworkRoles(t *testing.T) {
 	user2Cert, _ := writeMSP(t, org, "User2@org1.example.com")
 
 	cfg := ConnectionConfig{MSPID: "Org1MSP", CertPath: user2Cert}
-	if notes := FillTestNetworkRoles(&cfg); len(notes) != 0 {
-		t.Fatalf("notes: %v", notes)
+	if err := FillTestNetworkRoles(&cfg); err != nil {
+		t.Fatal(err)
 	}
 	if cfg.Admin == nil || cfg.Admin.CertPath != adminCert || cfg.Admin.KeyPath != adminKey || cfg.Admin.MSPID != "Org1MSP" {
 		t.Fatalf("admin = %+v", cfg.Admin)
@@ -217,14 +219,59 @@ func TestFillTestNetworkRoles(t *testing.T) {
 	// An explicit identity is kept.
 	mine := &Identity{CertPath: "m.pem", KeyPath: "m.key"}
 	cfg = ConnectionConfig{CertPath: user2Cert, Machine: mine}
-	FillTestNetworkRoles(&cfg)
+	if err := FillTestNetworkRoles(&cfg); err != nil {
+		t.Fatal(err)
+	}
 	if cfg.Machine != mine {
 		t.Fatalf("explicit machine replaced by %+v", cfg.Machine)
 	}
 
-	// Outside the layout: both roles noted, both left unset.
+	// Outside the layout: both roles unresolved, an error naming each.
 	cfg = ConnectionConfig{CertPath: filepath.Join(t.TempDir(), "cert.pem")}
-	if notes := FillTestNetworkRoles(&cfg); len(notes) != 2 || cfg.Admin != nil || cfg.Machine != nil {
-		t.Fatalf("notes %v, admin %+v, machine %+v", notes, cfg.Admin, cfg.Machine)
+	err := FillTestNetworkRoles(&cfg)
+	var ur *UnresolvedRolesError
+	if !errors.As(err, &ur) || len(ur.Roles) != 2 || ur.Roles[0].Role != RoleAdmin || ur.Roles[1].Role != RoleMachine {
+		t.Fatalf("err = %v, want both roles unresolved", err)
+	}
+	if !strings.Contains(err.Error(), "Admin@<org>") || !strings.Contains(err.Error(), "User1@<org>") {
+		t.Fatalf("error %q does not name the users looked for", err)
+	}
+
+	// Admin folder missing, machine resolvable: only the admin is reported.
+	org2 := filepath.Join(t.TempDir(), "org1.example.com")
+	c1, _ := writeMSP(t, org2, "User1@org1.example.com")
+	cfg = ConnectionConfig{CertPath: c1}
+	if err := FillTestNetworkRoles(&cfg); !errors.As(err, &ur) || len(ur.Roles) != 1 || ur.Roles[0].Role != RoleAdmin {
+		t.Fatalf("err = %v, want only the admin unresolved", err)
+	}
+
+	// No default certificate: nothing to resolve.
+	cfg = ConnectionConfig{}
+	if err := FillTestNetworkRoles(&cfg); err != nil || cfg.Admin != nil {
+		t.Fatalf("empty config: %v %+v", err, cfg.Admin)
+	}
+}
+
+// TestCertFingerprintMatchesSharedVector pins CertFingerprint to
+// saksi-protocol/test-vectors/machine-fingerprint-v1.json, the vector the
+// chaincode's callerOf is checked against too.
+func TestCertFingerprintMatchesSharedVector(t *testing.T) {
+	raw, err := os.ReadFile(filepath.Join("..", "..", "saksi-protocol", "test-vectors", "machine-fingerprint-v1.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var v struct {
+		CertPEM     string `json:"cert_pem"`
+		Fingerprint string `json:"fingerprint"`
+	}
+	if err := json.Unmarshal(raw, &v); err != nil {
+		t.Fatal(err)
+	}
+	got, err := CertFingerprint([]byte(v.CertPEM))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != v.Fingerprint {
+		t.Fatalf("CertFingerprint %s, vector %s", got, v.Fingerprint)
 	}
 }

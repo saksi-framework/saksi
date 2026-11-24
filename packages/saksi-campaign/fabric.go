@@ -1,9 +1,11 @@
 package campaign
 
 import (
+	"errors"
 	"flag"
 	"fmt"
 	"os"
+	"strings"
 
 	clientsdk "github.com/saksi-framework/saksi/packages/saksi-bulletin/client-sdk"
 )
@@ -21,12 +23,13 @@ type FabricConfig struct {
 	Chaincode    string
 	// AdminCert and AdminKey are the administrator identity that signs
 	// CreateElection, RegisterPrecinctMachine and CloseElection (the
-	// chaincode's admin gate). Empty = Cert/Key sign them.
+	// chaincode's admin gate). The binaries fill an empty pair from the
+	// test-network layout (ResolveTestNetworkRoles) or refuse to start.
 	AdminCert string
 	AdminKey  string
 	// MachineCert and MachineKey are the precinct machine that signs every
 	// SubmitBallot; each election this console creates registers this
-	// certificate's fingerprint. Empty = Cert/Key are the machine.
+	// certificate's fingerprint. Filled or refused like AdminCert/AdminKey.
 	MachineCert string
 	MachineKey  string
 	// PeerVolume is the host path of the peer's ledger volume. Optional: set
@@ -78,9 +81,11 @@ func (c FabricConfig) CheckRoles() error {
 
 // ResolveTestNetworkRoles fills an unset administrator and precinct machine
 // from the test-network layout around Cert: Admin@<org> and User1@<org>
-// (clientsdk.FillTestNetworkRoles). It returns a note per role it could not
-// resolve; that role then stays on Cert/Key.
-func (c *FabricConfig) ResolveTestNetworkRoles() []string {
+// (clientsdk.FillTestNetworkRoles). A role it cannot fill is a start-up
+// error naming the flag and environment variable that set it: falling back
+// to Cert would only fail later, at the chaincode's admin or caller gate,
+// in the middle of a run. With no Cert (offline) there is nothing to resolve.
+func (c *FabricConfig) ResolveTestNetworkRoles() error {
 	if c.Cert == "" {
 		return nil
 	}
@@ -91,14 +96,26 @@ func (c *FabricConfig) ResolveTestNetworkRoles() []string {
 	if c.MachineCert != "" {
 		cfg.Machine = &clientsdk.Identity{CertPath: c.MachineCert, KeyPath: c.MachineKey}
 	}
-	notes := clientsdk.FillTestNetworkRoles(&cfg)
-	if cfg.Admin != nil {
-		c.AdminCert, c.AdminKey = cfg.Admin.CertPath, cfg.Admin.KeyPath
+	if err := clientsdk.FillTestNetworkRoles(&cfg); err != nil {
+		var ur *clientsdk.UnresolvedRolesError
+		if !errors.As(err, &ur) {
+			return err
+		}
+		lines := []string{"an identity the chaincode requires is missing"}
+		for _, r := range ur.Roles {
+			flagRole, env := "admin", "ADMIN"
+			if r.Role == clientsdk.RoleMachine {
+				flagRole, env = "machine", "MACHINE"
+			}
+			lines = append(lines, fmt.Sprintf(
+				"  %s: %s@<org> not found beside --fabric-cert (%v); pass --fabric-%s-cert and --fabric-%s-key (or set SAKSI_FABRIC_%s_CERT and SAKSI_FABRIC_%s_KEY)",
+				r.Role, r.User, r.Err, flagRole, flagRole, env, env))
+		}
+		return errors.New(strings.Join(lines, "\n"))
 	}
-	if cfg.Machine != nil {
-		c.MachineCert, c.MachineKey = cfg.Machine.CertPath, cfg.Machine.KeyPath
-	}
-	return notes
+	c.AdminCert, c.AdminKey = cfg.Admin.CertPath, cfg.Admin.KeyPath
+	c.MachineCert, c.MachineKey = cfg.Machine.CertPath, cfg.Machine.KeyPath
+	return nil
 }
 
 // RoleFlags are the --fabric-admin-* and --fabric-machine-* flags, shared by
@@ -125,12 +142,12 @@ func FabricRoleFlags(fs *flag.FlagSet) RoleFlags {
 
 // Apply sets the flags' identities on c, checks each is given whole, and
 // fills the unset ones from the test-network layout (ResolveTestNetworkRoles).
-// It returns that resolution's notes.
-func (f RoleFlags) Apply(c *FabricConfig) ([]string, error) {
+// An identity it cannot fill is an error: the caller stops at start-up.
+func (f RoleFlags) Apply(c *FabricConfig) error {
 	c.AdminCert, c.AdminKey = *f.AdminCert, *f.AdminKey
 	c.MachineCert, c.MachineKey = *f.MachineCert, *f.MachineKey
 	if err := c.CheckRoles(); err != nil {
-		return nil, err
+		return err
 	}
-	return c.ResolveTestNetworkRoles(), nil
+	return c.ResolveTestNetworkRoles()
 }

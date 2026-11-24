@@ -24,6 +24,7 @@ import (
 	"bufio"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
@@ -89,8 +90,8 @@ func main() {
 			*r.dst = &id
 		}
 	}
-	for _, note := range clientsdk.FillTestNetworkRoles(&cfg) {
-		fmt.Fprintln(os.Stderr, "note:", note)
+	if err := clientsdk.FillTestNetworkRoles(&cfg); err != nil {
+		log.Fatal(rolesError(err))
 	}
 
 	conn, err := clientsdk.Connect(cfg)
@@ -132,6 +133,22 @@ func main() {
 		return
 	}
 	menu(client, b, create)
+}
+
+// rolesError turns an unresolved administrator or machine identity into a
+// start-up error naming the flags that set it. Running on would sign that
+// role's transactions with --cert, which the chaincode refuses mid-run.
+func rolesError(err error) string {
+	var ur *clientsdk.UnresolvedRolesError
+	if !errors.As(err, &ur) {
+		return err.Error()
+	}
+	lines := []string{"cannot start: an identity the chaincode requires is missing"}
+	for _, r := range ur.Roles {
+		lines = append(lines, fmt.Sprintf("  %s: %s@<org> not found beside --cert (%v); pass --%s-cert and --%s-key",
+			r.Role, r.User, r.Err, r.Role, r.Role))
+	}
+	return strings.Join(lines, "\n")
 }
 
 // createElection records the election, then registers this console's

@@ -4,6 +4,7 @@ import (
 	"flag"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -32,8 +33,8 @@ func TestResolveTestNetworkRoles(t *testing.T) {
 	u2c, u2k := writeTestMSP(t, org, "User2@org1.example.com")
 
 	c := FabricConfig{MSPID: "Org1MSP", Cert: u1c, Key: u1k}
-	if notes := c.ResolveTestNetworkRoles(); len(notes) != 0 {
-		t.Fatalf("notes %v", notes)
+	if err := c.ResolveTestNetworkRoles(); err != nil {
+		t.Fatal(err)
 	}
 	if c.AdminCert != adc || c.AdminKey != adk || c.MachineCert != u1c || c.MachineKey != u1k {
 		t.Fatalf("resolved %+v", c)
@@ -41,21 +42,52 @@ func TestResolveTestNetworkRoles(t *testing.T) {
 
 	// An explicit machine (precinct B's User2) is kept; the admin is still filled.
 	c = FabricConfig{MSPID: "Org1MSP", Cert: u1c, Key: u1k, MachineCert: u2c, MachineKey: u2k}
-	c.ResolveTestNetworkRoles()
+	if err := c.ResolveTestNetworkRoles(); err != nil {
+		t.Fatal(err)
+	}
 	if c.MachineCert != u2c || c.AdminCert != adc {
 		t.Fatalf("resolved %+v", c)
 	}
 
 	// No Fabric configured: nothing to resolve, nothing noted.
 	var off FabricConfig
-	if notes := off.ResolveTestNetworkRoles(); notes != nil || off.AdminCert != "" {
-		t.Fatalf("offline config resolved: %+v %v", off, notes)
+	if err := off.ResolveTestNetworkRoles(); err != nil || off.AdminCert != "" {
+		t.Fatalf("offline config resolved: %+v %v", off, err)
+	}
+}
+
+// An identity that cannot be resolved stops the console at start-up, with an
+// error naming the role and the flag and environment variable that set it;
+// it never silently falls back to --fabric-cert.
+func TestResolveTestNetworkRolesFailsLoud(t *testing.T) {
+	// Outside the layout: both roles missing.
+	c := FabricConfig{Cert: filepath.Join(t.TempDir(), "c.pem")}
+	err := c.ResolveTestNetworkRoles()
+	if err == nil {
+		t.Fatal("unresolvable roles accepted")
+	}
+	for _, want := range []string{"admin:", "machine:", "--fabric-admin-cert", "SAKSI_FABRIC_ADMIN_CERT", "--fabric-machine-cert", "SAKSI_FABRIC_MACHINE_CERT"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error does not name %q:\n%v", want, err)
+		}
+	}
+	if c.AdminCert != "" || c.MachineCert != "" {
+		t.Fatalf("a failed resolution set identities: %+v", c)
 	}
 
-	// Outside the layout: the roles stay on Cert/Key, with a note each.
-	c = FabricConfig{Cert: filepath.Join(t.TempDir(), "c.pem")}
-	if notes := c.ResolveTestNetworkRoles(); len(notes) != 2 || c.AdminCert != "" || c.MachineCert != "" {
-		t.Fatalf("outside layout: %+v %v", c, notes)
+	// Admin@org1 missing (an org without it): only the admin is named.
+	org := filepath.Join(t.TempDir(), "org1.example.com")
+	u1c, u1k := writeTestMSP(t, org, "User1@org1.example.com")
+	c = FabricConfig{Cert: u1c, Key: u1k}
+	err = c.ResolveTestNetworkRoles()
+	if err == nil || !strings.Contains(err.Error(), "--fabric-admin-cert") || strings.Contains(err.Error(), "machine:") {
+		t.Fatalf("err = %v, want only the admin named", err)
+	}
+
+	// Given explicitly, the missing admin is no longer a problem.
+	c = FabricConfig{Cert: u1c, Key: u1k, AdminCert: u1c, AdminKey: u1k}
+	if err := c.ResolveTestNetworkRoles(); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -85,7 +117,7 @@ func TestFabricRoleFlags(t *testing.T) {
 		t.Fatal(err)
 	}
 	c := FabricConfig{MSPID: "Org1MSP", Cert: u1c, Key: u1k}
-	if _, err := rf.Apply(&c); err != nil {
+	if err := rf.Apply(&c); err != nil {
 		t.Fatal(err)
 	}
 	if c.AdminCert != adc || c.AdminKey != adk || c.MachineCert != u2c || c.MachineKey != u2k {
@@ -97,7 +129,7 @@ func TestFabricRoleFlags(t *testing.T) {
 	if err := fs.Parse([]string{"--fabric-admin-cert", adc}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := rf.Apply(&FabricConfig{Cert: u1c}); err == nil {
+	if err := rf.Apply(&FabricConfig{Cert: u1c}); err == nil {
 		t.Fatal("--fabric-admin-cert without its key accepted")
 	}
 }

@@ -228,12 +228,8 @@ func serve(args []string) {
 		Chaincode:    *fabricChaincode,
 		PeerVolume:   *fabricPeerVolume,
 	}
-	notes, err := fabricRoles.Apply(&fabric)
-	if err != nil {
-		fatal("%v", err)
-	}
-	for _, n := range notes {
-		fmt.Fprintln(os.Stderr, "fabric:", n)
+	if err := fabricRoles.Apply(&fabric); err != nil {
+		fatal("cannot start: %v", err)
 	}
 
 	if err := os.MkdirAll(*runsDir, 0o755); err != nil {

@@ -153,12 +153,37 @@ func TestNetworkRoleUser(role Role) string {
 	return "User1"
 }
 
+// UnresolvedRole is a role FillTestNetworkRoles could not fill: no identity
+// was given for it, and the test-network user it defaults to was not found.
+type UnresolvedRole struct {
+	Role Role
+	User string // the test-network user looked for ("Admin", "User1")
+	Err  error
+}
+
+// UnresolvedRolesError lists every role FillTestNetworkRoles could not fill.
+// A connection without them would sign that role's transactions with the
+// default identity, which the chaincode refuses (gate admin or caller) only
+// once a run is under way, so callers treat this as a start-up error.
+type UnresolvedRolesError struct {
+	Roles []UnresolvedRole
+}
+
+func (e *UnresolvedRolesError) Error() string {
+	parts := make([]string, len(e.Roles))
+	for i, r := range e.Roles {
+		parts[i] = fmt.Sprintf("%s identity not set and %s@<org> not found beside the default certificate (%v)", r.Role, r.User, r.Err)
+	}
+	return strings.Join(parts, "; ")
+}
+
 // FillTestNetworkRoles sets cfg.Admin and cfg.Machine, where they are unset,
 // to the test-network users TestNetworkRoleUser names in cfg.CertPath's
-// organization. It returns one note per role it could not resolve; that role
-// then stays unset, so the default identity signs its transactions.
-func FillTestNetworkRoles(cfg *ConnectionConfig) []string {
-	var notes []string
+// organization. A role it cannot fill is an *UnresolvedRolesError: the
+// default identity is never used for it silently. With no CertPath there is
+// nothing to resolve and it returns nil.
+func FillTestNetworkRoles(cfg *ConnectionConfig) error {
+	var missing []UnresolvedRole
 	for _, r := range []struct {
 		role Role
 		dst  **Identity
@@ -166,12 +191,16 @@ func FillTestNetworkRoles(cfg *ConnectionConfig) []string {
 		if *r.dst != nil || cfg.CertPath == "" {
 			continue
 		}
-		cert, key, err := TestNetworkUser(cfg.CertPath, TestNetworkRoleUser(r.role))
+		user := TestNetworkRoleUser(r.role)
+		cert, key, err := TestNetworkUser(cfg.CertPath, user)
 		if err != nil {
-			notes = append(notes, fmt.Sprintf("%s identity not resolved (%v); the default identity signs its transactions", r.role, err))
+			missing = append(missing, UnresolvedRole{Role: r.role, User: user, Err: err})
 			continue
 		}
 		*r.dst = &Identity{MSPID: cfg.MSPID, CertPath: cert, KeyPath: key}
 	}
-	return notes
+	if len(missing) > 0 {
+		return &UnresolvedRolesError{Roles: missing}
+	}
+	return nil
 }
