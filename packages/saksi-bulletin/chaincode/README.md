@@ -10,8 +10,20 @@ Hyperledger Fabric chaincode (Contract API) for the BalotaChain bulletin board.
 | `PublishDKGTranscript` / `GetDKGTranscript` | submit / query | record + read the DKG transcript |
 | `SubmitBallot` / `GetBallot` | submit / query | cast + read a ballot |
 | `CloseElection` / `GetElectionStatus` | submit / query | end voting + read lifecycle status |
+| `RegisterPrecinctMachine` / `GetPrecinctMachine` | submit / query | bind + read the one machine certificate allowed to submit an election's ballots |
 | `SubmitPartialDecryption` / `GetPartialDecryption` | submit / query | record + read a trustee decryption share |
 | `PublishTally` / `GetTally` | submit / query | publish + read the final tally |
+
+## Caller identity gates
+
+- `CreateElection`, `RegisterPrecinctMachine` and `CloseElection` need an administrator:
+  MSP id `Org1MSP` and OU `admin` in the caller's certificate (gate `admin`).
+- `RegisterPrecinctMachine(electionID, fingerprint)` takes the lower-case hex SHA-256 of
+  the machine certificate's DER (64 digits). One machine per election; it must be
+  registered before the election's first ballot and cannot be replaced.
+- `SubmitBallot` checks the caller first (gate `caller`): the election must have a
+  registered machine and the caller's certificate fingerprint must equal it. The older
+  gates follow unchanged.
 
 ## Hybrid verification split (locked)
 
