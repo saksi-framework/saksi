@@ -391,6 +391,25 @@ func TestBlackoutReportsALostCommittedRecord(t *testing.T) {
 	}
 }
 
+// With no chaincode container to check, the preflight refuses: the kill
+// never falls back to an unchecked name match.
+func TestBlackoutRefusesWithoutAChaincodeContainer(t *testing.T) {
+	cfg, n, _ := r11Setup(t, 20)
+	n.running[n.ccOrg1], n.running[n.ccOrg2] = false, false
+	ev, err := RunBlackoutTest(context.Background(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ev.Pass || !strings.Contains(ev.Aborted, "no running chaincode container") {
+		t.Fatalf("aborted %q", ev.Aborted)
+	}
+	for _, l := range n.dockerLog {
+		if strings.HasPrefix(l, "kill") || strings.HasPrefix(l, "start") {
+			t.Errorf("docker %s after a refused preflight", l)
+		}
+	}
+}
+
 // The preflight refuses to kill an orderer that belongs to another project.
 func TestBlackoutRefusesAnotherProjectsNetwork(t *testing.T) {
 	cfg, n, _ := r11Setup(t, 20)

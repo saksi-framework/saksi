@@ -572,6 +572,10 @@ func (r *r11Run) preflight(ctx context.Context) error {
 	if r.chaincode, err = r.chaincodeContainers(ctx); err != nil {
 		return err
 	}
+	if len(r.chaincode) == 0 {
+		return fmt.Errorf("no running chaincode container matches %s: nothing to check against the peers' network, so nothing is killed",
+			chaincodeContainerRE(r.cfg.Chaincode))
+	}
 	// The chaincode containers carry no compose label: the peer creates
 	// them. Each must be attached to a Docker network of the project's
 	// peers, which is where its peer launched it; one that is not belongs
@@ -656,14 +660,8 @@ func (r *r11Run) blackout() {
 	}
 	h, _, herr := r.winLed.ChainInfo()
 	targets := append([]string(nil), R11CoreContainers...)
-	chaincode := r.chaincode
-	if len(chaincode) == 0 {
-		var err error
-		if chaincode, err = r.chaincodeContainers(ctx); err != nil {
-			r.boError("docker ps before the kill: %v", err)
-		}
-	}
-	targets = append(targets, chaincode...)
+	// Only the chaincode containers the preflight listed and checked.
+	targets = append(targets, r.chaincode...)
 	cmd := append([]string{"kill"}, targets...)
 
 	r.boMu.Lock()
@@ -825,16 +823,26 @@ func (r *r11Run) restore(killDone time.Time) {
 	// The chaincode containers: the peers relaunch them on demand. Any still
 	// down after the grace is started here, and recorded as such.
 	graceEnd := time.Now().Add(r.cfg.ChaincodeGrace)
+	// startedBy and setStartedBy read and write a container's StartedBy
+	// under boMu, like every other blackout field.
+	startedBy := func(i int) (string, string) {
+		r.boMu.Lock()
+		defer r.boMu.Unlock()
+		return r.bo.Containers[i].Role, r.bo.Containers[i].StartedBy
+	}
+	setStartedBy := func(i int, by string) {
+		r.boMu.Lock()
+		r.bo.Containers[i].StartedBy = by
+		r.boMu.Unlock()
+	}
 	for {
 		pending := 0
 		for i, name := range names {
-			if r.bo.Containers[i].Role != "chaincode" || r.bo.Containers[i].StartedBy != "" {
+			if role, by := startedBy(i); role != "chaincode" || by != "" {
 				continue
 			}
 			if up, _ := r.inspect(ctx, name); up {
-				r.boMu.Lock()
-				r.bo.Containers[i].StartedBy = "peer"
-				r.boMu.Unlock()
+				setStartedBy(i, "peer")
 				continue
 			}
 			pending++
@@ -845,17 +853,14 @@ func (r *r11Run) restore(killDone time.Time) {
 		time.Sleep(time.Second)
 	}
 	for i, name := range names {
-		c := &r.bo.Containers[i]
-		switch {
-		case c.Role != "chaincode":
-			c.StartedBy = "harness"
-		case c.StartedBy == "":
+		switch role, by := startedBy(i); {
+		case role != "chaincode":
+			setStartedBy(i, "harness")
+		case by == "":
 			if out, err := r.docker(ctx, "start", name); err != nil {
 				r.boError("docker start %s: %v (%s)", name, err, out)
 			} else {
-				r.boMu.Lock()
-				c.StartedBy = "harness"
-				r.boMu.Unlock()
+				setStartedBy(i, "harness")
 				r.logf("chaincode container %s was not relaunched by its peer: started by the harness", name)
 			}
 		}
