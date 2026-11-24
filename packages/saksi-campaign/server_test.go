@@ -325,6 +325,18 @@ func TestRunsListReportsWhereEachRunStands(t *testing.T) {
 	// route takes it again as a close-only retry.
 	closePending := create("onchain", `{"event":"stage.ballots.start","n":10}`, `{"event":"stage.ballots.interrupted"}`,
 		`{"event":"segment.start","index":1,"pending":6}`, `{"event":"stage.ballots.end","segment":1,"dropped":0}`)
+	// A window that ran to its end with drops: an outage (every drop the
+	// network unreachable) is resumable; one that lost ballots to chaincode
+	// refusals, or was journalled before the count existed, stays failed.
+	outage := create("onchain", `{"event":"stage.ballots.start","n":100}`,
+		`{"event":"stage.ballots.end","committed":40,"dropped":60,"unavailable":60}`,
+		`{"event":"run.end","failed":true,"reason":"60 of 100 ballots did not commit"}`)
+	refused := create("onchain", `{"event":"stage.ballots.start","n":100}`,
+		`{"event":"stage.ballots.end","committed":40,"dropped":60,"unavailable":0}`,
+		`{"event":"run.end","failed":true,"reason":"60 of 100 ballots did not commit"}`)
+	legacy := create("onchain", `{"event":"stage.ballots.start","n":100}`,
+		`{"event":"stage.ballots.end","committed":40,"dropped":60}`,
+		`{"event":"run.end","failed":true,"reason":"60 of 100 ballots did not commit"}`)
 	s.mu.Lock()
 	s.busy[generated] = func() {}
 	s.mu.Unlock()
@@ -352,6 +364,9 @@ func TestRunsListReportsWhereEachRunStands(t *testing.T) {
 		{closed, "open", "", false, true, false, false, false, -1},
 		{resumed, "open", "", false, true, false, true, true, 4946},
 		{closePending, "close-pending", "", false, true, true, true, false, 6},
+		{outage, "interrupted", "60 of 100 ballots did not commit", false, true, true, false, false, -1},
+		{refused, "failed", "60 of 100 ballots did not commit", false, true, false, false, false, -1},
+		{legacy, "failed", "60 of 100 ballots did not commit", false, true, false, false, false, -1},
 	} {
 		v := got[want.id]
 		pending := -1

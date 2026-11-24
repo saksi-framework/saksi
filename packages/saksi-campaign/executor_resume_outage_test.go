@@ -2,6 +2,7 @@ package campaign
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"sync"
@@ -61,8 +62,9 @@ func TestResumeAfterANetworkOnlyOutage(t *testing.T) {
 		t.Fatal("want the window's drops reported")
 	}
 	// The window ended (every ballot dispatched), not interrupted.
-	if ends := journalEventsOfType(t, runDir, "stage.ballots.end"); len(ends) != 1 || jint(ends[0], "dropped") == 0 {
-		t.Fatalf("want one stage.ballots.end with drops, got %v", ends)
+	ends := journalEventsOfType(t, runDir, "stage.ballots.end")
+	if len(ends) != 1 || jint(ends[0], "dropped") == 0 || jint(ends[0], "unavailable") != jint(ends[0], "dropped") {
+		t.Fatalf("want one stage.ballots.end whose drops are all unavailable, got %v", ends)
 	}
 	if got := journalEventsOfType(t, runDir, "stage.ballots.interrupted"); len(got) != 0 {
 		t.Fatalf("the window was stamped interrupted: %v", got)
@@ -115,28 +117,48 @@ func TestResumeAfterANetworkOnlyOutage(t *testing.T) {
 }
 
 // TestPlanResumeEndedWindowWithDrops: an ended window is resumable only when
-// it dropped ballots and the election was never closed.
+// every one of its drops was the network being unreachable (an outage) and
+// the election was never closed. A window that lost a ballot to anything
+// else, or that was journalled before the count existed, stays failed.
 func TestPlanResumeEndedWindowWithDrops(t *testing.T) {
 	c := ElectionConfig{Mode: "onchain"}
+	start := `{"event":"stage.ballots.start","n":100}`
+	outage := `{"event":"stage.ballots.end","committed":40,"dropped":60,"unavailable":60}`
 	for _, tc := range []struct {
 		name      string
-		lines     []string
-		closed    bool
+		end       string
+		closed    string // "", "ceremony" or "receipt"
 		ok        bool
 		remaining int
 	}{
-		{"drops, open election", []string{`{"event":"stage.ballots.start","n":100}`,
-			`{"event":"stage.ballots.end","committed":40,"dropped":60}`}, false, true, 60},
-		{"drops, closed election", []string{`{"event":"stage.ballots.start","n":100}`,
-			`{"event":"stage.ballots.end","committed":40,"dropped":60}`}, true, false, 0},
-		{"no drops", []string{`{"event":"stage.ballots.start","n":100}`,
-			`{"event":"stage.ballots.end","committed":100,"dropped":0}`}, false, false, 0},
+		{"outage, open election", outage, "", true, 60},
+		{"outage, closed (ceremony file)", outage, "ceremony", false, 0},
+		{"outage, closed (CloseElection receipt only)", outage, "receipt", false, 0},
+		{"chaincode refusals", `{"event":"stage.ballots.end","committed":40,"dropped":60,"unavailable":0}`, "", false, 0},
+		{"outage mixed with refusals", `{"event":"stage.ballots.end","committed":40,"dropped":60,"unavailable":59}`, "", false, 0},
+		{"journalled before the count", `{"event":"stage.ballots.end","committed":40,"dropped":60}`, "", false, 0},
+		{"no drops", `{"event":"stage.ballots.end","committed":100,"dropped":0}`, "", false, 0},
 	} {
 		dir := t.TempDir()
-		writeJournalLines(t, dir, tc.lines...)
-		if tc.closed {
+		writeJournalLines(t, dir, start, tc.end)
+		switch tc.closed {
+		case "ceremony":
 			if err := os.WriteFile(filepath.Join(dir, CeremonyFile), []byte("{}"), 0o644); err != nil {
 				t.Fatal(err)
+			}
+		case "receipt":
+			w, err := openReceipts(dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := w.Lifecycle(TrailEvent{Event: "CloseElection", Receipt: clientsdk.Receipt{TxID: "tx-close", BlockNumber: 9}}); err != nil {
+				t.Fatal(err)
+			}
+			if err := w.Close(); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := os.Stat(filepath.Join(dir, CeremonyFile)); err == nil {
+				t.Fatal("the receipt case must have no ceremony file")
 			}
 		}
 		plan, err := planResume(dir, c)
@@ -147,5 +169,24 @@ func TestPlanResumeEndedWindowWithDrops(t *testing.T) {
 		if tc.ok && (plan.CloseOnly || plan.Remaining != tc.remaining) {
 			t.Errorf("%s: plan %+v, want remaining %d", tc.name, plan, tc.remaining)
 		}
+	}
+}
+
+// TestUnavailableTellsAnOutageFromARefusal: only the network being
+// unreachable counts toward an outage.
+func TestUnavailableTellsAnOutageFromARefusal(t *testing.T) {
+	for text, want := range map[string]bool{
+		"submit SubmitBallot: rpc error: code = Unavailable desc = connection error":                 true,
+		"commit status for SubmitBallot: rpc error: code = Unavailable desc = error reading: EOF":    true,
+		"rpc error: code = Aborted desc = failed to endorse transaction; gate=nullifier: spent":      false,
+		"commit status for SubmitBallot: rpc error: code = DeadlineExceeded desc = context deadline": false,
+		"tx did not validate (code 11)": false,
+	} {
+		if got := unavailable(errors.New(text)); got != want {
+			t.Errorf("unavailable(%q) = %v, want %v", text, got, want)
+		}
+	}
+	if unavailable(nil) {
+		t.Error("unavailable(nil) = true")
 	}
 }
