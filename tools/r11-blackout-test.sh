@@ -49,6 +49,7 @@
 # The network must already be up (see tools/r14-machine-test.sh for a safe
 # bring-up under a compose project of its own). This script never brings a
 # network up or down. The only docker calls it makes are: ps, inspect,
+# logs (the orderer's, for its Raft leader after the restart),
 # events, `kill` of exactly orderer.example.com, peer0.org1.example.com,
 # peer0.org2.example.com and the running dev-peer0.org{1,2}.example.com-
 # <chaincode>_* containers, and `start` of those same containers. It refuses

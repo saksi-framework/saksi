@@ -223,8 +223,14 @@ func r11Setup(t *testing.T, voters int) (BlackoutConfig, *r11Net, *bytes.Buffer)
 			return BlackoutConn{Ledger: r11FakeLedger{n}, Reader: r11FakeReader{n.chain, n}, Close: func() {}}, nil
 		},
 		Run: func(ctx context.Context, name string, args ...string) ([]byte, error) {
-			if name == "docker" {
+			switch name {
+			case "docker":
 				return n.docker(args)
+			case "sh":
+				if n.up(false) {
+					return []byte("... Raft leader changed: 0 -> 1 channel=saksi node=1\n"), nil
+				}
+				return nil, nil
 			}
 			return gen(ctx, name, args...)
 		},
@@ -288,6 +294,9 @@ func TestBlackoutRecoversEveryCommittedRecord(t *testing.T) {
 	}
 	if by[n.ccOrg1] != "peer" || by[n.ccOrg2] != "harness" || by["orderer.example.com"] != "harness" {
 		t.Errorf("started by %v", by)
+	}
+	if !ev.Blackout.Ready || ev.Blackout.FirstQuery == "" || ev.Blackout.OrdererLeaderAt == "" {
+		t.Errorf("readiness %+v", ev.Blackout)
 	}
 	if ev.Duplicate == nil || ev.Duplicate.Gate != "nullifier" {
 		t.Errorf("duplicate %+v", ev.Duplicate)

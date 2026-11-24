@@ -214,7 +214,7 @@ func R11DryRun(w io.Writer, c BlackoutConfig) {
 		"classify   each record C (commit status valid), U (submit or commit-status error) or N (not sent)",
 		fmt.Sprintf("downtime   %s from the kill; inspect: every killed container still down", c.Downtime),
 		"restart    docker start " + strings.Join(R11CoreContainers, " "),
-		"ready      CountCommittedBallots(<election>) until it answers; time from start to ready",
+		"ready      CountCommittedBallots(<election>) answers and the orderer logs a Raft leader; time from start to ready",
 		fmt.Sprintf("chaincode  up to %s for the peers to relaunch the chaincode containers; any still down: docker start (recorded)", c.ChaincodeGrace),
 		"after      ChainInfo (height after >= before); ListNullifiers: every C record on the ledger",
 		"duplicate  SubmitBallot(one C record) again: refused at gate nullifier",
@@ -240,7 +240,7 @@ var r11CheckNames = [][2]string{
 	{"blackout.killed", "every target container killed (orderer, both peers, the chaincode containers)"},
 	{"blackout.down", "every killed container still down at the end of the downtime"},
 	{"blackout.downtime", "downtime >= the configured downtime"},
-	{"blackout.ready", "a query succeeds after the restart"},
+	{"blackout.ready", "a query succeeds and the orderer has a Raft leader after the restart"},
 	{"blackout.restarted", "every killed container running again"},
 	{"after.height", "height after the restart >= height before the blackout"},
 	{"after.committed_kept", "every C record's nullifier on the ledger after the restart"},
@@ -295,11 +295,18 @@ type R11Blackout struct {
 	Ready          bool           `json:"ready"`
 	ReadyAt        string         `json:"ready_at,omitempty"`
 	TimeToReadyMs  int64          `json:"time_to_ready_ms"`
-	ReadyAttempts  int            `json:"ready_attempts"`
-	FirstQuery     string         `json:"first_query,omitempty"`
-	HeightAfter    uint64         `json:"height_after"`
-	HeightAfterOK  bool           `json:"height_after_ok"`
-	Errors         []string       `json:"errors,omitempty"`
+	// The two halves of ready: the first query the chaincode answered, and
+	// the orderer's Raft leader election (its log line), each timed from the
+	// docker start.
+	FirstQueryAt    string   `json:"first_query_at,omitempty"`
+	TimeToQueryMs   int64    `json:"time_to_first_query_ms"`
+	OrdererLeaderAt string   `json:"orderer_leader_seen_at,omitempty"`
+	TimeToLeaderMs  int64    `json:"time_to_orderer_leader_ms"`
+	ReadyAttempts   int      `json:"ready_attempts"`
+	FirstQuery      string   `json:"first_query,omitempty"`
+	HeightAfter     uint64   `json:"height_after"`
+	HeightAfterOK   bool     `json:"height_after_ok"`
+	Errors          []string `json:"errors,omitempty"`
 }
 
 // R11Classification counts the records by class at the blackout, and what
@@ -620,6 +627,16 @@ func (r *r11Run) blackout() {
 	go r.restore(done)
 }
 
+// ordererLeader reports whether the orderer has logged a Raft leader since
+// the restart. Fabric logs to stderr, hence the shell redirect.
+func (r *r11Run) ordererLeader(since time.Time) bool {
+	ctx, cancel := context.WithTimeout(context.Background(), faultDockerTimeout)
+	defer cancel()
+	out, err := r.run(ctx, "sh", "-c", fmt.Sprintf("docker logs --since %s orderer.example.com 2>&1",
+		since.Add(-time.Second).UTC().Format(time.RFC3339)))
+	return err == nil && strings.Contains(string(out), "Raft leader changed")
+}
+
 // startCore starts the orderer and the peers, once.
 func (r *r11Run) startCore() {
 	r.coreStart.Do(func() {
@@ -666,6 +683,7 @@ func (r *r11Run) restore(killDone time.Time) {
 
 	deadline := time.Now().Add(r.cfg.ReadyTimeout)
 	attempts := 0
+	queried, leader := false, false
 	for {
 		attempts++
 		if r.post == nil {
@@ -674,17 +692,36 @@ func (r *r11Run) restore(killDone time.Time) {
 			}
 		}
 		if r.post != nil {
-			n, err := r.post.Reader.CountCommittedBallots(r.elec)
-			if err == nil {
+			if !queried {
+				if n, err := r.post.Reader.CountCommittedBallots(r.elec); err == nil {
+					queried = true
+					now := time.Now()
+					r.boMu.Lock()
+					r.bo.FirstQueryAt = now.UTC().Format(time.RFC3339Nano)
+					r.bo.TimeToQueryMs = now.Sub(startIssued).Milliseconds()
+					r.bo.FirstQuery = fmt.Sprintf("CountCommittedBallots(%s) = %d", r.elec, n)
+					r.boMu.Unlock()
+					r.logf("first query: %s after %d ms", r.bo.FirstQuery, r.bo.TimeToQueryMs)
+				}
+			}
+			if !leader && r.ordererLeader(startIssued) {
+				leader = true
+				now := time.Now()
+				r.boMu.Lock()
+				r.bo.OrdererLeaderAt = now.UTC().Format(time.RFC3339Nano)
+				r.bo.TimeToLeaderMs = now.Sub(startIssued).Milliseconds()
+				r.boMu.Unlock()
+				r.logf("orderer: Raft leader elected, seen %d ms after the start", r.bo.TimeToLeaderMs)
+			}
+			if queried && leader {
 				now := time.Now()
 				r.boMu.Lock()
 				r.bo.Ready = true
 				r.bo.ReadyAt = now.UTC().Format(time.RFC3339Nano)
 				r.bo.TimeToReadyMs = now.Sub(startIssued).Milliseconds()
 				r.bo.ReadyAttempts = attempts
-				r.bo.FirstQuery = fmt.Sprintf("CountCommittedBallots(%s) = %d", r.elec, n)
 				r.boMu.Unlock()
-				r.logf("ready: %s after %d ms (%d attempts)", r.bo.FirstQuery, r.bo.TimeToReadyMs, attempts)
+				r.logf("ready: %d ms after the start (%d attempts)", r.bo.TimeToReadyMs, attempts)
 				break
 			}
 		}
@@ -692,7 +729,7 @@ func (r *r11Run) restore(killDone time.Time) {
 			r.boMu.Lock()
 			r.bo.ReadyAttempts = attempts
 			r.boMu.Unlock()
-			r.boError("no successful query within %s of the restart", r.cfg.ReadyTimeout)
+			r.boError("not ready within %s of the restart (query answered %v, orderer leader %v)", r.cfg.ReadyTimeout, queried, leader)
 			return
 		}
 		time.Sleep(time.Second)
@@ -987,20 +1024,27 @@ func (r *r11Run) drive(ctx context.Context, ev *R11Evidence) string {
 	if refused != "" {
 		ev.ResumeConsoleRefusal = refused
 		ev.ResumePath = r11PathFallbackText
-		before, err := chainCommitted(byNullifier, b, reader)
-		if err != nil {
-			return "list nullifiers before the fallback: " + err.Error()
+		for attempt := 1; attempt <= r11MaxResumes; attempt++ {
+			before, err := chainCommitted(byNullifier, b, reader)
+			if err != nil {
+				return "list nullifiers before the fallback: " + err.Error()
+			}
+			phase := fmt.Sprintf("%s-%d", r11PhaseFallback, attempt)
+			r.setPhase(phase)
+			ferr := r.fallbackResume(ctx, post, before, bundlePath)
+			a := resumeAttempt(len(ev.Resume)+1, before, byNullifier, r.callsIn(phase))
+			a.Path = r11PathFallback
+			if ferr != nil {
+				a.Error = ferr.Error()
+			}
+			ev.Resume = append(ev.Resume, a)
+			r.logf("harness fallback %d: %d on chain before, %d submitted, %d accepted; err %v",
+				attempt, a.OnChainBefore, a.Submitted, a.Accepted, ferr)
+			if ferr == nil || ctx.Err() != nil {
+				break
+			}
+			time.Sleep(cfg.ResumeRetryWait)
 		}
-		r.setPhase(r11PhaseFallback)
-		ferr := r.fallbackResume(ctx, post, before, bundlePath)
-		a := resumeAttempt(len(ev.Resume)+1, before, byNullifier, r.callsIn(r11PhaseFallback))
-		a.Path = r11PathFallback
-		if ferr != nil {
-			a.Error = ferr.Error()
-		}
-		ev.Resume = append(ev.Resume, a)
-		r.logf("console resume refused (%s): harness fallback: %d on chain before, %d submitted, %d accepted; err %v",
-			refused, a.OnChainBefore, a.Submitted, a.Accepted, ferr)
 	}
 	if n := len(ev.Resume); n == 0 || ev.Resume[n-1].Error != "" {
 		return "the resume did not finish"
@@ -1098,7 +1142,11 @@ func (r *r11Run) fallbackResume(ctx context.Context, led clientsdk.Ledger, befor
 		return err
 	}
 	defer r.e.closeReceipts(r.runID)
-	return step(ctx, "CloseElection", "", "CloseElection", b.ElectionID)
+	err = step(ctx, "CloseElection", "", "CloseElection", b.ElectionID)
+	if err != nil && strings.Contains(clientsdk.ErrorText(err), "is already closed") {
+		return nil // a close that landed while its answer did not reach us
+	}
+	return err
 }
 
 // ceremony commits the bundle's partial decryptions and the tally through
@@ -1400,7 +1448,8 @@ func r11Checks(ev R11Evidence) []R11Check {
 		len(bo.Containers) > 0 && inspected == len(bo.Containers) && down == len(bo.Containers))
 	add("blackout.downtime", fmt.Sprintf("down %d ms (configured %d ms)", bo.DowntimeMs, bo.ConfiguredMs),
 		bo.StartOK && bo.ConfiguredMs > 0 && bo.DowntimeMs >= bo.ConfiguredMs)
-	add("blackout.ready", fmt.Sprintf("ready %v after %d ms (%d attempts): %s", bo.Ready, bo.TimeToReadyMs, bo.ReadyAttempts, bo.FirstQuery), bo.Ready)
+	add("blackout.ready", fmt.Sprintf("ready %v after %d ms (%d attempts): first query %d ms (%s), orderer leader %d ms",
+		bo.Ready, bo.TimeToReadyMs, bo.ReadyAttempts, bo.TimeToQueryMs, bo.FirstQuery, bo.TimeToLeaderMs), bo.Ready)
 	up := 0
 	var by []string
 	for _, c := range bo.Containers {
