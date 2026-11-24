@@ -319,15 +319,18 @@ type R11Blackout struct {
 	// The two halves of ready: the first query the chaincode answered, and
 	// the orderer's Raft leader election (its log line), each timed from the
 	// docker start.
-	FirstQueryAt    string   `json:"first_query_at,omitempty"`
-	TimeToQueryMs   int64    `json:"time_to_first_query_ms"`
-	OrdererLeaderAt string   `json:"orderer_leader_seen_at,omitempty"`
-	TimeToLeaderMs  int64    `json:"time_to_orderer_leader_ms"`
-	ReadyAttempts   int      `json:"ready_attempts"`
-	FirstQuery      string   `json:"first_query,omitempty"`
-	HeightAfter     uint64   `json:"height_after"`
-	HeightAfterOK   bool     `json:"height_after_ok"`
-	Errors          []string `json:"errors,omitempty"`
+	FirstQueryAt    string `json:"first_query_at,omitempty"`
+	TimeToQueryMs   int64  `json:"time_to_first_query_ms"`
+	OrdererLeaderAt string `json:"orderer_leader_seen_at,omitempty"`
+	TimeToLeaderMs  int64  `json:"time_to_orderer_leader_ms"`
+	ReadyAttempts   int    `json:"ready_attempts"`
+	FirstQuery      string `json:"first_query,omitempty"`
+	HeightAfter     uint64 `json:"height_after"`
+	HeightAfterOK   bool   `json:"height_after_ok"`
+	// EventsCaptured is how many docker events of the killed containers
+	// docker-events.ndjson holds.
+	EventsCaptured int      `json:"docker_events_captured"`
+	Errors         []string `json:"errors,omitempty"`
 }
 
 // R11Classification counts the records by class at the blackout, and what
@@ -709,6 +712,10 @@ func (r *r11Run) startCore() {
 func (r *r11Run) restore(killDone time.Time) {
 	defer close(r.restarted)
 	defer r.startCore()
+	// The daemon keeps only its most recent events (a few hundred, shared
+	// with every other container on the machine), so they are read as soon
+	// as the recovery is over, not at the end of the run.
+	defer r.writeEvents(r.killAt.Add(-10 * time.Second))
 	if wait := time.Until(killDone.Add(r.cfg.Downtime)); wait > 0 {
 		time.Sleep(wait)
 	}
@@ -897,7 +904,6 @@ func RunBlackoutTest(ctx context.Context, cfg BlackoutConfig) (R11Evidence, erro
 	r.boMu.Lock()
 	ev.Blackout = r.bo
 	r.boMu.Unlock()
-	r.writeEvents(started)
 
 	ev.Checks = r11Checks(ev)
 	ev.Pass = ev.Aborted == "" && len(ev.Checks) > 0
@@ -1261,8 +1267,8 @@ func (r *r11Run) inspectAtEnd() {
 	}
 }
 
-// writeEvents saves the docker events of the killed containers over the run.
-func (r *r11Run) writeEvents(started time.Time) {
+// writeEvents saves the docker events of the killed containers since since.
+func (r *r11Run) writeEvents(since time.Time) {
 	r.boMu.Lock()
 	names := append([]string(nil), r.killed...)
 	r.boMu.Unlock()
@@ -1270,9 +1276,12 @@ func (r *r11Run) writeEvents(started time.Time) {
 		return
 	}
 	out, err := r.docker(context.Background(), "events",
-		"--since", strconv.FormatInt(started.Add(-5*time.Second).Unix(), 10),
+		"--since", strconv.FormatInt(since.Unix(), 10),
 		"--until", strconv.FormatInt(time.Now().Add(time.Second).Unix(), 10),
 		"--filter", "type=container", "--format", "{{json .}}")
+	r.boMu.Lock()
+	r.bo.EventsCaptured = strings.Count(filterEvents(out, names), "\n")
+	r.boMu.Unlock()
 	if err != nil {
 		r.boError("docker events: %v", err)
 	}

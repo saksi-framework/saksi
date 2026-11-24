@@ -309,7 +309,7 @@ func TestBlackoutRecoversEveryCommittedRecord(t *testing.T) {
 		t.Fatalf("election on the fake chain: %+v", e)
 	}
 	ev2 := readFile(t, cfg.OutDir+"/docker-events.ndjson")
-	if !strings.Contains(ev2, "orderer.example.com") || strings.Contains(ev2, "saksilive") {
+	if ev.Blackout.EventsCaptured != 1 || !strings.Contains(ev2, "orderer.example.com") || strings.Contains(ev2, "saksilive") {
 		t.Errorf("docker events not filtered to the killed containers:\n%s", ev2)
 	}
 }
