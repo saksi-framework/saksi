@@ -39,6 +39,7 @@ func main() {
 	concurrency := fs.Int("concurrency", 32, "ballots in flight")
 	blackoutAt := fs.Float64("blackout-at", 0.4, "fraction of the ballot records committed when the network is killed")
 	downtime := fs.Duration("downtime", 30*time.Second, "how long the network stays down")
+	stopWindow := fs.String("stop-window", campaign.R11StopWithKill, "when the ballot window stops dispatching: with-kill (immediately before docker kill) or after-kill (once it returns)")
 	readyTimeout := fs.Duration("ready-timeout", 5*time.Minute, "wait for the first successful query after the restart")
 	ccGrace := fs.Duration("chaincode-grace", time.Minute, "time the peers get to relaunch the chaincode containers before the harness starts them")
 	project := fs.String("compose-project", "r14", "compose project the orderer and peers must belong to")
@@ -63,7 +64,7 @@ func main() {
 		Voters: *voters, Positions: *positions, Candidates: *candidates,
 		Trustees: *trustees, Threshold: *threshold, Distribution: *distribution,
 		Concurrency: *concurrency, BlackoutAt: *blackoutAt, Downtime: *downtime,
-		ReadyTimeout: *readyTimeout, ChaincodeGrace: *ccGrace,
+		ReadyTimeout: *readyTimeout, ChaincodeGrace: *ccGrace, StopWindow: *stopWindow,
 		ComposeProject: *project, Chaincode: *chaincode, Commit: *commit,
 		Network: map[string]string{
 			"peer": *peer, "gateway_peer": *gatewayPeer, "msp_id": *mspID,

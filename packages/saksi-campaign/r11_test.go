@@ -218,7 +218,7 @@ func r11Setup(t *testing.T, voters int) (BlackoutConfig, *r11Net, *bytes.Buffer)
 		Distribution: "uniform", Concurrency: 4, BlackoutAt: 0.4,
 		Downtime: 20 * time.Millisecond, ReadyTimeout: 3 * time.Second,
 		ChaincodeGrace: 50 * time.Millisecond, ResumeRetryWait: 10 * time.Millisecond,
-		ComposeProject: "r14", Chaincode: "saksi-bulletin", Commit: "abc",
+		ComposeProject: "r14", Chaincode: "saksi-bulletin", Commit: "abc", StopWindow: R11StopWithKill,
 		Dial: func() (BlackoutConn, error) {
 			return BlackoutConn{Ledger: r11FakeLedger{n}, Reader: r11FakeReader{n.chain, n}, Close: func() {}}, nil
 		},
@@ -329,6 +329,7 @@ func readFile(t *testing.T, path string) string {
 func TestBlackoutFallsBackWhenTheConsoleRefusesToResume(t *testing.T) {
 	cfg, n, log := r11Setup(t, 2)
 	cfg.Concurrency = 8
+	cfg.StopWindow = R11StopAfterKill
 	n.holdFrom = cfg.TriggerCount()
 	ev, err := RunBlackoutTest(context.Background(), cfg)
 	if err != nil {
@@ -526,6 +527,7 @@ func TestBlackoutConfigValidate(t *testing.T) {
 		"at 1":       func(c *BlackoutConfig) { c.BlackoutAt = 1 },
 		"no project": func(c *BlackoutConfig) { c.ComposeProject = "" },
 		"downtime":   func(c *BlackoutConfig) { c.Downtime = 0 },
+		"stop":       func(c *BlackoutConfig) { c.StopWindow = "" },
 		"tiny":       func(c *BlackoutConfig) { c.Voters, c.Positions, c.BlackoutAt = 1, 1, 0.5 },
 	} {
 		c := cfg

@@ -38,6 +38,12 @@
 #   other flags go to saksi-r11-test as is: --positions 3 --candidates 4
 #   --trustees 5 --threshold 3 --concurrency 32 --compose-project r14
 #   --ready-timeout 5m --chaincode-grace 1m --stamp S --distribution D
+#   --stop-window with-kill|after-kill (default with-kill: the window stops
+#   dispatching at the instant of the kill, as a console that stops sending
+#   when its network dies; after-kill keeps dispatching into the dead network
+#   until docker kill returns, which drops every remaining record, ends the
+#   window instead of interrupting it, and the console's resume then refuses
+#   the run, so the harness falls back to resubmitting by nullifier itself)
 #
 # Environment:
 #   FABRIC_SAMPLES     fabric-samples checkout (default: beside the repo, as network.sh)

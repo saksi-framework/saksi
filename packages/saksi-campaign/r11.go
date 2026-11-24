@@ -120,6 +120,9 @@ type BlackoutConfig struct {
 	BlackoutAt float64
 	// Downtime is how long the network stays down after the kill.
 	Downtime time.Duration
+	// StopWindow is when the ballot window stops dispatching:
+	// R11StopWithKill (default) or R11StopAfterKill.
+	StopWindow string
 	// ReadyTimeout bounds the wait for the first successful query after the
 	// restart (default 5 minutes).
 	ReadyTimeout time.Duration
@@ -146,6 +149,14 @@ type BlackoutConfig struct {
 	// Log receives progress lines. nil discards them.
 	Log io.Writer
 }
+
+// When the ballot window stops dispatching, relative to the kill.
+const (
+	// R11StopWithKill cancels the window immediately before docker kill.
+	R11StopWithKill = "with-kill"
+	// R11StopAfterKill cancels it once docker kill has returned.
+	R11StopAfterKill = "after-kill"
+)
 
 // Records is the election's ballot records: one per voter per position.
 func (c BlackoutConfig) Records() int { return c.Voters * c.Positions }
@@ -184,6 +195,8 @@ func (c BlackoutConfig) Validate() error {
 		return errors.New("the compose project is required: the blackout kills only that project's containers")
 	case c.Chaincode == "":
 		return errors.New("the chaincode name is required")
+	case c.StopWindow != R11StopWithKill && c.StopWindow != R11StopAfterKill:
+		return fmt.Errorf("--stop-window must be %q or %q (got %q)", R11StopWithKill, R11StopAfterKill, c.StopWindow)
 	}
 	if t := c.TriggerCount(); t >= c.Records() {
 		return fmt.Errorf("--blackout-at %v of %d records fires at %d: at least one record must be left for the resume", c.BlackoutAt, c.Records(), t)
@@ -210,7 +223,8 @@ func R11DryRun(w io.Writer, c BlackoutConfig) {
 		"preflight  docker ps: " + strings.Join(R11CoreContainers, ", ") + " running, labelled com.docker.compose.project=" + c.ComposeProject,
 		"generate   Executor.Generate: saksi-demo gen --stream <out>/runs/<run>",
 		"window     Executor.Submit: CreateElection (admin), RegisterPrecinctMachine (admin), PublishDKGTranscript, SubmitBallot x N (machine)",
-		fmt.Sprintf("blackout   at commit %d: ChainInfo (height before), docker kill <core + running chaincode containers> in one call, cancel the window", c.TriggerCount()),
+		fmt.Sprintf("blackout   at commit %d: ChainInfo (height before), docker kill <core + running chaincode containers> in one call;\n"+
+			"           the window stops dispatching %s", c.TriggerCount(), stopText(c.StopWindow)),
 		"classify   each record C (commit status valid), U (submit or commit-status error) or N (not sent)",
 		fmt.Sprintf("downtime   %s from the kill; inspect: every killed container still down", c.Downtime),
 		"restart    docker start " + strings.Join(R11CoreContainers, " "),
@@ -231,6 +245,13 @@ func R11DryRun(w io.Writer, c BlackoutConfig) {
 	for _, ch := range r11CheckNames {
 		fmt.Fprintf(w, "  %-26s %s\n", ch[0], ch[1])
 	}
+}
+
+func stopText(mode string) string {
+	if mode == R11StopAfterKill {
+		return "once docker kill has returned (after-kill)"
+	}
+	return "at the instant of the kill (with-kill)"
 }
 
 // r11CheckNames lists every check, in order, with what it expects.
@@ -599,8 +620,15 @@ func (r *r11Run) blackout() {
 		r.boError("ChainInfo before the kill: %v", herr)
 	}
 
+	// The window stops dispatching: what was not sent stays N. With
+	// StopWithKill it stops at the instant of the kill (the console stops
+	// sending as the network dies, which leaves its window interrupted and
+	// resumable); otherwise only once docker kill has returned, and the
+	// workers keep dispatching into the dead network meanwhile.
+	if r.cfg.StopWindow == R11StopWithKill {
+		r.winCancel()
+	}
 	out, kerr := r.docker(ctx, cmd...)
-	// The window stops dispatching: what was not sent stays N.
 	r.winCancel()
 	done := time.Now()
 
@@ -806,7 +834,7 @@ func RunBlackoutTest(ctx context.Context, cfg BlackoutConfig) (R11Evidence, erro
 			"name": cfg.ElectionName(), "voters": cfg.Voters, "positions": cfg.Positions,
 			"candidates": cfg.Candidates, "trustees": cfg.Trustees, "threshold": cfg.Threshold,
 			"distribution": cfg.Distribution, "concurrency": cfg.Concurrency, "records": cfg.Records(),
-			"blackout_at": cfg.BlackoutAt, "downtime_s": cfg.Downtime.Seconds(),
+			"blackout_at": cfg.BlackoutAt, "downtime_s": cfg.Downtime.Seconds(), "stop_window": cfg.StopWindow,
 		},
 		ResumePath: "Executor.resumeAndClose, the body of the console's Resume (POST /api/runs/<id>/resume), " +
 			"called in process: journal checkpoint + ListNullifiers ∩ run nullifiers, then CloseElection",
